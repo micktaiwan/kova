@@ -18,7 +18,7 @@ Terminal Mac ultra-rapide en Rust + Metal.
 
 ## État
 
-- **V0 terminée** — single pane fonctionnel (PTY, rendu Metal, scrollback, alternate screen, dirty flag)
+- **V0 terminée** — single pane fonctionnel (PTY, rendu Metal, scrollback, alternate screen, dirty flag, reflow au resize)
 - **V1 en cours** — voir `roadmap.md` pour le détail et l'ordre recommandé
 
 ## Notes techniques

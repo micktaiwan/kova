@@ -44,6 +44,7 @@ pub struct Renderer {
     status_bar_scroll_color: [f32; 3],
     status_bar_time_color: [f32; 3],
     last_minute: u32,
+    selection_color: [f32; 3],
 }
 
 impl Renderer {
@@ -115,6 +116,7 @@ impl Renderer {
             status_bar_scroll_color: config.status_bar.scroll_color,
             status_bar_time_color: config.status_bar.time_color,
             last_minute: u32::MAX,
+            selection_color: [0.45, 0.42, 0.20],
         }
     }
 
@@ -308,6 +310,35 @@ impl Renderer {
 
         let mut vertices = Vec::with_capacity(display.len() * term.cols as usize * 6);
 
+        // Precompute selection abs_line base if selection is active
+        let has_selection = term.selection.is_some();
+        let abs_line_base = if has_selection {
+            term.scrollback_len() as i64 - term.scroll_offset() as i64
+        } else {
+            0
+        };
+
+        // Pass 1: backgrounds + selection highlights (under text)
+        for (row_idx, line) in display.iter().enumerate() {
+            let abs_line = (abs_line_base + row_idx as i64) as usize;
+            let y = y_offset + row_idx as f32 * cell_h;
+
+            for col_idx in 0..term.cols as usize {
+                let x = col_idx as f32 * cell_w;
+
+                // Cell background
+                if col_idx < line.len() && line[col_idx].bg != self.bg_color {
+                    Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, line[col_idx].bg);
+                }
+
+                // Selection highlight (rendered on top of cell bg, under glyphs)
+                if has_selection && term.is_selected(abs_line, col_idx as u16) {
+                    Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, self.selection_color);
+                }
+            }
+        }
+
+        // Pass 2: glyphs (on top of backgrounds and selection)
         for (row_idx, line) in display.iter().enumerate() {
             for col_idx in 0..term.cols as usize {
                 let cell = if col_idx < line.len() {
@@ -318,19 +349,7 @@ impl Renderer {
 
                 let c = cell.c;
                 if c == ' ' || c == '\0' {
-                    if cell.bg != self.bg_color {
-                        let x = col_idx as f32 * cell_w;
-                        let y = y_offset + row_idx as f32 * cell_h;
-                        Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, cell.bg);
-                    }
                     continue;
-                }
-
-                let x = col_idx as f32 * cell_w;
-                let y = y_offset + row_idx as f32 * cell_h;
-
-                if cell.bg != self.bg_color {
-                    Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, cell.bg);
                 }
 
                 let glyph = match self.atlas.glyph(c) {
@@ -342,8 +361,8 @@ impl Renderer {
                     continue;
                 }
 
-                let gx = x;
-                let gy = y;
+                let gx = col_idx as f32 * cell_w;
+                let gy = y_offset + row_idx as f32 * cell_h;
                 let gw = glyph.width as f32;
                 let gh = glyph.height as f32;
 
