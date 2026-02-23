@@ -3,6 +3,7 @@ use rustix::termios::{self, Winsize};
 use rustix_openpty::openpty;
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -40,74 +41,64 @@ impl Pty {
         };
         let _ = termios::tcsetwinsize(master_fd.as_fd(), winsize);
 
-        // Use posix_spawnp instead of fork+exec (safe in multi-threaded context)
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let shell_c = std::ffi::CString::new(shell.as_str())?;
         // Login shell: arg0 = "-" + shell name (e.g. "-zsh")
         let shell_name = std::path::Path::new(&shell)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("zsh");
-        let arg0 = std::ffi::CString::new(format!("-{}", shell_name))?;
-        let argv: [*mut libc::c_char; 2] = [arg0.as_ptr() as *mut _, std::ptr::null_mut()];
+        let arg0 = format!("-{}", shell_name);
 
-        // Build full environment with TERM override
-        let mut env_strs: Vec<std::ffi::CString> = std::env::vars()
-            .filter(|(k, _)| k != "TERM")
-            .map(|(k, v)| std::ffi::CString::new(format!("{k}={v}")).unwrap())
-            .collect();
-        env_strs.push(std::ffi::CString::new("TERM=xterm-256color").unwrap());
-        let mut envp: Vec<*mut libc::c_char> = env_strs.iter().map(|s| s.as_ptr() as *mut _).collect();
-        envp.push(std::ptr::null_mut());
-
-        // chdir to $HOME before spawn (child inherits cwd)
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        let _ = std::env::set_current_dir(&home);
 
-        // File actions: dup2 slave_fd to stdin/stdout/stderr
-        let mut file_actions: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::posix_spawn_file_actions_init(&mut file_actions);
-            libc::posix_spawn_file_actions_adddup2(&mut file_actions, slave_fd.as_raw_fd(), 0);
-            libc::posix_spawn_file_actions_adddup2(&mut file_actions, slave_fd.as_raw_fd(), 1);
-            libc::posix_spawn_file_actions_adddup2(&mut file_actions, slave_fd.as_raw_fd(), 2);
-            if slave_fd.as_raw_fd() > 2 {
-                libc::posix_spawn_file_actions_addclose(&mut file_actions, slave_fd.as_raw_fd());
-            }
-        }
+        // Raw fd values for use inside pre_exec (which is async-signal-safe)
+        let slave_raw = slave_fd.as_raw_fd();
+        let master_raw = master_fd.as_raw_fd();
 
-        // Spawn attributes: new session (POSIX_SPAWN_SETSID on macOS)
-        let mut spawnattr: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::posix_spawnattr_init(&mut spawnattr);
-            // POSIX_SPAWN_SETSID = 0x0400 on macOS (not in libc crate yet)
-            libc::posix_spawnattr_setflags(&mut spawnattr, 0x0400i16);
-        }
+        // Spawn shell using Command + pre_exec (like Alacritty).
+        // pre_exec runs in the child after fork, before exec — the correct
+        // place for setsid + TIOCSCTTY to establish the controlling terminal.
+        let child = unsafe {
+            std::process::Command::new(&shell)
+                .arg0(&arg0)
+                .stdin(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
+                .stdout(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
+                .stderr(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
+                .env("TERM", "xterm-256color")
+                .env("TERM_PROGRAM", "Kova")
+                .current_dir(&home)
+                .pre_exec(move || {
+                    // New session — required before TIOCSCTTY
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
 
-        let mut child_pid: libc::pid_t = 0;
-        let ret = unsafe {
-            libc::posix_spawnp(
-                &mut child_pid,
-                shell_c.as_ptr(),
-                &file_actions,
-                &spawnattr,
-                argv.as_ptr(),
-                envp.as_ptr(),
-            )
+                    // Set the slave PTY as controlling terminal
+                    // (stdin fd 0 is the slave after Command sets it up)
+                    if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+
+                    // Close fds that the child doesn't need
+                    libc::close(slave_raw);
+                    libc::close(master_raw);
+
+                    // Reset signal handlers
+                    libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+                    libc::signal(libc::SIGHUP, libc::SIG_DFL);
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                    libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                    libc::signal(libc::SIGALRM, libc::SIG_DFL);
+
+                    Ok(())
+                })
+                .spawn()?
         };
 
-        unsafe {
-            libc::posix_spawn_file_actions_destroy(&mut file_actions);
-            libc::posix_spawnattr_destroy(&mut spawnattr);
-        }
-
-        if ret != 0 {
-            return Err(format!("posix_spawnp failed: {}", std::io::Error::from_raw_os_error(ret)).into());
-        }
-
+        let child_pid = child.id();
         drop(slave_fd);
 
-        let child_pid = child_pid as u32;
         PTY_PIDS.lock().push(child_pid);
 
         let dup_fd = unsafe { libc::dup(master_fd.as_raw_fd()) };
@@ -165,9 +156,9 @@ impl Pty {
             ws_ypixel: 0,
         };
         let _ = termios::tcsetwinsize(self.master_fd.as_fd(), winsize);
-        unsafe {
-            libc::kill(self.child_pid as i32, libc::SIGWINCH);
-        }
+        // TIOCSWINSZ (via tcsetwinsize) automatically sends SIGWINCH to the
+        // foreground process group when the controlling terminal is properly
+        // established (setsid + TIOCSCTTY in pre_exec).
     }
 }
 
