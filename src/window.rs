@@ -1,15 +1,17 @@
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSBackingStoreType, NSEvent, NSEventModifierFlags, NSPasteboard, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{NSApplication, NSBackingStoreType, NSEvent, NSEventModifierFlags, NSPasteboard, NSWindow, NSWindowStyleMask};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
 use objc2_metal::MTLCreateSystemDefaultDevice;
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::{Cell, OnceCell};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::config::Config;
 use crate::input;
 use crate::renderer::Renderer;
 use crate::terminal::pty::Pty;
@@ -20,6 +22,8 @@ pub struct KovaViewIvars {
     terminal: OnceCell<Arc<parking_lot::RwLock<TerminalState>>>,
     pty: OnceCell<Pty>,
     metal_layer: OnceCell<Retained<CAMetalLayer>>,
+    shell_exited: OnceCell<Arc<AtomicBool>>,
+    shell_ready: OnceCell<Arc<AtomicBool>>,
     scroll_accumulator: Cell<f64>,
     last_scale: Cell<f64>,
 }
@@ -112,6 +116,8 @@ impl KovaView {
             terminal: OnceCell::new(),
             pty: OnceCell::new(),
             metal_layer: OnceCell::new(),
+            shell_exited: OnceCell::new(),
+            shell_ready: OnceCell::new(),
             scroll_accumulator: Cell::new(0.0),
             last_scale: Cell::new(0.0),
         });
@@ -153,7 +159,7 @@ impl KovaView {
         }
     }
 
-    pub fn setup_metal(&self, _mtm: MainThreadMarker) {
+    pub fn setup_metal(&self, _mtm: MainThreadMarker, config: &Config) {
         let device = MTLCreateSystemDefaultDevice()
             .expect("no Metal device");
 
@@ -179,28 +185,48 @@ impl KovaView {
         self.ivars().metal_layer.set(layer.clone()).ok();
 
         self.ivars().last_scale.set(scale);
-        let terminal = Arc::new(parking_lot::RwLock::new(TerminalState::new(80, 24)));
-        let renderer = Arc::new(parking_lot::RwLock::new(Renderer::new(&device, &layer, terminal.clone(), scale)));
-        let pty = Pty::spawn(80, 24, terminal.clone()).expect("failed to spawn PTY");
+
+        let cols = config.terminal.columns;
+        let rows = config.terminal.rows;
+        let terminal = Arc::new(parking_lot::RwLock::new(
+            TerminalState::new(cols, rows, config.terminal.scrollback, config.colors.foreground, config.colors.background),
+        ));
+        let renderer = Arc::new(parking_lot::RwLock::new(
+            Renderer::new(&device, &layer, terminal.clone(), scale, config),
+        ));
+        let shell_exited = Arc::new(AtomicBool::new(false));
+        let shell_ready = Arc::new(AtomicBool::new(false));
+        let pty = Pty::spawn(cols, rows, terminal.clone(), shell_exited.clone(), shell_ready.clone())
+            .expect("failed to spawn PTY");
 
         self.ivars().renderer.set(renderer).ok();
         self.ivars().terminal.set(terminal).ok();
         self.ivars().pty.set(pty).ok();
+        self.ivars().shell_exited.set(shell_exited).ok();
+        self.ivars().shell_ready.set(shell_ready).ok();
 
-        self.start_render_timer();
+        self.start_render_timer(config.terminal.fps);
     }
 
-    fn start_render_timer(&self) {
+    fn start_render_timer(&self, fps: u32) {
         let renderer = self.ivars().renderer.get().unwrap().clone();
         let terminal = self.ivars().terminal.get().unwrap().clone();
         let layer = self.ivars().metal_layer.get().expect("metal_layer not initialized").clone();
+        let shell_exited = self.ivars().shell_exited.get().unwrap().clone();
+        let shell_ready = self.ivars().shell_ready.get().unwrap().clone();
 
         let timer = unsafe {
             NSTimer::scheduledTimerWithTimeInterval_repeats_block(
-                1.0 / 60.0,
+                1.0 / fps as f64,
                 true,
                 &RcBlock::new(move |_timer: NonNull<NSTimer>| {
-                    renderer.write().render(&layer, &terminal);
+                    if shell_exited.load(Ordering::Relaxed) {
+                        let mtm = MainThreadMarker::new_unchecked();
+                        let app = NSApplication::sharedApplication(mtm);
+                        app.terminate(None);
+                        return;
+                    }
+                    renderer.write().render(&layer, &terminal, shell_ready.load(Ordering::Relaxed));
                 }),
             )
         };
@@ -210,12 +236,12 @@ impl KovaView {
 
 }
 
-pub fn create_window(mtm: MainThreadMarker) -> Retained<NSWindow> {
+pub fn create_window(mtm: MainThreadMarker, config: &Config) -> Retained<NSWindow> {
     let content_rect = CGRect {
-        origin: CGPoint { x: 200.0, y: 200.0 },
+        origin: CGPoint { x: config.window.x, y: config.window.y },
         size: CGSize {
-            width: 800.0,
-            height: 600.0,
+            width: config.window.width,
+            height: config.window.height,
         },
     };
 
@@ -242,7 +268,7 @@ pub fn create_window(mtm: MainThreadMarker) -> Retained<NSWindow> {
     });
 
     let view = KovaView::new(mtm, content_rect);
-    view.setup_metal(mtm);
+    view.setup_metal(mtm, config);
     window.setContentView(Some(&view));
     window.makeFirstResponder(Some(&view));
 

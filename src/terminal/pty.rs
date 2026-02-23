@@ -23,6 +23,8 @@ impl Pty {
         cols: u16,
         rows: u16,
         terminal: Arc<RwLock<TerminalState>>,
+        shell_exited: Arc<AtomicBool>,
+        shell_ready: Arc<AtomicBool>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_pair = openpty(None, None)?;
 
@@ -41,7 +43,12 @@ impl Pty {
         // Use posix_spawnp instead of fork+exec (safe in multi-threaded context)
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let shell_c = std::ffi::CString::new(shell.as_str())?;
-        let arg0 = std::ffi::CString::new("-kova")?;
+        // Login shell: arg0 = "-" + shell name (e.g. "-zsh")
+        let shell_name = std::path::Path::new(&shell)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("zsh");
+        let arg0 = std::ffi::CString::new(format!("-{}", shell_name))?;
         let argv: [*mut libc::c_char; 2] = [arg0.as_ptr() as *mut _, std::ptr::null_mut()];
 
         // Build full environment with TERM override
@@ -53,7 +60,11 @@ impl Pty {
         let mut envp: Vec<*mut libc::c_char> = env_strs.iter().map(|s| s.as_ptr() as *mut _).collect();
         envp.push(std::ptr::null_mut());
 
-        // File actions: dup2 slave_fd to stdin/stdout/stderr, close slave_fd
+        // chdir to $HOME before spawn (child inherits cwd)
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let _ = std::env::set_current_dir(&home);
+
+        // File actions: dup2 slave_fd to stdin/stdout/stderr
         let mut file_actions: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
         unsafe {
             libc::posix_spawn_file_actions_init(&mut file_actions);
@@ -112,19 +123,26 @@ impl Pty {
                 let mut parser = vte::Parser::new();
                 let mut handler = VteHandler::new(terminal);
                 let mut buf = [0u8; 4096];
+                let mut eof = false;
 
                 loop {
                     if SHUTDOWN.load(Ordering::Relaxed) {
                         break;
                     }
                     match file.read(&mut buf) {
-                        Ok(0) => break,
+                        Ok(0) => { eof = true; break; }
                         Ok(n) => {
+                            if !shell_ready.load(Ordering::Relaxed) {
+                                shell_ready.store(true, Ordering::Relaxed);
+                            }
                             parser.advance(&mut handler, &buf[..n]);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
+                        Err(_) => { eof = true; break; }
                     }
+                }
+                if eof {
+                    shell_exited.store(true, Ordering::Relaxed);
                 }
                 log::info!("PTY reader thread exiting");
             })?;

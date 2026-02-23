@@ -213,7 +213,10 @@ impl Perform for VteHandler {
                 // Full reset
                 let cols = term.cols;
                 let rows = term.rows;
-                *term = TerminalState::new(cols, rows);
+                let scrollback_limit = term.scrollback_limit;
+                let fg = term.default_fg;
+                let bg = term.default_bg;
+                *term = TerminalState::new(cols, rows, scrollback_limit, fg, bg);
             }
             _ => {
                 log::debug!(

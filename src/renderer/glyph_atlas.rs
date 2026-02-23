@@ -40,9 +40,9 @@ pub struct GlyphAtlas {
 }
 
 impl GlyphAtlas {
-    pub fn new(device: &ProtocolObject<dyn MTLDevice>, font_size: f64) -> Self {
-        let font_name = CFString::from_static_str("Menlo");
-        let font = unsafe { CTFont::with_name(&font_name, font_size, ptr::null()) };
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>, font_size: f64, font_name: &str) -> Self {
+        let cf_font_name = CFString::from_str(font_name);
+        let font = unsafe { CTFont::with_name(&cf_font_name, font_size, ptr::null()) };
 
         let ascent = unsafe { font.ascent() };
         let descent = unsafe { font.descent() };

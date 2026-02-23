@@ -12,7 +12,8 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use vertex::Vertex;
 
-use crate::terminal::{TerminalState, DEFAULT_BG};
+use crate::config::Config;
+use crate::terminal::TerminalState;
 
 const MAX_VERTEX_BYTES: usize = 4 * 1024 * 1024; // 4MB
 
@@ -29,6 +30,11 @@ pub struct Renderer {
     last_atlas_size: [f32; 2],
     blink_counter: u32,
     last_cursor_epoch: u32,
+    bg_color: [f32; 3],
+    cursor_color: [f32; 3],
+    font_size: f64,
+    font_name: String,
+    cursor_blink_frames: u32,
 }
 
 impl Renderer {
@@ -37,6 +43,7 @@ impl Renderer {
         layer: &CAMetalLayer,
         _terminal: Arc<RwLock<TerminalState>>,
         scale: f64,
+        config: &Config,
     ) -> Self {
         let command_queue = device
             .newCommandQueue()
@@ -44,7 +51,7 @@ impl Renderer {
 
         let pixel_format = layer.pixelFormat();
         let pipeline = pipeline::create_pipeline(device, pixel_format);
-        let atlas = GlyphAtlas::new(device, 14.0 * scale);
+        let atlas = GlyphAtlas::new(device, config.font.size * scale, &config.font.family);
 
         let make_vertex_buf = || {
             device.newBufferWithLength_options(
@@ -86,11 +93,16 @@ impl Renderer {
             last_atlas_size: atlas_size,
             blink_counter: 0,
             last_cursor_epoch: 0,
+            bg_color: config.colors.background,
+            cursor_color: config.colors.cursor,
+            font_size: config.font.size,
+            font_name: config.font.family.clone(),
+            cursor_blink_frames: config.terminal.cursor_blink_frames,
         }
     }
 
 
-    pub fn render(&mut self, layer: &CAMetalLayer, terminal: &Arc<RwLock<TerminalState>>) {
+    pub fn render(&mut self, layer: &CAMetalLayer, terminal: &Arc<RwLock<TerminalState>>, shell_ready: bool) {
         // Reset blink on cursor movement so cursor is immediately visible
         let epoch = terminal.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed);
         if epoch != self.last_cursor_epoch {
@@ -99,11 +111,19 @@ impl Renderer {
         }
 
         self.blink_counter = self.blink_counter.wrapping_add(1);
-        let blink_on = self.blink_counter % 60 < 30;
-        let blink_changed = (self.blink_counter % 30) == 0;
+        let (blink_on, blink_changed) = if self.cursor_blink_frames >= 2 {
+            let half = self.cursor_blink_frames / 2;
+            (
+                self.blink_counter % self.cursor_blink_frames < half,
+                (self.blink_counter % half) == 0,
+            )
+        } else {
+            // cursor_blink_frames 0 or 1: cursor always on, never triggers blink refresh
+            (true, false)
+        };
 
         let is_dirty = terminal.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed);
-        if !is_dirty && !blink_changed {
+        if shell_ready && !is_dirty && !blink_changed {
             return;
         }
 
@@ -116,9 +136,11 @@ impl Renderer {
         let viewport_w = drawable_size.width as f32;
         let viewport_h = drawable_size.height as f32;
 
-        let vertices = {
+        let vertices = if shell_ready {
             let term = terminal.read();
             self.build_vertices(&term, viewport_w, viewport_h, blink_on)
+        } else {
+            self.build_loading_vertices(viewport_w, viewport_h)
         };
 
         // Update viewport buffer if changed
@@ -150,9 +172,9 @@ impl Renderer {
             color.setTexture(Some(&tex));
             color.setLoadAction(MTLLoadAction::Clear);
             color.setClearColor(MTLClearColor {
-                red: 0.1,
-                green: 0.1,
-                blue: 0.12,
+                red: self.bg_color[0] as f64,
+                green: self.bg_color[1] as f64,
+                blue: self.bg_color[2] as f64,
                 alpha: 1.0,
             });
             color.setStoreAction(MTLStoreAction::Store);
@@ -252,7 +274,7 @@ impl Renderer {
 
                 let c = cell.c;
                 if c == ' ' || c == '\0' {
-                    if cell.bg != DEFAULT_BG {
+                    if cell.bg != self.bg_color {
                         let x = col_idx as f32 * cell_w;
                         let y = row_idx as f32 * cell_h;
                         Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, cell.bg);
@@ -263,7 +285,7 @@ impl Renderer {
                 let x = col_idx as f32 * cell_w;
                 let y = row_idx as f32 * cell_h;
 
-                if cell.bg != DEFAULT_BG {
+                if cell.bg != self.bg_color {
                     Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, cell.bg);
                 }
 
@@ -307,8 +329,50 @@ impl Renderer {
             if screen_y >= 0 && screen_y < term.rows as i32 {
                 let cx = term.cursor_x as f32 * cell_w;
                 let cy = screen_y as f32 * cell_h;
-                Self::push_bg_quad(&mut vertices, cx, cy, cell_w, cell_h, [0.8, 0.8, 0.8]);
+                Self::push_bg_quad(&mut vertices, cx, cy, cell_w, cell_h, self.cursor_color);
             }
+        }
+
+        vertices
+    }
+
+    fn build_loading_vertices(&mut self, viewport_w: f32, viewport_h: f32) -> Vec<Vertex> {
+        let text = "starting...";
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+        let atlas_w = self.atlas.atlas_width as f32;
+        let atlas_h = self.atlas.atlas_height as f32;
+
+        let text_w = text.len() as f32 * cell_w;
+        let start_x = (viewport_w - text_w) / 2.0;
+        let start_y = (viewport_h - cell_h) / 2.0;
+
+        let fg = [0.4, 0.4, 0.45, 1.0];
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let mut vertices = Vec::new();
+
+        for (i, c) in text.chars().enumerate() {
+            let glyph = match self.atlas.glyph(c) {
+                Some(g) => *g,
+                None => continue,
+            };
+            if glyph.width == 0 || glyph.height == 0 { continue; }
+
+            let x = start_x + i as f32 * cell_w;
+            let y = start_y;
+            let gw = glyph.width as f32;
+            let gh = glyph.height as f32;
+            let tx = glyph.x as f32 / atlas_w;
+            let ty = glyph.y as f32 / atlas_h;
+            let tw = glyph.width as f32 / atlas_w;
+            let th = glyph.height as f32 / atlas_h;
+
+            vertices.push(Vertex { position: [x, y], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x + gw, y + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
         }
 
         vertices
@@ -316,7 +380,7 @@ impl Renderer {
 
     pub fn rebuild_atlas(&mut self, scale: f64) {
         let device = self.atlas.device.clone();
-        self.atlas = GlyphAtlas::new(&device, 14.0 * scale);
+        self.atlas = GlyphAtlas::new(&device, self.font_size * scale, &self.font_name);
         // Update atlas size buffer
         let atlas_size = [self.atlas.atlas_width as f32, self.atlas.atlas_height as f32];
         self.last_atlas_size = atlas_size;

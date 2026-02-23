@@ -52,3 +52,5 @@ bitflags = "2"
 unicode-width = "0.2"
 libc = "0.2"
 block2 = "0.6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
