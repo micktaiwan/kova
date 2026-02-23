@@ -412,25 +412,22 @@ impl KovaView {
     /// Close the focused pane.
     fn do_close_pane(&self) {
         let focused_id = self.ivars().focused.get();
+        let tree_opt = self.ivars().tree.borrow();
+        // Don't close the last pane — use Cmd+Q to quit
+        if let Some(tree) = tree_opt.as_ref() {
+            if matches!(tree, SplitTree::Leaf(_)) {
+                return;
+            }
+        }
+        drop(tree_opt);
         let mut tree_opt = self.ivars().tree.borrow_mut();
         if let Some(tree) = tree_opt.take() {
             *tree_opt = tree.remove_pane(focused_id);
         }
-        match tree_opt.as_ref() {
-            Some(tree) => {
-                self.ivars().focused.set(tree.first_pane().id);
-                drop(tree_opt);
-                self.resize_all_panes();
-            }
-            None => {
-                drop(tree_opt);
-                // No panes left — quit
-                unsafe {
-                    let mtm = MainThreadMarker::new_unchecked();
-                    let app = NSApplication::sharedApplication(mtm);
-                    app.terminate(None);
-                }
-            }
+        if let Some(tree) = tree_opt.as_ref() {
+            self.ivars().focused.set(tree.first_pane().id);
+            drop(tree_opt);
+            self.resize_all_panes();
         }
     }
 
