@@ -5,6 +5,26 @@ use vte::{Params, Perform};
 
 use super::TerminalState;
 
+/// Walk up from `path` to find `.git/HEAD` and extract the branch name.
+/// Returns `None` if not in a git repo.
+fn resolve_git_branch(path: &str) -> Option<String> {
+    let mut dir = std::path::PathBuf::from(path);
+    loop {
+        let head = dir.join(".git/HEAD");
+        if let Ok(content) = std::fs::read_to_string(&head) {
+            let content = content.trim();
+            if let Some(ref_path) = content.strip_prefix("ref: refs/heads/") {
+                return Some(ref_path.to_string());
+            }
+            // Detached HEAD — show short hash
+            return Some(content.chars().take(7).collect());
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 pub struct VteHandler {
     terminal: Arc<RwLock<TerminalState>>,
     pty_writer: Arc<OwnedFd>,
@@ -57,9 +77,11 @@ impl Perform for VteHandler {
         if params.len() >= 2 {
             match params[0] {
                 b"0" | b"2" => {
-                    // Set window title - ignore for V0
-                    let _title = String::from_utf8_lossy(params[1]);
-                    log::debug!("OSC title: {}", _title);
+                    let title = String::from_utf8_lossy(params[1]).into_owned();
+                    log::debug!("OSC title: {}", title);
+                    let mut term = self.terminal.write();
+                    term.title = Some(title);
+                    term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 b"7" => {
                     // Current working directory: file://hostname/path
@@ -71,8 +93,10 @@ impl Perform for VteHandler {
                         None
                     };
                     if let Some(path) = path {
+                        let git_branch = resolve_git_branch(path);
                         let mut term = self.terminal.write();
                         term.cwd = Some(path.to_string());
+                        term.git_branch = git_branch;
                         term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }

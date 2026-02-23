@@ -356,7 +356,7 @@ impl GlyphAtlas {
         // Advance cursor
         self.next_x += self.glyph_cell_w;
 
-        log::debug!("Rasterized '{}' (U+{:04X}) into atlas", c, c as u32);
+        log::trace!("Rasterized '{}' (U+{:04X}) into atlas", c, c as u32);
         Some(info)
     }
 

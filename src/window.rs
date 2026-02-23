@@ -230,6 +230,9 @@ impl KovaView {
         let pty_ptr = self.ivars().pty.get().unwrap() as *const Pty;
         let last_focused = &self.ivars().last_focused as *const Cell<bool>;
 
+        let last_title: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+        let window_for_title: std::cell::OnceCell<Retained<NSWindow>> = std::cell::OnceCell::new();
+
         let timer = unsafe {
             NSTimer::scheduledTimerWithTimeInterval_repeats_block(
                 1.0 / fps as f64,
@@ -254,6 +257,30 @@ impl KovaView {
                             drop(term);
                             let seq = if focused { b"\x1b[I" as &[u8] } else { b"\x1b[O" };
                             (*pty_ptr).write(seq);
+                        }
+                    }
+
+                    // Update NSWindow title from OSC 0/2
+                    {
+                        let term = terminal.read();
+                        let current = term.title.clone();
+                        drop(term);
+                        let mut prev = last_title.borrow_mut();
+                        if current != *prev {
+                            let mtm2 = MainThreadMarker::new_unchecked();
+                            let app2 = NSApplication::sharedApplication(mtm2);
+                            if let Some(win) = window_for_title.get().or_else(|| {
+                                let w = app2.mainWindow()?;
+                                let _ = window_for_title.set(w);
+                                window_for_title.get()
+                            }) {
+                                let title_str = match current {
+                                    Some(ref t) => format!("Kova — {}", t),
+                                    None => "Kova".to_string(),
+                                };
+                                win.setTitle(&NSString::from_str(&title_str));
+                            }
+                            *prev = current;
                         }
                     }
 
