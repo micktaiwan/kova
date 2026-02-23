@@ -8,6 +8,7 @@ pub struct Config {
     pub colors: ColorsConfig,
     pub window: WindowConfig,
     pub terminal: TerminalConfig,
+    pub status_bar: StatusBarConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +45,24 @@ pub struct TerminalConfig {
     pub cursor_blink_frames: u32,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct StatusBarConfig {
+    pub enabled: bool,
+    pub bg_color: [f32; 3],
+    pub fg_color: [f32; 3],
+}
+
+impl Default for StatusBarConfig {
+    fn default() -> Self {
+        StatusBarConfig {
+            enabled: true,
+            bg_color: [0.15, 0.15, 0.18],
+            fg_color: [0.6, 0.6, 0.65],
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -51,6 +70,7 @@ impl Default for Config {
             colors: ColorsConfig::default(),
             window: WindowConfig::default(),
             terminal: TerminalConfig::default(),
+            status_bar: StatusBarConfig::default(),
         }
     }
 }

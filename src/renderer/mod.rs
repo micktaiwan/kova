@@ -10,6 +10,7 @@ use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::RwLock;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::time::SystemTime;
 use vertex::Vertex;
 
 use crate::config::Config;
@@ -35,6 +36,10 @@ pub struct Renderer {
     font_size: f64,
     font_name: String,
     cursor_blink_frames: u32,
+    status_bar_enabled: bool,
+    status_bar_bg: [f32; 3],
+    status_bar_fg: [f32; 3],
+    last_minute: u32,
 }
 
 impl Renderer {
@@ -98,6 +103,10 @@ impl Renderer {
             font_size: config.font.size,
             font_name: config.font.family.clone(),
             cursor_blink_frames: config.terminal.cursor_blink_frames,
+            status_bar_enabled: config.status_bar.enabled,
+            status_bar_bg: config.status_bar.bg_color,
+            status_bar_fg: config.status_bar.fg_color,
+            last_minute: u32::MAX,
         }
     }
 
@@ -122,8 +131,24 @@ impl Renderer {
             (true, false)
         };
 
+        // Check if minute changed for status bar update
+        let minute_changed = if self.status_bar_enabled {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            let current_minute = (now.as_secs() / 60) as u32;
+            if current_minute != self.last_minute {
+                self.last_minute = current_minute;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let is_dirty = terminal.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed);
-        if shell_ready && !is_dirty && !blink_changed {
+        if shell_ready && !is_dirty && !blink_changed && !minute_changed {
             return;
         }
 
@@ -230,8 +255,8 @@ impl Renderer {
     fn build_vertices(
         &mut self,
         term: &TerminalState,
-        _viewport_w: f32,
-        _viewport_h: f32,
+        viewport_w: f32,
+        viewport_h: f32,
         blink_on: bool,
     ) -> Vec<Vertex> {
         // Pass 1: collect unknown chars for dynamic rasterization
@@ -262,6 +287,17 @@ impl Renderer {
         let atlas_w = self.atlas.atlas_width as f32;
         let atlas_h = self.atlas.atlas_height as f32;
 
+        // Calculate y_offset: push content to bottom when screen isn't full
+        let max_rows = term.rows as usize;
+        let last_used = display.iter().rposition(|line|
+            line.iter().any(|c| c.c != ' ' && c.c != '\0')
+        ).map_or(0, |i| i + 1);
+        let y_offset = if last_used < max_rows && term.scroll_offset() == 0 {
+            (max_rows - last_used) as f32 * cell_h
+        } else {
+            0.0
+        };
+
         let mut vertices = Vec::with_capacity(display.len() * term.cols as usize * 6);
 
         for (row_idx, line) in display.iter().enumerate() {
@@ -276,14 +312,14 @@ impl Renderer {
                 if c == ' ' || c == '\0' {
                     if cell.bg != self.bg_color {
                         let x = col_idx as f32 * cell_w;
-                        let y = row_idx as f32 * cell_h;
+                        let y = y_offset + row_idx as f32 * cell_h;
                         Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, cell.bg);
                     }
                     continue;
                 }
 
                 let x = col_idx as f32 * cell_w;
-                let y = row_idx as f32 * cell_h;
+                let y = y_offset + row_idx as f32 * cell_h;
 
                 if cell.bg != self.bg_color {
                     Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, cell.bg);
@@ -320,20 +356,88 @@ impl Renderer {
             }
         }
 
-        // Draw cursor (adjusted for scroll offset)
+        // Draw cursor (adjusted for scroll offset and y_offset)
         if term.cursor_visible && blink_on {
             let offset = term.scroll_offset();
-            // In visible_lines(), grid starts at screen row `offset`,
-            // so cursor_y in the grid maps to screen row `offset + cursor_y`
             let screen_y = offset + term.cursor_y as i32;
             if screen_y >= 0 && screen_y < term.rows as i32 {
                 let cx = term.cursor_x as f32 * cell_w;
-                let cy = screen_y as f32 * cell_h;
+                let cy = y_offset + screen_y as f32 * cell_h;
                 Self::push_bg_quad(&mut vertices, cx, cy, cell_w, cell_h, self.cursor_color);
             }
         }
 
+        // Status bar
+        if self.status_bar_enabled {
+            self.build_status_bar_vertices(&mut vertices, viewport_w, viewport_h);
+        }
+
         vertices
+    }
+
+    fn build_status_bar_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+        let bar_y = viewport_h - cell_h;
+
+        // Background quad for the full status bar
+        Self::push_bg_quad(vertices, 0.0, bar_y, viewport_w, cell_h, self.status_bar_bg);
+
+        // Render time HH:MM aligned to the right
+        let time_str = {
+            let secs = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let t = secs as libc::time_t;
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            unsafe { libc::localtime_r(&t, &mut tm) };
+            format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+        };
+
+        // Ensure time chars are in the atlas
+        for c in time_str.chars() {
+            if self.atlas.glyph(c).is_none() {
+                self.atlas.rasterize_char(c);
+            }
+        }
+
+        let atlas_w = self.atlas.atlas_width as f32;
+        let atlas_h = self.atlas.atlas_height as f32;
+        let fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 1.0];
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+
+        let text_w = time_str.len() as f32 * cell_w;
+        let start_x = viewport_w - text_w - cell_w; // 1 cell padding from right
+
+        for (i, c) in time_str.chars().enumerate() {
+            let glyph = match self.atlas.glyph(c) {
+                Some(g) => *g,
+                None => continue,
+            };
+            if glyph.width == 0 || glyph.height == 0 { continue; }
+
+            let x = start_x + i as f32 * cell_w;
+            let y = bar_y;
+            let gw = glyph.width as f32;
+            let gh = glyph.height as f32;
+            let tx = glyph.x as f32 / atlas_w;
+            let ty = glyph.y as f32 / atlas_h;
+            let tw = glyph.width as f32 / atlas_w;
+            let th = glyph.height as f32 / atlas_h;
+
+            vertices.push(Vertex { position: [x, y], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x + gw, y + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+        }
     }
 
     fn build_loading_vertices(&mut self, viewport_w: f32, viewport_h: f32) -> Vec<Vertex> {
@@ -392,6 +496,10 @@ impl Renderer {
 
     pub fn cell_size(&self) -> (f32, f32) {
         (self.atlas.cell_width, self.atlas.cell_height)
+    }
+
+    pub fn status_bar_enabled(&self) -> bool {
+        self.status_bar_enabled
     }
 
     fn push_bg_quad(
