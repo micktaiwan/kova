@@ -23,6 +23,7 @@ Rust + Metal, zéro compromis cross-platform.
 - [x] Scroll trackpad (accumulateur fractionnaire)
 - [x] Alternate screen buffer (CSI ?1049 h/l)
 - [x] Resize fenêtre (recalcul cols/rows + SIGWINCH)
+  - Passé de `posix_spawn`+`SETSID` à `fork`+`setsid`+`TIOCSCTTY` : nécessaire pour que le slave PTY soit le controlling terminal et que SIGWINCH atteigne les sous-processes (fork OK car single-threaded à ce stade)
 - [x] Cmd+V (coller depuis le presse-papier)
 - [x] Rendu à la demande (dirty flag) — ne redessiner que quand l'état change
 
@@ -60,6 +61,8 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 
 ## V2 — Polished
 
+- [ ] Focus events (DEC mode 1004) — notifier le shell/app quand la fenêtre gagne/perd le focus
+- [ ] Kitty keyboard protocol (CSI u) — progressive enhancement pour un meilleur handling des touches
 - [ ] Synchronized output (mode 2026) — bufferiser le rendu entre h/l pour éviter le tearing
 - [ ] Thèmes de couleurs (quelques built-in + custom)
 - [ ] Support ProMotion (120Hz)
