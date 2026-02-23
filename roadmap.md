@@ -41,9 +41,8 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Détecter la mort du shell (EOF sur PTY) → fermer la fenêtre
 - [x] Status bar (CWD via OSC 7, git branch, indicateur scroll, titre OSC 0/2, heure HH:MM, couleur par élément configurable)
 - [x] Shift+Tab (backtab) — envoie `CSI Z` au lieu du raw `0x19`
-- [ ] Config keybindings
-- [ ] Sélection texte + copier/coller (sur le pane unique actuel)
-- [ ] Resize fenêtre : reflow du texte
+- [x] Sélection texte + copier/coller (mouseDown/Dragged/Up, Cmd+C, highlight sélection, copie auto dans presse-papier, respect du soft-wrap)
+- [x] Resize fenêtre : reflow du texte (struct `Row` avec flag `wrapped`, reconstruction des lignes logiques, re-wrap à la nouvelle largeur)
 
 ### Refacto multi-pane (prérequis splits)
 
@@ -65,6 +64,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 
 - [x] Focus events (DEC mode 1004) — notifier le shell/app quand la fenêtre gagne/perd le focus
 - [x] Kitty keyboard protocol (CSI u) — réponse à la query `CSI > 0 u` (flags=0, fallback propre)
+- [ ] Config keybindings (raccourcis hardcodés suffisent pour V1)
 - [ ] Synchronized output (mode 2026) — bufferiser le rendu entre h/l pour éviter le tearing
 - [ ] Thèmes de couleurs (quelques built-in + custom)
 - [ ] Support ProMotion (120Hz)

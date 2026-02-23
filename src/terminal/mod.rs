@@ -9,6 +9,19 @@ use crate::terminal::parser::AnsiColor;
 pub const DEFAULT_FG: [f32; 3] = [1.0, 1.0, 1.0];
 pub const DEFAULT_BG: [f32; 3] = [0.1, 0.1, 0.12];
 
+#[derive(Clone, Copy, Debug)]
+pub struct GridPos {
+    /// Absolute line: 0 = first scrollback line, scrollback.len() = first grid line
+    pub line: usize,
+    pub col: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct Selection {
+    pub anchor: GridPos,
+    pub end: GridPos,
+}
+
 #[derive(Clone, Debug)]
 pub struct Cell {
     pub c: char,
@@ -26,11 +39,26 @@ impl Default for Cell {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Row {
+    pub cells: Vec<Cell>,
+    pub wrapped: bool,
+}
+
+impl Row {
+    pub fn new(cols: usize, blank: &Cell) -> Self {
+        Row {
+            cells: vec![blank.clone(); cols],
+            wrapped: false,
+        }
+    }
+}
+
 pub struct TerminalState {
     pub cols: u16,
     pub rows: u16,
-    grid: Vec<Vec<Cell>>,
-    scrollback: VecDeque<Vec<Cell>>,
+    grid: Vec<Row>,
+    scrollback: VecDeque<Row>,
     pub scrollback_limit: usize,
     pub cursor_x: u16,
     pub cursor_y: u16,
@@ -59,7 +87,7 @@ pub struct TerminalState {
     // Dirty flag for render optimization
     pub dirty: AtomicBool,
     // Alternate screen buffer
-    alt_grid: Option<Vec<Vec<Cell>>>,
+    alt_grid: Option<Vec<Row>>,
     alt_cursor: Option<(u16, u16)>,
     in_alt_screen: bool,
     // Focus reporting (DEC mode 1004)
@@ -70,12 +98,14 @@ pub struct TerminalState {
     pub git_branch: Option<String>,
     // Window title (set via OSC 0/2)
     pub title: Option<String>,
+    // Text selection
+    pub selection: Option<Selection>,
 }
 
 impl TerminalState {
     pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [f32; 3], bg: [f32; 3]) -> Self {
         let blank = Cell { c: ' ', fg, bg };
-        let grid = vec![vec![blank.clone(); cols as usize]; rows as usize];
+        let grid = (0..rows as usize).map(|_| Row::new(cols as usize, &blank)).collect();
         TerminalState {
             cols,
             rows,
@@ -107,24 +137,25 @@ impl TerminalState {
             cwd: None,
             git_branch: None,
             title: None,
+            selection: None,
         }
     }
 
-    pub fn visible_lines(&self) -> Vec<&Vec<Cell>> {
+    pub fn visible_lines(&self) -> Vec<&[Cell]> {
         if self.scroll_offset == 0 {
-            self.grid.iter().collect()
+            self.grid.iter().map(|r| r.cells.as_slice()).collect()
         } else {
             let sb_len = self.scrollback.len() as i32;
             let offset = self.scroll_offset.min(sb_len);
             let sb_start = (sb_len - offset) as usize;
             let grid_end = (self.rows as i32 - offset).max(0) as usize;
 
-            let mut lines: Vec<&Vec<Cell>> = Vec::with_capacity(self.rows as usize);
+            let mut lines: Vec<&[Cell]> = Vec::with_capacity(self.rows as usize);
             for i in sb_start..self.scrollback.len() {
-                lines.push(&self.scrollback[i]);
+                lines.push(&self.scrollback[i].cells);
             }
             for i in 0..grid_end.min(self.grid.len()) {
-                lines.push(&self.grid[i]);
+                lines.push(&self.grid[i].cells);
             }
             // No padding — truncate handles the upper bound
             lines.truncate(self.rows as usize);
@@ -142,17 +173,23 @@ impl TerminalState {
     }
 
     pub fn put_char(&mut self, c: char) {
+        self.selection = None;
         self.cursor_moved();
         self.scroll_offset = 0; // Auto-scroll on new output
 
         if self.cursor_x >= self.cols {
+            // Mark current row as soft-wrapped before advancing
+            let row = self.cursor_y as usize;
+            if row < self.grid.len() {
+                self.grid[row].wrapped = true;
+            }
             self.cursor_x = 0;
             self.advance_line();
         }
 
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
-        if row < self.grid.len() && col < self.grid[row].len() {
+        if row < self.grid.len() && col < self.grid[row].cells.len() {
             let mut fg = self.current_fg;
             if self.dim {
                 fg = [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5];
@@ -164,7 +201,7 @@ impl TerminalState {
                     (fg[2] * 1.3).min(1.0),
                 ];
             }
-            self.grid[row][col] = Cell {
+            self.grid[row].cells[col] = Cell {
                 c,
                 fg,
                 bg: self.current_bg,
@@ -174,6 +211,7 @@ impl TerminalState {
     }
 
     pub fn newline(&mut self) {
+        self.selection = None;
         self.advance_line();
     }
 
@@ -217,13 +255,13 @@ impl TerminalState {
                     }
                 }
             }
-            let new_line = vec![self.blank.clone(); self.cols as usize];
+            let new_line = Row::new(self.cols as usize, &self.blank);
             let insert_pos = bottom.min(self.grid.len());
             self.grid.insert(insert_pos, new_line);
         }
 
         // Ensure grid has correct number of rows
-        self.grid.resize(self.rows as usize, vec![self.blank.clone(); self.cols as usize]);
+        self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
     }
 
     fn scroll_down(&mut self, n: u16) {
@@ -234,11 +272,11 @@ impl TerminalState {
             if bottom < self.grid.len() {
                 self.grid.remove(bottom);
             }
-            let new_line = vec![self.blank.clone(); self.cols as usize];
+            let new_line = Row::new(self.cols as usize, &self.blank);
             self.grid.insert(top, new_line);
         }
 
-        self.grid.resize(self.rows as usize, vec![self.blank.clone(); self.cols as usize]);
+        self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
     }
 
     pub fn set_sgr(&mut self, params: &[u16]) {
@@ -324,13 +362,15 @@ impl TerminalState {
                 let row = self.cursor_y as usize;
                 let col = self.cursor_x as usize;
                 if row < self.grid.len() {
-                    for c in col..self.grid[row].len() {
-                        self.grid[row][c] = self.blank.clone();
+                    for c in col..self.grid[row].cells.len() {
+                        self.grid[row].cells[c] = self.blank.clone();
                     }
+                    self.grid[row].wrapped = false;
                     for r in (row + 1)..self.grid.len() {
-                        for c in 0..self.grid[r].len() {
-                            self.grid[r][c] = self.blank.clone();
+                        for c in 0..self.grid[r].cells.len() {
+                            self.grid[r].cells[c] = self.blank.clone();
                         }
+                        self.grid[r].wrapped = false;
                     }
                 }
             }
@@ -340,23 +380,25 @@ impl TerminalState {
                 let col = self.cursor_x as usize;
                 for r in 0..row {
                     if r < self.grid.len() {
-                        for c in 0..self.grid[r].len() {
-                            self.grid[r][c] = self.blank.clone();
+                        for c in 0..self.grid[r].cells.len() {
+                            self.grid[r].cells[c] = self.blank.clone();
                         }
+                        self.grid[r].wrapped = false;
                     }
                 }
                 if row < self.grid.len() {
-                    for c in 0..=col.min(self.grid[row].len().saturating_sub(1)) {
-                        self.grid[row][c] = self.blank.clone();
+                    for c in 0..=col.min(self.grid[row].cells.len().saturating_sub(1)) {
+                        self.grid[row].cells[c] = self.blank.clone();
                     }
                 }
             }
             2 | 3 => {
                 // Erase entire display
                 for row in &mut self.grid {
-                    for cell in row.iter_mut() {
+                    for cell in row.cells.iter_mut() {
                         *cell = self.blank.clone();
                     }
+                    row.wrapped = false;
                 }
             }
             _ => {}
@@ -371,19 +413,21 @@ impl TerminalState {
         }
         match mode {
             0 => {
-                for c in (self.cursor_x as usize)..self.grid[row].len() {
-                    self.grid[row][c] = self.blank.clone();
+                for c in (self.cursor_x as usize)..self.grid[row].cells.len() {
+                    self.grid[row].cells[c] = self.blank.clone();
                 }
+                self.grid[row].wrapped = false;
             }
             1 => {
-                for c in 0..=(self.cursor_x as usize).min(self.grid[row].len().saturating_sub(1)) {
-                    self.grid[row][c] = self.blank.clone();
+                for c in 0..=(self.cursor_x as usize).min(self.grid[row].cells.len().saturating_sub(1)) {
+                    self.grid[row].cells[c] = self.blank.clone();
                 }
             }
             2 => {
-                for cell in self.grid[row].iter_mut() {
+                for cell in self.grid[row].cells.iter_mut() {
                     *cell = self.blank.clone();
                 }
+                self.grid[row].wrapped = false;
             }
             _ => {}
         }
@@ -433,9 +477,9 @@ impl TerminalState {
             if bottom < self.grid.len() {
                 self.grid.remove(bottom);
             }
-            self.grid.insert(row, vec![self.blank.clone(); self.cols as usize]);
+            self.grid.insert(row, Row::new(self.cols as usize, &self.blank));
         }
-        self.grid.resize(self.rows as usize, vec![self.blank.clone(); self.cols as usize]);
+        self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
     }
 
     pub fn delete_lines(&mut self, n: u16) {
@@ -446,9 +490,9 @@ impl TerminalState {
                 self.grid.remove(row);
             }
             let insert_pos = bottom.min(self.grid.len());
-            self.grid.insert(insert_pos, vec![self.blank.clone(); self.cols as usize]);
+            self.grid.insert(insert_pos, Row::new(self.cols as usize, &self.blank));
         }
-        self.grid.resize(self.rows as usize, vec![self.blank.clone(); self.cols as usize]);
+        self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
     }
 
     pub fn delete_chars(&mut self, n: u16) {
@@ -456,9 +500,9 @@ impl TerminalState {
         let col = self.cursor_x as usize;
         if row < self.grid.len() {
             for _ in 0..n {
-                if col < self.grid[row].len() {
-                    self.grid[row].remove(col);
-                    self.grid[row].push(self.blank.clone());
+                if col < self.grid[row].cells.len() {
+                    self.grid[row].cells.remove(col);
+                    self.grid[row].cells.push(self.blank.clone());
                 }
             }
         }
@@ -469,8 +513,8 @@ impl TerminalState {
         let col = self.cursor_x as usize;
         if row < self.grid.len() {
             for i in 0..n as usize {
-                if col + i < self.grid[row].len() {
-                    self.grid[row][col + i] = self.blank.clone();
+                if col + i < self.grid[row].cells.len() {
+                    self.grid[row].cells[col + i] = self.blank.clone();
                 }
             }
         }
@@ -499,7 +543,7 @@ impl TerminalState {
         self.alt_cursor = Some((self.cursor_x, self.cursor_y));
         let alt_grid = std::mem::replace(
             &mut self.grid,
-            vec![vec![self.blank.clone(); self.cols as usize]; self.rows as usize],
+            (0..self.rows as usize).map(|_| Row::new(self.cols as usize, &self.blank)).collect(),
         );
         self.alt_grid = Some(alt_grid);
         self.cursor_x = 0;
@@ -533,64 +577,209 @@ impl TerminalState {
         self.scroll_offset
     }
 
-    pub fn resize(&mut self, cols: u16, rows: u16) {
-        if cols == self.cols && rows == self.rows {
+    pub fn resize(&mut self, new_cols: u16, new_rows: u16) {
+        if new_cols == self.cols && new_rows == self.rows {
             return;
         }
-        let old_rows = self.rows as usize;
-        self.cols = cols;
-        self.rows = rows;
 
-        // Resize each existing row to new column count
-        for row in &mut self.grid {
-            row.resize(cols as usize, self.blank.clone());
+        let old_cols = self.cols;
+        self.cols = new_cols;
+        self.rows = new_rows;
+
+        // Alt screen: no reflow, just truncate/pad
+        if self.in_alt_screen {
+            for row in &mut self.grid {
+                row.cells.resize(new_cols as usize, self.blank.clone());
+            }
+            let nr = new_rows as usize;
+            self.grid.resize(nr, Row::new(new_cols as usize, &self.blank));
+
+            if let Some(ref mut alt_grid) = self.alt_grid {
+                for row in alt_grid.iter_mut() {
+                    row.cells.resize(new_cols as usize, self.blank.clone());
+                }
+                alt_grid.resize(nr, Row::new(new_cols as usize, &self.blank));
+            }
+
+            self.cursor_x = self.cursor_x.min(new_cols.saturating_sub(1));
+            self.cursor_y = self.cursor_y.min(new_rows.saturating_sub(1));
+            self.scroll_top = 0;
+            self.scroll_bottom = new_rows.saturating_sub(1);
+            self.scroll_offset = 0;
+            self.dirty.store(true, Ordering::Relaxed);
+            return;
         }
 
-        let new_rows = rows as usize;
-        if new_rows > old_rows {
-            // Add blank rows at the bottom
-            self.grid.resize(new_rows, vec![self.blank.clone(); cols as usize]);
-        } else if new_rows < old_rows {
-            // Remove blank rows from the bottom first
-            while self.grid.len() > new_rows {
-                let is_blank = self.grid.last()
-                    .map(|row| row.iter().all(|c| c.c == ' ' || c.c == '\0'))
-                    .unwrap_or(true);
-                if is_blank && self.grid.len() > self.cursor_y as usize + 1 {
-                    self.grid.pop();
-                } else {
+        if new_cols != old_cols {
+            // --- Reflow ---
+
+            // Compute cursor position as (logical_line_index, offset_within_logical_line)
+            // by walking the grid rows before reflow.
+            let cursor_row = self.cursor_y as usize;
+            let cursor_col = self.cursor_x as usize;
+            let mut logical_line_idx: usize = 0;
+            let mut offset_in_logical: usize = 0;
+            {
+                let mut cells_in_current_logical: usize = 0;
+                for (i, row) in self.grid.iter().enumerate() {
+                    if i == cursor_row {
+                        offset_in_logical = cells_in_current_logical + cursor_col;
+                        break;
+                    }
+                    cells_in_current_logical += row.cells.len();
+                    if !row.wrapped {
+                        logical_line_idx += 1;
+                        cells_in_current_logical = 0;
+                    }
+                }
+            }
+
+            // Reflow scrollback
+            let sb: Vec<Row> = self.scrollback.drain(..).collect();
+            let reflowed_sb = Self::reflow_rows(sb, new_cols as usize, &self.blank);
+            self.scrollback = reflowed_sb.into();
+
+            // Reflow grid
+            let grid = std::mem::take(&mut self.grid);
+            let reflowed_grid = Self::reflow_rows(grid, new_cols as usize, &self.blank);
+
+            // Find cursor in reflowed grid: skip logical_line_idx logical lines,
+            // then walk offset_in_logical cells into that logical line.
+            let mut new_cy: u16 = 0;
+            let mut new_cx: u16 = 0;
+            let mut ll = 0; // current logical line counter
+            let mut i = 0;
+            // Skip past logical_line_idx complete logical lines
+            while i < reflowed_grid.len() && ll < logical_line_idx {
+                if !reflowed_grid[i].wrapped {
+                    ll += 1;
+                }
+                i += 1;
+            }
+            // Now walk offset_in_logical cells within the target logical line
+            let mut remaining = offset_in_logical;
+            while i < reflowed_grid.len() {
+                let row_len = reflowed_grid[i].cells.len();
+                if remaining < row_len || !reflowed_grid[i].wrapped {
+                    new_cy = i as u16;
+                    new_cx = (remaining as u16).min(new_cols.saturating_sub(1));
                     break;
                 }
+                remaining -= row_len;
+                i += 1;
             }
-            // If still too many rows, push top rows into scrollback
-            while self.grid.len() > new_rows {
-                let line = self.grid.remove(0);
-                if !self.in_alt_screen {
-                    self.scrollback.push_back(line);
-                }
-                // Adjust cursor to track its content
-                self.cursor_y = self.cursor_y.saturating_sub(1);
+            if i >= reflowed_grid.len() {
+                // Cursor beyond grid — clamp to last row
+                new_cy = reflowed_grid.len().saturating_sub(1) as u16;
+                new_cx = 0;
             }
+
+            self.grid = reflowed_grid;
+            self.cursor_x = new_cx;
+            self.cursor_y = new_cy;
+        }
+
+        // Adjust grid to new_rows
+        let nr = new_rows as usize;
+        // Remove blank rows from bottom first
+        while self.grid.len() > nr {
+            let is_blank = self.grid.last()
+                .map(|row| row.cells.iter().all(|c| c.c == ' ' || c.c == '\0'))
+                .unwrap_or(true);
+            if is_blank && self.grid.len() > self.cursor_y as usize + 1 {
+                self.grid.pop();
+            } else {
+                break;
+            }
+        }
+        // Push excess top rows into scrollback
+        while self.grid.len() > nr {
+            let line = self.grid.remove(0);
+            self.scrollback.push_back(line);
+            self.cursor_y = self.cursor_y.saturating_sub(1);
+        }
+        // Add blank rows if needed
+        while self.grid.len() < nr {
+            self.grid.push(Row::new(new_cols as usize, &self.blank));
         }
 
         // Clamp cursor
-        self.cursor_x = self.cursor_x.min(cols.saturating_sub(1));
-        self.cursor_y = self.cursor_y.min(rows.saturating_sub(1));
+        self.cursor_x = self.cursor_x.min(new_cols.saturating_sub(1));
+        self.cursor_y = self.cursor_y.min(new_rows.saturating_sub(1));
 
-        // Reset scroll region to full screen
+        // Reset scroll region
         self.scroll_top = 0;
-        self.scroll_bottom = rows.saturating_sub(1);
+        self.scroll_bottom = new_rows.saturating_sub(1);
         self.scroll_offset = 0;
 
-        // Resize alt grid if active
+        // Resize alt grid (no reflow)
         if let Some(ref mut alt_grid) = self.alt_grid {
             for row in alt_grid.iter_mut() {
-                row.resize(cols as usize, self.blank.clone());
+                row.cells.resize(new_cols as usize, self.blank.clone());
             }
-            alt_grid.resize(new_rows, vec![self.blank.clone(); cols as usize]);
+            alt_grid.resize(nr, Row::new(new_cols as usize, &self.blank));
+        }
+
+        // Trim scrollback
+        while self.scrollback.len() > self.scrollback_limit {
+            self.scrollback.pop_front();
         }
 
         self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    // --- Reflow helpers ---
+
+    /// Concatenate consecutive wrapped rows into logical lines
+    fn rows_to_logical_lines(rows: Vec<Row>) -> Vec<Vec<Cell>> {
+        let mut lines: Vec<Vec<Cell>> = Vec::new();
+        let mut current: Vec<Cell> = Vec::new();
+        for row in rows {
+            current.extend(row.cells);
+            if !row.wrapped {
+                lines.push(current);
+                current = Vec::new();
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+        lines
+    }
+
+    /// Wrap a logical line to new_cols, trimming trailing blanks
+    fn wrap_logical_line(cells: Vec<Cell>, new_cols: usize, blank: &Cell) -> Vec<Row> {
+        // Trim trailing blank cells
+        let len = cells.iter().rposition(|c| c.c != ' ' && c.c != '\0')
+            .map_or(0, |i| i + 1);
+
+        if len == 0 {
+            // Entirely blank logical line → single blank row (hard newline)
+            return vec![Row::new(new_cols, blank)];
+        }
+
+        let trimmed = &cells[..len];
+        let mut rows = Vec::new();
+        for chunk in trimmed.chunks(new_cols) {
+            let mut row_cells = chunk.to_vec();
+            row_cells.resize(new_cols, blank.clone());
+            rows.push(Row { cells: row_cells, wrapped: true });
+        }
+        // Last row of a logical line is not wrapped (it ends with a hard newline)
+        if let Some(last) = rows.last_mut() {
+            last.wrapped = false;
+        }
+        rows
+    }
+
+    /// Reflow a set of rows to new column width
+    fn reflow_rows(rows: Vec<Row>, new_cols: usize, blank: &Cell) -> Vec<Row> {
+        let logical = Self::rows_to_logical_lines(rows);
+        let mut result = Vec::new();
+        for line in logical {
+            result.extend(Self::wrap_logical_line(line, new_cols, blank));
+        }
+        result
     }
 
     pub fn reverse_index(&mut self) {
@@ -598,6 +787,89 @@ impl TerminalState {
             self.scroll_down(1);
         } else if self.cursor_y > 0 {
             self.cursor_y -= 1;
+        }
+    }
+
+    // --- Selection ---
+
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    fn row_at(&self, abs_line: usize) -> Option<&Row> {
+        let sb_len = self.scrollback.len();
+        if abs_line < sb_len {
+            Some(&self.scrollback[abs_line])
+        } else {
+            self.grid.get(abs_line - sb_len)
+        }
+    }
+
+    fn ordered_selection(&self) -> Option<(GridPos, GridPos)> {
+        let sel = self.selection.as_ref()?;
+        if (sel.anchor.line, sel.anchor.col) <= (sel.end.line, sel.end.col) {
+            Some((sel.anchor, sel.end))
+        } else {
+            Some((sel.end, sel.anchor))
+        }
+    }
+
+    pub fn is_selected(&self, abs_line: usize, col: u16) -> bool {
+        let Some((start, end)) = self.ordered_selection() else { return false };
+        if abs_line < start.line || abs_line > end.line { return false; }
+        if start.line == end.line {
+            col >= start.col && col <= end.col
+        } else if abs_line == start.line {
+            col >= start.col
+        } else if abs_line == end.line {
+            col <= end.col
+        } else {
+            true
+        }
+    }
+
+    pub fn selected_text(&self) -> String {
+        let Some((start, end)) = self.ordered_selection() else { return String::new() };
+        let mut result = String::new();
+        for line_idx in start.line..=end.line {
+            let Some(row) = self.row_at(line_idx) else { continue };
+            let cells = &row.cells;
+            let col_start = if line_idx == start.line { start.col as usize } else { 0 };
+            let col_end = if line_idx == end.line {
+                (end.col as usize).min(cells.len().saturating_sub(1))
+            } else {
+                cells.len().saturating_sub(1)
+            };
+            if col_start <= col_end {
+                let text: String = cells[col_start..=col_end].iter().map(|c| c.c).collect();
+                result.push_str(text.trim_end());
+            }
+            // Only insert newline if this row is NOT soft-wrapped
+            if line_idx < end.line && !row.wrapped {
+                result.push('\n');
+            }
+        }
+        result
+    }
+
+    pub fn clear_selection(&mut self) {
+        if self.selection.is_some() {
+            self.selection = None;
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Number of empty rows at top when screen isn't full (for pixel→grid conversion)
+    pub fn y_offset_rows(&self) -> usize {
+        if self.scroll_offset != 0 { return 0; }
+        let display = self.visible_lines();
+        let last_used = display.iter().rposition(|line|
+            line.iter().any(|c| c.c != ' ' && c.c != '\0')
+        ).map_or(0, |i| i + 1);
+        if last_used < self.rows as usize {
+            self.rows as usize - last_used
+        } else {
+            0
         }
     }
 }
