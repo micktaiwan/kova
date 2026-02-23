@@ -2,7 +2,7 @@ use objc2_app_kit::{NSEvent, NSEventModifierFlags};
 
 use crate::terminal::pty::Pty;
 
-pub fn handle_key_event(event: &NSEvent, pty: &Pty) {
+pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool) {
     let modifiers = event.modifierFlags();
 
     let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
@@ -42,10 +42,10 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty) {
     let unmod_char = unmod_str.chars().next().unwrap_or('\0');
 
     match unmod_char {
-        '\u{F700}' => { pty.write(b"\x1b[A"); return; }
-        '\u{F701}' => { pty.write(b"\x1b[B"); return; }
-        '\u{F702}' => { pty.write(b"\x1b[D"); return; }
-        '\u{F703}' => { pty.write(b"\x1b[C"); return; }
+        '\u{F700}' => { pty.write(if cursor_keys_app { b"\x1bOA" } else { b"\x1b[A" }); return; }
+        '\u{F701}' => { pty.write(if cursor_keys_app { b"\x1bOB" } else { b"\x1b[B" }); return; }
+        '\u{F702}' => { pty.write(if cursor_keys_app { b"\x1bOD" } else { b"\x1b[D" }); return; }
+        '\u{F703}' => { pty.write(if cursor_keys_app { b"\x1bOC" } else { b"\x1b[C" }); return; }
         '\u{F727}' => { pty.write(b"\x1b[2~"); return; }
         '\u{F728}' => { pty.write(b"\x1b[3~"); return; }
         '\u{F729}' => { pty.write(b"\x1b[H"); return; }

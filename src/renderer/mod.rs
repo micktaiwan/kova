@@ -14,7 +14,16 @@ use std::time::SystemTime;
 use vertex::Vertex;
 
 use crate::config::Config;
-use crate::terminal::TerminalState;
+use crate::terminal::{CursorShape, TerminalState};
+
+/// Sub-region of the drawable where a pane is rendered (in pixels).
+#[derive(Clone, Copy)]
+pub struct PaneViewport {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
 
 const MAX_VERTEX_BYTES: usize = 4 * 1024 * 1024; // 4MB
 
@@ -121,12 +130,19 @@ impl Renderer {
     }
 
 
-    pub fn render(&mut self, layer: &CAMetalLayer, terminal: &Arc<RwLock<TerminalState>>, shell_ready: bool) {
-        // Reset blink on cursor movement so cursor is immediately visible
-        let epoch = terminal.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed);
-        if epoch != self.last_cursor_epoch {
-            self.last_cursor_epoch = epoch;
-            self.blink_counter = 0;
+    /// Render multiple panes. Each entry: (terminal, viewport, shell_ready, is_focused).
+    pub fn render_panes(
+        &mut self,
+        layer: &CAMetalLayer,
+        panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool)],
+    ) {
+        // Reset blink on cursor movement of focused pane
+        if let Some((term, _, _, _)) = panes.iter().find(|(_, _, _, focused)| *focused) {
+            let epoch = term.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed);
+            if epoch != self.last_cursor_epoch {
+                self.last_cursor_epoch = epoch;
+                self.blink_counter = 0;
+            }
         }
 
         self.blink_counter = self.blink_counter.wrapping_add(1);
@@ -137,7 +153,6 @@ impl Renderer {
                 (self.blink_counter % half) == 0,
             )
         } else {
-            // cursor_blink_frames 0 or 1: cursor always on, never triggers blink refresh
             (true, false)
         };
 
@@ -157,8 +172,30 @@ impl Renderer {
             false
         };
 
-        let is_dirty = terminal.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed);
-        if shell_ready && !is_dirty && !blink_changed && !minute_changed {
+        // Check if any pane is dirty (consume ALL flags, no short-circuit)
+        let mut any_dirty = false;
+        let mut any_not_ready = false;
+        let mut any_sync_deferred = false;
+        for (term, _, ready, _) in panes {
+            if !ready { any_not_ready = true; }
+            let t = term.read();
+            // Synchronized output: this pane wants to defer, but don't block others
+            if t.synchronized_output {
+                if let Some(since) = t.sync_output_since {
+                    if since.elapsed().as_millis() < 100 {
+                        any_sync_deferred = true;
+                        continue; // Don't consume dirty flag — pane will render later
+                    }
+                }
+            }
+            drop(t);
+            if term.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                any_dirty = true;
+            }
+        }
+        // If only sync-deferred panes were dirty, still need to render the others
+        let all_ready = !any_not_ready;
+        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed {
             return;
         }
 
@@ -171,12 +208,20 @@ impl Renderer {
         let viewport_w = drawable_size.width as f32;
         let viewport_h = drawable_size.height as f32;
 
-        let vertices = if shell_ready {
-            let term = terminal.read();
-            self.build_vertices(&term, viewport_w, viewport_h, blink_on)
-        } else {
-            self.build_loading_vertices(viewport_w, viewport_h)
-        };
+        // Build vertices for all panes
+        let mut all_vertices = Vec::new();
+        for (term, vp, shell_ready, is_focused) in panes {
+            if *shell_ready {
+                let t = term.read();
+                // Only blink cursor on focused pane
+                let show_blink = if *is_focused { blink_on } else { true };
+                let mut verts = self.build_vertices(&t, vp, show_blink, *is_focused);
+                all_vertices.append(&mut verts);
+            } else {
+                let mut verts = self.build_loading_vertices(vp);
+                all_vertices.append(&mut verts);
+            }
+        }
 
         // Update viewport buffer if changed
         let viewport = [viewport_w, viewport_h];
@@ -219,15 +264,14 @@ impl Renderer {
         let cmd_buf = self.command_queue.commandBuffer().unwrap();
         let encoder = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc).unwrap();
 
-        if !vertices.is_empty() {
+        if !all_vertices.is_empty() {
             let vertex_bytes = unsafe {
                 std::slice::from_raw_parts(
-                    vertices.as_ptr() as *const u8,
-                    std::mem::size_of_val(vertices.as_slice()),
+                    all_vertices.as_ptr() as *const u8,
+                    std::mem::size_of_val(all_vertices.as_slice()),
                 )
             };
 
-            // Use pre-allocated double-buffered vertex buffer
             let buf_idx = self.vertex_buf_idx;
             self.vertex_buf_idx = 1 - buf_idx;
             let vertex_buf = &self.vertex_bufs[buf_idx];
@@ -239,6 +283,12 @@ impl Renderer {
             }
 
             encoder.setRenderPipelineState(&self.pipeline);
+            encoder.setScissorRect(MTLScissorRect {
+                x: 0,
+                y: 0,
+                width: viewport_w as usize,
+                height: viewport_h as usize,
+            });
             unsafe {
                 encoder.setVertexBuffer_offset_atIndex(Some(vertex_buf), 0, 0);
                 encoder.setVertexBuffer_offset_atIndex(Some(&self.viewport_buf), 0, 1);
@@ -250,7 +300,7 @@ impl Renderer {
                 encoder.drawPrimitives_vertexStart_vertexCount(
                     MTLPrimitiveType::Triangle,
                     0,
-                    vertices.len(),
+                    all_vertices.len(),
                 );
             }
         }
@@ -265,9 +315,9 @@ impl Renderer {
     fn build_vertices(
         &mut self,
         term: &TerminalState,
-        viewport_w: f32,
-        viewport_h: f32,
+        vp: &PaneViewport,
         blink_on: bool,
+        is_focused: bool,
     ) -> Vec<Vertex> {
         // Pass 1: collect unknown chars for dynamic rasterization
         let display = term.visible_lines();
@@ -296,6 +346,8 @@ impl Renderer {
         let cell_h = self.atlas.cell_height;
         let atlas_w = self.atlas.atlas_width as f32;
         let atlas_h = self.atlas.atlas_height as f32;
+        let ox = vp.x;
+        let oy = vp.y;
 
         // Calculate y_offset: push content to bottom when screen isn't full
         let max_rows = term.rows as usize;
@@ -321,10 +373,10 @@ impl Renderer {
         // Pass 1: backgrounds + selection highlights (under text)
         for (row_idx, line) in display.iter().enumerate() {
             let abs_line = (abs_line_base + row_idx as i64) as usize;
-            let y = y_offset + row_idx as f32 * cell_h;
+            let y = oy + y_offset + row_idx as f32 * cell_h;
 
             for col_idx in 0..term.cols as usize {
-                let x = col_idx as f32 * cell_w;
+                let x = ox + col_idx as f32 * cell_w;
 
                 // Cell background
                 if col_idx < line.len() && line[col_idx].bg != self.bg_color {
@@ -352,6 +404,10 @@ impl Renderer {
                     continue;
                 }
 
+                if c == '─' && row_idx == 2 && col_idx < 3 {
+                    log::debug!("render ─ at col={} row={} fg={:?} bg={:?}", col_idx, row_idx, cell.fg, cell.bg);
+                }
+
                 let glyph = match self.atlas.glyph(c) {
                     Some(g) => *g,
                     None => continue,
@@ -361,8 +417,8 @@ impl Renderer {
                     continue;
                 }
 
-                let gx = col_idx as f32 * cell_w;
-                let gy = y_offset + row_idx as f32 * cell_h;
+                let gx = ox + col_idx as f32 * cell_w;
+                let gy = oy + y_offset + row_idx as f32 * cell_h;
                 let gw = glyph.width as f32;
                 let gh = glyph.height as f32;
 
@@ -388,15 +444,47 @@ impl Renderer {
             let offset = term.scroll_offset();
             let screen_y = offset + term.cursor_y as i32;
             if screen_y >= 0 && screen_y < term.rows as i32 {
-                let cx = term.cursor_x as f32 * cell_w;
-                let cy = y_offset + screen_y as f32 * cell_h;
-                Self::push_bg_quad(&mut vertices, cx, cy, cell_w, cell_h, self.cursor_color);
+                let cx = ox + term.cursor_x as f32 * cell_w;
+                let cy = oy + y_offset + screen_y as f32 * cell_h;
+                match term.cursor_shape {
+                    CursorShape::Block => {
+                        Self::push_bg_quad(&mut vertices, cx, cy, cell_w, cell_h, self.cursor_color);
+                    }
+                    CursorShape::Underline => {
+                        let thickness = (cell_h * 0.1).max(1.0);
+                        Self::push_bg_quad(&mut vertices, cx, cy + cell_h - thickness, cell_w, thickness, self.cursor_color);
+                    }
+                    CursorShape::Bar => {
+                        let thickness = (cell_w * 0.1).max(1.0);
+                        Self::push_bg_quad(&mut vertices, cx, cy, thickness, cell_h, self.cursor_color);
+                    }
+                }
             }
+        }
+
+        // Dim overlay on unfocused panes
+        if !is_focused {
+            let dim = [0.0, 0.0, 0.0]; // black overlay
+            let dim4 = [dim[0], dim[1], dim[2], 0.3]; // 30% opacity
+            let no_tex = [0.0, 0.0];
+            let white = [1.0, 1.0, 1.0, 0.0];
+            // Cover the whole pane area (excluding status bar)
+            let dim_h = if self.status_bar_enabled {
+                vp.height - self.atlas.cell_height
+            } else {
+                vp.height
+            };
+            vertices.push(Vertex { position: [vp.x, vp.y], tex_coords: no_tex, color: white, bg_color: dim4 });
+            vertices.push(Vertex { position: [vp.x + vp.width, vp.y], tex_coords: no_tex, color: white, bg_color: dim4 });
+            vertices.push(Vertex { position: [vp.x, vp.y + dim_h], tex_coords: no_tex, color: white, bg_color: dim4 });
+            vertices.push(Vertex { position: [vp.x + vp.width, vp.y], tex_coords: no_tex, color: white, bg_color: dim4 });
+            vertices.push(Vertex { position: [vp.x + vp.width, vp.y + dim_h], tex_coords: no_tex, color: white, bg_color: dim4 });
+            vertices.push(Vertex { position: [vp.x, vp.y + dim_h], tex_coords: no_tex, color: white, bg_color: dim4 });
         }
 
         // Status bar
         if self.status_bar_enabled {
-            self.build_status_bar_vertices(&mut vertices, viewport_w, viewport_h, term);
+            self.build_status_bar_vertices(&mut vertices, vp, term);
         }
 
         vertices
@@ -405,16 +493,15 @@ impl Renderer {
     fn build_status_bar_vertices(
         &mut self,
         vertices: &mut Vec<Vertex>,
-        viewport_w: f32,
-        viewport_h: f32,
+        vp: &PaneViewport,
         term: &TerminalState,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
-        let bar_y = viewport_h - cell_h;
+        let bar_y = vp.y + vp.height - cell_h;
 
         // Background quad for the full status bar
-        Self::push_bg_quad(vertices, 0.0, bar_y, viewport_w, cell_h, self.status_bar_bg);
+        Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, self.status_bar_bg);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let cwd_fg = [self.status_bar_cwd_color[0], self.status_bar_cwd_color[1], self.status_bar_cwd_color[2], 1.0];
@@ -424,7 +511,7 @@ impl Renderer {
         let title_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 1.0];
 
         // Render CWD aligned to the left
-        let mut cursor_x = cell_w; // 1 cell padding from left
+        let mut cursor_x = vp.x + cell_w; // 1 cell padding from left
         if let Some(ref cwd) = term.cwd {
             let home = std::env::var("HOME").unwrap_or_default();
             let display_path = if !home.is_empty() && cwd.starts_with(&home) {
@@ -432,7 +519,7 @@ impl Renderer {
             } else {
                 cwd.clone()
             };
-            cursor_x = self.render_status_text(vertices, &display_path, cursor_x, bar_y, viewport_w * 0.4, cwd_fg, no_bg);
+            cursor_x = self.render_status_text(vertices, &display_path, cursor_x, bar_y, vp.x + vp.width * 0.4, cwd_fg, no_bg);
         }
 
         // Render git branch after CWD
@@ -445,15 +532,15 @@ impl Renderer {
             Some(_) => branch_fg,
             None => [branch_fg[0] * 0.5, branch_fg[1] * 0.5, branch_fg[2] * 0.5, 0.5],
         };
-        self.render_status_text(vertices, &branch_display, cursor_x, bar_y, viewport_w * 0.6, actual_branch_fg, no_bg);
+        self.render_status_text(vertices, &branch_display, cursor_x, bar_y, vp.x + vp.width * 0.6, actual_branch_fg, no_bg);
 
         // Render title centered
         if let Some(ref title) = term.title {
             let char_count = title.chars().count();
             let text_w = char_count as f32 * cell_w;
-            let center_x = (viewport_w - text_w) / 2.0;
-            let min_x = viewport_w * 0.3;
-            let max_x = viewport_w * 0.7;
+            let center_x = vp.x + (vp.width - text_w) / 2.0;
+            let min_x = vp.x + vp.width * 0.3;
+            let max_x = vp.x + vp.width * 0.7;
             let start_x = center_x.max(min_x);
             self.render_status_text(vertices, title, start_x, bar_y, max_x, title_fg, no_bg);
         }
@@ -482,13 +569,14 @@ impl Renderer {
         let scroll_w = scroll_str.chars().count() as f32 * cell_w;
         let gap = if scroll_off > 0 { cell_w * 2.0 } else { 0.0 };
         let total_right_w = scroll_w + gap + time_w;
-        let mut right_x = viewport_w - total_right_w - cell_w;
+        let right_edge = vp.x + vp.width;
+        let mut right_x = right_edge - total_right_w - cell_w;
 
         if scroll_off > 0 {
-            right_x = self.render_status_text(vertices, &scroll_str, right_x, bar_y, viewport_w, scroll_fg, no_bg);
+            right_x = self.render_status_text(vertices, &scroll_str, right_x, bar_y, right_edge, scroll_fg, no_bg);
             right_x += cell_w * 2.0; // gap
         }
-        self.render_status_text(vertices, &time_str, right_x, bar_y, viewport_w, time_fg, no_bg);
+        self.render_status_text(vertices, &time_str, right_x, bar_y, right_edge, time_fg, no_bg);
     }
 
     /// Render a string in the status bar at the given x position.
@@ -541,7 +629,7 @@ impl Renderer {
         x
     }
 
-    fn build_loading_vertices(&mut self, viewport_w: f32, viewport_h: f32) -> Vec<Vertex> {
+    fn build_loading_vertices(&mut self, vp: &PaneViewport) -> Vec<Vertex> {
         let text = "starting...";
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
@@ -549,8 +637,8 @@ impl Renderer {
         let atlas_h = self.atlas.atlas_height as f32;
 
         let text_w = text.len() as f32 * cell_w;
-        let start_x = (viewport_w - text_w) / 2.0;
-        let start_y = (viewport_h - cell_h) / 2.0;
+        let start_x = vp.x + (vp.width - text_w) / 2.0;
+        let start_y = vp.y + (vp.height - cell_h) / 2.0;
 
         let fg = [0.4, 0.4, 0.45, 1.0];
         let no_bg = [0.0, 0.0, 0.0, 0.0];

@@ -3,7 +3,7 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use vte::{Params, Perform};
 
-use super::TerminalState;
+use super::{CursorShape, TerminalState};
 
 /// Walk up from `path` to find `.git/HEAD` and extract the branch name.
 /// Returns `None` if not in a git repo.
@@ -219,8 +219,12 @@ impl Perform for VteHandler {
                 // DEC Private Mode Set/Reset
                 for &p in &params {
                     match p {
-                        1 => {} // DECCKM - cursor keys mode
-                        7 => {} // DECAWM - auto wrap
+                        1 => {
+                            term.cursor_keys_application = action == 'h';
+                        }
+                        7 => {
+                            term.auto_wrap = action == 'h';
+                        }
                         12 => {} // Cursor blink
                         25 => {
                             term.cursor_visible = action == 'h';
@@ -237,21 +241,84 @@ impl Perform for VteHandler {
                         1004 => {
                             term.focus_reporting = action == 'h';
                         }
-                        2004 => {} // Bracketed paste mode
-                        2026 => {} // Synchronized output
+                        2004 => {
+                            term.bracketed_paste = action == 'h';
+                        }
+                        2026 => {
+                            if action == 'h' {
+                                term.synchronized_output = true;
+                                term.sync_output_since = Some(std::time::Instant::now());
+                            } else {
+                                term.synchronized_output = false;
+                                term.sync_output_since = None;
+                                term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                         _ => log::debug!("unhandled DEC mode: {}", p),
                     }
                 }
             }
+            ('h', []) | ('l', []) => {
+                // SM/RM — Set/Reset Mode (non-private)
+                for &p in &params {
+                    match p {
+                        4 => {
+                            term.insert_mode = action == 'h';
+                        }
+                        _ => log::debug!("unhandled SM/RM mode: {}", p),
+                    }
+                }
+            }
+            ('@', []) => {
+                // ICH — Insert Characters
+                let n = params.first().copied().unwrap_or(1).max(1);
+                term.insert_chars(n);
+            }
             ('n', []) => {
                 // Device Status Report
                 if params.first() == Some(&6) {
-                    // CPR - Cursor Position Report
-                    // Would need to write back to PTY, skip for V0
+                    // CPR - Cursor Position Report (1-based)
+                    let row = term.cursor_y + 1;
+                    let col = term.cursor_x + 1;
+                    drop(term);
+                    let response = format!("\x1b[{};{}R", row, col);
+                    self.write_to_pty(response.as_bytes());
                 }
             }
             ('c', []) | ('c', [b'?']) => {
-                // Device Attributes - skip for V0
+                // DA1 — identify as VT220-compatible
+                drop(term);
+                self.write_to_pty(b"\x1b[?62;22c");
+            }
+            ('p', [b'?', b'$']) => {
+                // DECRPM — Report Private Mode
+                if let Some(&mode) = params.first() {
+                    // 1 = set, 2 = reset, 0 = not recognized
+                    let value = match mode {
+                        1 => if term.cursor_keys_application { 1 } else { 2 },
+                        7 => if term.auto_wrap { 1 } else { 2 },
+                        25 => if term.cursor_visible { 1 } else { 2 },
+                        1004 => if term.focus_reporting { 1 } else { 2 },
+                        1049 => if term.in_alt_screen { 1 } else { 2 },
+                        2004 => if term.bracketed_paste { 1 } else { 2 },
+                        2026 => if term.synchronized_output { 1 } else { 2 },
+                        _ => 0,
+                    };
+                    drop(term);
+                    let response = format!("\x1b[?{};{}$y", mode, value);
+                    self.write_to_pty(response.as_bytes());
+                }
+            }
+            ('q', [b' ']) => {
+                // DECSCUSR — Set Cursor Style
+                let ps = params.first().copied().unwrap_or(0);
+                term.cursor_shape = match ps {
+                    0 | 1 | 2 => CursorShape::Block,
+                    3 | 4 => CursorShape::Underline,
+                    5 | 6 => CursorShape::Bar,
+                    _ => CursorShape::Block,
+                };
+                term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             _ => {
                 log::debug!(

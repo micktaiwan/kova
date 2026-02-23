@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub font: FontConfig,
@@ -11,14 +11,14 @@ pub struct Config {
     pub status_bar: StatusBarConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct FontConfig {
     pub family: String,
     pub size: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ColorsConfig {
     pub foreground: [f32; 3],
@@ -26,7 +26,7 @@ pub struct ColorsConfig {
     pub cursor: [f32; 3],
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct WindowConfig {
     pub width: f64,
@@ -35,7 +35,7 @@ pub struct WindowConfig {
     pub y: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
     pub columns: u16,
@@ -45,7 +45,7 @@ pub struct TerminalConfig {
     pub cursor_blink_frames: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct StatusBarConfig {
     pub enabled: bool,

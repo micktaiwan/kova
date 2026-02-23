@@ -21,6 +21,11 @@ Terminal Mac ultra-rapide en Rust + Metal.
 - **V0 terminée** — single pane fonctionnel (PTY, rendu Metal, scrollback, alternate screen, dirty flag, reflow au resize)
 - **V1 en cours** — voir `roadmap.md` pour le détail et l'ordre recommandé
 
+## Build
+
+- Le target directory Cargo est **global** : `~/.cargo/target` (pas `./target`)
+- Le binaire release se trouve donc dans `~/.cargo/target/release/kova`
+
 ## Notes techniques
 
 - `notes/pty-spawn.md` — pourquoi `Command + pre_exec` plutôt que `posix_spawn` ou `fork` brut pour le controlling terminal

@@ -3,8 +3,16 @@ pub mod pty;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Instant;
 
 use crate::terminal::parser::AnsiColor;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CursorShape {
+    Block,
+    Underline,
+    Bar,
+}
 
 pub const DEFAULT_FG: [f32; 3] = [1.0, 1.0, 1.0];
 pub const DEFAULT_BG: [f32; 3] = [0.1, 0.1, 0.12];
@@ -82,6 +90,8 @@ pub struct TerminalState {
     origin_mode: bool,
     // Cursor visibility (DECTCEM)
     pub cursor_visible: bool,
+    // Cursor shape (DECSCUSR)
+    pub cursor_shape: CursorShape,
     // Incremented on every cursor move to reset blink phase
     pub cursor_move_epoch: AtomicU32,
     // Dirty flag for render optimization
@@ -89,7 +99,7 @@ pub struct TerminalState {
     // Alternate screen buffer
     alt_grid: Option<Vec<Row>>,
     alt_cursor: Option<(u16, u16)>,
-    in_alt_screen: bool,
+    pub in_alt_screen: bool,
     // Focus reporting (DEC mode 1004)
     pub focus_reporting: bool,
     // Current working directory (set via OSC 7)
@@ -100,6 +110,17 @@ pub struct TerminalState {
     pub title: Option<String>,
     // Text selection
     pub selection: Option<Selection>,
+    // Synchronized output (DEC mode 2026)
+    pub synchronized_output: bool,
+    pub sync_output_since: Option<Instant>,
+    // Bracketed paste mode (DEC mode 2004)
+    pub bracketed_paste: bool,
+    // Cursor keys mode (DECCKM, mode 1) — true = application mode (ESC O), false = normal (CSI)
+    pub cursor_keys_application: bool,
+    // Auto-wrap mode (DECAWM, mode 7) — true = wrap at margin
+    pub auto_wrap: bool,
+    // Insert mode (SM 4) — true = insert, false = replace
+    pub insert_mode: bool,
 }
 
 impl TerminalState {
@@ -128,6 +149,7 @@ impl TerminalState {
             scroll_bottom: rows.saturating_sub(1),
             origin_mode: false,
             cursor_visible: true,
+            cursor_shape: CursorShape::Block,
             cursor_move_epoch: AtomicU32::new(0),
             dirty: AtomicBool::new(true),
             alt_grid: None,
@@ -138,6 +160,12 @@ impl TerminalState {
             git_branch: None,
             title: None,
             selection: None,
+            synchronized_output: false,
+            sync_output_since: None,
+            bracketed_paste: false,
+            cursor_keys_application: false,
+            auto_wrap: true,
+            insert_mode: false,
         }
     }
 
@@ -173,23 +201,37 @@ impl TerminalState {
     }
 
     pub fn put_char(&mut self, c: char) {
+        if c >= '\u{2500}' && c <= '\u{257F}' {
+            log::debug!("put_char box-drawing: '{}' U+{:04X} at ({}, {})", c, c as u32, self.cursor_x, self.cursor_y);
+        }
         self.selection = None;
         self.cursor_moved();
         self.scroll_offset = 0; // Auto-scroll on new output
 
         if self.cursor_x >= self.cols {
-            // Mark current row as soft-wrapped before advancing
-            let row = self.cursor_y as usize;
-            if row < self.grid.len() {
-                self.grid[row].wrapped = true;
+            if !self.auto_wrap {
+                // DECAWM off: stay at last column, overwrite
+                self.cursor_x = self.cols - 1;
+            } else {
+                // Mark current row as soft-wrapped before advancing
+                let row = self.cursor_y as usize;
+                if row < self.grid.len() {
+                    self.grid[row].wrapped = true;
+                }
+                self.cursor_x = 0;
+                self.advance_line();
             }
-            self.cursor_x = 0;
-            self.advance_line();
         }
 
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         if row < self.grid.len() && col < self.grid[row].cells.len() {
+            // Insert mode: shift characters right before writing
+            if self.insert_mode {
+                let cells = &mut self.grid[row].cells;
+                cells.pop(); // remove last to keep row length
+                cells.insert(col, self.blank.clone());
+            }
             let mut fg = self.current_fg;
             if self.dim {
                 fg = [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5];
@@ -506,6 +548,21 @@ impl TerminalState {
                 }
             }
         }
+    }
+
+    pub fn insert_chars(&mut self, n: u16) {
+        let row = self.cursor_y as usize;
+        let col = self.cursor_x as usize;
+        if row < self.grid.len() {
+            let cells = &mut self.grid[row].cells;
+            for _ in 0..n {
+                if col < cells.len() {
+                    cells.pop();
+                    cells.insert(col, self.blank.clone());
+                }
+            }
+        }
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn erase_chars(&mut self, n: u16) {
