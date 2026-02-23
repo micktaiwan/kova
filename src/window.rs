@@ -177,7 +177,17 @@ define_class!(
         fn mouse_down(&self, event: &NSEvent) {
             // Click sets focus to the pane under the cursor
             if let Some((pane, vp)) = self.pane_at_event(event) {
+                let old_focused = self.ivars().focused.get();
                 self.ivars().focused.set(pane.id);
+                // Mark old focused pane dirty so its dim overlay updates
+                if old_focused != pane.id {
+                    let tree_ref = self.ivars().tree.borrow();
+                    if let Some(tree) = tree_ref.as_ref() {
+                        if let Some(old) = tree.pane(old_focused) {
+                            old.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
                 if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
                     let mut term = pane.terminal.write();
                     term.selection = Some(Selection { anchor: pos, end: pos });
@@ -431,6 +441,13 @@ impl KovaView {
         if let Some(tree) = tree_ref.as_ref() {
             if let Some(neighbor_id) = tree.neighbor(focused_id, dir, self.drawable_viewport()) {
                 self.ivars().focused.set(neighbor_id);
+                // Mark both old and new pane dirty so dim overlay updates instantly
+                if let Some(old) = tree.pane(focused_id) {
+                    old.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(new) = tree.pane(neighbor_id) {
+                    new.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
