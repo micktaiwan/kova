@@ -369,7 +369,7 @@ impl Renderer {
 
         // Status bar
         if self.status_bar_enabled {
-            self.build_status_bar_vertices(&mut vertices, viewport_w, viewport_h);
+            self.build_status_bar_vertices(&mut vertices, viewport_w, viewport_h, term);
         }
 
         vertices
@@ -380,6 +380,7 @@ impl Renderer {
         vertices: &mut Vec<Vertex>,
         viewport_w: f32,
         viewport_h: f32,
+        term: &TerminalState,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
@@ -387,6 +388,54 @@ impl Renderer {
 
         // Background quad for the full status bar
         Self::push_bg_quad(vertices, 0.0, bar_y, viewport_w, cell_h, self.status_bar_bg);
+
+        let atlas_w = self.atlas.atlas_width as f32;
+        let atlas_h = self.atlas.atlas_height as f32;
+        let fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 1.0];
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+
+        // Render CWD aligned to the left
+        if let Some(ref cwd) = term.cwd {
+            // Replace home directory with ~
+            let home = std::env::var("HOME").unwrap_or_default();
+            let display_path = if !home.is_empty() && cwd.starts_with(&home) {
+                format!("~{}", &cwd[home.len()..])
+            } else {
+                cwd.clone()
+            };
+
+            for c in display_path.chars() {
+                if self.atlas.glyph(c).is_none() {
+                    self.atlas.rasterize_char(c);
+                }
+            }
+
+            let start_x = cell_w; // 1 cell padding from left
+            for (i, c) in display_path.chars().enumerate() {
+                let glyph = match self.atlas.glyph(c) {
+                    Some(g) => *g,
+                    None => continue,
+                };
+                if glyph.width == 0 || glyph.height == 0 { continue; }
+
+                let x = start_x + i as f32 * cell_w;
+                if x + cell_w > viewport_w * 0.6 { break; } // Don't overlap with right side
+                let y = bar_y;
+                let gw = glyph.width as f32;
+                let gh = glyph.height as f32;
+                let tx = glyph.x as f32 / atlas_w;
+                let ty = glyph.y as f32 / atlas_h;
+                let tw = glyph.width as f32 / atlas_w;
+                let th = glyph.height as f32 / atlas_h;
+
+                vertices.push(Vertex { position: [x, y], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
+                vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+                vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+                vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+                vertices.push(Vertex { position: [x + gw, y + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
+                vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+            }
+        }
 
         // Render time HH:MM aligned to the right
         let time_str = {
@@ -406,11 +455,6 @@ impl Renderer {
                 self.atlas.rasterize_char(c);
             }
         }
-
-        let atlas_w = self.atlas.atlas_width as f32;
-        let atlas_h = self.atlas.atlas_height as f32;
-        let fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 1.0];
-        let no_bg = [0.0, 0.0, 0.0, 0.0];
 
         let text_w = time_str.len() as f32 * cell_w;
         let start_x = viewport_w - text_w - cell_w; // 1 cell padding from right

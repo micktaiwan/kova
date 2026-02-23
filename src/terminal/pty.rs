@@ -107,12 +107,19 @@ impl Pty {
         }
         let reader_fd = unsafe { OwnedFd::from_raw_fd(dup_fd) };
 
+        // Dup for VteHandler write-back (CSI responses)
+        let writer_dup = unsafe { libc::dup(master_fd.as_raw_fd()) };
+        if writer_dup < 0 {
+            return Err("dup() failed for writer".into());
+        }
+        let writer_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(writer_dup) });
+
         std::thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {
                 let mut file = unsafe { std::fs::File::from_raw_fd(reader_fd.into_raw_fd()) };
                 let mut parser = vte::Parser::new();
-                let mut handler = VteHandler::new(terminal);
+                let mut handler = VteHandler::new(terminal, writer_fd);
                 let mut buf = [0u8; 4096];
                 let mut eof = false;
 

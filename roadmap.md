@@ -39,6 +39,8 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Config fichier (TOML) : font, taille, couleurs, FPS, cursor blink, scrollback
   - `~/.config/kova/config.toml`, defaults sensibles, fallback silencieux
 - [x] Détecter la mort du shell (EOF sur PTY) → fermer la fenêtre
+- [x] Status bar (CWD via OSC 7, heure HH:MM, configurable couleurs/activation)
+- [x] Shift+Tab (backtab) — envoie `CSI Z` au lieu du raw `0x19`
 - [ ] Config keybindings
 - [ ] Sélection texte + copier/coller (sur le pane unique actuel)
 - [ ] Resize fenêtre : reflow du texte
@@ -61,8 +63,8 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 
 ## V2 — Polished
 
-- [ ] Focus events (DEC mode 1004) — notifier le shell/app quand la fenêtre gagne/perd le focus
-- [ ] Kitty keyboard protocol (CSI u) — progressive enhancement pour un meilleur handling des touches
+- [x] Focus events (DEC mode 1004) — notifier le shell/app quand la fenêtre gagne/perd le focus
+- [x] Kitty keyboard protocol (CSI u) — réponse à la query `CSI > 0 u` (flags=0, fallback propre)
 - [ ] Synchronized output (mode 2026) — bufferiser le rendu entre h/l pour éviter le tearing
 - [ ] Thèmes de couleurs (quelques built-in + custom)
 - [ ] Support ProMotion (120Hz)

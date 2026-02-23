@@ -62,6 +62,10 @@ pub struct TerminalState {
     alt_grid: Option<Vec<Vec<Cell>>>,
     alt_cursor: Option<(u16, u16)>,
     in_alt_screen: bool,
+    // Focus reporting (DEC mode 1004)
+    pub focus_reporting: bool,
+    // Current working directory (set via OSC 7)
+    pub cwd: Option<String>,
 }
 
 impl TerminalState {
@@ -95,6 +99,8 @@ impl TerminalState {
             alt_grid: None,
             alt_cursor: None,
             in_alt_screen: false,
+            focus_reporting: false,
+            cwd: None,
         }
     }
 

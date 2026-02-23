@@ -1,4 +1,5 @@
 use parking_lot::RwLock;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use vte::{Params, Perform};
 
@@ -6,11 +7,16 @@ use super::TerminalState;
 
 pub struct VteHandler {
     terminal: Arc<RwLock<TerminalState>>,
+    pty_writer: Arc<OwnedFd>,
 }
 
 impl VteHandler {
-    pub fn new(terminal: Arc<RwLock<TerminalState>>) -> Self {
-        VteHandler { terminal }
+    pub fn new(terminal: Arc<RwLock<TerminalState>>, pty_writer: Arc<OwnedFd>) -> Self {
+        VteHandler { terminal, pty_writer }
+    }
+
+    fn write_to_pty(&self, data: &[u8]) {
+        let _ = rustix::io::write(&*self.pty_writer, data);
     }
 }
 
@@ -30,11 +36,19 @@ impl Perform for VteHandler {
             }
             0x0D => term.carriage_return(),  // CR
             0x07 => {}                       // BEL - ignore
-            _ => {}
+            _ => log::debug!("unhandled execute: byte=0x{:02X}", byte),
         }
     }
 
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+    fn hook(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        let params: Vec<u16> = params.iter().flat_map(|p| p.iter().map(|&v| v)).collect();
+        log::debug!(
+            "unhandled DCS hook: action={}, params={:?}, intermediates={:?}",
+            action,
+            params,
+            intermediates
+        );
+    }
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
 
@@ -47,7 +61,25 @@ impl Perform for VteHandler {
                     let _title = String::from_utf8_lossy(params[1]);
                     log::debug!("OSC title: {}", _title);
                 }
-                _ => {}
+                b"7" => {
+                    // Current working directory: file://hostname/path
+                    let uri = String::from_utf8_lossy(params[1]);
+                    let path = if let Some(rest) = uri.strip_prefix("file://") {
+                        // Skip hostname (everything up to the next '/')
+                        rest.find('/').map(|i| &rest[i..])
+                    } else {
+                        None
+                    };
+                    if let Some(path) = path {
+                        let mut term = self.terminal.write();
+                        term.cwd = Some(path.to_string());
+                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                _ => {
+                    let cmd = String::from_utf8_lossy(params[0]);
+                    log::debug!("unhandled OSC: cmd={}, params_count={}", cmd, params.len());
+                }
             }
         }
     }
@@ -154,6 +186,11 @@ impl Perform for VteHandler {
             }
             ('s', []) => term.save_cursor(),
             ('u', []) => term.restore_cursor(),
+            ('u', [b'>']) => {
+                // Kitty keyboard protocol query — respond with flags=0 (not supported)
+                drop(term);
+                self.write_to_pty(b"\x1b[?0u");
+            }
             ('h', [b'?']) | ('l', [b'?']) => {
                 // DEC Private Mode Set/Reset
                 for &p in &params {
@@ -172,6 +209,9 @@ impl Perform for VteHandler {
                             } else {
                                 term.leave_alt_screen();
                             }
+                        }
+                        1004 => {
+                            term.focus_reporting = action == 'h';
                         }
                         2004 => {} // Bracketed paste mode
                         2026 => {} // Synchronized output
