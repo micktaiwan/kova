@@ -31,9 +31,14 @@ pub struct TerminalState {
     pub rows: u16,
     grid: Vec<Vec<Cell>>,
     scrollback: VecDeque<Vec<Cell>>,
+    pub scrollback_limit: usize,
     pub cursor_x: u16,
     pub cursor_y: u16,
     scroll_offset: i32,
+    // Config colors used as defaults
+    pub default_fg: [f32; 3],
+    pub default_bg: [f32; 3],
+    blank: Cell,
     // SGR state
     current_fg: [f32; 3],
     current_bg: [f32; 3],
@@ -58,18 +63,23 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
-    pub fn new(cols: u16, rows: u16) -> Self {
-        let grid = vec![vec![Cell::default(); cols as usize]; rows as usize];
+    pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [f32; 3], bg: [f32; 3]) -> Self {
+        let blank = Cell { c: ' ', fg, bg };
+        let grid = vec![vec![blank.clone(); cols as usize]; rows as usize];
         TerminalState {
             cols,
             rows,
             grid,
             scrollback: VecDeque::new(),
+            scrollback_limit,
             cursor_x: 0,
             cursor_y: 0,
             scroll_offset: 0,
-            current_fg: DEFAULT_FG,
-            current_bg: DEFAULT_BG,
+            default_fg: fg,
+            default_bg: bg,
+            blank,
+            current_fg: fg,
+            current_bg: bg,
             reversed: false,
             saved_cursor: None,
             scroll_top: 0,
@@ -175,18 +185,18 @@ impl TerminalState {
                 let line = self.grid.remove(top);
                 if top == 0 && !self.in_alt_screen {
                     self.scrollback.push_back(line);
-                    if self.scrollback.len() > 10_000 {
+                    if self.scrollback.len() > self.scrollback_limit {
                         self.scrollback.pop_front();
                     }
                 }
             }
-            let new_line = vec![Cell::default(); self.cols as usize];
+            let new_line = vec![self.blank.clone(); self.cols as usize];
             let insert_pos = bottom.min(self.grid.len());
             self.grid.insert(insert_pos, new_line);
         }
 
         // Ensure grid has correct number of rows
-        self.grid.resize(self.rows as usize, vec![Cell::default(); self.cols as usize]);
+        self.grid.resize(self.rows as usize, vec![self.blank.clone(); self.cols as usize]);
     }
 
     fn scroll_down(&mut self, n: u16) {
@@ -197,11 +207,11 @@ impl TerminalState {
             if bottom < self.grid.len() {
                 self.grid.remove(bottom);
             }
-            let new_line = vec![Cell::default(); self.cols as usize];
+            let new_line = vec![self.blank.clone(); self.cols as usize];
             self.grid.insert(top, new_line);
         }
 
-        self.grid.resize(self.rows as usize, vec![Cell::default(); self.cols as usize]);
+        self.grid.resize(self.rows as usize, vec![self.blank.clone(); self.cols as usize]);
     }
 
     pub fn set_sgr(&mut self, params: &[u16]) {
@@ -209,8 +219,8 @@ impl TerminalState {
         while i < params.len() {
             match params[i] {
                 0 => {
-                    self.current_fg = DEFAULT_FG;
-                    self.current_bg = DEFAULT_BG;
+                    self.current_fg = self.default_fg;
+                    self.current_bg = self.default_bg;
                     self.reversed = false;
                 }
                 7 => {
@@ -241,7 +251,7 @@ impl TerminalState {
                         i += 4;
                     }
                 }
-                39 => self.current_fg = DEFAULT_FG,
+                39 => self.current_fg = self.default_fg,
                 40..=47 => {
                     self.current_bg = AnsiColor::from_index((params[i] - 40) as u8).to_rgb();
                 }
@@ -258,7 +268,7 @@ impl TerminalState {
                         i += 4;
                     }
                 }
-                49 => self.current_bg = DEFAULT_BG,
+                49 => self.current_bg = self.default_bg,
                 90..=97 => {
                     self.current_fg = AnsiColor::from_index((params[i] - 90 + 8) as u8).to_rgb();
                 }
@@ -280,11 +290,11 @@ impl TerminalState {
                 let col = self.cursor_x as usize;
                 if row < self.grid.len() {
                     for c in col..self.grid[row].len() {
-                        self.grid[row][c] = Cell::default();
+                        self.grid[row][c] = self.blank.clone();
                     }
                     for r in (row + 1)..self.grid.len() {
                         for c in 0..self.grid[r].len() {
-                            self.grid[r][c] = Cell::default();
+                            self.grid[r][c] = self.blank.clone();
                         }
                     }
                 }
@@ -296,13 +306,13 @@ impl TerminalState {
                 for r in 0..row {
                     if r < self.grid.len() {
                         for c in 0..self.grid[r].len() {
-                            self.grid[r][c] = Cell::default();
+                            self.grid[r][c] = self.blank.clone();
                         }
                     }
                 }
                 if row < self.grid.len() {
                     for c in 0..=col.min(self.grid[row].len().saturating_sub(1)) {
-                        self.grid[row][c] = Cell::default();
+                        self.grid[row][c] = self.blank.clone();
                     }
                 }
             }
@@ -310,7 +320,7 @@ impl TerminalState {
                 // Erase entire display
                 for row in &mut self.grid {
                     for cell in row.iter_mut() {
-                        *cell = Cell::default();
+                        *cell = self.blank.clone();
                     }
                 }
             }
@@ -327,17 +337,17 @@ impl TerminalState {
         match mode {
             0 => {
                 for c in (self.cursor_x as usize)..self.grid[row].len() {
-                    self.grid[row][c] = Cell::default();
+                    self.grid[row][c] = self.blank.clone();
                 }
             }
             1 => {
                 for c in 0..=(self.cursor_x as usize).min(self.grid[row].len().saturating_sub(1)) {
-                    self.grid[row][c] = Cell::default();
+                    self.grid[row][c] = self.blank.clone();
                 }
             }
             2 => {
                 for cell in self.grid[row].iter_mut() {
-                    *cell = Cell::default();
+                    *cell = self.blank.clone();
                 }
             }
             _ => {}
@@ -388,9 +398,9 @@ impl TerminalState {
             if bottom < self.grid.len() {
                 self.grid.remove(bottom);
             }
-            self.grid.insert(row, vec![Cell::default(); self.cols as usize]);
+            self.grid.insert(row, vec![self.blank.clone(); self.cols as usize]);
         }
-        self.grid.resize(self.rows as usize, vec![Cell::default(); self.cols as usize]);
+        self.grid.resize(self.rows as usize, vec![self.blank.clone(); self.cols as usize]);
     }
 
     pub fn delete_lines(&mut self, n: u16) {
@@ -401,9 +411,9 @@ impl TerminalState {
                 self.grid.remove(row);
             }
             let insert_pos = bottom.min(self.grid.len());
-            self.grid.insert(insert_pos, vec![Cell::default(); self.cols as usize]);
+            self.grid.insert(insert_pos, vec![self.blank.clone(); self.cols as usize]);
         }
-        self.grid.resize(self.rows as usize, vec![Cell::default(); self.cols as usize]);
+        self.grid.resize(self.rows as usize, vec![self.blank.clone(); self.cols as usize]);
     }
 
     pub fn delete_chars(&mut self, n: u16) {
@@ -413,7 +423,7 @@ impl TerminalState {
             for _ in 0..n {
                 if col < self.grid[row].len() {
                     self.grid[row].remove(col);
-                    self.grid[row].push(Cell::default());
+                    self.grid[row].push(self.blank.clone());
                 }
             }
         }
@@ -425,7 +435,7 @@ impl TerminalState {
         if row < self.grid.len() {
             for i in 0..n as usize {
                 if col + i < self.grid[row].len() {
-                    self.grid[row][col + i] = Cell::default();
+                    self.grid[row][col + i] = self.blank.clone();
                 }
             }
         }
@@ -454,7 +464,7 @@ impl TerminalState {
         self.alt_cursor = Some((self.cursor_x, self.cursor_y));
         let alt_grid = std::mem::replace(
             &mut self.grid,
-            vec![vec![Cell::default(); self.cols as usize]; self.rows as usize],
+            vec![vec![self.blank.clone(); self.cols as usize]; self.rows as usize],
         );
         self.alt_grid = Some(alt_grid);
         self.cursor_x = 0;
@@ -498,13 +508,13 @@ impl TerminalState {
 
         // Resize each existing row to new column count
         for row in &mut self.grid {
-            row.resize(cols as usize, Cell::default());
+            row.resize(cols as usize, self.blank.clone());
         }
 
         let new_rows = rows as usize;
         if new_rows > old_rows {
             // Add blank rows at the bottom
-            self.grid.resize(new_rows, vec![Cell::default(); cols as usize]);
+            self.grid.resize(new_rows, vec![self.blank.clone(); cols as usize]);
         } else if new_rows < old_rows {
             // Remove blank rows from the bottom first
             while self.grid.len() > new_rows {
@@ -540,9 +550,9 @@ impl TerminalState {
         // Resize alt grid if active
         if let Some(ref mut alt_grid) = self.alt_grid {
             for row in alt_grid.iter_mut() {
-                row.resize(cols as usize, Cell::default());
+                row.resize(cols as usize, self.blank.clone());
             }
-            alt_grid.resize(new_rows, vec![Cell::default(); cols as usize]);
+            alt_grid.resize(new_rows, vec![self.blank.clone(); cols as usize]);
         }
 
         self.dirty.store(true, Ordering::Relaxed);

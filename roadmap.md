@@ -30,15 +30,33 @@ Rust + Metal, zéro compromis cross-platform.
 
 ## V1 — Utilisable au quotidien
 
+Ordre recommandé : config d'abord (indépendant), puis sélection texte (pane unique),
+puis refacto multi-pane, puis splits, puis tabs par-dessus.
+
+### Config & fondations
+
+- [x] Config fichier (TOML) : font, taille, couleurs, FPS, cursor blink, scrollback
+  - `~/.config/kova/config.toml`, defaults sensibles, fallback silencieux
+- [x] Détecter la mort du shell (EOF sur PTY) → fermer la fenêtre
+- [ ] Config keybindings
+- [ ] Sélection texte + copier/coller (sur le pane unique actuel)
+- [ ] Resize fenêtre : reflow du texte
+
+### Refacto multi-pane (prérequis splits)
+
+- [ ] PTY lifecycle per-pane — remplacer les singletons globaux (`static SHUTDOWN`, `static PTY_PIDS`) par un shutdown par PTY (Arc<AtomicBool> par instance)
+- [ ] Split tree (`enum SplitTree { Leaf(Pane), Hsplit(...), Vsplit(...) }`) — remplacer le terminal/pty/renderer uniques dans KovaView ivars
+- [ ] Modèle de focus — tracker le pane actif pour router l'input clavier
+- [ ] Renderer multi-pane — `render()` accepte un `&SplitTree`, clipping et offset par pane
+
+### Splits & tabs
+
 - [ ] Splits horizontaux et verticaux (arbre binaire)
 - [ ] Navigation entre splits (raccourcis clavier)
 - [ ] Resize des splits (raccourcis + drag)
 - [ ] Tabs (barre minimale en haut)
 - [ ] Navigation entre tabs
-- [ ] Fermeture tab/split
-- [ ] Config fichier (TOML) : font, taille, couleurs, keybindings
-- [ ] Sélection texte + copier/coller
-- [ ] Resize fenêtre : reflow du texte
+- [ ] Fermeture tab/split — actuellement `exit` ferme toute l'app (`app.terminate`), à remplacer par fermeture du pane seul
 
 ## V2 — Polished
 

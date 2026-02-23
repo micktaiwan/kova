@@ -4,10 +4,12 @@ use objc2_app_kit::{NSApplication, NSApplicationDelegate, NSMenu, NSMenuItem, NS
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString};
 use std::cell::OnceCell;
 
+use crate::config::Config;
 use crate::window;
 
 pub struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
+    config: OnceCell<Config>,
 }
 
 define_class!(
@@ -25,7 +27,8 @@ define_class!(
             let mtm = MainThreadMarker::from(self);
             setup_menu(mtm);
 
-            let win = window::create_window(mtm);
+            let config = self.ivars().config.get().unwrap();
+            let win = window::create_window(mtm, config);
             win.makeKeyAndOrderFront(None);
 
             let app = NSApplication::sharedApplication(mtm);
@@ -51,11 +54,14 @@ define_class!(
 );
 
 impl AppDelegate {
-    pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
+    pub fn new(mtm: MainThreadMarker, config: Config) -> Retained<Self> {
         let this = mtm.alloc::<Self>().set_ivars(AppDelegateIvars {
             window: OnceCell::new(),
+            config: OnceCell::new(),
         });
-        unsafe { msg_send![super(this), init] }
+        let retained: Retained<Self> = unsafe { msg_send![super(this), init] };
+        retained.ivars().config.set(config).ok();
+        retained
     }
 }
 
