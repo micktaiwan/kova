@@ -143,14 +143,24 @@ impl KovaView {
             renderer.write().rebuild_atlas(scale);
         }
 
-        let (cell_w, cell_h) = renderer.read().cell_size();
+        let renderer_state = renderer.read();
+        let (cell_w, cell_h) = renderer_state.cell_size();
+        let status_bar = renderer_state.status_bar_enabled();
+        drop(renderer_state);
+
         let pixel_w = (frame.size.width * scale) as f32;
         let pixel_h = (frame.size.height * scale) as f32;
         let cols = (pixel_w / cell_w).floor().max(1.0) as u16;
-        let rows = (pixel_h / cell_h).floor().max(1.0) as u16;
+        let usable_h = if status_bar {
+            pixel_h - cell_h // Reserve 1 row for the status bar
+        } else {
+            pixel_h
+        };
+        let rows = (usable_h / cell_h).floor().max(1.0) as u16;
 
         let mut term = terminal.write();
         if cols != term.cols || rows != term.rows {
+            log::debug!("resize: {}x{} -> {}x{}", term.cols, term.rows, cols, rows);
             term.resize(cols, rows);
             drop(term);
             if let Some(pty) = self.ivars().pty.get() {
