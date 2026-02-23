@@ -39,7 +39,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Config fichier (TOML) : font, taille, couleurs, FPS, cursor blink, scrollback
   - `~/.config/kova/config.toml`, defaults sensibles, fallback silencieux
 - [x] Détecter la mort du shell (EOF sur PTY) → fermer la fenêtre
-- [x] Status bar (CWD via OSC 7, heure HH:MM, configurable couleurs/activation)
+- [x] Status bar (CWD via OSC 7, git branch, indicateur scroll, titre OSC 0/2, heure HH:MM, couleur par élément configurable)
 - [x] Shift+Tab (backtab) — envoie `CSI Z` au lieu du raw `0x19`
 - [ ] Config keybindings
 - [ ] Sélection texte + copier/coller (sur le pane unique actuel)

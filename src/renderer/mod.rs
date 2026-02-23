@@ -39,6 +39,10 @@ pub struct Renderer {
     status_bar_enabled: bool,
     status_bar_bg: [f32; 3],
     status_bar_fg: [f32; 3],
+    status_bar_cwd_color: [f32; 3],
+    status_bar_branch_color: [f32; 3],
+    status_bar_scroll_color: [f32; 3],
+    status_bar_time_color: [f32; 3],
     last_minute: u32,
 }
 
@@ -106,6 +110,10 @@ impl Renderer {
             status_bar_enabled: config.status_bar.enabled,
             status_bar_bg: config.status_bar.bg_color,
             status_bar_fg: config.status_bar.fg_color,
+            status_bar_cwd_color: config.status_bar.cwd_color,
+            status_bar_branch_color: config.status_bar.branch_color,
+            status_bar_scroll_color: config.status_bar.scroll_color,
+            status_bar_time_color: config.status_bar.time_color,
             last_minute: u32::MAX,
         }
     }
@@ -389,55 +397,49 @@ impl Renderer {
         // Background quad for the full status bar
         Self::push_bg_quad(vertices, 0.0, bar_y, viewport_w, cell_h, self.status_bar_bg);
 
-        let atlas_w = self.atlas.atlas_width as f32;
-        let atlas_h = self.atlas.atlas_height as f32;
-        let fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 1.0];
         let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let cwd_fg = [self.status_bar_cwd_color[0], self.status_bar_cwd_color[1], self.status_bar_cwd_color[2], 1.0];
+        let branch_fg = [self.status_bar_branch_color[0], self.status_bar_branch_color[1], self.status_bar_branch_color[2], 1.0];
+        let scroll_fg = [self.status_bar_scroll_color[0], self.status_bar_scroll_color[1], self.status_bar_scroll_color[2], 1.0];
+        let time_fg = [self.status_bar_time_color[0], self.status_bar_time_color[1], self.status_bar_time_color[2], 1.0];
+        let title_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 1.0];
 
         // Render CWD aligned to the left
+        let mut cursor_x = cell_w; // 1 cell padding from left
         if let Some(ref cwd) = term.cwd {
-            // Replace home directory with ~
             let home = std::env::var("HOME").unwrap_or_default();
             let display_path = if !home.is_empty() && cwd.starts_with(&home) {
                 format!("~{}", &cwd[home.len()..])
             } else {
                 cwd.clone()
             };
-
-            for c in display_path.chars() {
-                if self.atlas.glyph(c).is_none() {
-                    self.atlas.rasterize_char(c);
-                }
-            }
-
-            let start_x = cell_w; // 1 cell padding from left
-            for (i, c) in display_path.chars().enumerate() {
-                let glyph = match self.atlas.glyph(c) {
-                    Some(g) => *g,
-                    None => continue,
-                };
-                if glyph.width == 0 || glyph.height == 0 { continue; }
-
-                let x = start_x + i as f32 * cell_w;
-                if x + cell_w > viewport_w * 0.6 { break; } // Don't overlap with right side
-                let y = bar_y;
-                let gw = glyph.width as f32;
-                let gh = glyph.height as f32;
-                let tx = glyph.x as f32 / atlas_w;
-                let ty = glyph.y as f32 / atlas_h;
-                let tw = glyph.width as f32 / atlas_w;
-                let th = glyph.height as f32 / atlas_h;
-
-                vertices.push(Vertex { position: [x, y], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [x + gw, y + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-            }
+            cursor_x = self.render_status_text(vertices, &display_path, cursor_x, bar_y, viewport_w * 0.4, cwd_fg, no_bg);
         }
 
-        // Render time HH:MM aligned to the right
+        // Render git branch after CWD
+        cursor_x += cell_w * 2.0; // 2 cell gap
+        let branch_display = match term.git_branch {
+            Some(ref b) => format!(" {}", b),
+            None => " no git".to_string(),
+        };
+        let actual_branch_fg = match term.git_branch {
+            Some(_) => branch_fg,
+            None => [branch_fg[0] * 0.5, branch_fg[1] * 0.5, branch_fg[2] * 0.5, 0.5],
+        };
+        self.render_status_text(vertices, &branch_display, cursor_x, bar_y, viewport_w * 0.6, actual_branch_fg, no_bg);
+
+        // Render title centered
+        if let Some(ref title) = term.title {
+            let char_count = title.chars().count();
+            let text_w = char_count as f32 * cell_w;
+            let center_x = (viewport_w - text_w) / 2.0;
+            let min_x = viewport_w * 0.3;
+            let max_x = viewport_w * 0.7;
+            let start_x = center_x.max(min_x);
+            self.render_status_text(vertices, title, start_x, bar_y, max_x, title_fg, no_bg);
+        }
+
+        // Right side: scroll indicator + time
         let time_str = {
             let secs = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -449,25 +451,59 @@ impl Renderer {
             format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
         };
 
-        // Ensure time chars are in the atlas
-        for c in time_str.chars() {
+        let scroll_off = term.scroll_offset();
+        let scroll_str = if scroll_off > 0 {
+            format!("↑{}", scroll_off)
+        } else {
+            String::new()
+        };
+
+        // Calculate total right width to align from right edge
+        let time_w = time_str.chars().count() as f32 * cell_w;
+        let scroll_w = scroll_str.chars().count() as f32 * cell_w;
+        let gap = if scroll_off > 0 { cell_w * 2.0 } else { 0.0 };
+        let total_right_w = scroll_w + gap + time_w;
+        let mut right_x = viewport_w - total_right_w - cell_w;
+
+        if scroll_off > 0 {
+            right_x = self.render_status_text(vertices, &scroll_str, right_x, bar_y, viewport_w, scroll_fg, no_bg);
+            right_x += cell_w * 2.0; // gap
+        }
+        self.render_status_text(vertices, &time_str, right_x, bar_y, viewport_w, time_fg, no_bg);
+    }
+
+    /// Render a string in the status bar at the given x position.
+    /// Returns the x position after the last rendered character.
+    /// Stops rendering if x exceeds max_x.
+    fn render_status_text(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        text: &str,
+        start_x: f32,
+        y: f32,
+        max_x: f32,
+        fg: [f32; 4],
+        no_bg: [f32; 4],
+    ) -> f32 {
+        let cell_w = self.atlas.cell_width;
+        let atlas_w = self.atlas.atlas_width as f32;
+        let atlas_h = self.atlas.atlas_height as f32;
+
+        for c in text.chars() {
             if self.atlas.glyph(c).is_none() {
                 self.atlas.rasterize_char(c);
             }
         }
 
-        let text_w = time_str.len() as f32 * cell_w;
-        let start_x = viewport_w - text_w - cell_w; // 1 cell padding from right
-
-        for (i, c) in time_str.chars().enumerate() {
+        let mut x = start_x;
+        for c in text.chars() {
+            if x + cell_w > max_x { break; }
             let glyph = match self.atlas.glyph(c) {
                 Some(g) => *g,
-                None => continue,
+                None => { x += cell_w; continue; }
             };
-            if glyph.width == 0 || glyph.height == 0 { continue; }
+            if glyph.width == 0 || glyph.height == 0 { x += cell_w; continue; }
 
-            let x = start_x + i as f32 * cell_w;
-            let y = bar_y;
             let gw = glyph.width as f32;
             let gh = glyph.height as f32;
             let tx = glyph.x as f32 / atlas_w;
@@ -481,7 +517,9 @@ impl Renderer {
             vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
             vertices.push(Vertex { position: [x + gw, y + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
             vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+            x += cell_w;
         }
+        x
     }
 
     fn build_loading_vertices(&mut self, viewport_w: f32, viewport_h: f32) -> Vec<Vertex> {

@@ -51,6 +51,10 @@ pub struct StatusBarConfig {
     pub enabled: bool,
     pub bg_color: [f32; 3],
     pub fg_color: [f32; 3],
+    pub cwd_color: [f32; 3],
+    pub branch_color: [f32; 3],
+    pub scroll_color: [f32; 3],
+    pub time_color: [f32; 3],
 }
 
 impl Default for StatusBarConfig {
@@ -59,6 +63,10 @@ impl Default for StatusBarConfig {
             enabled: true,
             bg_color: [0.15, 0.15, 0.18],
             fg_color: [0.6, 0.6, 0.65],
+            cwd_color: [0.6, 0.6, 0.65],
+            branch_color: [0.4, 0.7, 0.5],
+            scroll_color: [0.8, 0.6, 0.3],
+            time_color: [0.5, 0.5, 0.55],
         }
     }
 }

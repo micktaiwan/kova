@@ -66,6 +66,10 @@ pub struct TerminalState {
     pub focus_reporting: bool,
     // Current working directory (set via OSC 7)
     pub cwd: Option<String>,
+    // Git branch (resolved when CWD changes)
+    pub git_branch: Option<String>,
+    // Window title (set via OSC 0/2)
+    pub title: Option<String>,
 }
 
 impl TerminalState {
@@ -101,6 +105,8 @@ impl TerminalState {
             in_alt_screen: false,
             focus_reporting: false,
             cwd: None,
+            git_branch: None,
+            title: None,
         }
     }
 
