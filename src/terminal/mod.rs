@@ -43,6 +43,8 @@ pub struct TerminalState {
     current_fg: [f32; 3],
     current_bg: [f32; 3],
     reversed: bool,
+    bold: bool,
+    dim: bool,
     // Saved cursor
     saved_cursor: Option<(u16, u16)>,
     // Scroll region
@@ -81,6 +83,8 @@ impl TerminalState {
             current_fg: fg,
             current_bg: bg,
             reversed: false,
+            bold: false,
+            dim: false,
             saved_cursor: None,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
@@ -137,9 +141,20 @@ impl TerminalState {
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         if row < self.grid.len() && col < self.grid[row].len() {
+            let mut fg = self.current_fg;
+            if self.dim {
+                fg = [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5];
+            }
+            if self.bold {
+                fg = [
+                    (fg[0] * 1.3).min(1.0),
+                    (fg[1] * 1.3).min(1.0),
+                    (fg[2] * 1.3).min(1.0),
+                ];
+            }
             self.grid[row][col] = Cell {
                 c,
-                fg: self.current_fg,
+                fg,
                 bg: self.current_bg,
             };
         }
@@ -222,6 +237,14 @@ impl TerminalState {
                     self.current_fg = self.default_fg;
                     self.current_bg = self.default_bg;
                     self.reversed = false;
+                    self.bold = false;
+                    self.dim = false;
+                }
+                1 => self.bold = true,
+                2 => self.dim = true,
+                22 => {
+                    self.bold = false;
+                    self.dim = false;
                 }
                 7 => {
                     if !self.reversed {
