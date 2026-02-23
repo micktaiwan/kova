@@ -20,6 +20,11 @@ Rust + Metal, zéro compromis cross-platform.
 - [x] Ctrl+C (signal au process)
 - [x] Quitter proprement (Cmd+Q, fermeture fenêtre, cleanup PTY)
 - [x] Buffers Metal pré-alloués (double-buffering, pas d'alloc par frame)
+- [x] Scroll trackpad (accumulateur fractionnaire)
+- [x] Alternate screen buffer (CSI ?1049 h/l)
+- [x] Resize fenêtre (recalcul cols/rows + SIGWINCH)
+- [x] Cmd+V (coller depuis le presse-papier)
+- [x] Rendu à la demande (dirty flag) — ne redessiner que quand l'état change
 
 **Critère de succès** : lancer `ls`, `htop`, `claude` et que ça marche.
 
@@ -33,8 +38,7 @@ Rust + Metal, zéro compromis cross-platform.
 - [ ] Fermeture tab/split
 - [ ] Config fichier (TOML) : font, taille, couleurs, keybindings
 - [ ] Sélection texte + copier/coller
-- [ ] Resize fenêtre (reflow du texte)
-- [ ] Rendu à la demande (dirty flag) — ne redessiner que quand l'état change
+- [ ] Resize fenêtre : reflow du texte
 
 ## V2 — Polished
 
