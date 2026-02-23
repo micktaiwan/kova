@@ -26,6 +26,7 @@ pub struct KovaViewIvars {
     shell_ready: OnceCell<Arc<AtomicBool>>,
     scroll_accumulator: Cell<f64>,
     last_scale: Cell<f64>,
+    last_focused: Cell<bool>,
 }
 
 define_class!(
@@ -120,6 +121,7 @@ impl KovaView {
             shell_ready: OnceCell::new(),
             scroll_accumulator: Cell::new(0.0),
             last_scale: Cell::new(0.0),
+            last_focused: Cell::new(true),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -224,6 +226,9 @@ impl KovaView {
         let layer = self.ivars().metal_layer.get().expect("metal_layer not initialized").clone();
         let shell_exited = self.ivars().shell_exited.get().unwrap().clone();
         let shell_ready = self.ivars().shell_ready.get().unwrap().clone();
+        let terminal_for_focus = terminal.clone();
+        let pty_ptr = self.ivars().pty.get().unwrap() as *const Pty;
+        let last_focused = &self.ivars().last_focused as *const Cell<bool>;
 
         let timer = unsafe {
             NSTimer::scheduledTimerWithTimeInterval_repeats_block(
@@ -236,6 +241,22 @@ impl KovaView {
                         app.terminate(None);
                         return;
                     }
+
+                    // Focus reporting (DEC mode 1004)
+                    let mtm = MainThreadMarker::new_unchecked();
+                    let app = NSApplication::sharedApplication(mtm);
+                    let focused = app.isActive();
+                    let prev = (*last_focused).get();
+                    if focused != prev {
+                        (*last_focused).set(focused);
+                        let term = terminal_for_focus.read();
+                        if term.focus_reporting {
+                            drop(term);
+                            let seq = if focused { b"\x1b[I" as &[u8] } else { b"\x1b[O" };
+                            (*pty_ptr).write(seq);
+                        }
+                    }
+
                     renderer.write().render(&layer, &terminal, shell_ready.load(Ordering::Relaxed));
                 }),
             )

@@ -21,6 +21,10 @@ Terminal Mac ultra-rapide en Rust + Metal.
 - **V0 terminée** — single pane fonctionnel (PTY, rendu Metal, scrollback, alternate screen, dirty flag)
 - **V1 en cours** — voir `roadmap.md` pour le détail et l'ordre recommandé
 
+## Notes techniques
+
+- `notes/pty-spawn.md` — pourquoi `Command + pre_exec` plutôt que `posix_spawn` ou `fork` brut pour le controlling terminal
+
 ## Principes
 
 - Mac-only, pas de cross-platform

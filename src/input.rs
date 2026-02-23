@@ -52,6 +52,7 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty) {
         '\u{F72B}' => { pty.write(b"\x1b[F"); return; }
         '\u{F72C}' => { pty.write(b"\x1b[5~"); return; }
         '\u{F72D}' => { pty.write(b"\x1b[6~"); return; }
+        '\u{0019}' => { pty.write(b"\x1b[Z"); return; } // Shift+Tab (backtab)
         '\u{F704}' => { pty.write(b"\x1bOP"); return; }
         '\u{F705}' => { pty.write(b"\x1bOQ"); return; }
         '\u{F706}' => { pty.write(b"\x1bOR"); return; }
