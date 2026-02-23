@@ -1,0 +1,54 @@
+[package]
+name = "kova"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSNotification", "NSRunLoop", "NSThread", "NSArray", "NSDictionary", "NSValue", "NSRange"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSWindow",
+    "NSView",
+    "NSEvent",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSColor",
+    "NSGraphics",
+    "NSScreen",
+    "NSMenu",
+    "NSMenuItem",
+    "NSText",
+    "NSPasteboard",
+] }
+objc2-metal = { version = "0.3", features = [
+    "MTLDevice",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLRenderCommandEncoder",
+    "MTLRenderPipeline",
+    "MTLTexture",
+    "MTLBuffer",
+    "MTLLibrary",
+    "MTLRenderPass",
+    "MTLDrawable",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLVertexDescriptor",
+    "MTLDepthStencil",
+    "MTLSampler",
+] }
+objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer"] }
+objc2-core-foundation = { version = "0.3", features = ["CFString", "CFDictionary", "CFNumber", "CFArray"] }
+objc2-core-text = { version = "0.3", features = ["CTFont", "CTFontDescriptor", "CTLine", "CTRun"] }
+objc2-core-graphics = { version = "0.3", features = ["CGContext", "CGColorSpace", "CGBitmapContext", "CGFont", "CGPath"] }
+vte = "0.15"
+rustix = { version = "1.0", features = ["termios", "process", "stdio"] }
+rustix-openpty = "0.2"
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.11"
+bitflags = "2"
+unicode-width = "0.2"
+libc = "0.2"
+block2 = "0.6"
