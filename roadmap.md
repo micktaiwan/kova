@@ -50,15 +50,15 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 
 ### Refacto multi-pane (prérequis splits)
 
-- [ ] PTY lifecycle per-pane — remplacer les singletons globaux (`static SHUTDOWN`, `static PTY_PIDS`) par un shutdown par PTY (Arc<AtomicBool> par instance)
-- [ ] Split tree (`enum SplitTree { Leaf(Pane), Hsplit(...), Vsplit(...) }`) — remplacer le terminal/pty/renderer uniques dans KovaView ivars
-- [ ] Modèle de focus — tracker le pane actif pour router l'input clavier
-- [ ] Renderer multi-pane — `render()` accepte un `&SplitTree`, clipping et offset par pane
+- [x] PTY lifecycle per-pane — shutdown par PTY (Arc<AtomicBool> par instance)
+- [x] Split tree (`enum SplitTree { Leaf(Pane), Hsplit(...), Vsplit(...) }`) — arbre binaire dans `pane.rs`
+- [x] Modèle de focus — tracker le pane actif pour router l'input clavier
+- [x] Renderer multi-pane — `render()` accepte un viewport par pane, clipping et offset
 
 ### Splits & tabs
 
-- [ ] Splits horizontaux et verticaux (arbre binaire)
-- [ ] Navigation entre splits (raccourcis clavier)
+- [x] Splits horizontaux et verticaux (arbre binaire)
+- [x] Navigation entre splits (raccourcis clavier)
 - [ ] Resize des splits (raccourcis + drag)
 - [ ] Tabs (barre minimale en haut)
 - [ ] Navigation entre tabs
@@ -85,7 +85,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] Clickable URLs
 - [ ] Support multi-fenêtres
 - [ ] Notifications visuelles (bell, activité dans un split inactif)
-- [ ] Font fallback (emoji, symboles)
+- [ ] Font fallback (emoji, symboles) — CoreText fallback fonctionne mais block elements/box-drawing nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
 - [ ] Ligatures (optionnel)
 
 ## V3 — Avancé
