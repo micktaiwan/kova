@@ -44,6 +44,10 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Sélection texte + copier/coller (mouseDown/Dragged/Up, Cmd+C, highlight sélection, copie auto dans presse-papier, respect du soft-wrap)
 - [x] Resize fenêtre : reflow du texte (struct `Row` avec flag `wrapped`, reconstruction des lignes logiques, re-wrap à la nouvelle largeur)
 
+### Input macOS
+- [ ] Option+Left/Right — déplacement mot par mot (envoie `\x1bb`/`\x1bf`)
+- [ ] Cmd+Backspace — effacer toute la ligne (envoie `\x15` Ctrl+U)
+
 ### Refacto multi-pane (prérequis splits)
 
 - [ ] PTY lifecycle per-pane — remplacer les singletons globaux (`static SHUTDOWN`, `static PTY_PIDS`) par un shutdown par PTY (Arc<AtomicBool> par instance)
@@ -65,7 +69,16 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Focus events (DEC mode 1004) — notifier le shell/app quand la fenêtre gagne/perd le focus
 - [x] Kitty keyboard protocol (CSI u) — réponse à la query `CSI > 0 u` (flags=0, fallback propre)
 - [ ] Config keybindings (raccourcis hardcodés suffisent pour V1)
-- [ ] Synchronized output (mode 2026) — bufferiser le rendu entre h/l pour éviter le tearing
+- [x] Synchronized output (mode 2026) — bufferiser le rendu entre h/l pour éviter le tearing
+- [x] CPR (Cursor Position Report, CSI 6 n) — réponse position curseur
+- [x] DA1 (Device Attributes, CSI c) — identification VT220 + ANSI color
+- [x] DECRPM (Report Private Mode, CSI ? Ps $ p) — report état des modes 1, 7, 25, 1004, 1049, 2004, 2026
+- [x] Bracketed paste mode (DEC 2004) — wrapping `\x1b[200~`/`\x1b[201~` sur Cmd+V
+- [x] DECCKM (mode 1) — cursor keys application mode (`\x1bO` vs `\x1b[`)
+- [x] DECAWM (mode 7) — auto-wrap on/off, respecté dans put_char
+- [x] Insert mode (SM/RM 4) — décale les caractères au lieu d'écraser
+- [x] ICH (CSI @) — insertion de caractères blancs à la position curseur
+- [x] DECSCUSR (CSI Ps SP q) — cursor shape block/underline/bar
 - [ ] Thèmes de couleurs (quelques built-in + custom)
 - [ ] Support ProMotion (120Hz)
 - [ ] Recherche dans le scrollback

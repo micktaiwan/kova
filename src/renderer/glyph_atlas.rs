@@ -1,7 +1,7 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::Message;
-use objc2_core_foundation::{CFString, CGPoint, CGSize};
+use objc2_core_foundation::{CFRange, CFRetained, CFString, CGPoint, CGSize};
 use objc2_core_graphics::*;
 use objc2_core_text::*;
 use objc2_metal::{
@@ -37,6 +37,7 @@ pub struct GlyphAtlas {
     descent: f64,
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     color_space: Retained<CGColorSpace>,
+    fallback_fonts: HashMap<char, CFRetained<CTFont>>,
 }
 
 impl GlyphAtlas {
@@ -233,11 +234,74 @@ impl GlyphAtlas {
             descent,
             device: device.retain(),
             color_space: color_space.into(),
+            fallback_fonts: HashMap::new(),
         }
     }
 
     pub fn glyph(&self, c: char) -> Option<&GlyphInfo> {
         self.glyphs.get(&c)
+    }
+
+    /// Resolve glyph ID and font for a character, using fallback if needed.
+    /// Returns (glyph_id, font_to_use) where font_to_use is either the primary
+    /// font or a cached fallback font.
+    fn resolve_glyph(&mut self, c: char) -> Option<(CGGlyph, *const CTFont)> {
+        let mut uni_buf = [0u16; 2];
+        let encoded = c.encode_utf16(&mut uni_buf);
+        let count = encoded.len();
+        log::debug!("resolve_glyph: '{}' U+{:04X} utf16_len={}", c, c as u32, count);
+
+        let mut glyph_buf = [0u16; 2];
+        let ok = unsafe {
+            self.font.glyphs_for_characters(
+                NonNull::new(uni_buf.as_mut_ptr()).unwrap(),
+                NonNull::new(glyph_buf.as_mut_ptr()).unwrap(),
+                count as isize,
+            )
+        };
+
+        // For surrogate pairs, CoreText puts the glyph in the first slot
+        let glyph_id = glyph_buf[0];
+
+        log::debug!("  primary: ok={} glyph_buf={:?}", ok, &glyph_buf[..count]);
+
+        if ok && glyph_id != 0 {
+            return Some((glyph_id, &*self.font as *const CTFont));
+        }
+
+        // Try font fallback via CoreText
+        if !self.fallback_fonts.contains_key(&c) {
+            let s = c.to_string();
+            let cf_str = CFString::from_str(&s);
+            let fallback = unsafe {
+                self.font.for_string(
+                    &cf_str,
+                    CFRange { location: 0, length: cf_str.length() },
+                )
+            };
+            let fallback_name = unsafe { fallback.display_name() };
+            log::debug!("  fallback font: {:?}", fallback_name);
+            self.fallback_fonts.insert(c, fallback);
+        }
+
+        let fallback = self.fallback_fonts.get(&c)?;
+        let mut glyph_buf2 = [0u16; 2];
+        let ok2 = unsafe {
+            fallback.glyphs_for_characters(
+                NonNull::new(uni_buf.as_mut_ptr()).unwrap(),
+                NonNull::new(glyph_buf2.as_mut_ptr()).unwrap(),
+                count as isize,
+            )
+        };
+
+        let glyph_id2 = glyph_buf2[0];
+        log::debug!("  fallback: ok2={} glyph_buf2={:?}", ok2, &glyph_buf2[..count]);
+        if ok2 && glyph_id2 != 0 {
+            Some((glyph_id2, &**fallback as *const CTFont))
+        } else {
+            log::warn!("  no glyph found for '{}' U+{:04X} in any font", c, c as u32);
+            None
+        }
     }
 
     /// Rasterize a single character on-demand and add it to the atlas.
@@ -246,29 +310,7 @@ impl GlyphAtlas {
             return Some(*g);
         }
 
-        // Get glyph ID
-        let mut uni_buf = [0u16; 2];
-        let encoded = c.encode_utf16(&mut uni_buf);
-        let count = encoded.len();
-
-        // For now only handle BMP characters (single UTF-16 unit)
-        if count != 1 {
-            return None;
-        }
-
-        let mut uni_char = uni_buf[0];
-        let mut glyph_id: CGGlyph = 0;
-        let ok = unsafe {
-            self.font.glyphs_for_characters(
-                NonNull::new(&mut uni_char).unwrap(),
-                NonNull::new(&mut glyph_id).unwrap(),
-                1,
-            )
-        };
-
-        if !ok || glyph_id == 0 {
-            return None;
-        }
+        let (mut glyph_id, draw_font) = self.resolve_glyph(c)?;
 
         // Check if we need to wrap to next row
         if self.next_x + self.glyph_cell_w > self.atlas_width {
@@ -308,15 +350,21 @@ impl GlyphAtlas {
 
         CGContext::set_rgb_fill_color(Some(&bmp_ctx), 1.0, 1.0, 1.0, 1.0);
 
+        // Draw with the resolved font (primary or fallback) but keep primary baseline
         let mut pos = CGPoint { x: 0.0, y: self.descent };
         unsafe {
-            self.font.draw_glyphs(
+            let font_ref = &*draw_font;
+            font_ref.draw_glyphs(
                 NonNull::new(&mut glyph_id).unwrap(),
                 NonNull::new(&mut pos).unwrap(),
                 1,
                 &bmp_ctx,
             );
         }
+
+        // Debug: count non-zero pixels
+        let nonzero = bmp_buf.iter().filter(|&&b| b != 0).count();
+        log::debug!("rasterize '{}' U+{:04X}: bmp {}x{}, nonzero_bytes={}", c, c as u32, bmp_w, bmp_h, nonzero);
 
         // Copy cell bitmap to atlas
         let atlas_bpr = self.atlas_width as usize * 4;

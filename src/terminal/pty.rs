@@ -10,13 +10,15 @@ use std::sync::Arc;
 use super::parser::VteHandler;
 use super::TerminalState;
 
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-static PTY_PIDS: parking_lot::Mutex<Vec<u32>> = parking_lot::Mutex::new(Vec::new());
+/// Global registry of live PTYs: (child_pid, per-instance shutdown flag).
+/// Used by `shutdown_all()` on app termination to signal every PTY reader thread.
+static PTY_REGISTRY: parking_lot::Mutex<Vec<(u32, Arc<AtomicBool>)>> =
+    parking_lot::Mutex::new(Vec::new());
 
 pub struct Pty {
     master_fd: OwnedFd,
     child_pid: u32,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Pty {
@@ -99,7 +101,8 @@ impl Pty {
         let child_pid = child.id();
         drop(slave_fd);
 
-        PTY_PIDS.lock().push(child_pid);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        PTY_REGISTRY.lock().push((child_pid, shutdown.clone()));
 
         let dup_fd = unsafe { libc::dup(master_fd.as_raw_fd()) };
         if dup_fd < 0 {
@@ -114,6 +117,7 @@ impl Pty {
         }
         let writer_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(writer_dup) });
 
+        let reader_shutdown = shutdown.clone();
         std::thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {
@@ -124,7 +128,7 @@ impl Pty {
                 let mut eof = false;
 
                 loop {
-                    if SHUTDOWN.load(Ordering::Relaxed) {
+                    if reader_shutdown.load(Ordering::Relaxed) {
                         break;
                     }
                     match file.read(&mut buf) {
@@ -148,6 +152,7 @@ impl Pty {
         Ok(Pty {
             master_fd,
             child_pid,
+            shutdown,
         })
     }
 
@@ -169,17 +174,19 @@ impl Pty {
     }
 }
 
+/// Signal all live PTY reader threads to stop and kill their child processes.
+/// Called once from `AppDelegate::will_terminate`.
 pub fn shutdown_all() {
-    SHUTDOWN.store(true, Ordering::Relaxed);
-    let pids = PTY_PIDS.lock().clone();
-    for pid in pids {
+    let entries = PTY_REGISTRY.lock().clone();
+    for (pid, shutdown) in &entries {
+        shutdown.store(true, Ordering::Relaxed);
         unsafe {
-            libc::kill(pid as i32, libc::SIGHUP);
+            libc::kill(*pid as i32, libc::SIGHUP);
         }
     }
     // Give children a moment to exit, then reap
     std::thread::sleep(std::time::Duration::from_millis(50));
-    for pid in PTY_PIDS.lock().iter() {
+    for (pid, _) in &entries {
         unsafe {
             libc::waitpid(*pid as i32, std::ptr::null_mut(), libc::WNOHANG);
         }
@@ -188,11 +195,14 @@ pub fn shutdown_all() {
 
 impl Drop for Pty {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
         unsafe {
             libc::kill(self.child_pid as i32, libc::SIGHUP);
             libc::waitpid(self.child_pid as i32, std::ptr::null_mut(), 0);
         }
-        PTY_PIDS.lock().retain(|&pid| pid != self.child_pid);
+        PTY_REGISTRY
+            .lock()
+            .retain(|(pid, _)| *pid != self.child_pid);
         log::info!("PTY child {} cleaned up", self.child_pid);
     }
 }
