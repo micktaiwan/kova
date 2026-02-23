@@ -21,6 +21,7 @@ pub struct KovaViewIvars {
     pty: OnceCell<Pty>,
     metal_layer: OnceCell<Retained<CAMetalLayer>>,
     scroll_accumulator: Cell<f64>,
+    last_scale: Cell<f64>,
 }
 
 define_class!(
@@ -112,6 +113,7 @@ impl KovaView {
             pty: OnceCell::new(),
             metal_layer: OnceCell::new(),
             scroll_accumulator: Cell::new(0.0),
+            last_scale: Cell::new(0.0),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -128,6 +130,12 @@ impl KovaView {
             width: frame.size.width * scale,
             height: frame.size.height * scale,
         });
+
+        // Rebuild glyph atlas if scale changed (e.g. moved to different display)
+        if (scale - self.ivars().last_scale.get()).abs() > 0.01 {
+            self.ivars().last_scale.set(scale);
+            renderer.write().rebuild_atlas(scale);
+        }
 
         let (cell_w, cell_h) = renderer.read().cell_size();
         let pixel_w = (frame.size.width * scale) as f32;
@@ -170,8 +178,9 @@ impl KovaView {
         self.setLayer(Some(&layer));
         self.ivars().metal_layer.set(layer.clone()).ok();
 
+        self.ivars().last_scale.set(scale);
         let terminal = Arc::new(parking_lot::RwLock::new(TerminalState::new(80, 24)));
-        let renderer = Arc::new(parking_lot::RwLock::new(Renderer::new(&device, &layer, terminal.clone())));
+        let renderer = Arc::new(parking_lot::RwLock::new(Renderer::new(&device, &layer, terminal.clone(), scale)));
         let pty = Pty::spawn(80, 24, terminal.clone()).expect("failed to spawn PTY");
 
         self.ivars().renderer.set(renderer).ok();

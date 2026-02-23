@@ -36,6 +36,7 @@ impl Renderer {
         device: &ProtocolObject<dyn MTLDevice>,
         layer: &CAMetalLayer,
         _terminal: Arc<RwLock<TerminalState>>,
+        scale: f64,
     ) -> Self {
         let command_queue = device
             .newCommandQueue()
@@ -43,7 +44,7 @@ impl Renderer {
 
         let pixel_format = layer.pixelFormat();
         let pipeline = pipeline::create_pipeline(device, pixel_format);
-        let atlas = GlyphAtlas::new(device);
+        let atlas = GlyphAtlas::new(device, 14.0 * scale);
 
         let make_vertex_buf = || {
             device.newBufferWithLength_options(
@@ -311,6 +312,18 @@ impl Renderer {
         }
 
         vertices
+    }
+
+    pub fn rebuild_atlas(&mut self, scale: f64) {
+        let device = self.atlas.device.clone();
+        self.atlas = GlyphAtlas::new(&device, 14.0 * scale);
+        // Update atlas size buffer
+        let atlas_size = [self.atlas.atlas_width as f32, self.atlas.atlas_height as f32];
+        self.last_atlas_size = atlas_size;
+        unsafe {
+            let ptr = self.atlas_size_buf.contents().as_ptr() as *mut [f32; 2];
+            *ptr = atlas_size;
+        }
     }
 
     pub fn cell_size(&self) -> (f32, f32) {

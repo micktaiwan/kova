@@ -35,14 +35,14 @@ pub struct GlyphAtlas {
     glyph_cell_h: u32,
     font: Retained<CTFont>,
     descent: f64,
-    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     color_space: Retained<CGColorSpace>,
 }
 
 impl GlyphAtlas {
-    pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Self {
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>, font_size: f64) -> Self {
         let font_name = CFString::from_static_str("Menlo");
-        let font = unsafe { CTFont::with_name(&font_name, 14.0, ptr::null()) };
+        let font = unsafe { CTFont::with_name(&font_name, font_size, ptr::null()) };
 
         let ascent = unsafe { font.ascent() };
         let descent = unsafe { font.descent() };
