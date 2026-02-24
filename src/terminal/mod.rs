@@ -123,6 +123,13 @@ pub struct TerminalState {
     pub insert_mode: bool,
 }
 
+/// A single line matching a filter query.
+#[derive(Clone, Debug)]
+pub struct FilterMatch {
+    pub abs_line: usize,
+    pub text: String,
+}
+
 impl TerminalState {
     pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [f32; 3], bg: [f32; 3]) -> Self {
         let blank = Cell { c: ' ', fg, bg };
@@ -914,6 +921,50 @@ impl TerminalState {
             self.selection = None;
             self.dirty.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Search all lines (scrollback + grid) for a case-insensitive query.
+    /// Returns matching lines as (absolute_line_index, line_text).
+    pub fn search_lines(&self, query: &str) -> Vec<FilterMatch> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let query_lower = query.to_lowercase();
+        let mut results = Vec::new();
+        let sb_len = self.scrollback.len();
+
+        // Search scrollback
+        for (i, row) in self.scrollback.iter().enumerate() {
+            let text: String = row.cells.iter().map(|c| c.c).collect::<String>().trim_end().to_string();
+            if text.to_lowercase().contains(&query_lower) {
+                results.push(FilterMatch { abs_line: i, text });
+            }
+        }
+
+        // Search grid
+        for (i, row) in self.grid.iter().enumerate() {
+            let text: String = row.cells.iter().map(|c| c.c).collect::<String>().trim_end().to_string();
+            if text.to_lowercase().contains(&query_lower) {
+                results.push(FilterMatch { abs_line: sb_len + i, text });
+            }
+        }
+
+        results
+    }
+
+    /// Set scroll_offset to center a given absolute line in the viewport.
+    pub fn scroll_to_abs_line(&mut self, abs_line: usize) {
+        let sb_len = self.scrollback.len();
+        if abs_line >= sb_len {
+            // Line is in the grid — scroll to bottom
+            self.scroll_offset = 0;
+        } else {
+            // Center the line in the viewport
+            let half_screen = self.rows as i32 / 2;
+            let offset = sb_len as i32 - abs_line as i32 + half_screen;
+            self.scroll_offset = offset.clamp(0, sb_len as i32);
+        }
+        self.cursor_moved();
     }
 
     /// Number of empty rows at top when screen isn't full (for pixel→grid conversion)

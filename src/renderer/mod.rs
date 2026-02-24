@@ -16,7 +16,13 @@ use std::time::SystemTime;
 use vertex::Vertex;
 
 use crate::config::Config;
-use crate::terminal::{CursorShape, TerminalState};
+use crate::terminal::{CursorShape, FilterMatch, TerminalState};
+
+/// Data passed to the renderer for drawing filter overlay.
+pub struct FilterRenderData {
+    pub query: String,
+    pub matches: Vec<FilterMatch>,
+}
 
 /// Sub-region of the drawable where a pane is rendered (in pixels).
 #[derive(Clone, Copy)]
@@ -146,6 +152,7 @@ impl Renderer {
         panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool)],
         separators: &[(f32, f32, f32, f32)],
         tab_titles: &[(String, bool)],
+        filter: Option<&FilterRenderData>,
     ) {
         // Reset blink on cursor movement of focused pane
         if let Some((term, _, _, _)) = panes.iter().find(|(_, _, _, focused)| *focused) {
@@ -206,7 +213,8 @@ impl Renderer {
         }
         // If only sync-deferred panes were dirty, still need to render the others
         let all_ready = !any_not_ready;
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed {
+        let has_filter = filter.is_some();
+        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !has_filter {
             return;
         }
 
@@ -222,6 +230,10 @@ impl Renderer {
         // Build vertices for all panes
         let mut all_vertices = Vec::new();
         for (term, vp, shell_ready, is_focused) in panes {
+            // Skip rendering focused pane content when filter overlay covers it
+            if *is_focused && filter.is_some() {
+                continue;
+            }
             if *shell_ready {
                 let t = term.read();
                 // Only blink cursor on focused pane
@@ -268,6 +280,13 @@ impl Renderer {
         // Draw tab bar
         if tab_titles.len() > 0 {
             self.build_tab_bar_vertices(&mut all_vertices, viewport_w, tab_titles);
+        }
+
+        // Draw filter overlay on focused pane
+        if let Some(filter_data) = filter {
+            if let Some((_, vp, _, _)) = panes.iter().find(|(_, _, _, focused)| *focused) {
+                self.build_filter_overlay_vertices(&mut all_vertices, vp, filter_data);
+            }
         }
 
         // Update viewport buffer if changed
@@ -715,6 +734,94 @@ impl Renderer {
             x += cell_w;
         }
         x
+    }
+
+    fn build_filter_overlay_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        vp: &PaneViewport,
+        filter: &FilterRenderData,
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+
+        // 1. Semi-transparent dark overlay covering the entire pane
+        let overlay_bg = [0.0, 0.0, 0.0, 0.85];
+        let no_tex = [0.0_f32, 0.0];
+        let white = [1.0_f32, 1.0, 1.0, 0.0];
+        vertices.push(Vertex { position: [vp.x, vp.y], tex_coords: no_tex, color: white, bg_color: overlay_bg });
+        vertices.push(Vertex { position: [vp.x + vp.width, vp.y], tex_coords: no_tex, color: white, bg_color: overlay_bg });
+        vertices.push(Vertex { position: [vp.x, vp.y + vp.height], tex_coords: no_tex, color: white, bg_color: overlay_bg });
+        vertices.push(Vertex { position: [vp.x + vp.width, vp.y], tex_coords: no_tex, color: white, bg_color: overlay_bg });
+        vertices.push(Vertex { position: [vp.x + vp.width, vp.y + vp.height], tex_coords: no_tex, color: white, bg_color: overlay_bg });
+        vertices.push(Vertex { position: [vp.x, vp.y + vp.height], tex_coords: no_tex, color: white, bg_color: overlay_bg });
+
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+
+        // 2. Search bar background
+        let bar_bg = [0.2, 0.2, 0.25];
+        Self::push_bg_quad(vertices, vp.x, vp.y, vp.width, cell_h, bar_bg);
+
+        // 3. Search bar text: "/ query▏"
+        let bar_text = format!("/ {}▏", &filter.query);
+        let bar_fg = [1.0, 0.8, 0.2, 1.0]; // accent yellow
+        self.render_status_text(vertices, &bar_text, vp.x + PANE_H_PADDING, vp.y, vp.x + vp.width - cell_w, bar_fg, no_bg);
+
+        // Match count
+        let count_text = format!("{} matches", filter.matches.len());
+        let count_fg = [0.6, 0.6, 0.6, 1.0];
+        let count_w = count_text.chars().count() as f32 * cell_w;
+        self.render_status_text(vertices, &count_text, vp.x + vp.width - count_w - PANE_H_PADDING, vp.y, vp.x + vp.width, count_fg, no_bg);
+
+        // 4. List matched lines — truncate text to visible columns to limit vertices
+        let max_visible = ((vp.height / cell_h).floor() as usize).saturating_sub(1);
+        let match_fg = [0.85, 0.85, 0.85, 1.0];
+        let highlight_fg = [1.0, 0.8, 0.2, 1.0];
+        let query_lower = filter.query.to_lowercase();
+        let max_chars = ((vp.width - 2.0 * PANE_H_PADDING) / cell_w) as usize;
+
+        for (i, m) in filter.matches.iter().take(max_visible).enumerate() {
+            let y = vp.y + (i + 1) as f32 * cell_h;
+            let max_x = vp.x + vp.width - PANE_H_PADDING;
+
+            // Line number prefix
+            let prefix = format!("{:>6}: ", m.abs_line);
+            let prefix_fg = [0.5, 0.5, 0.5, 1.0];
+            let after_prefix = self.render_status_text(vertices, &prefix, vp.x + PANE_H_PADDING, y, max_x, prefix_fg, no_bg);
+
+            // Truncate line text to what fits on screen
+            let prefix_chars = prefix.chars().count();
+            let text_limit = max_chars.saturating_sub(prefix_chars);
+            let display_text: String = m.text.chars().take(text_limit).collect();
+
+            if query_lower.is_empty() {
+                self.render_status_text(vertices, &display_text, after_prefix, y, max_x, match_fg, no_bg);
+            } else {
+                // Split text into spans: alternating normal/highlighted
+                let text_lower: String = display_text.to_lowercase();
+                let mut spans: Vec<(&str, bool)> = Vec::new();
+                let mut pos = 0;
+                while pos < display_text.len() {
+                    if let Some(found) = text_lower[pos..].find(&query_lower) {
+                        if found > 0 {
+                            spans.push((&display_text[pos..pos + found], false));
+                        }
+                        let end = pos + found + filter.query.len();
+                        spans.push((&display_text[pos + found..end], true));
+                        pos = end;
+                    } else {
+                        spans.push((&display_text[pos..], false));
+                        break;
+                    }
+                }
+
+                let mut x = after_prefix;
+                for (span, is_hl) in spans {
+                    let fg = if is_hl { highlight_fg } else { match_fg };
+                    x = self.render_status_text(vertices, span, x, y, max_x, fg, no_bg);
+                }
+            }
+        }
     }
 
     fn build_loading_vertices(&mut self, vp: &PaneViewport) -> Vec<Vertex> {

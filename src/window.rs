@@ -13,8 +13,8 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::input;
 use crate::pane::{NavDirection, Pane, SplitAxis, SplitDirection, SplitTree, Tab};
-use crate::renderer::{PaneViewport, Renderer};
-use crate::terminal::{GridPos, Selection};
+use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
+use crate::terminal::{FilterMatch, GridPos, Selection};
 
 #[derive(Clone, Copy)]
 struct SeparatorDrag {
@@ -34,6 +34,12 @@ pub struct KovaViewIvars {
     last_focused: Cell<bool>,
     config: OnceCell<Config>,
     drag_separator: Cell<Option<SeparatorDrag>>,
+    filter: RefCell<Option<FilterState>>,
+}
+
+struct FilterState {
+    query: String,
+    matches: Vec<FilterMatch>,
 }
 
 define_class!(
@@ -53,6 +59,12 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            // If filter is active, route keys to filter
+            if self.ivars().filter.borrow().is_some() {
+                self.handle_filter_key(event);
+                return;
+            }
+
             if let Some(pane) = self.focused_pane() {
                 let cursor_keys_app = pane.terminal.read().cursor_keys_application;
                 input::handle_key_event(event, &pane.pty, cursor_keys_app);
@@ -71,6 +83,12 @@ define_class!(
                 let chars = event.charactersIgnoringModifiers();
                 if let Some(chars) = chars {
                     let ch = chars.to_string();
+
+                    // Cmd+F → toggle filter
+                    if ch == "f" && !has_shift && !has_option {
+                        self.toggle_filter();
+                        return objc2::runtime::Bool::YES;
+                    }
 
                     // Cmd+T → new tab
                     if ch == "t" && !has_shift && !has_option {
@@ -243,6 +261,12 @@ define_class!(
         fn mouse_down(&self, event: &NSEvent) {
             let (px, py) = self.event_to_pixel(event);
 
+            // Check filter click
+            if self.ivars().filter.borrow().is_some() {
+                self.handle_filter_click(px, py);
+                return;
+            }
+
             // Check tab bar click
             if self.hit_test_tab_bar(px, py) {
                 return;
@@ -364,6 +388,7 @@ impl KovaView {
             last_focused: Cell::new(true),
             config: OnceCell::new(),
             drag_separator: Cell::new(None),
+            filter: RefCell::new(None),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -761,6 +786,113 @@ impl KovaView {
         }
     }
 
+    fn toggle_filter(&self) {
+        let mut filter = self.ivars().filter.borrow_mut();
+        if filter.is_some() {
+            *filter = None;
+        } else {
+            *filter = Some(FilterState {
+                query: String::new(),
+                matches: Vec::new(),
+            });
+        }
+        drop(filter);
+        // Mark dirty to trigger redraw
+        if let Some(pane) = self.focused_pane() {
+            pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn handle_filter_key(&self, event: &NSEvent) {
+        let chars = event.charactersIgnoringModifiers();
+        let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
+        let ch = ch_str.chars().next().unwrap_or('\0');
+
+        let mut filter = self.ivars().filter.borrow_mut();
+        let state = match filter.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        match ch {
+            '\u{1B}' => {
+                // Escape → close filter without scrolling
+                *filter = None;
+                drop(filter);
+                if let Some(pane) = self.focused_pane() {
+                    pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                return;
+            }
+            '\r' => {
+                // Enter → close filter and scroll to first match
+                let first_match = state.matches.first().map(|m| m.abs_line);
+                *filter = None;
+                drop(filter);
+                if let Some(abs_line) = first_match {
+                    if let Some(pane) = self.focused_pane() {
+                        let mut term = pane.terminal.write();
+                        term.scroll_to_abs_line(abs_line);
+                    }
+                }
+                return;
+            }
+            '\u{7F}' | '\u{08}' => {
+                // Backspace
+                state.query.pop();
+            }
+            c if c >= ' ' && !c.is_control() => {
+                state.query.push(c);
+            }
+            _ => return,
+        }
+
+        // Re-run search
+        if let Some(pane) = self.focused_pane() {
+            let term = pane.terminal.read();
+            state.matches = term.search_lines(&state.query);
+            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn handle_filter_click(&self, _px: f32, py: f32) {
+        let renderer = match self.ivars().renderer.get() {
+            Some(r) => r,
+            None => return,
+        };
+        let (_, cell_h) = renderer.read().cell_size();
+
+        // The overlay starts with: 1 row search bar + matches below
+        let match_start_y = {
+            let panes_vp = self.panes_viewport();
+            panes_vp.y + cell_h // search bar takes 1 row
+        };
+
+        let click_row = ((py - match_start_y) / cell_h).floor() as i32;
+        if click_row < 0 {
+            return;
+        }
+
+        let mut filter = self.ivars().filter.borrow_mut();
+        let abs_line = match filter.as_ref() {
+            Some(state) => {
+                let idx = click_row as usize;
+                state.matches.get(idx).map(|m| m.abs_line)
+            }
+            None => return,
+        };
+
+        *filter = None;
+        drop(filter);
+
+        if let Some(abs_line) = abs_line {
+            if let Some(pane) = self.focused_pane() {
+                let mut term = pane.terminal.write();
+                term.scroll_to_abs_line(abs_line);
+            }
+        }
+    }
+
     fn handle_resize(&self) {
         let Some(layer) = self.ivars().metal_layer.get() else { return };
         let Some(renderer) = self.ivars().renderer.get() else { return };
@@ -998,7 +1130,16 @@ impl KovaView {
                         }
                     };
 
-                    renderer.write().render_panes(&layer, &pane_data, &separators, &tab_titles);
+                    // Build filter render data if active
+                    let filter_data = {
+                        let filter = ivars.filter.borrow();
+                        filter.as_ref().map(|f| FilterRenderData {
+                            query: f.query.clone(),
+                            matches: f.matches.clone(),
+                        })
+                    };
+
+                    renderer.write().render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref());
                 }),
             )
         };

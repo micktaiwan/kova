@@ -26,6 +26,22 @@ Terminal Mac ultra-rapide en Rust + Metal.
 - Le target directory Cargo est **global** : `~/.cargo/target` (pas `./target`)
 - Le binaire release se trouve donc dans `~/.cargo/target/release/kova`
 
+## Installation
+
+```bash
+cargo build --release
+# Le .app bundle est un symlink, donc il suffit de rebuild :
+# /Applications/Kova.app/Contents/MacOS/kova -> ~/.cargo/target/release/kova
+```
+
+Si le bundle n'existe pas encore :
+
+```bash
+mkdir -p /Applications/Kova.app/Contents/MacOS
+cp Info.plist /Applications/Kova.app/Contents/
+ln -sf ~/.cargo/target/release/kova /Applications/Kova.app/Contents/MacOS/kova
+```
+
 ## Notes techniques
 
 - `notes/pty-spawn.md` — pourquoi `Command + pre_exec` plutôt que `posix_spawn` ou `fork` brut pour le controlling terminal
