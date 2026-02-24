@@ -28,6 +28,7 @@ impl Pty {
         terminal: Arc<RwLock<TerminalState>>,
         shell_exited: Arc<AtomicBool>,
         shell_ready: Arc<AtomicBool>,
+        working_dir: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_pair = openpty(None, None)?;
 
@@ -51,7 +52,9 @@ impl Pty {
             .unwrap_or("zsh");
         let arg0 = format!("-{}", shell_name);
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let start_dir = working_dir
+            .map(String::from)
+            .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
 
         // Raw fd values for use inside pre_exec (which is async-signal-safe)
         let slave_raw = slave_fd.as_raw_fd();
@@ -68,7 +71,7 @@ impl Pty {
                 .stderr(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
                 .env("TERM", "xterm-256color")
                 .env("TERM_PROGRAM", "Kova")
-                .current_dir(&home)
+                .current_dir(&start_dir)
                 .pre_exec(move || {
                     // New session — required before TIOCSCTTY
                     if libc::setsid() == -1 {
@@ -171,6 +174,26 @@ impl Pty {
         // TIOCSWINSZ (via tcsetwinsize) automatically sends SIGWINCH to the
         // foreground process group when the controlling terminal is properly
         // established (setsid + TIOCSCTTY in pre_exec).
+    }
+
+    /// Returns the current working directory of the child shell process.
+    /// Uses macOS `proc_pidinfo` with `PROC_PIDVNODEPATHINFO`.
+    pub fn cwd(&self) -> Option<String> {
+        unsafe {
+            let mut vpi: libc::proc_vnodepathinfo = std::mem::zeroed();
+            let ret = libc::proc_pidinfo(
+                self.child_pid as i32,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                &mut vpi as *mut _ as *mut libc::c_void,
+                std::mem::size_of::<libc::proc_vnodepathinfo>() as i32,
+            );
+            if ret <= 0 {
+                return None;
+            }
+            let path = std::ffi::CStr::from_ptr(vpi.pvi_cdir.vip_path.as_ptr() as *const i8);
+            path.to_str().ok().map(String::from)
+        }
     }
 }
 
