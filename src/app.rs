@@ -50,6 +50,16 @@ define_class!(
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _notification: &NSNotification) {
             log::info!("Kova shutting down");
+            // Save session BEFORE shutting down PTYs (we need them alive for CWD detection)
+            if let Some(window) = self.ivars().window.get() {
+                if let Some(content_view) = window.contentView() {
+                    let ptr: *const objc2_app_kit::NSView = &*content_view;
+                    let view: &crate::window::KovaView = unsafe {
+                        &*(ptr as *const crate::window::KovaView)
+                    };
+                    view.save_session();
+                }
+            }
             crate::terminal::pty::shutdown_all();
         }
     }

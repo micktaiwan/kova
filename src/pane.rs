@@ -58,7 +58,7 @@ fn alloc_pane_id() -> PaneId {
     NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn alloc_tab_id() -> TabId {
+pub(crate) fn alloc_tab_id() -> TabId {
     NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed)
 }
 
