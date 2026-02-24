@@ -1,4 +1,4 @@
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockWriteGuard};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use vte::{Params, Perform};
@@ -28,11 +28,33 @@ fn resolve_git_branch(path: &str) -> Option<String> {
 pub struct VteHandler {
     terminal: Arc<RwLock<TerminalState>>,
     pty_writer: Arc<OwnedFd>,
+    // SAFETY: The Arc<RwLock<TerminalState>> is held in `terminal` on the same struct,
+    // guaranteeing the RwLock outlives this guard. We transmute the lifetime to 'static
+    // to allow storing it alongside the Arc.
+    pending_guard: Option<RwLockWriteGuard<'static, TerminalState>>,
 }
 
 impl VteHandler {
     pub fn new(terminal: Arc<RwLock<TerminalState>>, pty_writer: Arc<OwnedFd>) -> Self {
-        VteHandler { terminal, pty_writer }
+        VteHandler { terminal, pty_writer, pending_guard: None }
+    }
+
+    /// Lazily acquires the write lock on first call, reuses it on subsequent calls.
+    fn term(&mut self) -> &mut TerminalState {
+        if self.pending_guard.is_none() {
+            let guard = self.terminal.write();
+            // SAFETY: self.terminal (Arc) keeps the RwLock alive as long as self lives,
+            // and pending_guard is always dropped before or with self.
+            let guard: RwLockWriteGuard<'static, TerminalState> = unsafe { std::mem::transmute(guard) };
+            self.pending_guard = Some(guard);
+        }
+        self.pending_guard.as_mut().unwrap()
+    }
+
+    /// Releases the write lock (if held). Called after parser.advance() and
+    /// before PTY writes that should not hold the lock.
+    pub fn release_guard(&mut self) {
+        self.pending_guard = None;
     }
 
     fn write_to_pty(&self, data: &[u8]) {
@@ -42,20 +64,18 @@ impl VteHandler {
 
 impl Perform for VteHandler {
     fn print(&mut self, c: char) {
-        let mut term = self.terminal.write();
-        term.put_char(c);
+        self.term().put_char(c);
     }
 
     fn execute(&mut self, byte: u8) {
-        let mut term = self.terminal.write();
         match byte {
-            0x08 => term.backspace(),        // BS
-            0x09 => term.tab(),              // HT
-            0x0A | 0x0B | 0x0C => {          // LF, VT, FF
-                term.newline();
+            0x08 => self.term().backspace(),        // BS
+            0x09 => self.term().tab(),              // HT
+            0x0A | 0x0B | 0x0C => {                 // LF, VT, FF
+                self.term().newline();
             }
-            0x0D => term.carriage_return(),  // CR
-            0x07 => {}                       // BEL - ignore
+            0x0D => self.term().carriage_return(),  // CR
+            0x07 => {}                              // BEL - ignore
             _ => log::debug!("unhandled execute: byte=0x{:02X}", byte),
         }
     }
@@ -79,7 +99,7 @@ impl Perform for VteHandler {
                 b"0" | b"2" => {
                     let title = String::from_utf8_lossy(params[1]).into_owned();
                     log::trace!("OSC title: {}", title);
-                    let mut term = self.terminal.write();
+                    let term = self.term();
                     term.title = Some(title);
                     term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -88,14 +108,16 @@ impl Perform for VteHandler {
                     let uri = String::from_utf8_lossy(params[1]);
                     let path = if let Some(rest) = uri.strip_prefix("file://") {
                         // Skip hostname (everything up to the next '/')
-                        rest.find('/').map(|i| &rest[i..])
+                        rest.find('/').map(|i| rest[i..].to_string())
                     } else {
                         None
                     };
                     if let Some(path) = path {
-                        let git_branch = resolve_git_branch(path);
-                        let mut term = self.terminal.write();
-                        term.cwd = Some(path.to_string());
+                        // Release lock before filesystem I/O
+                        self.release_guard();
+                        let git_branch = resolve_git_branch(&path);
+                        let term = self.term();
+                        term.cwd = Some(path);
                         term.git_branch = git_branch;
                         term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -110,44 +132,46 @@ impl Perform for VteHandler {
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let params: Vec<u16> = params.iter().flat_map(|p| p.iter().map(|&v| v)).collect();
-        let mut term = self.terminal.write();
 
         match (action, intermediates) {
             ('A', []) => {
                 // Cursor Up
                 let n = params.first().copied().unwrap_or(1).max(1);
-                term.cursor_up(n);
+                self.term().cursor_up(n);
             }
             ('B', []) => {
                 // Cursor Down
                 let n = params.first().copied().unwrap_or(1).max(1);
-                term.cursor_down(n);
+                self.term().cursor_down(n);
             }
             ('C', []) => {
                 // Cursor Forward
                 let n = params.first().copied().unwrap_or(1).max(1);
-                term.cursor_forward(n);
+                self.term().cursor_forward(n);
             }
             ('D', []) => {
                 // Cursor Backward
                 let n = params.first().copied().unwrap_or(1).max(1);
-                term.cursor_backward(n);
+                self.term().cursor_backward(n);
             }
             ('E', []) => {
                 // Cursor Next Line
                 let n = params.first().copied().unwrap_or(1).max(1);
+                let term = self.term();
                 term.cursor_down(n);
                 term.carriage_return();
             }
             ('F', []) => {
                 // Cursor Previous Line
                 let n = params.first().copied().unwrap_or(1).max(1);
+                let term = self.term();
                 term.cursor_up(n);
                 term.carriage_return();
             }
             ('G', []) => {
                 // Cursor Horizontal Absolute
                 let col = params.first().copied().unwrap_or(1).max(1) - 1;
+                let term = self.term();
                 let row = term.cursor_y;
                 term.set_cursor_pos(row, col);
             }
@@ -155,68 +179,71 @@ impl Perform for VteHandler {
                 // Cursor Position
                 let row = params.first().copied().unwrap_or(1).max(1) - 1;
                 let col = params.get(1).copied().unwrap_or(1).max(1) - 1;
-                term.set_cursor_pos(row, col);
+                self.term().set_cursor_pos(row, col);
             }
             ('J', []) => {
                 let mode = params.first().copied().unwrap_or(0);
-                term.erase_in_display(mode);
+                self.term().erase_in_display(mode);
             }
             ('K', []) => {
                 let mode = params.first().copied().unwrap_or(0);
-                term.erase_in_line(mode);
+                self.term().erase_in_line(mode);
             }
             ('L', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                term.insert_lines(n);
+                self.term().insert_lines(n);
             }
             ('M', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                term.delete_lines(n);
+                self.term().delete_lines(n);
             }
             ('P', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                term.delete_chars(n);
+                self.term().delete_chars(n);
             }
             ('S', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                term.scroll_up_region(n);
+                self.term().scroll_up_region(n);
             }
             ('T', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                term.scroll_down_region(n);
+                self.term().scroll_down_region(n);
             }
             ('X', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                term.erase_chars(n);
+                self.term().erase_chars(n);
             }
             ('d', []) => {
                 // Vertical Position Absolute
                 let row = params.first().copied().unwrap_or(1).max(1) - 1;
+                let term = self.term();
                 let col = term.cursor_x;
                 term.set_cursor_pos(row, col);
             }
             ('m', []) => {
                 if params.is_empty() {
-                    term.set_sgr(&[0]);
+                    self.term().set_sgr(&[0]);
                 } else {
-                    term.set_sgr(&params);
+                    self.term().set_sgr(&params);
                 }
             }
             ('r', []) => {
                 // Set scroll region
                 let top = params.first().copied().unwrap_or(1).max(1) - 1;
+                let term = self.term();
                 let bottom = params.get(1).copied().unwrap_or(term.rows).max(1) - 1;
                 term.set_scroll_region(top, bottom);
             }
-            ('s', []) => term.save_cursor(),
-            ('u', []) => term.restore_cursor(),
+            ('s', []) => self.term().save_cursor(),
+            ('u', []) => self.term().restore_cursor(),
             ('u', [b'>']) => {
                 // Kitty keyboard protocol query — respond with flags=0 (not supported)
-                drop(term);
+                self.release_guard();
                 self.write_to_pty(b"\x1b[?0u");
             }
             ('h', [b'?']) | ('l', [b'?']) => {
                 // DEC Private Mode Set/Reset
+                let term = self.term();
                 for &p in &params {
                     match p {
                         1 => {
@@ -260,6 +287,7 @@ impl Perform for VteHandler {
             }
             ('h', []) | ('l', []) => {
                 // SM/RM — Set/Reset Mode (non-private)
+                let term = self.term();
                 for &p in &params {
                     match p {
                         4 => {
@@ -272,27 +300,29 @@ impl Perform for VteHandler {
             ('@', []) => {
                 // ICH — Insert Characters
                 let n = params.first().copied().unwrap_or(1).max(1);
-                term.insert_chars(n);
+                self.term().insert_chars(n);
             }
             ('n', []) => {
                 // Device Status Report
                 if params.first() == Some(&6) {
                     // CPR - Cursor Position Report (1-based)
+                    let term = self.term();
                     let row = term.cursor_y + 1;
                     let col = term.cursor_x + 1;
-                    drop(term);
+                    self.release_guard();
                     let response = format!("\x1b[{};{}R", row, col);
                     self.write_to_pty(response.as_bytes());
                 }
             }
             ('c', []) | ('c', [b'?']) => {
                 // DA1 — identify as VT220-compatible
-                drop(term);
+                self.release_guard();
                 self.write_to_pty(b"\x1b[?62;22c");
             }
             ('p', [b'?', b'$']) => {
                 // DECRPM — Report Private Mode
                 if let Some(&mode) = params.first() {
+                    let term = self.term();
                     // 1 = set, 2 = reset, 0 = not recognized
                     let value = match mode {
                         1 => if term.cursor_keys_application { 1 } else { 2 },
@@ -304,7 +334,7 @@ impl Perform for VteHandler {
                         2026 => if term.synchronized_output { 1 } else { 2 },
                         _ => 0,
                     };
-                    drop(term);
+                    self.release_guard();
                     let response = format!("\x1b[?{};{}$y", mode, value);
                     self.write_to_pty(response.as_bytes());
                 }
@@ -312,6 +342,7 @@ impl Perform for VteHandler {
             ('q', [b' ']) => {
                 // DECSCUSR — Set Cursor Style
                 let ps = params.first().copied().unwrap_or(0);
+                let term = self.term();
                 term.cursor_shape = match ps {
                     0 | 1 | 2 => CursorShape::Block,
                     3 | 4 => CursorShape::Underline,
@@ -332,16 +363,16 @@ impl Perform for VteHandler {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        let mut term = self.terminal.write();
         match (byte, intermediates) {
             (b'M', []) => {
                 // Reverse Index
-                term.reverse_index();
+                self.term().reverse_index();
             }
-            (b'7', []) => term.save_cursor(),
-            (b'8', []) => term.restore_cursor(),
+            (b'7', []) => self.term().save_cursor(),
+            (b'8', []) => self.term().restore_cursor(),
             (b'c', []) => {
                 // Full reset
+                let term = self.term();
                 let cols = term.cols;
                 let rows = term.rows;
                 let scrollback_limit = term.scrollback_limit;
