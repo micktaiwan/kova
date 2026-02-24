@@ -8,10 +8,17 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool) {
     let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
     let has_alt = modifiers.contains(NSEventModifierFlags::Option);
     let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
+    let has_shift = modifiers.contains(NSEventModifierFlags::Shift);
 
     let chars_unmod = event.charactersIgnoringModifiers();
     let unmod_str = chars_unmod.map(|s| s.to_string()).unwrap_or_default();
     let unmod_char = unmod_str.chars().next().unwrap_or('\0');
+
+    // Shift+Enter → newline without executing (CSI u: \e[13;2u)
+    if has_shift && unmod_char == '\r' {
+        pty.write(b"\x1b[13;2u");
+        return;
+    }
 
     if has_cmd {
         // Cmd+Backspace → kill line (Ctrl+U)
