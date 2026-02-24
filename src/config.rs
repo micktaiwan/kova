@@ -43,6 +43,7 @@ pub struct TerminalConfig {
     pub scrollback: usize,
     pub fps: u32,
     pub cursor_blink_frames: u32,
+    pub scroll_sensitivity: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,6 +122,7 @@ impl Default for TerminalConfig {
             scrollback: 10_000,
             fps: 60,
             cursor_blink_frames: 60,
+            scroll_sensitivity: 3.0,
         }
     }
 }
