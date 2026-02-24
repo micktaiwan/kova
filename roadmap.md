@@ -88,7 +88,9 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] Recherche dans le scrollback
 - [ ] Clickable URLs
 - [ ] Support multi-fenêtres
+- [ ] Déplacer un split (réorganiser l'arbre de splits par drag ou raccourci)
 - [ ] Notifications visuelles (bell, activité dans un split inactif)
+- [ ] PTY cleanup non-bloquant — remplacer le `waitpid` bloquant dans `Drop for Pty` par une escalade SIGHUP → SIGTERM → SIGKILL avec timeouts (~200ms max), pour éviter un freeze UI si un process ignore SIGHUP
 - [ ] Font fallback (emoji, symboles) — CoreText fallback fonctionne mais block elements/box-drawing nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
 - [ ] Ligatures (optionnel)
 
