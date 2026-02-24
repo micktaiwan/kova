@@ -3,6 +3,7 @@ mod config;
 mod input;
 mod pane;
 mod renderer;
+mod session;
 mod terminal;
 mod window;
 

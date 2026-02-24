@@ -1129,6 +1129,12 @@ impl KovaView {
         self.resize_all_panes();
     }
 
+    pub fn save_session(&self) {
+        let tabs = self.ivars().tabs.borrow();
+        let active_tab = self.ivars().active_tab.get();
+        crate::session::save(&tabs, active_tab);
+    }
+
     pub fn setup_metal(&self, _mtm: MainThreadMarker, config: &Config) {
         log::info!("Setting up Metal");
         let device = MTLCreateSystemDefaultDevice()
@@ -1157,8 +1163,19 @@ impl KovaView {
 
         self.ivars().last_scale.set(scale);
 
-        let tab = Tab::new(config).expect("failed to create initial tab");
-        let terminal_for_renderer = tab.tree.first_pane().terminal.clone();
+        // Try to restore previous session, fallback to fresh tab
+        let (tabs, active_tab) = match crate::session::load().and_then(|s| crate::session::restore_session(s, config)) {
+            Some((tabs, active)) => {
+                log::info!("Restored session: {} tabs, active={}", tabs.len(), active);
+                (tabs, active)
+            }
+            None => {
+                let tab = Tab::new(config).expect("failed to create initial tab");
+                (vec![tab], 0)
+            }
+        };
+
+        let terminal_for_renderer = tabs[active_tab].tree.first_pane().terminal.clone();
 
         let renderer = Arc::new(parking_lot::RwLock::new(
             Renderer::new(&device, &layer, terminal_for_renderer, scale, config),
@@ -1166,8 +1183,8 @@ impl KovaView {
 
         self.ivars().renderer.set(renderer).ok();
         self.ivars().config.set(config.clone()).ok();
-        *self.ivars().tabs.borrow_mut() = vec![tab];
-        self.ivars().active_tab.set(0);
+        *self.ivars().tabs.borrow_mut() = tabs;
+        self.ivars().active_tab.set(active_tab);
 
         self.start_render_timer(config.terminal.fps);
     }
