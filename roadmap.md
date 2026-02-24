@@ -45,8 +45,8 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Resize fenêtre : reflow du texte (struct `Row` avec flag `wrapped`, reconstruction des lignes logiques, re-wrap à la nouvelle largeur)
 
 ### Input macOS
-- [ ] Option+Left/Right — déplacement mot par mot (envoie `\x1bb`/`\x1bf`)
-- [ ] Cmd+Backspace — effacer toute la ligne (envoie `\x15` Ctrl+U)
+- [x] Option+Left/Right — déplacement mot par mot (envoie `\x1bb`/`\x1bf`)
+- [x] Cmd+Backspace — effacer toute la ligne (envoie `\x15` Ctrl+U)
 
 ### Refacto multi-pane (prérequis splits)
 
@@ -59,10 +59,13 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 
 - [x] Splits horizontaux et verticaux (arbre binaire)
 - [x] Navigation entre splits (raccourcis clavier)
+- [x] Séparateurs visuels entre splits (ligne 1px semi-transparente)
+- [x] Padding horizontal des panes (10px)
+- [x] Nouveau split hérite du CWD du pane focusé (via `proc_pidinfo`)
 - [ ] Resize des splits (raccourcis + drag)
 - [ ] Tabs (barre minimale en haut)
 - [ ] Navigation entre tabs
-- [ ] Fermeture tab/split — actuellement `exit` ferme toute l'app (`app.terminate`), à remplacer par fermeture du pane seul
+- [x] Fermeture split — `exit`/Cmd+W retire le pane de l'arbre, reporte le focus, `app.terminate` seulement quand plus aucun pane
 
 ## V2 — Polished
 
@@ -82,6 +85,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] Thèmes de couleurs (quelques built-in + custom)
 - [ ] Support ProMotion (120Hz)
 - [ ] Recherche dans le scrollback
+- [ ] Bug paste dans Claude Code — le Cmd+V ne semble pas fonctionner quand Claude Code tourne (marche en shell normal). Pistes : vérifier que `pty.write()` gère les gros blocs sans troncature (buffer plein → écriture partielle), vérifier que le `read()` lock sur `bracketed_paste` ne bloque pas, ajouter logs temporaires pour confirmer que le texte arrive bien au PTY
 - [ ] Clickable URLs
 - [ ] Support multi-fenêtres
 - [ ] Notifications visuelles (bell, activité dans un split inactif)
