@@ -304,32 +304,222 @@ impl GlyphAtlas {
         }
     }
 
+    /// Draw a block element or box-drawing character directly into a bitmap buffer.
+    /// Returns true if the character was handled, false otherwise.
+    fn draw_builtin_glyph(c: char, buf: &mut [u8], w: usize, h: usize) -> bool {
+        let bpr = w * 4;
+
+        // Helper: fill a rectangular region with white (alpha=255 in channel 0)
+        let fill_rect = |buf: &mut [u8], x0: usize, y0: usize, x1: usize, y1: usize| {
+            for y in y0..y1.min(h) {
+                for x in x0..x1.min(w) {
+                    let off = y * bpr + x * 4;
+                    buf[off] = 255;
+                    buf[off + 1] = 255;
+                    buf[off + 2] = 255;
+                    buf[off + 3] = 255;
+                }
+            }
+        };
+
+        let hw = w / 2; // half width
+        let hh = h / 2; // half height
+
+        match c {
+            // === Block Elements (U+2580-U+259F) ===
+            '\u{2580}' => { fill_rect(buf, 0, 0, w, hh); true }         // ▀ upper half
+            '\u{2581}' => { let t = h - h/8; fill_rect(buf, 0, t, w, h); true } // ▁ lower 1/8
+            '\u{2582}' => { let t = h - h/4; fill_rect(buf, 0, t, w, h); true } // ▂ lower 1/4
+            '\u{2583}' => { let t = h - 3*h/8; fill_rect(buf, 0, t, w, h); true } // ▃ lower 3/8
+            '\u{2584}' => { fill_rect(buf, 0, hh, w, h); true }         // ▄ lower half
+            '\u{2585}' => { let t = h - 5*h/8; fill_rect(buf, 0, t, w, h); true } // ▅ lower 5/8
+            '\u{2586}' => { let t = h - 3*h/4; fill_rect(buf, 0, t, w, h); true } // ▆ lower 3/4
+            '\u{2587}' => { let t = h - 7*h/8; fill_rect(buf, 0, t, w, h); true } // ▇ lower 7/8
+            '\u{2588}' => { fill_rect(buf, 0, 0, w, h); true }          // █ full block
+            '\u{2589}' => { let r = 7*w/8; fill_rect(buf, 0, 0, r, h); true } // ▉ left 7/8
+            '\u{258A}' => { let r = 3*w/4; fill_rect(buf, 0, 0, r, h); true } // ▊ left 3/4
+            '\u{258B}' => { let r = 5*w/8; fill_rect(buf, 0, 0, r, h); true } // ▋ left 5/8
+            '\u{258C}' => { fill_rect(buf, 0, 0, hw, h); true }         // ▌ left half
+            '\u{258D}' => { let r = 3*w/8; fill_rect(buf, 0, 0, r, h); true } // ▍ left 3/8
+            '\u{258E}' => { let r = w/4; fill_rect(buf, 0, 0, r, h); true }   // ▎ left 1/4
+            '\u{258F}' => { let r = w/8; fill_rect(buf, 0, 0, r, h); true }   // ▏ left 1/8
+            '\u{2590}' => { fill_rect(buf, hw, 0, w, h); true }         // ▐ right half
+            '\u{2591}' => { // ░ light shade (25%)
+                for y in 0..h { for x in 0..w { if (x + y) % 4 == 0 { let o = y*bpr+x*4; buf[o]=255; buf[o+1]=255; buf[o+2]=255; buf[o+3]=255; } } }
+                true
+            }
+            '\u{2592}' => { // ▒ medium shade (50%)
+                for y in 0..h { for x in 0..w { if (x + y) % 2 == 0 { let o = y*bpr+x*4; buf[o]=255; buf[o+1]=255; buf[o+2]=255; buf[o+3]=255; } } }
+                true
+            }
+            '\u{2593}' => { // ▓ dark shade (75%)
+                for y in 0..h { for x in 0..w { if (x + y) % 4 != 0 { let o = y*bpr+x*4; buf[o]=255; buf[o+1]=255; buf[o+2]=255; buf[o+3]=255; } } }
+                true
+            }
+            // Quadrants
+            '\u{2596}' => { fill_rect(buf, 0, hh, hw, h); true }        // ▖ lower left
+            '\u{2597}' => { fill_rect(buf, hw, hh, w, h); true }        // ▗ lower right
+            '\u{2598}' => { fill_rect(buf, 0, 0, hw, hh); true }        // ▘ upper left
+            '\u{2599}' => { // ▙ upper left + lower left + lower right
+                fill_rect(buf, 0, 0, hw, hh);
+                fill_rect(buf, 0, hh, w, h);
+                true
+            }
+            '\u{259A}' => { // ▚ upper left + lower right
+                fill_rect(buf, 0, 0, hw, hh);
+                fill_rect(buf, hw, hh, w, h);
+                true
+            }
+            '\u{259B}' => { // ▛ upper left + upper right + lower left
+                fill_rect(buf, 0, 0, w, hh);
+                fill_rect(buf, 0, hh, hw, h);
+                true
+            }
+            '\u{259C}' => { // ▜ upper left + upper right + lower right
+                fill_rect(buf, 0, 0, w, hh);
+                fill_rect(buf, hw, hh, w, h);
+                true
+            }
+            '\u{259D}' => { fill_rect(buf, hw, 0, w, hh); true }        // ▝ upper right
+            '\u{259E}' => { // ▞ upper right + lower left
+                fill_rect(buf, hw, 0, w, hh);
+                fill_rect(buf, 0, hh, hw, h);
+                true
+            }
+            '\u{259F}' => { // ▟ upper right + lower left + lower right
+                fill_rect(buf, hw, 0, w, hh);
+                fill_rect(buf, 0, hh, w, h);
+                true
+            }
+
+            // === Box-Drawing (U+2500-U+257F) ===
+            '\u{2500}' | '\u{2501}' => { // ─ ━ horizontal line
+                let thick = if c == '\u{2501}' { 3 } else { 1 };
+                let y0 = hh.saturating_sub(thick / 2);
+                fill_rect(buf, 0, y0, w, y0 + thick);
+                true
+            }
+            '\u{2502}' | '\u{2503}' => { // │ ┃ vertical line
+                let thick = if c == '\u{2503}' { 3 } else { 1 };
+                let x0 = hw.saturating_sub(thick / 2);
+                fill_rect(buf, x0, 0, x0 + thick, h);
+                true
+            }
+            '\u{250C}' => { // ┌
+                fill_rect(buf, hw, hh, hw + 1, h);
+                fill_rect(buf, hw, hh, w, hh + 1);
+                true
+            }
+            '\u{2510}' => { // ┐
+                fill_rect(buf, hw, hh, hw + 1, h);
+                fill_rect(buf, 0, hh, hw + 1, hh + 1);
+                true
+            }
+            '\u{2514}' => { // └
+                fill_rect(buf, hw, 0, hw + 1, hh + 1);
+                fill_rect(buf, hw, hh, w, hh + 1);
+                true
+            }
+            '\u{2518}' => { // ┘
+                fill_rect(buf, hw, 0, hw + 1, hh + 1);
+                fill_rect(buf, 0, hh, hw + 1, hh + 1);
+                true
+            }
+            '\u{251C}' => { // ├
+                fill_rect(buf, hw, 0, hw + 1, h);
+                fill_rect(buf, hw, hh, w, hh + 1);
+                true
+            }
+            '\u{2524}' => { // ┤
+                fill_rect(buf, hw, 0, hw + 1, h);
+                fill_rect(buf, 0, hh, hw + 1, hh + 1);
+                true
+            }
+            '\u{252C}' => { // ┬
+                fill_rect(buf, 0, hh, w, hh + 1);
+                fill_rect(buf, hw, hh, hw + 1, h);
+                true
+            }
+            '\u{2534}' => { // ┴
+                fill_rect(buf, 0, hh, w, hh + 1);
+                fill_rect(buf, hw, 0, hw + 1, hh + 1);
+                true
+            }
+            '\u{253C}' => { // ┼
+                fill_rect(buf, 0, hh, w, hh + 1);
+                fill_rect(buf, hw, 0, hw + 1, h);
+                true
+            }
+            // Rounded corners (same as sharp corners visually at terminal scale)
+            '\u{256D}' => { // ╭
+                fill_rect(buf, hw, hh, hw + 1, h);
+                fill_rect(buf, hw, hh, w, hh + 1);
+                true
+            }
+            '\u{256E}' => { // ╮
+                fill_rect(buf, hw, hh, hw + 1, h);
+                fill_rect(buf, 0, hh, hw + 1, hh + 1);
+                true
+            }
+            '\u{256F}' => { // ╯
+                fill_rect(buf, hw, 0, hw + 1, hh + 1);
+                fill_rect(buf, 0, hh, hw + 1, hh + 1);
+                true
+            }
+            '\u{2570}' => { // ╰
+                fill_rect(buf, hw, 0, hw + 1, hh + 1);
+                fill_rect(buf, hw, hh, w, hh + 1);
+                true
+            }
+            // Double lines
+            '\u{2550}' => { // ═ double horizontal
+                let y0 = hh.saturating_sub(1);
+                fill_rect(buf, 0, y0, w, y0 + 1);
+                fill_rect(buf, 0, y0 + 2, w, y0 + 3);
+                true
+            }
+            '\u{2551}' => { // ║ double vertical
+                let x0 = hw.saturating_sub(1);
+                fill_rect(buf, x0, 0, x0 + 1, h);
+                fill_rect(buf, x0 + 2, 0, x0 + 3, h);
+                true
+            }
+            '\u{2552}'..='\u{256C}' => {
+                // For remaining double-line box-drawing, fall through to font rendering
+                // (less commonly used, can be added later)
+                false
+            }
+            // Dashes
+            '\u{2504}' | '\u{2505}' | '\u{2508}' | '\u{2509}' | // ┄ ┅ ┈ ┉
+            '\u{254C}' | '\u{254D}' | '\u{254E}' | '\u{254F}' => { // ╌ ╍ ╎ ╏
+                // Dashed lines - fall through to font for now
+                false
+            }
+
+            _ => false,
+        }
+    }
+
     /// Rasterize a single character on-demand and add it to the atlas.
     pub fn rasterize_char(&mut self, c: char) -> Option<GlyphInfo> {
         if let Some(g) = self.glyphs.get(&c) {
             return Some(*g);
         }
 
-        let (mut glyph_id, draw_font) = self.resolve_glyph(c)?;
-
-        // Check if we need to wrap to next row
-        if self.next_x + self.glyph_cell_w > self.atlas_width {
-            self.next_x = 0;
-            self.next_y += self.glyph_cell_h;
-        }
-
-        // Grow atlas if needed
-        if self.next_y + self.glyph_cell_h > self.atlas_height {
-            self.grow_atlas();
-        }
-
-        let atlas_x = self.next_x;
-        let atlas_y = self.next_y;
-
-        // Render glyph into cell-sized bitmap with fixed baseline
+        // Try builtin drawing for block elements and box-drawing first
         let bmp_w = self.cell_width as usize;
         let bmp_h = self.cell_height as usize;
         let bmp_bpr = bmp_w * 4;
+        let mut builtin_buf = vec![0u8; bmp_bpr * bmp_h];
+
+        if Self::draw_builtin_glyph(c, &mut builtin_buf, bmp_w, bmp_h) {
+            log::trace!("builtin glyph for '{}' U+{:04X}", c, c as u32);
+            return self.insert_bitmap(c, &builtin_buf, bmp_w, bmp_h);
+        }
+
+        let (mut glyph_id, draw_font) = self.resolve_glyph(c)?;
+
+        // Render glyph into cell-sized bitmap with fixed baseline
         let mut bmp_buf = vec![0u8; bmp_bpr * bmp_h];
 
         let bmp_ctx = unsafe {
@@ -365,6 +555,27 @@ impl GlyphAtlas {
         // Debug: count non-zero pixels
         let nonzero = bmp_buf.iter().filter(|&&b| b != 0).count();
         log::trace!("rasterize '{}' U+{:04X}: bmp {}x{}, nonzero_bytes={}", c, c as u32, bmp_w, bmp_h, nonzero);
+
+        self.insert_bitmap(c, &bmp_buf, bmp_w, bmp_h)
+    }
+
+    /// Insert a rendered bitmap into the atlas and return glyph info.
+    fn insert_bitmap(&mut self, c: char, bmp_buf: &[u8], bmp_w: usize, bmp_h: usize) -> Option<GlyphInfo> {
+        let bmp_bpr = bmp_w * 4;
+
+        // Check if we need to wrap to next row
+        if self.next_x + self.glyph_cell_w > self.atlas_width {
+            self.next_x = 0;
+            self.next_y += self.glyph_cell_h;
+        }
+
+        // Grow atlas if needed
+        if self.next_y + self.glyph_cell_h > self.atlas_height {
+            self.grow_atlas();
+        }
+
+        let atlas_x = self.next_x;
+        let atlas_y = self.next_y;
 
         // Copy cell bitmap to atlas
         let atlas_bpr = self.atlas_width as usize * 4;

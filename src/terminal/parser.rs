@@ -7,7 +7,7 @@ use super::{CursorShape, TerminalState};
 
 /// Walk up from `path` to find `.git/HEAD` and extract the branch name.
 /// Returns `None` if not in a git repo.
-fn resolve_git_branch(path: &str) -> Option<String> {
+pub fn resolve_git_branch(path: &str) -> Option<String> {
     let mut dir = std::path::PathBuf::from(path);
     loop {
         let head = dir.join(".git/HEAD");
