@@ -24,10 +24,12 @@ define_class!(
     unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
+            log::info!("Application launched");
             let mtm = MainThreadMarker::from(self);
             setup_menu(mtm);
 
             let config = self.ivars().config.get().unwrap();
+            log::debug!("Config loaded: {}x{} cols/rows, {} scrollback", config.terminal.columns, config.terminal.rows, config.terminal.scrollback);
             let win = window::create_window(mtm, config);
             win.makeKeyAndOrderFront(None);
 

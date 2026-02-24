@@ -4,6 +4,17 @@ pub mod vertex;
 
 pub const PANE_H_PADDING: f32 = 10.0;
 
+/// Predefined tab color palette (macOS Finder-style tags).
+/// Each entry is [R, G, B] in 0.0–1.0.
+pub const TAB_COLORS: [[f32; 3]; 6] = [
+    [0.82, 0.22, 0.22], // Red
+    [0.90, 0.55, 0.15], // Orange
+    [0.85, 0.75, 0.15], // Yellow
+    [0.30, 0.70, 0.30], // Green
+    [0.25, 0.50, 0.85], // Blue
+    [0.60, 0.35, 0.75], // Violet
+];
+
 use glyph_atlas::GlyphAtlas;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -33,7 +44,7 @@ pub struct PaneViewport {
     pub height: f32,
 }
 
-const MAX_VERTEX_BYTES: usize = 4 * 1024 * 1024; // 4MB
+const MAX_VERTEX_BYTES: usize = 16 * 1024 * 1024; // 16MB
 
 pub struct Renderer {
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -151,7 +162,7 @@ impl Renderer {
         layer: &CAMetalLayer,
         panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool)],
         separators: &[(f32, f32, f32, f32)],
-        tab_titles: &[(String, bool)],
+        tab_titles: &[(String, bool, Option<usize>)],
         filter: Option<&FilterRenderData>,
     ) {
         // Reset blink on cursor movement of focused pane
@@ -342,7 +353,12 @@ impl Renderer {
             self.vertex_buf_idx = 1 - buf_idx;
             let vertex_buf = &self.vertex_bufs[buf_idx];
 
-            assert!(vertex_bytes.len() <= MAX_VERTEX_BYTES, "vertex data exceeds buffer size");
+            if vertex_bytes.len() > MAX_VERTEX_BYTES {
+                log::error!("Vertex data ({} bytes) exceeds buffer size ({} bytes), skipping frame", vertex_bytes.len(), MAX_VERTEX_BYTES);
+                encoder.endEncoding();
+                cmd_buf.commit();
+                return;
+            }
             unsafe {
                 let ptr = vertex_buf.contents().as_ptr() as *mut u8;
                 std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), ptr, vertex_bytes.len());
@@ -471,7 +487,7 @@ impl Renderer {
                 }
 
                 if c == '─' && row_idx == 2 && col_idx < 3 {
-                    log::debug!("render ─ at col={} row={} fg={:?} bg={:?}", col_idx, row_idx, cell.fg, cell.bg);
+                    log::trace!("render ─ at col={} row={} fg={:?} bg={:?}", col_idx, row_idx, cell.fg, cell.bg);
                 }
 
                 let glyph = match self.atlas.glyph(c) {
@@ -649,40 +665,64 @@ impl Renderer {
         &mut self,
         vertices: &mut Vec<Vertex>,
         viewport_w: f32,
-        tab_titles: &[(String, bool)],
+        tab_titles: &[(String, bool, Option<usize>)],
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
+        let bar_h = (cell_h * 1.6).round();
         let tab_count = tab_titles.len();
+        let gap = 4.0_f32;
 
         // Full-width background
-        Self::push_bg_quad(vertices, 0.0, 0.0, viewport_w, cell_h, self.tab_bar_bg);
+        Self::push_bg_quad(vertices, 0.0, 0.0, viewport_w, bar_h, self.tab_bar_bg);
 
-        // Each tab gets equal width
-        let tab_width = viewport_w / tab_count as f32;
+        // Fixed width per tab, capped at cell_w * 15
+        let max_tab_w = cell_w * 15.0;
+        let available_w = viewport_w - gap * (tab_count as f32 + 1.0);
+        let tab_width = (available_w / tab_count as f32).min(max_tab_w);
         let no_bg = [0.0, 0.0, 0.0, 0.0];
 
-        for (i, (title, is_active)) in tab_titles.iter().enumerate() {
-            let x = i as f32 * tab_width;
+        for (i, (title, is_active, color_idx)) in tab_titles.iter().enumerate() {
+            let x = gap + i as f32 * (tab_width + gap);
 
-            // Active tab highlight
+            // Tab background color
+            let tab_bg: Option<[f32; 3]> = if let Some(idx) = color_idx {
+                Some(TAB_COLORS[*idx % TAB_COLORS.len()])
+            } else if *is_active {
+                Some(self.tab_bar_active_bg)
+            } else {
+                None // transparent, shows bar bg
+            };
+
+            if let Some(bg) = tab_bg {
+                Self::push_bg_quad(vertices, x, 0.0, tab_width, bar_h, bg);
+            }
+
+            // Active tab with custom color: darker border at bottom
             if *is_active {
-                Self::push_bg_quad(vertices, x, 0.0, tab_width, cell_h, self.tab_bar_active_bg);
+                if let Some(idx) = color_idx {
+                    let c = TAB_COLORS[*idx % TAB_COLORS.len()];
+                    let border_color = [(c[0] + 1.0) * 0.5, (c[1] + 1.0) * 0.5, (c[2] + 1.0) * 0.5];
+                    let border_h = 3.0_f32;
+                    Self::push_bg_quad(vertices, x, bar_h - border_h, tab_width, border_h, border_color);
+                }
             }
 
             // Tab number + title: "1: title"
             let label = format!("{}:{}", i + 1, if title.len() > 20 { &title[..20] } else { title });
-            let fg = if *is_active {
+            // White text on colored tabs (active or not), grey on default bg
+            let fg = if color_idx.is_some() || *is_active {
                 [1.0, 1.0, 1.0, 1.0]
             } else {
                 [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 1.0]
             };
 
-            // Center text in the tab
+            // Center text vertically and horizontally in the tab
             let text_w = label.chars().count() as f32 * cell_w;
             let text_x = x + (tab_width - text_w) / 2.0;
+            let text_y = (bar_h - cell_h) / 2.0;
             let max_x = x + tab_width - cell_w;
-            self.render_status_text(vertices, &label, text_x.max(x + cell_w * 0.5), 0.0, max_x, fg, no_bg);
+            self.render_status_text(vertices, &label, text_x.max(x + cell_w * 0.5), text_y, max_x, fg, no_bg);
         }
     }
 

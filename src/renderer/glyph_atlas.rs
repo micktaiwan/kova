@@ -249,7 +249,7 @@ impl GlyphAtlas {
         let mut uni_buf = [0u16; 2];
         let encoded = c.encode_utf16(&mut uni_buf);
         let count = encoded.len();
-        log::debug!("resolve_glyph: '{}' U+{:04X} utf16_len={}", c, c as u32, count);
+        log::trace!("resolve_glyph: '{}' U+{:04X} utf16_len={}", c, c as u32, count);
 
         let mut glyph_buf = [0u16; 2];
         let ok = unsafe {
@@ -263,7 +263,7 @@ impl GlyphAtlas {
         // For surrogate pairs, CoreText puts the glyph in the first slot
         let glyph_id = glyph_buf[0];
 
-        log::debug!("  primary: ok={} glyph_buf={:?}", ok, &glyph_buf[..count]);
+        log::trace!("  primary: ok={} glyph_buf={:?}", ok, &glyph_buf[..count]);
 
         if ok && glyph_id != 0 {
             return Some((glyph_id, &*self.font as *const CTFont));
@@ -280,7 +280,7 @@ impl GlyphAtlas {
                 )
             };
             let fallback_name = unsafe { fallback.display_name() };
-            log::debug!("  fallback font: {:?}", fallback_name);
+            log::trace!("  fallback font: {:?}", fallback_name);
             self.fallback_fonts.insert(c, fallback);
         }
 
@@ -295,7 +295,7 @@ impl GlyphAtlas {
         };
 
         let glyph_id2 = glyph_buf2[0];
-        log::debug!("  fallback: ok2={} glyph_buf2={:?}", ok2, &glyph_buf2[..count]);
+        log::trace!("  fallback: ok2={} glyph_buf2={:?}", ok2, &glyph_buf2[..count]);
         if ok2 && glyph_id2 != 0 {
             Some((glyph_id2, &**fallback as *const CTFont))
         } else {
@@ -364,7 +364,7 @@ impl GlyphAtlas {
 
         // Debug: count non-zero pixels
         let nonzero = bmp_buf.iter().filter(|&&b| b != 0).count();
-        log::debug!("rasterize '{}' U+{:04X}: bmp {}x{}, nonzero_bytes={}", c, c as u32, bmp_w, bmp_h, nonzero);
+        log::trace!("rasterize '{}' U+{:04X}: bmp {}x{}, nonzero_bytes={}", c, c as u32, bmp_w, bmp_h, nonzero);
 
         // Copy cell bitmap to atlas
         let atlas_bpr = self.atlas_width as usize * 4;
