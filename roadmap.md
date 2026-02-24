@@ -85,7 +85,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] DECSCUSR (CSI Ps SP q) — cursor shape block/underline/bar
 - [ ] Thèmes de couleurs (quelques built-in + custom)
 - [ ] Support ProMotion (120Hz)
-- [ ] Recherche dans le scrollback
+- [x] Recherche dans le scrollback (Cmd+F — filtre overlay, highlight query, click pour scroller)
 - [ ] Clickable URLs
 - [ ] Support multi-fenêtres
 - [ ] Déplacer un split (réorganiser l'arbre de splits par drag ou raccourci)
