@@ -21,9 +21,11 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool) {
     }
 
     if has_cmd {
-        // Cmd+Backspace → kill line (Ctrl+U)
-        if unmod_char == '\u{7F}' {
-            pty.write(b"\x15");
+        match unmod_char {
+            '\u{7F}' => pty.write(b"\x15"),         // Cmd+Backspace → kill line (Ctrl+U)
+            '\u{F702}' => pty.write(b"\x1b[H"),     // Cmd+Left → Home (beginning of line)
+            '\u{F703}' => pty.write(b"\x1b[F"),     // Cmd+Right → End (end of line)
+            _ => {}
         }
         return;
     }

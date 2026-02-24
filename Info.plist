@@ -18,6 +18,8 @@
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>CFBundleIconFile</key>
+    <string>kova</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

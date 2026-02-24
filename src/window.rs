@@ -1,7 +1,7 @@
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSBackingStoreType, NSEvent, NSEventModifierFlags, NSPasteboard, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{NSApplication, NSBackingStoreType, NSEvent, NSEventModifierFlags, NSPasteboard, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
 use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -25,6 +25,14 @@ struct SeparatorDrag {
     node_ptr: usize,
 }
 
+#[derive(Clone, Copy)]
+struct DragTabState {
+    tab_index: usize,
+    start_x: f32,
+    current_x: f32,
+    dragging: bool,
+}
+
 pub struct KovaViewIvars {
     renderer: OnceCell<Arc<parking_lot::RwLock<Renderer>>>,
     tabs: RefCell<Vec<Tab>>,
@@ -36,8 +44,11 @@ pub struct KovaViewIvars {
     drag_separator: Cell<Option<SeparatorDrag>>,
     filter: RefCell<Option<FilterState>>,
     rename_tab: RefCell<Option<RenameTabState>>,
+    /// Left inset (pixels) for tab bar, cached from traffic light button positions.
+    tab_bar_left_inset: Cell<f32>,
     /// Tab index targeted by right-click color menu.
     color_menu_tab: Cell<usize>,
+    drag_tab: Cell<Option<DragTabState>>,
 }
 
 struct FilterState {
@@ -62,6 +73,14 @@ define_class!(
         #[unsafe(method(acceptsFirstResponder))]
         fn accepts_first_responder(&self) -> bool {
             true
+        }
+
+        #[unsafe(method(mouseDownCanMoveWindow))]
+        fn mouse_down_can_move_window(&self) -> bool {
+            // Must be false so we get mouseDown events in the titlebar area.
+            // We handle window dragging ourselves in hit_test_tab_bar when clicking
+            // outside of tabs.
+            false
         }
 
         #[unsafe(method(keyDown:))]
@@ -216,7 +235,26 @@ define_class!(
                     if ch == "v" && !has_shift && !has_option {
                         if let Some(pane) = self.focused_pane() {
                             let pasteboard = NSPasteboard::generalPasteboard();
-                            if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+
+                            // Try image paste first (PNG from clipboard)
+                            let pasted_image = unsafe { pasteboard.dataForType(objc2_app_kit::NSPasteboardTypePNG) }
+                                .and_then(|data| {
+                                    if data.is_empty() { return None; }
+                                    let bytes = data.to_vec();
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis();
+                                    let path = format!("/tmp/kova-paste-{timestamp}.png");
+                                    std::fs::write(&path, bytes).ok().map(|_| path)
+                                });
+
+                            if let Some(path) = pasted_image {
+                                let bracketed = pane.terminal.read().bracketed_paste;
+                                if bracketed { pane.pty.write(b"\x1b[200~"); }
+                                pane.pty.write(path.as_bytes());
+                                if bracketed { pane.pty.write(b"\x1b[201~"); }
+                            } else if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
                                 let text = text.to_string();
                                 let bracketed = pane.terminal.read().bracketed_paste;
                                 if bracketed {
@@ -287,7 +325,7 @@ define_class!(
             }
 
             // Check tab bar click
-            if self.hit_test_tab_bar(px, py) {
+            if self.hit_test_tab_bar(px, py, event) {
                 return;
             }
 
@@ -331,6 +369,32 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
+            // Handle tab drag
+            if let Some(mut drag) = self.ivars().drag_tab.get() {
+                let (px, _py) = self.event_to_pixel(event);
+                drag.current_x = px;
+                if !drag.dragging {
+                    if (px - drag.start_x).abs() >= 3.0 {
+                        drag.dragging = true;
+                    } else {
+                        self.ivars().drag_tab.set(Some(drag));
+                        return;
+                    }
+                }
+                if let Some(target) = self.tab_index_at_x(px) {
+                    if target != drag.tab_index {
+                        let mut tabs = self.ivars().tabs.borrow_mut();
+                        tabs.swap(drag.tab_index, target);
+                        drop(tabs);
+                        self.ivars().active_tab.set(target);
+                        drag.tab_index = target;
+                        self.mark_dirty();
+                    }
+                }
+                self.ivars().drag_tab.set(Some(drag));
+                return;
+            }
+
             // Handle separator drag
             if let Some(drag) = self.ivars().drag_separator.get() {
                 let (px, py) = self.event_to_pixel(event);
@@ -368,6 +432,10 @@ define_class!(
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
+            if self.ivars().drag_tab.get().is_some() {
+                self.ivars().drag_tab.set(None);
+                return;
+            }
             if self.ivars().drag_separator.get().is_some() {
                 self.ivars().drag_separator.set(None);
                 return;
@@ -435,7 +503,9 @@ impl KovaView {
             drag_separator: Cell::new(None),
             filter: RefCell::new(None),
             rename_tab: RefCell::new(None),
+            tab_bar_left_inset: Cell::new(0.0),
             color_menu_tab: Cell::new(0),
+            drag_tab: Cell::new(None),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -461,6 +531,11 @@ impl KovaView {
             width: full.width,
             height: full.height - tab_bar_h,
         }
+    }
+
+    fn get_tab_bar_left_inset(&self) -> f32 {
+        let v = self.ivars().tab_bar_left_inset.get();
+        if v > 0.0 { v } else { 136.0 } // fallback 68pt * 2x
     }
 
     /// Tab bar height in pixels (1.6x cell height).
@@ -513,13 +588,22 @@ impl KovaView {
     }
 
     /// Hit-test the tab bar. Returns true if click was in the tab bar (and handled).
-    fn hit_test_tab_bar(&self, px: f32, py: f32) -> bool {
+    fn hit_test_tab_bar(&self, px: f32, py: f32, event: &NSEvent) -> bool {
         let tab_bar_h = self.tab_bar_height();
         if py > tab_bar_h {
             return false;
         }
         if let Some(idx) = self.tab_index_at_x(px) {
             self.do_switch_tab(idx);
+            self.ivars().drag_tab.set(Some(DragTabState {
+                tab_index: idx,
+                start_x: px,
+                current_x: px,
+                dragging: false,
+            }));
+        } else if let Some(win) = self.window() {
+            // Click in titlebar but not on a tab — initiate window drag
+            win.performWindowDragWithEvent(event);
         }
         true
     }
@@ -532,14 +616,14 @@ impl KovaView {
             return None;
         }
         let full = self.drawable_viewport();
+        let left_inset = self.get_tab_bar_left_inset();
         let renderer = self.ivars().renderer.get()?;
         let cell_w = renderer.read().cell_size().0;
-        let gap = 4.0_f32;
         let max_tab_w = cell_w * 15.0;
-        let available_w = full.width - gap * (tab_count as f32 + 1.0);
+        let available_w = full.width - left_inset;
         let tab_width = (available_w / tab_count as f32).min(max_tab_w);
         for i in 0..tab_count {
-            let x = gap + i as f32 * (tab_width + gap);
+            let x = left_inset + i as f32 * tab_width;
             if px >= x && px <= x + tab_width {
                 return Some(i);
             }
@@ -662,6 +746,10 @@ impl KovaView {
             return;
         }
         log::debug!("Switch to tab {}", idx);
+        // Mark all panes of new tab dirty so the next render tick draws them
+        tabs[idx].tree.for_each_pane(&mut |pane| {
+            pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
         drop(tabs);
         self.ivars().active_tab.set(idx);
         // Lazy resize: resize panes when switching to them
@@ -1200,6 +1288,8 @@ impl KovaView {
 
         let last_title: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
         let window_for_title: std::cell::OnceCell<Retained<NSWindow>> = std::cell::OnceCell::new();
+        let git_poll_counter: Cell<u32> = Cell::new(0);
+        let git_poll_interval: u32 = fps * 2; // poll git branch every ~2 seconds
 
         let timer = unsafe {
             NSTimer::scheduledTimerWithTimeInterval_repeats_block(
@@ -1207,6 +1297,30 @@ impl KovaView {
                 true,
                 &RcBlock::new(move |_timer: NonNull<NSTimer>| {
                     let ivars = &*ivars;
+
+                    // --- Poll git branch for all panes with a CWD ---
+                    let count = git_poll_counter.get() + 1;
+                    git_poll_counter.set(count);
+                    if count >= git_poll_interval {
+                        git_poll_counter.set(0);
+                        let tabs = ivars.tabs.borrow();
+                        for tab in tabs.iter() {
+                            tab.tree.for_each_pane(&mut |pane| {
+                                let term = pane.terminal.read();
+                                let cwd = term.cwd.clone();
+                                let old_branch = term.git_branch.clone();
+                                drop(term);
+                                if let Some(ref cwd) = cwd {
+                                    let new_branch = crate::terminal::parser::resolve_git_branch(cwd);
+                                    if new_branch != old_branch {
+                                        let mut term = pane.terminal.write();
+                                        term.git_branch = new_branch;
+                                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                            });
+                        }
+                    }
 
                     // --- Reap exited panes across ALL tabs ---
                     let mut any_removed = false;
@@ -1362,13 +1476,17 @@ impl KovaView {
                     let separators = {
                         let tabs = ivars.tabs.borrow();
                         if let Some(tab) = tabs.get(active_idx) {
-                            let cell_h = renderer.read().cell_size().1;
+                            let renderer_r = renderer.read();
+                            let cell_h = renderer_r.cell_size().1;
+                            let status_bar = renderer_r.status_bar_enabled();
+                            drop(renderer_r);
                             let drawable_size = layer.drawableSize();
+                            let status_bar_h = if status_bar { cell_h } else { 0.0 };
                             let panes_vp = PaneViewport {
                                 x: 0.0,
                                 y: cell_h,
                                 width: drawable_size.width as f32,
-                                height: drawable_size.height as f32 - cell_h,
+                                height: drawable_size.height as f32 - cell_h - status_bar_h,
                             };
                             let mut seps = Vec::new();
                             tab.tree.collect_separators(panes_vp, &mut seps);
@@ -1387,7 +1505,25 @@ impl KovaView {
                         })
                     };
 
-                    renderer.write().render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref());
+                    // Compute left_inset from traffic light buttons
+                    let left_inset = {
+                        let mtm2 = MainThreadMarker::new_unchecked();
+                        let app2 = NSApplication::sharedApplication(mtm2);
+                        let inset = app2.mainWindow()
+                            .and_then(|win| {
+                                let scale = win.backingScaleFactor() as f32;
+                                win.standardWindowButton(NSWindowButton::ZoomButton)
+                                    .map(|btn| {
+                                        let frame = btn.frame();
+                                        let right_edge = (frame.origin.x + frame.size.width) as f32;
+                                        (right_edge + 8.0) * scale
+                                    })
+                            })
+                            .unwrap_or(140.0);
+                        ivars.tab_bar_left_inset.set(inset);
+                        inset
+                    };
+                    renderer.write().render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset);
                 }),
             )
         };
@@ -1409,7 +1545,8 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config) -> Retained<NSWindo
     let style = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
         | NSWindowStyleMask::Miniaturizable
-        | NSWindowStyleMask::Resizable;
+        | NSWindowStyleMask::Resizable
+        | NSWindowStyleMask::FullSizeContentView;
 
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -1423,6 +1560,8 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config) -> Retained<NSWindo
 
     let title = NSString::from_str("Kova");
     window.setTitle(&title);
+    window.setTitlebarAppearsTransparent(true);
+    window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
     window.setMinSize(CGSize {
         width: 200.0,
         height: 150.0,

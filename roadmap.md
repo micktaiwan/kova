@@ -40,6 +40,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
   - `~/.config/kova/config.toml`, defaults sensibles, fallback silencieux
 - [x] Détecter la mort du shell (EOF sur PTY) → fermer la fenêtre
 - [x] Status bar (CWD via OSC 7, git branch, indicateur scroll, titre OSC 0/2, heure HH:MM, couleur par élément configurable)
+- [x] Git branch polling — re-lecture de `.git/HEAD` toutes les ~2s pour détecter les changements de branche sans attendre un changement de CWD
 - [x] Shift+Tab (backtab) — envoie `CSI Z` au lieu du raw `0x19`
 - [x] Sélection texte + copier/coller (mouseDown/Dragged/Up, Cmd+C, highlight sélection, copie auto dans presse-papier, respect du soft-wrap)
 - [x] Resize fenêtre : reflow du texte (struct `Row` avec flag `wrapped`, reconstruction des lignes logiques, re-wrap à la nouvelle largeur)
@@ -48,6 +49,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 ### Input macOS
 - [x] Option+Left/Right — déplacement mot par mot (envoie `\x1bb`/`\x1bf`)
 - [x] Cmd+Backspace — effacer toute la ligne (envoie `\x15` Ctrl+U)
+- [x] Cmd+Left/Right — début/fin de ligne (envoie Home `\x1b[H` / End `\x1b[F`)
 
 ### Refacto multi-pane (prérequis splits)
 
@@ -67,6 +69,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Égalisation automatique des splits — après ajout/suppression d'un pane, tous les panes d'un même axe sont redistribués à taille égale (1/N chacun)
 - [x] Tabs (barre minimale en haut, Cmd+T nouveau tab, Cmd+W ferme pane/tab, rendu Metal, tab bar cliquable)
 - [x] Navigation entre tabs (Cmd+Shift+[/], Cmd+1..9)
+- [x] Drag & reorder des tabs (drag souris avec seuil 3px, swap temps réel)
 - [x] Renommage de tab (Cmd+Shift+R, nom custom prioritaire, vider pour revenir au nom auto)
 - [x] Fermeture split — `exit`/Cmd+W retire le pane de l'arbre, reporte le focus, `app.terminate` seulement quand plus aucun pane
 
@@ -74,6 +77,11 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 
 - [x] Focus events (DEC mode 1004) — notifier le shell/app quand la fenêtre gagne/perd le focus
 - [x] Kitty keyboard protocol (CSI u) — réponse à la query `CSI > 0 u` (flags=0, fallback propre)
+- [x] Save/restore session layout — sauvegarde arbre de tabs/splits et CWD au quit, restauration au lancement
+- [x] File logging — écriture des logs dans un fichier pour debug
+- [x] Tab bar redesign — couleurs de tabs, refonte visuelle
+- [x] Navigation cross-tab (Cmd+Shift+Arrows entre splits de différents tabs)
+- [x] Lazy write lock dans le parser VTE — acquisition du write lock uniquement quand nécessaire, réduit la contention
 - [ ] Config keybindings (raccourcis hardcodés suffisent pour V1)
 - [x] Synchronized output (mode 2026) — bufferiser le rendu entre h/l pour éviter le tearing
 - [x] CPR (Cursor Position Report, CSI 6 n) — réponse position curseur
@@ -88,9 +96,10 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] Thèmes de couleurs (quelques built-in + custom)
 - [ ] Support ProMotion (120Hz)
 - [x] Recherche dans le scrollback (Cmd+F — filtre overlay, highlight query, click pour scroller)
+- [x] App icon dans Info.plist (`CFBundleIconFile`) — corrige l'icône surdimensionnée dans Alt-Tab
 - [ ] Clickable URLs
-- [ ] Support multi-fenêtres
-- [ ] Déplacer un split (réorganiser l'arbre de splits par drag ou raccourci)
+- [ ] Support multi-fenêtres (dont detach d'un split vers une nouvelle fenêtre)
+- [ ] Déplacer un split (réorganiser l'arbre de splits par drag ou raccourci, anchor visuelle pendant le drag)
 - [ ] Notifications visuelles (bell, activité dans un split inactif)
 - [ ] Batching du parser VT — le pty-reader prend un write lock sur `TerminalState` à chaque caractère parsé (`print`, `execute`, `csi_dispatch`…). Quand un pane en background reçoit beaucoup de données (build, logs…), ces write locks en rafale bloquent les read locks du render timer au moment du switch de tab (parking_lot donne priorité aux writers). Solution : parser dans un buffer local puis flusher en un seul write lock par read() de 4 Ko.
 - [ ] PTY cleanup non-bloquant — remplacer le `waitpid` bloquant dans `Drop for Pty` par une escalade SIGHUP → SIGTERM → SIGKILL avec timeouts (~200ms max), pour éviter un freeze UI si un process ignore SIGHUP

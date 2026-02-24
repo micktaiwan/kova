@@ -164,6 +164,7 @@ impl Renderer {
         separators: &[(f32, f32, f32, f32)],
         tab_titles: &[(String, bool, Option<usize>)],
         filter: Option<&FilterRenderData>,
+        tab_bar_left_inset: f32,
     ) {
         // Reset blink on cursor movement of focused pane
         if let Some((term, _, _, _)) = panes.iter().find(|(_, _, _, focused)| *focused) {
@@ -290,7 +291,7 @@ impl Renderer {
 
         // Draw tab bar
         if tab_titles.len() > 0 {
-            self.build_tab_bar_vertices(&mut all_vertices, viewport_w, tab_titles);
+            self.build_tab_bar_vertices(&mut all_vertices, viewport_w, tab_titles, tab_bar_left_inset);
         }
 
         // Draw filter overlay on focused pane
@@ -666,24 +667,24 @@ impl Renderer {
         vertices: &mut Vec<Vertex>,
         viewport_w: f32,
         tab_titles: &[(String, bool, Option<usize>)],
+        left_inset: f32,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
         let bar_h = (cell_h * 1.6).round();
         let tab_count = tab_titles.len();
-        let gap = 4.0_f32;
 
         // Full-width background
         Self::push_bg_quad(vertices, 0.0, 0.0, viewport_w, bar_h, self.tab_bar_bg);
 
         // Fixed width per tab, capped at cell_w * 15
         let max_tab_w = cell_w * 15.0;
-        let available_w = viewport_w - gap * (tab_count as f32 + 1.0);
+        let available_w = viewport_w - left_inset;
         let tab_width = (available_w / tab_count as f32).min(max_tab_w);
         let no_bg = [0.0, 0.0, 0.0, 0.0];
 
         for (i, (title, is_active, color_idx)) in tab_titles.iter().enumerate() {
-            let x = gap + i as f32 * (tab_width + gap);
+            let x = left_inset + i as f32 * tab_width;
 
             // Tab background color
             let tab_bg: Option<[f32; 3]> = if let Some(idx) = color_idx {
