@@ -454,6 +454,21 @@ impl TerminalState {
         }
     }
 
+    /// Clear scrollback buffer and visible screen, reset cursor to top-left.
+    pub fn clear_scrollback_and_screen(&mut self) {
+        self.dirty.store(true, Ordering::Relaxed);
+        self.scrollback.clear();
+        self.scroll_offset = 0;
+        for row in &mut self.grid {
+            for cell in row.cells.iter_mut() {
+                *cell = self.blank.clone();
+            }
+            row.wrapped = false;
+        }
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+    }
+
     pub fn erase_in_line(&mut self, mode: u16) {
         self.dirty.store(true, Ordering::Relaxed);
         let row = self.cursor_y as usize;

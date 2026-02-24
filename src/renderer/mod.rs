@@ -162,7 +162,7 @@ impl Renderer {
         layer: &CAMetalLayer,
         panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool)],
         separators: &[(f32, f32, f32, f32)],
-        tab_titles: &[(String, bool, Option<usize>)],
+        tab_titles: &[(String, bool, Option<usize>, bool)],
         filter: Option<&FilterRenderData>,
         tab_bar_left_inset: f32,
     ) {
@@ -666,24 +666,24 @@ impl Renderer {
         &mut self,
         vertices: &mut Vec<Vertex>,
         viewport_w: f32,
-        tab_titles: &[(String, bool, Option<usize>)],
+        tab_titles: &[(String, bool, Option<usize>, bool)],
         left_inset: f32,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
-        let bar_h = (cell_h * 1.6).round();
+        let bar_h = (cell_h * 2.0).round();
         let tab_count = tab_titles.len();
 
         // Full-width background
         Self::push_bg_quad(vertices, 0.0, 0.0, viewport_w, bar_h, self.tab_bar_bg);
 
         // Fixed width per tab, capped at cell_w * 15
-        let max_tab_w = cell_w * 15.0;
+        let max_tab_w = cell_w * 20.0;
         let available_w = viewport_w - left_inset;
         let tab_width = (available_w / tab_count as f32).min(max_tab_w);
         let no_bg = [0.0, 0.0, 0.0, 0.0];
 
-        for (i, (title, is_active, color_idx)) in tab_titles.iter().enumerate() {
+        for (i, (title, is_active, color_idx, is_renaming)) in tab_titles.iter().enumerate() {
             let x = left_inset + i as f32 * tab_width;
 
             // Tab background color
@@ -710,7 +710,23 @@ impl Renderer {
             }
 
             // Tab number + title: "1: title"
-            let label = format!("{}:{}", i + 1, if title.len() > 20 { &title[..20] } else { title });
+            // When renaming, show the end of the text so the cursor is visible
+            let truncated: String;
+            let max_title_chars = 25;
+            let display_title = if title.chars().count() > max_title_chars {
+                if *is_renaming {
+                    // Show last N chars to keep cursor visible
+                    let skip = title.chars().count() - max_title_chars;
+                    truncated = title.chars().skip(skip).collect();
+                    &truncated
+                } else {
+                    truncated = title.chars().take(max_title_chars).collect();
+                    &truncated
+                }
+            } else {
+                title
+            };
+            let label = format!("{}:{}", i + 1, display_title);
             // White text on colored tabs (active or not), grey on default bg
             let fg = if color_idx.is_some() || *is_active {
                 [1.0, 1.0, 1.0, 1.0]
