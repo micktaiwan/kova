@@ -17,7 +17,7 @@ pub enum CursorShape {
 pub const DEFAULT_FG: [f32; 3] = [1.0, 1.0, 1.0];
 pub const DEFAULT_BG: [f32; 3] = [0.1, 0.1, 0.12];
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridPos {
     /// Absolute line: 0 = first scrollback line, scrollback.len() = first grid line
     pub line: usize,
