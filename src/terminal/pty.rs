@@ -142,6 +142,7 @@ impl Pty {
                                 shell_ready.store(true, Ordering::Relaxed);
                             }
                             parser.advance(&mut handler, &buf[..n]);
+                            handler.release_guard();
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(e) => { log::warn!("PTY read error: {}", e); eof = true; break; }
