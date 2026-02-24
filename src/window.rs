@@ -738,6 +738,9 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config) -> Retained<NSWindo
         height: 150.0,
     });
 
+    // Persist and restore window position/size automatically via NSUserDefaults
+    window.setFrameAutosaveName(&NSString::from_str("KovaMainWindow"));
+
     let view = KovaView::new(mtm, content_rect);
     view.setup_metal(mtm, config);
     window.setContentView(Some(&view));

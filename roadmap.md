@@ -43,7 +43,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Shift+Tab (backtab) — envoie `CSI Z` au lieu du raw `0x19`
 - [x] Sélection texte + copier/coller (mouseDown/Dragged/Up, Cmd+C, highlight sélection, copie auto dans presse-papier, respect du soft-wrap)
 - [x] Resize fenêtre : reflow du texte (struct `Row` avec flag `wrapped`, reconstruction des lignes logiques, re-wrap à la nouvelle largeur)
-- [ ] Restauration position fenêtre au lancement — persister position (x, y), taille et écran (`NSScreen`) avec debounce à chaque changement, restaurer au démarrage (ex: `~/.config/kova/state.json`)
+- [x] Restauration position fenêtre au lancement — `NSWindow.setFrameAutosaveName` (persistence automatique via `NSUserDefaults`)
 
 ### Input macOS
 - [x] Option+Left/Right — déplacement mot par mot (envoie `\x1bb`/`\x1bf`)
@@ -63,7 +63,6 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Séparateurs visuels entre splits (ligne 1px semi-transparente)
 - [x] Padding horizontal des panes (10px)
 - [x] Nouveau split hérite du CWD du pane focusé (via `proc_pidinfo`)
-- [ ] Bug paste dans Claude Code — Cmd+V ne fonctionne pas quand Claude Code tourne (OK en shell normal). Pistes : vérifier que `pty.write()` gère les gros blocs sans troncature (buffer plein → écriture partielle), vérifier que le `read()` lock sur `bracketed_paste` ne bloque pas, ajouter logs temporaires pour confirmer que le texte arrive bien au PTY
 - [ ] Resize des splits (raccourcis + drag)
 - [ ] Tabs (barre minimale en haut)
 - [ ] Navigation entre tabs
