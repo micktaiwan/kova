@@ -102,6 +102,7 @@ impl Pty {
         };
 
         let child_pid = child.id();
+        log::info!("PTY spawned: pid={}, shell={}, cols={}, rows={}, cwd={}", child_pid, shell, cols, rows, start_dir);
         drop(slave_fd);
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -143,7 +144,7 @@ impl Pty {
                             parser.advance(&mut handler, &buf[..n]);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => { eof = true; break; }
+                        Err(e) => { log::warn!("PTY read error: {}", e); eof = true; break; }
                     }
                 }
                 if eof {
@@ -164,6 +165,7 @@ impl Pty {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
+        log::debug!("PTY resize: pid={}, cols={}, rows={}", self.child_pid, cols, rows);
         let winsize = Winsize {
             ws_row: rows,
             ws_col: cols,
@@ -201,6 +203,7 @@ impl Pty {
 /// Called once from `AppDelegate::will_terminate`.
 pub fn shutdown_all() {
     let entries = PTY_REGISTRY.lock().clone();
+    log::info!("Shutting down {} PTY(s)", entries.len());
     for (pid, shutdown) in &entries {
         shutdown.store(true, Ordering::Relaxed);
         unsafe {

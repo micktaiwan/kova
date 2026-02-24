@@ -69,6 +69,8 @@ pub struct Tab {
     pub tree: SplitTree,
     pub focused_pane: PaneId,
     pub custom_title: Option<String>,
+    /// Index into TAB_COLORS palette, None = default bg.
+    pub color: Option<usize>,
 }
 
 impl Tab {
@@ -81,6 +83,7 @@ impl Tab {
             tree: SplitTree::Leaf(pane),
             focused_pane: focused,
             custom_title: None,
+            color: None,
         })
     }
 
@@ -93,6 +96,7 @@ impl Tab {
             tree: SplitTree::Leaf(pane),
             focused_pane: focused,
             custom_title: None,
+            color: None,
         })
     }
 
@@ -147,8 +151,10 @@ impl Pane {
             working_dir,
         )?;
 
+        let id = alloc_pane_id();
+        log::debug!("Pane spawned: id={}, cols={}, rows={}", id, cols, rows);
         Ok(Pane {
-            id: alloc_pane_id(),
+            id,
             terminal,
             pty,
             shell_exited,
@@ -207,6 +213,16 @@ impl SplitTree {
             SplitTree::Leaf(p) => p,
             SplitTree::HSplit { left, .. } | SplitTree::VSplit { top: left, .. } => {
                 left.first_pane()
+            }
+        }
+    }
+
+    /// Return the last (rightmost/bottommost) pane.
+    pub fn last_pane(&self) -> &Pane {
+        match self {
+            SplitTree::Leaf(p) => p,
+            SplitTree::HSplit { right, .. } | SplitTree::VSplit { bottom: right, .. } => {
+                right.last_pane()
             }
         }
     }

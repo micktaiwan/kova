@@ -209,7 +209,7 @@ impl TerminalState {
 
     pub fn put_char(&mut self, c: char) {
         if c >= '\u{2500}' && c <= '\u{257F}' {
-            log::debug!("put_char box-drawing: '{}' U+{:04X} at ({}, {})", c, c as u32, self.cursor_x, self.cursor_y);
+            log::trace!("put_char box-drawing: '{}' U+{:04X} at ({}, {})", c, c as u32, self.cursor_x, self.cursor_y);
         }
         self.selection = None;
         self.cursor_moved();

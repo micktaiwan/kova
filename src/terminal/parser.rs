@@ -78,7 +78,7 @@ impl Perform for VteHandler {
             match params[0] {
                 b"0" | b"2" => {
                     let title = String::from_utf8_lossy(params[1]).into_owned();
-                    log::debug!("OSC title: {}", title);
+                    log::trace!("OSC title: {}", title);
                     let mut term = self.terminal.write();
                     term.title = Some(title);
                     term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);

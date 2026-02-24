@@ -92,6 +92,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] Support multi-fenêtres
 - [ ] Déplacer un split (réorganiser l'arbre de splits par drag ou raccourci)
 - [ ] Notifications visuelles (bell, activité dans un split inactif)
+- [ ] Batching du parser VT — le pty-reader prend un write lock sur `TerminalState` à chaque caractère parsé (`print`, `execute`, `csi_dispatch`…). Quand un pane en background reçoit beaucoup de données (build, logs…), ces write locks en rafale bloquent les read locks du render timer au moment du switch de tab (parking_lot donne priorité aux writers). Solution : parser dans un buffer local puis flusher en un seul write lock par read() de 4 Ko.
 - [ ] PTY cleanup non-bloquant — remplacer le `waitpid` bloquant dans `Drop for Pty` par une escalade SIGHUP → SIGTERM → SIGKILL avec timeouts (~200ms max), pour éviter un freeze UI si un process ignore SIGHUP
 - [ ] Font fallback (emoji, symboles) — CoreText fallback fonctionne mais block elements/box-drawing nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
 - [ ] Ligatures (optionnel)

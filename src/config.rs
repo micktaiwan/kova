@@ -82,11 +82,11 @@ impl Default for StatusBarConfig {
         StatusBarConfig {
             enabled: true,
             bg_color: [0.15, 0.15, 0.18],
-            fg_color: [0.6, 0.6, 0.65],
+            fg_color: [0.8, 0.8, 0.85],
             cwd_color: [0.6, 0.6, 0.65],
             branch_color: [0.4, 0.7, 0.5],
             scroll_color: [0.8, 0.6, 0.3],
-            time_color: [0.5, 0.5, 0.55],
+            time_color: [0.65, 0.65, 0.7],
         }
     }
 }
@@ -107,8 +107,8 @@ impl Default for Config {
 impl Default for FontConfig {
     fn default() -> Self {
         FontConfig {
-            family: "Menlo".to_string(),
-            size: 14.0,
+            family: "Hack".to_string(),
+            size: 13.0,
         }
     }
 }

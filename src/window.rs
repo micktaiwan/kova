@@ -36,6 +36,8 @@ pub struct KovaViewIvars {
     drag_separator: Cell<Option<SeparatorDrag>>,
     filter: RefCell<Option<FilterState>>,
     rename_tab: RefCell<Option<RenameTabState>>,
+    /// Tab index targeted by right-click color menu.
+    color_menu_tab: Cell<usize>,
 }
 
 struct FilterState {
@@ -391,6 +393,32 @@ define_class!(
                 }
             }
         }
+
+        #[unsafe(method(tabColorSelected:))]
+        fn tab_color_selected(&self, sender: &objc2_app_kit::NSMenuItem) {
+            let tag = sender.tag();
+            let tab_idx = self.ivars().color_menu_tab.get();
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            if let Some(tab) = tabs.get_mut(tab_idx) {
+                tab.color = if tag < 0 { None } else { Some(tag as usize) };
+            }
+            drop(tabs);
+            self.mark_dirty();
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            let (px, py) = self.event_to_pixel(event);
+            let tab_bar_h = self.tab_bar_height();
+            if py <= tab_bar_h {
+                if let Some(tab_idx) = self.tab_index_at_x(px) {
+                    self.show_tab_color_menu(event, tab_idx);
+                    return;
+                }
+            }
+            // Default behavior for right-click outside tab bar
+            unsafe { msg_send![super(self), rightMouseDown: event] }
+        }
     }
 );
 
@@ -407,6 +435,7 @@ impl KovaView {
             drag_separator: Cell::new(None),
             filter: RefCell::new(None),
             rename_tab: RefCell::new(None),
+            color_menu_tab: Cell::new(0),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -434,7 +463,7 @@ impl KovaView {
         }
     }
 
-    /// Tab bar height in pixels (1 cell height).
+    /// Tab bar height in pixels (1.6x cell height).
     fn tab_bar_height(&self) -> f32 {
         let renderer = match self.ivars().renderer.get() {
             Some(r) => r,
@@ -442,7 +471,7 @@ impl KovaView {
         };
         let r = renderer.read();
         let (_, cell_h) = r.cell_size();
-        cell_h
+        (cell_h * 1.6).round()
     }
 
     /// Hit-test separators in the active tab's tree.
@@ -489,19 +518,33 @@ impl KovaView {
         if py > tab_bar_h {
             return false;
         }
-        // Determine which tab was clicked based on x position
+        if let Some(idx) = self.tab_index_at_x(px) {
+            self.do_switch_tab(idx);
+        }
+        true
+    }
+
+    /// Returns the tab index at the given x pixel position, or None if outside tabs.
+    fn tab_index_at_x(&self, px: f32) -> Option<usize> {
         let tabs = self.ivars().tabs.borrow();
         let tab_count = tabs.len();
         if tab_count == 0 {
-            return false;
+            return None;
         }
         let full = self.drawable_viewport();
-        let tab_width = full.width / tab_count as f32;
-        let clicked_idx = (px / tab_width).floor() as usize;
-        let clicked_idx = clicked_idx.min(tab_count - 1);
-        drop(tabs);
-        self.do_switch_tab(clicked_idx);
-        true
+        let renderer = self.ivars().renderer.get()?;
+        let cell_w = renderer.read().cell_size().0;
+        let gap = 4.0_f32;
+        let max_tab_w = cell_w * 15.0;
+        let available_w = full.width - gap * (tab_count as f32 + 1.0);
+        let tab_width = (available_w / tab_count as f32).min(max_tab_w);
+        for i in 0..tab_count {
+            let x = gap + i as f32 * (tab_width + gap);
+            if px >= x && px <= x + tab_width {
+                return Some(i);
+            }
+        }
+        None
     }
 
     /// Total drawable viewport in pixels.
@@ -606,6 +649,7 @@ impl KovaView {
         let mut tabs = self.ivars().tabs.borrow_mut();
         tabs.push(tab);
         let new_idx = tabs.len() - 1;
+        log::debug!("New tab created: index={}, total={}", new_idx, tabs.len());
         drop(tabs);
         self.ivars().active_tab.set(new_idx);
         self.resize_all_panes();
@@ -617,10 +661,59 @@ impl KovaView {
         if idx >= tabs.len() || idx == self.ivars().active_tab.get() {
             return;
         }
+        log::debug!("Switch to tab {}", idx);
         drop(tabs);
         self.ivars().active_tab.set(idx);
         // Lazy resize: resize panes when switching to them
         self.resize_all_panes();
+    }
+
+    /// Show a context menu to pick a color for a tab.
+    fn show_tab_color_menu(&self, event: &NSEvent, tab_idx: usize) {
+        use objc2_app_kit::{NSMenu, NSMenuItem};
+
+        self.ivars().color_menu_tab.set(tab_idx);
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let pastilles = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣"];
+        let menu = NSMenu::new(mtm);
+        let action = objc2::sel!(tabColorSelected:);
+        let empty_ke = NSString::from_str("");
+
+        for (i, emoji) in pastilles.iter().enumerate() {
+            let title = NSString::from_str(emoji);
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &title,
+                    Some(action),
+                    &empty_ke,
+                )
+            };
+            item.setTag(i as isize);
+            unsafe { item.setTarget(Some(&*self)) };
+            menu.addItem(&item);
+        }
+
+        // Separator + "Aucune" item
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let none_title = NSString::from_str("Aucune");
+        let none_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &none_title,
+                Some(action),
+                &empty_ke,
+            )
+        };
+        none_item.setTag(-1);
+        unsafe { none_item.setTarget(Some(&*self)) };
+        menu.addItem(&none_item);
+
+        // Show menu at click location (synchronous, blocks until user picks or dismisses)
+        let location = event.locationInWindow();
+        let _ok: bool = unsafe {
+            objc2::msg_send![&menu, popUpMenuPositioningItem: std::ptr::null::<NSMenuItem>(), atLocation: location, inView: self]
+        };
     }
 
     /// Switch to relative tab (delta = -1 for prev, +1 for next).
@@ -675,6 +768,12 @@ impl KovaView {
         };
         let (cols, rows) = self.viewport_to_grid(&half_vp);
 
+        let dir_name = match direction {
+            SplitDirection::Horizontal => "horizontal",
+            SplitDirection::Vertical => "vertical",
+        };
+        log::debug!("Split pane {}: direction={}, new size={}x{}", focused_id, dir_name, cols, rows);
+
         let new_pane = match Pane::spawn(cols, rows, config, focused_cwd.as_deref()) {
             Ok(p) => p,
             Err(e) => {
@@ -709,6 +808,7 @@ impl KovaView {
 
         if is_single_pane {
             // Close the tab
+            log::debug!("Closing tab {}", idx);
             tabs.remove(idx);
             if tabs.is_empty() {
                 drop(tabs);
@@ -728,6 +828,7 @@ impl KovaView {
 
         // Multiple panes → close focused pane
         let focused_id = tabs[idx].focused_pane;
+        log::debug!("Closing pane {} in tab {}", focused_id, idx);
         let config = self.ivars().config.get().unwrap();
         let dummy = Pane::spawn(1, 1, config, None).unwrap();
         let tree = std::mem::replace(&mut tabs[idx].tree, SplitTree::Leaf(dummy));
@@ -774,6 +875,29 @@ impl KovaView {
             }
             if let Some(new) = tab.tree.pane(neighbor_id) {
                 new.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            // No neighbor in this direction → overflow to adjacent tab
+            let count = tabs.len();
+            if count <= 1 {
+                return;
+            }
+            drop(tabs);
+            let delta: i32 = match dir {
+                NavDirection::Left | NavDirection::Up => -1,
+                NavDirection::Right | NavDirection::Down => 1,
+            };
+            self.do_switch_tab_relative(delta);
+            // Focus the appropriate pane in the new tab:
+            // going right/down → first pane, going left/up → last pane
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let new_idx = self.ivars().active_tab.get();
+            if let Some(new_tab) = tabs.get_mut(new_idx) {
+                let target_id = match dir {
+                    NavDirection::Right | NavDirection::Down => new_tab.tree.first_pane().id,
+                    NavDirection::Left | NavDirection::Up => new_tab.tree.last_pane().id,
+                };
+                new_tab.focused_pane = target_id;
             }
         }
     }
@@ -997,6 +1121,7 @@ impl KovaView {
 
         // Rebuild glyph atlas if scale changed (e.g. moved to different display)
         if (scale - self.ivars().last_scale.get()).abs() > 0.01 {
+            log::debug!("Scale changed: {} -> {}", self.ivars().last_scale.get(), scale);
             self.ivars().last_scale.set(scale);
             renderer.write().rebuild_atlas(scale);
         }
@@ -1005,6 +1130,7 @@ impl KovaView {
     }
 
     pub fn setup_metal(&self, _mtm: MainThreadMarker, config: &Config) {
+        log::info!("Setting up Metal");
         let device = MTLCreateSystemDefaultDevice()
             .expect("no Metal device");
 
@@ -1076,6 +1202,7 @@ impl KovaView {
                                 continue;
                             }
                             any_removed = true;
+                            log::debug!("Reaping exited panes in tab {}: {:?}", tab_idx, exited);
                             for id in &exited {
                                 let tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(
                                     // We need a dummy — but remove_pane might return None
@@ -1136,7 +1263,7 @@ impl KovaView {
                         let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool)> = Vec::new();
                         let drawable_size = layer.drawableSize();
                         let cell_h = renderer.read().cell_size().1;
-                        let tab_bar_h = cell_h;
+                        let tab_bar_h = (cell_h * 1.6).round();
                         let panes_vp = PaneViewport {
                             x: 0.0,
                             y: tab_bar_h,
@@ -1157,7 +1284,7 @@ impl KovaView {
                         let focus_reporting = focused.map_or(false, |p| p.terminal.read().focus_reporting);
 
                         let rename = ivars.rename_tab.borrow();
-                        let tab_titles: Vec<(String, bool)> = tabs.iter().enumerate()
+                        let tab_titles: Vec<(String, bool, Option<usize>)> = tabs.iter().enumerate()
                             .map(|(i, t)| {
                                 let title = if i == active_idx {
                                     if let Some(ref rs) = *rename {
@@ -1168,7 +1295,7 @@ impl KovaView {
                                 } else {
                                     t.title()
                                 };
-                                (title, i == active_idx)
+                                (title, i == active_idx, t.color)
                             })
                             .collect();
                         drop(rename);
