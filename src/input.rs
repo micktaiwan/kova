@@ -9,7 +9,15 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool) {
     let has_alt = modifiers.contains(NSEventModifierFlags::Option);
     let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
 
+    let chars_unmod = event.charactersIgnoringModifiers();
+    let unmod_str = chars_unmod.map(|s| s.to_string()).unwrap_or_default();
+    let unmod_char = unmod_str.chars().next().unwrap_or('\0');
+
     if has_cmd {
+        // Cmd+Backspace → kill line (Ctrl+U)
+        if unmod_char == '\u{7F}' {
+            pty.write(b"\x15");
+        }
         return;
     }
 
@@ -37,9 +45,14 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool) {
         }
     }
 
-    let chars_unmod = event.charactersIgnoringModifiers();
-    let unmod_str = chars_unmod.map(|s| s.to_string()).unwrap_or_default();
-    let unmod_char = unmod_str.chars().next().unwrap_or('\0');
+    // Option+Arrow → word movement
+    if has_alt {
+        match unmod_char {
+            '\u{F702}' => { pty.write(b"\x1bb"); return; } // Option+Left → word back
+            '\u{F703}' => { pty.write(b"\x1bf"); return; } // Option+Right → word forward
+            _ => {}
+        }
+    }
 
     match unmod_char {
         '\u{F700}' => { pty.write(if cursor_keys_app { b"\x1bOA" } else { b"\x1b[A" }); return; }
