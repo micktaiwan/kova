@@ -122,6 +122,16 @@ define_class!(
                         return objc2::runtime::Bool::YES;
                     }
 
+                    // Cmd+K → clear scrollback and screen
+                    if ch == "k" && !has_shift && !has_option {
+                        if let Some(pane) = self.focused_pane() {
+                            pane.terminal.write().clear_scrollback_and_screen();
+                            // Send Ctrl+L (form feed) so the shell redraws its prompt
+                            pane.pty.write(b"\x0c");
+                        }
+                        return objc2::runtime::Bool::YES;
+                    }
+
                     // Cmd+T → new tab
                     if ch == "t" && !has_shift && !has_option {
                         self.do_new_tab();
@@ -538,7 +548,7 @@ impl KovaView {
         if v > 0.0 { v } else { 136.0 } // fallback 68pt * 2x
     }
 
-    /// Tab bar height in pixels (1.6x cell height).
+    /// Tab bar height in pixels (2.0x cell height).
     fn tab_bar_height(&self) -> f32 {
         let renderer = match self.ivars().renderer.get() {
             Some(r) => r,
@@ -546,7 +556,7 @@ impl KovaView {
         };
         let r = renderer.read();
         let (_, cell_h) = r.cell_size();
-        (cell_h * 1.6).round()
+        (cell_h * 2.0).round()
     }
 
     /// Hit-test separators in the active tab's tree.
@@ -619,7 +629,7 @@ impl KovaView {
         let left_inset = self.get_tab_bar_left_inset();
         let renderer = self.ivars().renderer.get()?;
         let cell_w = renderer.read().cell_size().0;
-        let max_tab_w = cell_w * 15.0;
+        let max_tab_w = cell_w * 20.0;
         let available_w = full.width - left_inset;
         let tab_width = (available_w / tab_count as f32).min(max_tab_w);
         for i in 0..tab_count {
@@ -1394,7 +1404,7 @@ impl KovaView {
                         let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool)> = Vec::new();
                         let drawable_size = layer.drawableSize();
                         let cell_h = renderer.read().cell_size().1;
-                        let tab_bar_h = (cell_h * 1.6).round();
+                        let tab_bar_h = (cell_h * 2.0).round();
                         let panes_vp = PaneViewport {
                             x: 0.0,
                             y: tab_bar_h,
@@ -1415,18 +1425,16 @@ impl KovaView {
                         let focus_reporting = focused.map_or(false, |p| p.terminal.read().focus_reporting);
 
                         let rename = ivars.rename_tab.borrow();
-                        let tab_titles: Vec<(String, bool, Option<usize>)> = tabs.iter().enumerate()
+                        let tab_titles: Vec<(String, bool, Option<usize>, bool)> = tabs.iter().enumerate()
                             .map(|(i, t)| {
-                                let title = if i == active_idx {
-                                    if let Some(ref rs) = *rename {
-                                        format!("{}▏", rs.input)
-                                    } else {
-                                        t.title()
-                                    }
+                                let is_renaming = i == active_idx && rename.is_some();
+                                let title = if is_renaming {
+                                    let rs = rename.as_ref().unwrap();
+                                    format!("{}▏", rs.input)
                                 } else {
                                     t.title()
                                 };
-                                (title, i == active_idx, t.color)
+                                (title, i == active_idx, t.color, is_renaming)
                             })
                             .collect();
                         drop(rename);
