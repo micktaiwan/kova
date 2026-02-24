@@ -43,6 +43,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Shift+Tab (backtab) — envoie `CSI Z` au lieu du raw `0x19`
 - [x] Sélection texte + copier/coller (mouseDown/Dragged/Up, Cmd+C, highlight sélection, copie auto dans presse-papier, respect du soft-wrap)
 - [x] Resize fenêtre : reflow du texte (struct `Row` avec flag `wrapped`, reconstruction des lignes logiques, re-wrap à la nouvelle largeur)
+- [ ] Restauration position fenêtre au lancement — persister position (x, y), taille et écran (`NSScreen`) avec debounce à chaque changement, restaurer au démarrage (ex: `~/.config/kova/state.json`)
 
 ### Input macOS
 - [x] Option+Left/Right — déplacement mot par mot (envoie `\x1bb`/`\x1bf`)
