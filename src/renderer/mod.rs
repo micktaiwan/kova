@@ -2,6 +2,8 @@ pub mod glyph_atlas;
 pub mod pipeline;
 pub mod vertex;
 
+pub const PANE_H_PADDING: f32 = 10.0;
+
 use glyph_atlas::GlyphAtlas;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -131,10 +133,12 @@ impl Renderer {
 
 
     /// Render multiple panes. Each entry: (terminal, viewport, shell_ready, is_focused).
+    /// `separators` are line segments (x1, y1, x2, y2) drawn between splits.
     pub fn render_panes(
         &mut self,
         layer: &CAMetalLayer,
         panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool)],
+        separators: &[(f32, f32, f32, f32)],
     ) {
         // Reset blink on cursor movement of focused pane
         if let Some((term, _, _, _)) = panes.iter().find(|(_, _, _, focused)| *focused) {
@@ -220,6 +224,37 @@ impl Renderer {
             } else {
                 let mut verts = self.build_loading_vertices(vp);
                 all_vertices.append(&mut verts);
+            }
+        }
+
+        // Draw split separators (1px lines)
+        if !separators.is_empty() {
+            let no_tex = [0.0_f32, 0.0];
+            let white = [1.0_f32, 1.0, 1.0, 0.0]; // unused (bg_color path)
+            let sep_bg = [1.0_f32, 1.0, 1.0, 0.15]; // light grey via bg_color
+            let thickness = 1.0_f32;
+            for &(x1, y1, x2, y2) in separators {
+                if (x1 - x2).abs() < 0.1 {
+                    // Vertical line
+                    let lx = x1 - thickness * 0.5;
+                    let rx = x1 + thickness * 0.5;
+                    all_vertices.push(Vertex { position: [lx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    all_vertices.push(Vertex { position: [rx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    all_vertices.push(Vertex { position: [lx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    all_vertices.push(Vertex { position: [rx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    all_vertices.push(Vertex { position: [rx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    all_vertices.push(Vertex { position: [lx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                } else {
+                    // Horizontal line
+                    let ty = y1 - thickness * 0.5;
+                    let by = y1 + thickness * 0.5;
+                    all_vertices.push(Vertex { position: [x1, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    all_vertices.push(Vertex { position: [x2, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    all_vertices.push(Vertex { position: [x1, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    all_vertices.push(Vertex { position: [x2, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    all_vertices.push(Vertex { position: [x2, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    all_vertices.push(Vertex { position: [x1, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                }
             }
         }
 
@@ -346,7 +381,7 @@ impl Renderer {
         let cell_h = self.atlas.cell_height;
         let atlas_w = self.atlas.atlas_width as f32;
         let atlas_h = self.atlas.atlas_height as f32;
-        let ox = vp.x;
+        let ox = vp.x + PANE_H_PADDING;
         let oy = vp.y;
 
         // Calculate y_offset: push content to bottom when screen isn't full
@@ -511,7 +546,7 @@ impl Renderer {
         let title_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 1.0];
 
         // Render CWD aligned to the left
-        let mut cursor_x = vp.x + cell_w; // 1 cell padding from left
+        let mut cursor_x = vp.x + PANE_H_PADDING + cell_w; // 1 cell padding from left
         if let Some(ref cwd) = term.cwd {
             let home = std::env::var("HOME").unwrap_or_default();
             let display_path = if !home.is_empty() && cwd.starts_with(&home) {
