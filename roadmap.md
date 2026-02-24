@@ -62,6 +62,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Séparateurs visuels entre splits (ligne 1px semi-transparente)
 - [x] Padding horizontal des panes (10px)
 - [x] Nouveau split hérite du CWD du pane focusé (via `proc_pidinfo`)
+- [ ] Bug paste dans Claude Code — Cmd+V ne fonctionne pas quand Claude Code tourne (OK en shell normal). Pistes : vérifier que `pty.write()` gère les gros blocs sans troncature (buffer plein → écriture partielle), vérifier que le `read()` lock sur `bracketed_paste` ne bloque pas, ajouter logs temporaires pour confirmer que le texte arrive bien au PTY
 - [ ] Resize des splits (raccourcis + drag)
 - [ ] Tabs (barre minimale en haut)
 - [ ] Navigation entre tabs
@@ -85,7 +86,6 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] Thèmes de couleurs (quelques built-in + custom)
 - [ ] Support ProMotion (120Hz)
 - [ ] Recherche dans le scrollback
-- [ ] Bug paste dans Claude Code — le Cmd+V ne semble pas fonctionner quand Claude Code tourne (marche en shell normal). Pistes : vérifier que `pty.write()` gère les gros blocs sans troncature (buffer plein → écriture partielle), vérifier que le `read()` lock sur `bracketed_paste` ne bloque pas, ajouter logs temporaires pour confirmer que le texte arrive bien au PTY
 - [ ] Clickable URLs
 - [ ] Support multi-fenêtres
 - [ ] Notifications visuelles (bell, activité dans un split inactif)
