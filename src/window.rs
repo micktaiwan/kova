@@ -222,7 +222,15 @@ define_class!(
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
             if let Some(pane) = self.focused_pane() {
-                let term = pane.terminal.read();
+                let mut term = pane.terminal.write();
+                // Single click (no drag) — clear selection
+                if let Some(ref sel) = term.selection {
+                    if sel.anchor == sel.end {
+                        term.selection = None;
+                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                }
                 let text = term.selected_text();
                 if !text.is_empty() {
                     let pasteboard = NSPasteboard::generalPasteboard();
