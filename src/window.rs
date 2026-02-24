@@ -12,18 +12,28 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::input;
-use crate::pane::{NavDirection, Pane, PaneId, SplitDirection, SplitTree};
+use crate::pane::{NavDirection, Pane, SplitAxis, SplitDirection, SplitTree, Tab};
 use crate::renderer::{PaneViewport, Renderer};
 use crate::terminal::{GridPos, Selection};
 
+#[derive(Clone, Copy)]
+struct SeparatorDrag {
+    is_hsplit: bool,
+    origin_pixel: f32,
+    origin_ratio: f32,
+    parent_dim: f32,
+    node_ptr: usize,
+}
+
 pub struct KovaViewIvars {
     renderer: OnceCell<Arc<parking_lot::RwLock<Renderer>>>,
-    tree: RefCell<Option<SplitTree>>,
-    focused: Cell<PaneId>,
+    tabs: RefCell<Vec<Tab>>,
+    active_tab: Cell<usize>,
     metal_layer: OnceCell<Retained<CAMetalLayer>>,
     last_scale: Cell<f64>,
     last_focused: Cell<bool>,
     config: OnceCell<Config>,
+    drag_separator: Cell<Option<SeparatorDrag>>,
 }
 
 define_class!(
@@ -55,11 +65,18 @@ define_class!(
             let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
             let has_shift = modifiers.contains(NSEventModifierFlags::Shift);
             let has_option = modifiers.contains(NSEventModifierFlags::Option);
+            let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
 
             if has_cmd {
                 let chars = event.charactersIgnoringModifiers();
                 if let Some(chars) = chars {
                     let ch = chars.to_string();
+
+                    // Cmd+T → new tab
+                    if ch == "t" && !has_shift && !has_option {
+                        self.do_new_tab();
+                        return objc2::runtime::Bool::YES;
+                    }
 
                     // Cmd+D → vsplit
                     if ch == "d" && !has_shift && !has_option {
@@ -73,14 +90,37 @@ define_class!(
                         return objc2::runtime::Bool::YES;
                     }
 
-                    // Cmd+W → close focused pane
+                    // Cmd+W → close pane or tab
                     if ch == "w" && !has_shift && !has_option {
-                        self.do_close_pane();
+                        self.do_close_pane_or_tab();
                         return objc2::runtime::Bool::YES;
                     }
 
+                    // Cmd+Shift+[ → previous tab
+                    if ch == "{" && has_shift && !has_option {
+                        self.do_switch_tab_relative(-1);
+                        return objc2::runtime::Bool::YES;
+                    }
+
+                    // Cmd+Shift+] → next tab
+                    if ch == "}" && has_shift && !has_option {
+                        self.do_switch_tab_relative(1);
+                        return objc2::runtime::Bool::YES;
+                    }
+
+                    // Cmd+1..9 → switch to tab N
+                    if !has_shift && !has_option && !has_ctrl {
+                        if let Some(digit) = ch.chars().next() {
+                            if ('1'..='9').contains(&digit) {
+                                let idx = (digit as usize) - ('1' as usize);
+                                self.do_switch_tab(idx);
+                                return objc2::runtime::Bool::YES;
+                            }
+                        }
+                    }
+
                     // Cmd+Option+arrows → navigate panes
-                    if has_option {
+                    if has_option && !has_ctrl {
                         let nav = match ch.as_str() {
                             "\u{f702}" => Some(NavDirection::Left),   // left arrow
                             "\u{f703}" => Some(NavDirection::Right),  // right arrow
@@ -90,6 +130,29 @@ define_class!(
                         };
                         if let Some(dir) = nav {
                             self.do_navigate(dir);
+                            return objc2::runtime::Bool::YES;
+                        }
+                    }
+
+                    // Cmd+Ctrl+arrows → resize splits
+                    if has_ctrl && !has_option {
+                        let resize = match ch.as_str() {
+                            "\u{f702}" => Some((SplitAxis::Horizontal, -0.05_f32)), // left
+                            "\u{f703}" => Some((SplitAxis::Horizontal, 0.05)),       // right
+                            "\u{f700}" => Some((SplitAxis::Vertical, -0.05)),        // up
+                            "\u{f701}" => Some((SplitAxis::Vertical, 0.05)),         // down
+                            _ => None,
+                        };
+                        if let Some((axis, delta)) = resize {
+                            let mut tabs = self.ivars().tabs.borrow_mut();
+                            let idx = self.ivars().active_tab.get();
+                            if let Some(tab) = tabs.get_mut(idx) {
+                                let focused_id = tab.focused_pane;
+                                if tab.tree.adjust_ratio_for_pane(focused_id, delta, axis) {
+                                    drop(tabs);
+                                    self.resize_all_panes();
+                                }
+                            }
                             return objc2::runtime::Bool::YES;
                         }
                     }
@@ -178,15 +241,39 @@ define_class!(
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
+            let (px, py) = self.event_to_pixel(event);
+
+            // Check tab bar click
+            if self.hit_test_tab_bar(px, py) {
+                return;
+            }
+
+            // Check separator hit
+            if let Some(drag) = self.hit_test_separator(px, py) {
+                self.ivars().drag_separator.set(Some(drag));
+                return;
+            }
+
             // Click sets focus to the pane under the cursor
             if let Some((pane, vp)) = self.pane_at_event(event) {
-                let old_focused = self.ivars().focused.get();
-                self.ivars().focused.set(pane.id);
+                let old_focused = {
+                    let tabs = self.ivars().tabs.borrow();
+                    let idx = self.ivars().active_tab.get();
+                    tabs.get(idx).map(|t| t.focused_pane).unwrap_or(0)
+                };
+                {
+                    let mut tabs = self.ivars().tabs.borrow_mut();
+                    let idx = self.ivars().active_tab.get();
+                    if let Some(tab) = tabs.get_mut(idx) {
+                        tab.focused_pane = pane.id;
+                    }
+                }
                 // Mark old focused pane dirty so its dim overlay updates
                 if old_focused != pane.id {
-                    let tree_ref = self.ivars().tree.borrow();
-                    if let Some(tree) = tree_ref.as_ref() {
-                        if let Some(old) = tree.pane(old_focused) {
+                    let tabs = self.ivars().tabs.borrow();
+                    let idx = self.ivars().active_tab.get();
+                    if let Some(tab) = tabs.get(idx) {
+                        if let Some(old) = tab.tree.pane(old_focused) {
                             old.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
@@ -201,11 +288,28 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
+            // Handle separator drag
+            if let Some(drag) = self.ivars().drag_separator.get() {
+                let (px, py) = self.event_to_pixel(event);
+                let current_pixel = if drag.is_hsplit { px } else { py };
+                let new_ratio = drag.origin_ratio + (current_pixel - drag.origin_pixel) / drag.parent_dim;
+                let mut tabs = self.ivars().tabs.borrow_mut();
+                let idx = self.ivars().active_tab.get();
+                if let Some(tab) = tabs.get_mut(idx) {
+                    if tab.tree.set_ratio_by_ptr(drag.node_ptr, new_ratio) {
+                        drop(tabs);
+                        self.resize_all_panes();
+                    }
+                }
+                return;
+            }
+
             // Drag continues on the focused pane (set by mouseDown)
             if let Some(pane) = self.focused_pane() {
                 let vp = {
-                    let tree_ref = self.ivars().tree.borrow();
-                    tree_ref.as_ref().and_then(|t| t.viewport_for_pane(pane.id, self.drawable_viewport()))
+                    let tabs = self.ivars().tabs.borrow();
+                    let idx = self.ivars().active_tab.get();
+                    tabs.get(idx).and_then(|t| t.tree.viewport_for_pane(pane.id, self.panes_viewport()))
                 };
                 if let Some(vp) = vp {
                     if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
@@ -221,6 +325,10 @@ define_class!(
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
+            if self.ivars().drag_separator.get().is_some() {
+                self.ivars().drag_separator.set(None);
+                return;
+            }
             if let Some(pane) = self.focused_pane() {
                 let mut term = pane.terminal.write();
                 // Single click (no drag) — clear selection
@@ -249,31 +357,108 @@ impl KovaView {
     fn new(mtm: MainThreadMarker, frame: CGRect) -> Retained<Self> {
         let this = mtm.alloc::<Self>().set_ivars(KovaViewIvars {
             renderer: OnceCell::new(),
-            tree: RefCell::new(None),
-            focused: Cell::new(0),
+            tabs: RefCell::new(Vec::new()),
+            active_tab: Cell::new(0),
             metal_layer: OnceCell::new(),
             last_scale: Cell::new(0.0),
             last_focused: Cell::new(true),
             config: OnceCell::new(),
+            drag_separator: Cell::new(None),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
     /// Return the currently focused pane (keyboard input target).
-    ///
-    /// # Safety
-    /// The returned reference borrows from the RefCell. This is safe because:
-    /// - All access is on the main thread (MainThreadOnly)
-    /// - We never hold the borrow across a mutation point
     fn focused_pane(&self) -> Option<&Pane> {
-        let tree_ref = self.ivars().tree.borrow();
-        let tree = tree_ref.as_ref()?;
-        let id = self.ivars().focused.get();
-        let pane = tree.pane(id)?;
-        // SAFETY: The SplitTree lives in RefCell inside ivars, which is pinned in the
-        // ObjC heap object. We only mutate the tree in the render timer (pane removal),
-        // never while an event handler holds this reference.
+        let tabs = self.ivars().tabs.borrow();
+        let idx = self.ivars().active_tab.get();
+        let tab = tabs.get(idx)?;
+        let pane = tab.tree.pane(tab.focused_pane)?;
+        // SAFETY: The Tab/SplitTree lives in RefCell inside ivars, pinned in ObjC heap.
+        // We only mutate in the render timer (pane removal), never while an event handler holds this ref.
         Some(unsafe { &*(pane as *const Pane) })
+    }
+
+    /// Viewport for panes (below tab bar).
+    fn panes_viewport(&self) -> PaneViewport {
+        let full = self.drawable_viewport();
+        let tab_bar_h = self.tab_bar_height();
+        PaneViewport {
+            x: full.x,
+            y: full.y + tab_bar_h,
+            width: full.width,
+            height: full.height - tab_bar_h,
+        }
+    }
+
+    /// Tab bar height in pixels (1 cell height).
+    fn tab_bar_height(&self) -> f32 {
+        let renderer = match self.ivars().renderer.get() {
+            Some(r) => r,
+            None => return 0.0,
+        };
+        let r = renderer.read();
+        let (_, cell_h) = r.cell_size();
+        cell_h
+    }
+
+    /// Hit-test separators in the active tab's tree.
+    fn hit_test_separator(&self, px: f32, py: f32) -> Option<SeparatorDrag> {
+        let tabs = self.ivars().tabs.borrow();
+        let idx = self.ivars().active_tab.get();
+        let tab = tabs.get(idx)?;
+        let vp = self.panes_viewport();
+        let mut seps = Vec::new();
+        tab.tree.collect_separator_info(vp, &mut seps);
+
+        let scale = self.window().map_or(2.0, |w| w.backingScaleFactor()) as f32;
+        let tolerance = 4.0 * scale;
+
+        for sep in &seps {
+            if sep.is_hsplit {
+                if (px - sep.pos).abs() < tolerance && py >= sep.cross_start && py <= sep.cross_end {
+                    return Some(SeparatorDrag {
+                        is_hsplit: true,
+                        origin_pixel: px,
+                        origin_ratio: sep.origin_ratio,
+                        parent_dim: sep.parent_dim,
+                        node_ptr: sep.node_ptr,
+                    });
+                }
+            } else {
+                if (py - sep.pos).abs() < tolerance && px >= sep.cross_start && px <= sep.cross_end {
+                    return Some(SeparatorDrag {
+                        is_hsplit: false,
+                        origin_pixel: py,
+                        origin_ratio: sep.origin_ratio,
+                        parent_dim: sep.parent_dim,
+                        node_ptr: sep.node_ptr,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Hit-test the tab bar. Returns true if click was in the tab bar (and handled).
+    fn hit_test_tab_bar(&self, px: f32, py: f32) -> bool {
+        let tab_bar_h = self.tab_bar_height();
+        if py > tab_bar_h {
+            return false;
+        }
+        // Determine which tab was clicked based on x position
+        let tabs = self.ivars().tabs.borrow();
+        let tab_count = tabs.len();
+        if tab_count == 0 {
+            return false;
+        }
+        let full = self.drawable_viewport();
+        let tab_width = full.width / tab_count as f32;
+        let clicked_idx = (px / tab_width).floor() as usize;
+        let clicked_idx = clicked_idx.min(tab_count - 1);
+        drop(tabs);
+        self.do_switch_tab(clicked_idx);
+        true
     }
 
     /// Total drawable viewport in pixels.
@@ -299,13 +484,13 @@ impl KovaView {
         (pixel_x, pixel_y)
     }
 
-    /// Hit-test: find which pane is under the mouse event.
+    /// Hit-test: find which pane is under the mouse event (in active tab).
     fn pane_at_event(&self, event: &NSEvent) -> Option<(&Pane, PaneViewport)> {
-        let tree_ref = self.ivars().tree.borrow();
-        let tree = tree_ref.as_ref()?;
+        let tabs = self.ivars().tabs.borrow();
+        let idx = self.ivars().active_tab.get();
+        let tab = tabs.get(idx)?;
         let (px, py) = self.event_to_pixel(event);
-        let (pane, vp) = tree.hit_test(px, py, self.drawable_viewport())?;
-        // SAFETY: same reasoning as focused_pane — single-threaded, no mutation during event handling
+        let (pane, vp) = tab.tree.hit_test(px, py, self.panes_viewport())?;
         Some((unsafe { &*(pane as *const Pane) }, vp))
     }
 
@@ -318,7 +503,6 @@ impl KovaView {
         let (cell_w, cell_h) = renderer_r.cell_size();
         drop(renderer_r);
 
-        // Coordinates relative to the pane's viewport
         let rel_x = pixel_x - vp.x;
         let rel_y = pixel_y - vp.y;
 
@@ -358,6 +542,57 @@ impl KovaView {
         (cols, rows)
     }
 
+    /// Create a new tab (Cmd+T).
+    fn do_new_tab(&self) {
+        let config = match self.ivars().config.get() {
+            Some(c) => c,
+            None => return,
+        };
+
+        // Get CWD from currently focused pane
+        let cwd = self.focused_pane().and_then(|p| p.cwd());
+
+        let tab = match Tab::new_with_cwd(config, cwd.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("failed to create tab: {}", e);
+                return;
+            }
+        };
+
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        tabs.push(tab);
+        let new_idx = tabs.len() - 1;
+        drop(tabs);
+        self.ivars().active_tab.set(new_idx);
+        self.resize_all_panes();
+    }
+
+    /// Switch to tab at index.
+    fn do_switch_tab(&self, idx: usize) {
+        let tabs = self.ivars().tabs.borrow();
+        if idx >= tabs.len() || idx == self.ivars().active_tab.get() {
+            return;
+        }
+        drop(tabs);
+        self.ivars().active_tab.set(idx);
+        // Lazy resize: resize panes when switching to them
+        self.resize_all_panes();
+    }
+
+    /// Switch to relative tab (delta = -1 for prev, +1 for next).
+    fn do_switch_tab_relative(&self, delta: i32) {
+        let tabs = self.ivars().tabs.borrow();
+        let count = tabs.len();
+        if count <= 1 {
+            return;
+        }
+        drop(tabs);
+        let current = self.ivars().active_tab.get() as i32;
+        let new_idx = ((current + delta) % count as i32 + count as i32) as usize % count;
+        self.do_switch_tab(new_idx);
+    }
+
     /// Split the focused pane in the given direction.
     fn do_split(&self, direction: SplitDirection) {
         let config = match self.ivars().config.get() {
@@ -365,24 +600,22 @@ impl KovaView {
             None => return,
         };
 
-        let focused_id = self.ivars().focused.get();
-
-        // Compute the viewport the focused pane currently has + grab its cwd
-        let (current_vp, focused_cwd) = {
-            let tree_ref = self.ivars().tree.borrow();
-            let tree = match tree_ref.as_ref() {
+        let (focused_id, current_vp, focused_cwd) = {
+            let tabs = self.ivars().tabs.borrow();
+            let idx = self.ivars().active_tab.get();
+            let tab = match tabs.get(idx) {
                 Some(t) => t,
                 None => return,
             };
-            let vp = match tree.viewport_for_pane(focused_id, self.drawable_viewport()) {
+            let fid = tab.focused_pane;
+            let vp = match tab.tree.viewport_for_pane(fid, self.panes_viewport()) {
                 Some(vp) => vp,
                 None => return,
             };
-            let cwd = tree.pane(focused_id).and_then(|p| p.cwd());
-            (vp, cwd)
+            let cwd = tab.tree.pane(fid).and_then(|p| p.cwd());
+            (fid, vp, cwd)
         };
 
-        // Compute cols/rows for the new (half-size) pane
         let half_vp = match direction {
             SplitDirection::Horizontal => PaneViewport {
                 x: current_vp.x,
@@ -408,61 +641,98 @@ impl KovaView {
         };
         let new_id = new_pane.id;
 
-        // Perform the split: take tree, transform, put back
-        let mut tree_opt = self.ivars().tree.borrow_mut();
-        if let Some(tree) = tree_opt.take() {
-            *tree_opt = Some(tree.with_split(focused_id, new_pane, direction));
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        if let Some(tab) = tabs.get_mut(idx) {
+            let tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(Pane::spawn(1, 1, config, None).unwrap()));
+            tab.tree = tree.with_split(focused_id, new_pane, direction);
+            tab.focused_pane = new_id;
         }
-        drop(tree_opt);
+        drop(tabs);
 
-        // Focus the new pane
-        self.ivars().focused.set(new_id);
-
-        // Resize all panes to match their new viewports
         self.resize_all_panes();
     }
 
-    /// Close the focused pane.
-    fn do_close_pane(&self) {
-        let focused_id = self.ivars().focused.get();
-        let tree_opt = self.ivars().tree.borrow();
-        // Don't close the last pane — use Cmd+Q to quit
-        if let Some(tree) = tree_opt.as_ref() {
-            if matches!(tree, SplitTree::Leaf(_)) {
+    /// Close focused pane. If it's the last pane in the tab, close the tab.
+    fn do_close_pane_or_tab(&self) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        if idx >= tabs.len() {
+            return;
+        }
+
+        let is_single_pane = matches!(tabs[idx].tree, SplitTree::Leaf(_));
+
+        if is_single_pane {
+            // Close the tab
+            tabs.remove(idx);
+            if tabs.is_empty() {
+                drop(tabs);
+                unsafe {
+                    let mtm = MainThreadMarker::new_unchecked();
+                    let app = NSApplication::sharedApplication(mtm);
+                    app.terminate(None);
+                }
                 return;
             }
-        }
-        drop(tree_opt);
-        let mut tree_opt = self.ivars().tree.borrow_mut();
-        if let Some(tree) = tree_opt.take() {
-            *tree_opt = tree.remove_pane(focused_id);
-        }
-        if let Some(tree) = tree_opt.as_ref() {
-            self.ivars().focused.set(tree.first_pane().id);
-            drop(tree_opt);
+            let new_idx = if idx >= tabs.len() { tabs.len() - 1 } else { idx };
+            drop(tabs);
+            self.ivars().active_tab.set(new_idx);
             self.resize_all_panes();
+            return;
         }
+
+        // Multiple panes → close focused pane
+        let focused_id = tabs[idx].focused_pane;
+        let config = self.ivars().config.get().unwrap();
+        let dummy = Pane::spawn(1, 1, config, None).unwrap();
+        let tree = std::mem::replace(&mut tabs[idx].tree, SplitTree::Leaf(dummy));
+        match tree.remove_pane(focused_id) {
+            Some(new_tree) => {
+                tabs[idx].focused_pane = new_tree.first_pane().id;
+                tabs[idx].tree = new_tree;
+            }
+            None => {
+                // Tab became empty (shouldn't happen given check above)
+                tabs.remove(idx);
+                if tabs.is_empty() {
+                    drop(tabs);
+                    unsafe {
+                        let mtm = MainThreadMarker::new_unchecked();
+                        let app = NSApplication::sharedApplication(mtm);
+                        app.terminate(None);
+                    }
+                    return;
+                }
+                let new_idx = if idx >= tabs.len() { tabs.len() - 1 } else { idx };
+                self.ivars().active_tab.set(new_idx);
+            }
+        }
+        drop(tabs);
+        self.resize_all_panes();
     }
 
     /// Navigate focus to an adjacent pane.
     fn do_navigate(&self, dir: NavDirection) {
-        let focused_id = self.ivars().focused.get();
-        let tree_ref = self.ivars().tree.borrow();
-        if let Some(tree) = tree_ref.as_ref() {
-            if let Some(neighbor_id) = tree.neighbor(focused_id, dir, self.drawable_viewport()) {
-                self.ivars().focused.set(neighbor_id);
-                // Mark both old and new pane dirty so dim overlay updates instantly
-                if let Some(old) = tree.pane(focused_id) {
-                    old.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                if let Some(new) = tree.pane(neighbor_id) {
-                    new.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        let tab = match tabs.get_mut(idx) {
+            Some(t) => t,
+            None => return,
+        };
+        let focused_id = tab.focused_pane;
+        if let Some(neighbor_id) = tab.tree.neighbor(focused_id, dir, self.panes_viewport()) {
+            tab.focused_pane = neighbor_id;
+            if let Some(old) = tab.tree.pane(focused_id) {
+                old.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(new) = tab.tree.pane(neighbor_id) {
+                new.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
 
-    /// Resize all panes to match their current viewports.
+    /// Resize all panes in the active tab to match their current viewports.
     fn resize_all_panes(&self) {
         let renderer = match self.ivars().renderer.get() {
             Some(r) => r,
@@ -473,10 +743,11 @@ impl KovaView {
         let status_bar = renderer_r.status_bar_enabled();
         drop(renderer_r);
 
-        let drawable_vp = self.drawable_viewport();
-        let tree_ref = self.ivars().tree.borrow();
-        if let Some(tree) = tree_ref.as_ref() {
-            tree.for_each_pane_with_viewport(drawable_vp, &mut |pane, vp| {
+        let panes_vp = self.panes_viewport();
+        let tabs = self.ivars().tabs.borrow();
+        let idx = self.ivars().active_tab.get();
+        if let Some(tab) = tabs.get(idx) {
+            tab.tree.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
                 let cols = ((vp.width - 2.0 * crate::renderer::PANE_H_PADDING) / cell_w).floor().max(1.0) as u16;
                 let usable_h = if status_bar { vp.height - cell_h } else { vp.height };
                 let rows = (usable_h / cell_h).floor().max(1.0) as u16;
@@ -538,18 +809,17 @@ impl KovaView {
 
         self.ivars().last_scale.set(scale);
 
-        let cols = config.terminal.columns;
-        let rows = config.terminal.rows;
-        let pane = Pane::spawn(cols, rows, config, None).expect("failed to spawn pane");
-        let pane_id = pane.id;
+        let tab = Tab::new(config).expect("failed to create initial tab");
+        let terminal_for_renderer = tab.tree.first_pane().terminal.clone();
+
         let renderer = Arc::new(parking_lot::RwLock::new(
-            Renderer::new(&device, &layer, pane.terminal.clone(), scale, config),
+            Renderer::new(&device, &layer, terminal_for_renderer, scale, config),
         ));
 
         self.ivars().renderer.set(renderer).ok();
         self.ivars().config.set(config.clone()).ok();
-        *self.ivars().tree.borrow_mut() = Some(SplitTree::Leaf(pane));
-        self.ivars().focused.set(pane_id);
+        *self.ivars().tabs.borrow_mut() = vec![tab];
+        self.ivars().active_tab.set(0);
 
         self.start_render_timer(config.terminal.fps);
     }
@@ -573,57 +843,84 @@ impl KovaView {
                 &RcBlock::new(move |_timer: NonNull<NSTimer>| {
                     let ivars = &*ivars;
 
-                    // --- Reap exited panes ---
-                    let exited_ids = {
-                        let tree_ref = ivars.tree.borrow();
-                        match tree_ref.as_ref() {
-                            Some(tree) => tree.exited_pane_ids(),
-                            None => return,
-                        }
-                    };
-                    if !exited_ids.is_empty() {
-                        let mut tree_opt = ivars.tree.borrow_mut();
-                        for id in &exited_ids {
-                            if let Some(tree) = tree_opt.take() {
-                                *tree_opt = tree.remove_pane(*id);
+                    // --- Reap exited panes across ALL tabs ---
+                    let mut any_removed = false;
+                    let mut tabs_to_remove: Vec<usize> = Vec::new();
+                    {
+                        let mut tabs = ivars.tabs.borrow_mut();
+                        for (tab_idx, tab) in tabs.iter_mut().enumerate() {
+                            let exited = tab.tree.exited_pane_ids();
+                            if exited.is_empty() {
+                                continue;
+                            }
+                            any_removed = true;
+                            for id in &exited {
+                                let tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(
+                                    // We need a dummy — but remove_pane might return None
+                                    // So we take the tree and put back the result
+                                    Pane::spawn(1, 1, ivars.config.get().unwrap(), None).unwrap()
+                                ));
+                                match tree.remove_pane(*id) {
+                                    Some(new_tree) => {
+                                        tab.tree = new_tree;
+                                    }
+                                    None => {
+                                        // Tab is now empty
+                                        tabs_to_remove.push(tab_idx);
+                                        break;
+                                    }
+                                }
+                            }
+                            // Fix focused pane if it was removed
+                            if exited.contains(&tab.focused_pane) {
+                                if !tabs_to_remove.contains(&tab_idx) {
+                                    tab.focused_pane = tab.tree.first_pane().id;
+                                }
                             }
                         }
-                        // If focused pane was removed, move focus to first remaining pane
-                        let focused_id = ivars.focused.get();
-                        if exited_ids.contains(&focused_id) {
-                            if let Some(ref tree) = *tree_opt {
-                                ivars.focused.set(tree.first_pane().id);
-                            }
+                        // Remove empty tabs (in reverse to preserve indices)
+                        for &idx in tabs_to_remove.iter().rev() {
+                            tabs.remove(idx);
                         }
-                        drop(tree_opt);
                     }
 
-                    // If no panes left, terminate
-                    {
-                        let tree_ref = ivars.tree.borrow();
-                        if tree_ref.is_none() {
+                    // Adjust active_tab if needed
+                    if any_removed {
+                        let tabs = ivars.tabs.borrow();
+                        if tabs.is_empty() {
+                            drop(tabs);
                             let mtm = MainThreadMarker::new_unchecked();
                             let app = NSApplication::sharedApplication(mtm);
                             app.terminate(None);
                             return;
                         }
+                        let active = ivars.active_tab.get();
+                        if active >= tabs.len() {
+                            ivars.active_tab.set(tabs.len() - 1);
+                        }
                     }
 
-                    // Build pane render list for multi-pane rendering
-                    let focused_id = ivars.focused.get();
-                    let (pane_data, pty_ptr, focus_reporting) = {
-                        let tree_ref = ivars.tree.borrow();
-                        let tree = tree_ref.as_ref().unwrap();
+                    // Build pane render list from active tab only
+                    let active_idx = ivars.active_tab.get();
+                    let (pane_data, pty_ptr, focus_reporting, tab_titles) = {
+                        let tabs = ivars.tabs.borrow();
+                        if tabs.is_empty() {
+                            return;
+                        }
+                        let tab = &tabs[active_idx];
+                        let focused_id = tab.focused_pane;
 
-                        // Collect pane render data
                         let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool)> = Vec::new();
-                        let drawable_vp = PaneViewport {
+                        let drawable_size = layer.drawableSize();
+                        let cell_h = renderer.read().cell_size().1;
+                        let tab_bar_h = cell_h;
+                        let panes_vp = PaneViewport {
                             x: 0.0,
-                            y: 0.0,
-                            width: layer.drawableSize().width as f32,
-                            height: layer.drawableSize().height as f32,
+                            y: tab_bar_h,
+                            width: drawable_size.width as f32,
+                            height: drawable_size.height as f32 - tab_bar_h,
                         };
-                        tree.for_each_pane_with_viewport(drawable_vp, &mut |pane, vp| {
+                        tab.tree.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
                             pane_data.push((
                                 pane.terminal.clone(),
                                 vp,
@@ -632,12 +929,14 @@ impl KovaView {
                             ));
                         });
 
-                        // Get focused pane PTY for focus reporting
-                        let focused = tree.pane(focused_id);
+                        let focused = tab.tree.pane(focused_id);
                         let pty_ptr = focused.map(|p| &p.pty as *const crate::terminal::pty::Pty);
                         let focus_reporting = focused.map_or(false, |p| p.terminal.read().focus_reporting);
 
-                        (pane_data, pty_ptr, focus_reporting)
+                        let tab_titles: Vec<(String, bool)> = tabs.iter().enumerate()
+                            .map(|(i, t)| (t.title(), i == active_idx))
+                            .collect();
+                        (pane_data, pty_ptr, focus_reporting, tab_titles)
                     };
 
                     // Focus reporting (DEC mode 1004) — send to focused pane only
@@ -679,25 +978,27 @@ impl KovaView {
                         }
                     }
 
-                    // Collect split separators
+                    // Collect split separators from active tab
                     let separators = {
-                        let tree_ref = ivars.tree.borrow();
-                        if let Some(tree) = tree_ref.as_ref() {
-                            let drawable_vp = PaneViewport {
+                        let tabs = ivars.tabs.borrow();
+                        if let Some(tab) = tabs.get(active_idx) {
+                            let cell_h = renderer.read().cell_size().1;
+                            let drawable_size = layer.drawableSize();
+                            let panes_vp = PaneViewport {
                                 x: 0.0,
-                                y: 0.0,
-                                width: layer.drawableSize().width as f32,
-                                height: layer.drawableSize().height as f32,
+                                y: cell_h,
+                                width: drawable_size.width as f32,
+                                height: drawable_size.height as f32 - cell_h,
                             };
                             let mut seps = Vec::new();
-                            tree.collect_separators(drawable_vp, &mut seps);
+                            tab.tree.collect_separators(panes_vp, &mut seps);
                             seps
                         } else {
                             Vec::new()
                         }
                     };
 
-                    renderer.write().render_panes(&layer, &pane_data, &separators);
+                    renderer.write().render_panes(&layer, &pane_data, &separators, &tab_titles);
                 }),
             )
         };

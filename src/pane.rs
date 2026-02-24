@@ -17,6 +17,31 @@ pub enum SplitDirection {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SplitAxis {
+    Horizontal, // resize left/right
+    Vertical,   // resize up/down
+}
+
+/// Info about a separator line, used for mouse hit-testing and dragging.
+#[derive(Clone, Copy)]
+pub struct SeparatorInfo {
+    /// Pixel position of the separator line (x for hsplit, y for vsplit).
+    pub pos: f32,
+    /// Start of the separator extent on the cross-axis.
+    pub cross_start: f32,
+    /// End of the separator extent on the cross-axis.
+    pub cross_end: f32,
+    /// Whether this is an HSplit separator (vertical line).
+    pub is_hsplit: bool,
+    /// Current ratio of the parent node.
+    pub origin_ratio: f32,
+    /// Parent dimension along the split axis (width for hsplit, height for vsplit).
+    pub parent_dim: f32,
+    /// Pointer address of the split node, used as a stable identifier.
+    pub node_ptr: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum NavDirection {
     Left,
     Right,
@@ -24,10 +49,66 @@ pub enum NavDirection {
     Down,
 }
 
+pub type TabId = u32;
+
 static NEXT_PANE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+static NEXT_TAB_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 fn alloc_pane_id() -> PaneId {
     NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn alloc_tab_id() -> TabId {
+    NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A tab: owns a split tree and tracks which pane is focused within it.
+#[allow(dead_code)]
+pub struct Tab {
+    pub id: TabId,
+    pub tree: SplitTree,
+    pub focused_pane: PaneId,
+}
+
+impl Tab {
+    /// Create a new tab with a single pane.
+    pub fn new(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let pane = Pane::spawn(config.terminal.columns, config.terminal.rows, config, None)?;
+        let focused = pane.id;
+        Ok(Tab {
+            id: alloc_tab_id(),
+            tree: SplitTree::Leaf(pane),
+            focused_pane: focused,
+        })
+    }
+
+    /// Create a new tab inheriting the CWD from another pane.
+    pub fn new_with_cwd(config: &Config, cwd: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
+        let pane = Pane::spawn(config.terminal.columns, config.terminal.rows, config, cwd)?;
+        let focused = pane.id;
+        Ok(Tab {
+            id: alloc_tab_id(),
+            tree: SplitTree::Leaf(pane),
+            focused_pane: focused,
+        })
+    }
+
+    /// Title for this tab: OSC title of focused pane, or CWD basename, or "shell".
+    pub fn title(&self) -> String {
+        if let Some(pane) = self.tree.pane(self.focused_pane) {
+            let term = pane.terminal.read();
+            if let Some(ref title) = term.title {
+                return title.clone();
+            }
+            drop(term);
+            if let Some(cwd) = pane.cwd() {
+                if let Some(base) = std::path::Path::new(&cwd).file_name() {
+                    return base.to_string_lossy().to_string();
+                }
+            }
+        }
+        "shell".to_string()
+    }
 }
 
 /// A single terminal pane: owns its PTY, terminal state, and per-pane flags.
@@ -298,6 +379,120 @@ impl SplitTree {
     /// Check if this tree contains a pane with the given id.
     pub fn contains(&self, id: PaneId) -> bool {
         self.pane(id).is_some()
+    }
+
+    /// Move the nearest separator in the arrow direction.
+    /// `delta > 0` (Right/Down): separator moves right/down (ratio increases).
+    /// `delta < 0` (Left/Up): separator moves left/up (ratio decreases).
+    /// Finds the nearest ancestor of the matching axis and applies delta to its ratio.
+    pub fn adjust_ratio_for_pane(&mut self, id: PaneId, delta: f32, axis: SplitAxis) -> bool {
+        match self {
+            SplitTree::Leaf(_) => false,
+            SplitTree::HSplit { left, right, ratio } if axis == SplitAxis::Horizontal => {
+                if left.contains(id) {
+                    if left.adjust_ratio_for_pane(id, delta, axis) {
+                        return true;
+                    }
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    true
+                } else if right.contains(id) {
+                    if right.adjust_ratio_for_pane(id, delta, axis) {
+                        return true;
+                    }
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    true
+                } else {
+                    false
+                }
+            }
+            SplitTree::VSplit { top, bottom, ratio } if axis == SplitAxis::Vertical => {
+                if top.contains(id) {
+                    if top.adjust_ratio_for_pane(id, delta, axis) {
+                        return true;
+                    }
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    true
+                } else if bottom.contains(id) {
+                    if bottom.adjust_ratio_for_pane(id, delta, axis) {
+                        return true;
+                    }
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    true
+                } else {
+                    false
+                }
+            }
+            // Wrong axis — recurse through children
+            SplitTree::HSplit { left, right, .. } | SplitTree::VSplit { top: left, bottom: right, .. } => {
+                left.adjust_ratio_for_pane(id, delta, axis)
+                    || right.adjust_ratio_for_pane(id, delta, axis)
+            }
+        }
+    }
+
+    /// Collect separator info for mouse hit-testing and dragging.
+    pub fn collect_separator_info(&self, vp: PaneViewport, out: &mut Vec<SeparatorInfo>) {
+        match self {
+            SplitTree::Leaf(_) => {}
+            SplitTree::HSplit { left, right, ratio } => {
+                let split_x = vp.x + vp.width * ratio;
+                out.push(SeparatorInfo {
+                    pos: split_x,
+                    cross_start: vp.y,
+                    cross_end: vp.y + vp.height,
+                    is_hsplit: true,
+                    origin_ratio: *ratio,
+                    parent_dim: vp.width,
+                    node_ptr: self as *const SplitTree as usize,
+                });
+                let left_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width * ratio, height: vp.height };
+                let right_vp = PaneViewport { x: split_x, y: vp.y, width: vp.width * (1.0 - ratio), height: vp.height };
+                left.collect_separator_info(left_vp, out);
+                right.collect_separator_info(right_vp, out);
+            }
+            SplitTree::VSplit { top, bottom, ratio } => {
+                let split_y = vp.y + vp.height * ratio;
+                out.push(SeparatorInfo {
+                    pos: split_y,
+                    cross_start: vp.x,
+                    cross_end: vp.x + vp.width,
+                    is_hsplit: false,
+                    origin_ratio: *ratio,
+                    parent_dim: vp.height,
+                    node_ptr: self as *const SplitTree as usize,
+                });
+                let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: vp.height * ratio };
+                let bot_vp = PaneViewport { x: vp.x, y: split_y, width: vp.width, height: vp.height * (1.0 - ratio) };
+                top.collect_separator_info(top_vp, out);
+                bottom.collect_separator_info(bot_vp, out);
+            }
+        }
+    }
+
+    /// Set the ratio of a split node identified by its pointer address.
+    pub fn set_ratio_by_ptr(&mut self, ptr: usize, new_ratio: f32) -> bool {
+        let self_ptr = self as *const SplitTree as usize;
+        match self {
+            SplitTree::Leaf(_) => false,
+            SplitTree::HSplit { left, right, ratio } => {
+                if self_ptr == ptr {
+                    *ratio = new_ratio.clamp(0.1, 0.9);
+                    true
+                } else {
+                    left.set_ratio_by_ptr(ptr, new_ratio)
+                        || right.set_ratio_by_ptr(ptr, new_ratio)
+                }
+            }
+            SplitTree::VSplit { top, bottom, ratio } => {
+                if self_ptr == ptr {
+                    *ratio = new_ratio.clamp(0.1, 0.9);
+                    true
+                } else {
+                    top.set_ratio_by_ptr(ptr, new_ratio)
+                        || bottom.set_ratio_by_ptr(ptr, new_ratio)
+                }
+            }
+        }
     }
 
     /// Hit-test: find which pane contains the pixel coordinate (x, y)

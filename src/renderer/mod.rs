@@ -56,6 +56,9 @@ pub struct Renderer {
     status_bar_time_color: [f32; 3],
     last_minute: u32,
     selection_color: [f32; 3],
+    tab_bar_bg: [f32; 3],
+    tab_bar_fg: [f32; 3],
+    tab_bar_active_bg: [f32; 3],
 }
 
 impl Renderer {
@@ -128,6 +131,9 @@ impl Renderer {
             status_bar_time_color: config.status_bar.time_color,
             last_minute: u32::MAX,
             selection_color: [0.45, 0.42, 0.20],
+            tab_bar_bg: config.tab_bar.bg_color,
+            tab_bar_fg: config.tab_bar.fg_color,
+            tab_bar_active_bg: config.tab_bar.active_bg,
         }
     }
 
@@ -139,6 +145,7 @@ impl Renderer {
         layer: &CAMetalLayer,
         panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool)],
         separators: &[(f32, f32, f32, f32)],
+        tab_titles: &[(String, bool)],
     ) {
         // Reset blink on cursor movement of focused pane
         if let Some((term, _, _, _)) = panes.iter().find(|(_, _, _, focused)| *focused) {
@@ -256,6 +263,11 @@ impl Renderer {
                     all_vertices.push(Vertex { position: [x1, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
                 }
             }
+        }
+
+        // Draw tab bar
+        if tab_titles.len() > 0 {
+            self.build_tab_bar_vertices(&mut all_vertices, viewport_w, tab_titles);
         }
 
         // Update viewport buffer if changed
@@ -612,6 +624,47 @@ impl Renderer {
             right_x += cell_w * 2.0; // gap
         }
         self.render_status_text(vertices, &time_str, right_x, bar_y, right_edge, time_fg, no_bg);
+    }
+
+    fn build_tab_bar_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        viewport_w: f32,
+        tab_titles: &[(String, bool)],
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+        let tab_count = tab_titles.len();
+
+        // Full-width background
+        Self::push_bg_quad(vertices, 0.0, 0.0, viewport_w, cell_h, self.tab_bar_bg);
+
+        // Each tab gets equal width
+        let tab_width = viewport_w / tab_count as f32;
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+
+        for (i, (title, is_active)) in tab_titles.iter().enumerate() {
+            let x = i as f32 * tab_width;
+
+            // Active tab highlight
+            if *is_active {
+                Self::push_bg_quad(vertices, x, 0.0, tab_width, cell_h, self.tab_bar_active_bg);
+            }
+
+            // Tab number + title: "1: title"
+            let label = format!("{}:{}", i + 1, if title.len() > 20 { &title[..20] } else { title });
+            let fg = if *is_active {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 1.0]
+            };
+
+            // Center text in the tab
+            let text_w = label.chars().count() as f32 * cell_w;
+            let text_x = x + (tab_width - text_w) / 2.0;
+            let max_x = x + tab_width - cell_w;
+            self.render_status_text(vertices, &label, text_x.max(x + cell_w * 0.5), 0.0, max_x, fg, no_bg);
+        }
     }
 
     /// Render a string in the status bar at the given x position.

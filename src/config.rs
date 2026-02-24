@@ -9,6 +9,7 @@ pub struct Config {
     pub window: WindowConfig,
     pub terminal: TerminalConfig,
     pub status_bar: StatusBarConfig,
+    pub tab_bar: TabBarConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +59,24 @@ pub struct StatusBarConfig {
     pub time_color: [f32; 3],
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TabBarConfig {
+    pub bg_color: [f32; 3],
+    pub fg_color: [f32; 3],
+    pub active_bg: [f32; 3],
+}
+
+impl Default for TabBarConfig {
+    fn default() -> Self {
+        TabBarConfig {
+            bg_color: [0.12, 0.12, 0.14],
+            fg_color: [0.5, 0.5, 0.55],
+            active_bg: [0.22, 0.22, 0.26],
+        }
+    }
+}
+
 impl Default for StatusBarConfig {
     fn default() -> Self {
         StatusBarConfig {
@@ -80,6 +99,7 @@ impl Default for Config {
             window: WindowConfig::default(),
             terminal: TerminalConfig::default(),
             status_bar: StatusBarConfig::default(),
+            tab_bar: TabBarConfig::default(),
         }
     }
 }
