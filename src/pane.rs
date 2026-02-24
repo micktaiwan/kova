@@ -41,7 +41,7 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn spawn(cols: u16, rows: u16, config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn spawn(cols: u16, rows: u16, config: &Config, working_dir: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
         let terminal = Arc::new(RwLock::new(TerminalState::new(
             cols,
             rows,
@@ -57,6 +57,7 @@ impl Pane {
             terminal.clone(),
             shell_exited.clone(),
             shell_ready.clone(),
+            working_dir,
         )?;
 
         Ok(Pane {
@@ -67,6 +68,10 @@ impl Pane {
             shell_ready,
             scroll_accumulator: Cell::new(0.0),
         })
+    }
+
+    pub fn cwd(&self) -> Option<String> {
+        self.pty.cwd()
     }
 
     pub fn is_alive(&self) -> bool {
@@ -227,6 +232,29 @@ impl SplitTree {
                 let bot_vp = PaneViewport { x: vp.x, y: vp.y + top_h, width: vp.width, height: vp.height - top_h };
                 top.for_each_pane_with_viewport(top_vp, f);
                 bottom.for_each_pane_with_viewport(bot_vp, f);
+            }
+        }
+    }
+
+    /// Collect separator lines between splits as (x1, y1, x2, y2) segments.
+    pub fn collect_separators(&self, vp: PaneViewport, out: &mut Vec<(f32, f32, f32, f32)>) {
+        match self {
+            SplitTree::Leaf(_) => {}
+            SplitTree::HSplit { left, right, ratio } => {
+                let split_x = vp.x + vp.width * ratio;
+                out.push((split_x, vp.y, split_x, vp.y + vp.height));
+                let left_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width * ratio, height: vp.height };
+                let right_vp = PaneViewport { x: split_x, y: vp.y, width: vp.width * (1.0 - ratio), height: vp.height };
+                left.collect_separators(left_vp, out);
+                right.collect_separators(right_vp, out);
+            }
+            SplitTree::VSplit { top, bottom, ratio } => {
+                let split_y = vp.y + vp.height * ratio;
+                out.push((vp.x, split_y, vp.x + vp.width, split_y));
+                let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: vp.height * ratio };
+                let bot_vp = PaneViewport { x: vp.x, y: split_y, width: vp.width, height: vp.height * (1.0 - ratio) };
+                top.collect_separators(top_vp, out);
+                bottom.collect_separators(bot_vp, out);
             }
         }
     }

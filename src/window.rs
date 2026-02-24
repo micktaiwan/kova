@@ -155,7 +155,10 @@ define_class!(
             if let Some((pane, _vp)) = self.pane_at_event(event) {
                 let dy = event.scrollingDeltaY();
                 let lines = if event.hasPreciseScrollingDeltas() {
-                    let acc = pane.scroll_accumulator.get() + dy;
+                    let sensitivity = self.ivars().config.get()
+                        .map(|c| c.terminal.scroll_sensitivity)
+                        .unwrap_or(3.0);
+                    let acc = pane.scroll_accumulator.get() + dy / sensitivity;
                     let discrete = acc as i32;
                     pane.scroll_accumulator.set(acc - discrete as f64);
                     discrete
@@ -337,7 +340,7 @@ impl KovaView {
         let status_bar = renderer_r.status_bar_enabled();
         drop(renderer_r);
 
-        let cols = (vp.width / cell_w).floor().max(1.0) as u16;
+        let cols = ((vp.width - 2.0 * crate::renderer::PANE_H_PADDING) / cell_w).floor().max(1.0) as u16;
         let usable_h = if status_bar {
             vp.height - cell_h
         } else {
@@ -356,17 +359,19 @@ impl KovaView {
 
         let focused_id = self.ivars().focused.get();
 
-        // Compute the viewport the focused pane currently has
-        let current_vp = {
+        // Compute the viewport the focused pane currently has + grab its cwd
+        let (current_vp, focused_cwd) = {
             let tree_ref = self.ivars().tree.borrow();
             let tree = match tree_ref.as_ref() {
                 Some(t) => t,
                 None => return,
             };
-            match tree.viewport_for_pane(focused_id, self.drawable_viewport()) {
+            let vp = match tree.viewport_for_pane(focused_id, self.drawable_viewport()) {
                 Some(vp) => vp,
                 None => return,
-            }
+            };
+            let cwd = tree.pane(focused_id).and_then(|p| p.cwd());
+            (vp, cwd)
         };
 
         // Compute cols/rows for the new (half-size) pane
@@ -386,7 +391,7 @@ impl KovaView {
         };
         let (cols, rows) = self.viewport_to_grid(&half_vp);
 
-        let new_pane = match Pane::spawn(cols, rows, config) {
+        let new_pane = match Pane::spawn(cols, rows, config, focused_cwd.as_deref()) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("failed to spawn pane for split: {}", e);
@@ -464,7 +469,7 @@ impl KovaView {
         let tree_ref = self.ivars().tree.borrow();
         if let Some(tree) = tree_ref.as_ref() {
             tree.for_each_pane_with_viewport(drawable_vp, &mut |pane, vp| {
-                let cols = (vp.width / cell_w).floor().max(1.0) as u16;
+                let cols = ((vp.width - 2.0 * crate::renderer::PANE_H_PADDING) / cell_w).floor().max(1.0) as u16;
                 let usable_h = if status_bar { vp.height - cell_h } else { vp.height };
                 let rows = (usable_h / cell_h).floor().max(1.0) as u16;
                 let mut term = pane.terminal.write();
@@ -527,7 +532,7 @@ impl KovaView {
 
         let cols = config.terminal.columns;
         let rows = config.terminal.rows;
-        let pane = Pane::spawn(cols, rows, config).expect("failed to spawn pane");
+        let pane = Pane::spawn(cols, rows, config, None).expect("failed to spawn pane");
         let pane_id = pane.id;
         let renderer = Arc::new(parking_lot::RwLock::new(
             Renderer::new(&device, &layer, pane.terminal.clone(), scale, config),
@@ -666,7 +671,25 @@ impl KovaView {
                         }
                     }
 
-                    renderer.write().render_panes(&layer, &pane_data);
+                    // Collect split separators
+                    let separators = {
+                        let tree_ref = ivars.tree.borrow();
+                        if let Some(tree) = tree_ref.as_ref() {
+                            let drawable_vp = PaneViewport {
+                                x: 0.0,
+                                y: 0.0,
+                                width: layer.drawableSize().width as f32,
+                                height: layer.drawableSize().height as f32,
+                            };
+                            let mut seps = Vec::new();
+                            tree.collect_separators(drawable_vp, &mut seps);
+                            seps
+                        } else {
+                            Vec::new()
+                        }
+                    };
+
+                    renderer.write().render_panes(&layer, &pane_data, &separators);
                 }),
             )
         };
