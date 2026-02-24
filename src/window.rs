@@ -35,11 +35,16 @@ pub struct KovaViewIvars {
     config: OnceCell<Config>,
     drag_separator: Cell<Option<SeparatorDrag>>,
     filter: RefCell<Option<FilterState>>,
+    rename_tab: RefCell<Option<RenameTabState>>,
 }
 
 struct FilterState {
     query: String,
     matches: Vec<FilterMatch>,
+}
+
+struct RenameTabState {
+    input: String,
 }
 
 define_class!(
@@ -59,6 +64,12 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            // If rename tab is active, route keys to rename
+            if self.ivars().rename_tab.borrow().is_some() {
+                self.handle_rename_tab_key(event);
+                return;
+            }
+
             // If filter is active, route keys to filter
             if self.ivars().filter.borrow().is_some() {
                 self.handle_filter_key(event);
@@ -123,6 +134,12 @@ define_class!(
                     // Cmd+Shift+] → next tab
                     if ch == "}" && has_shift && !has_option {
                         self.do_switch_tab_relative(1);
+                        return objc2::runtime::Bool::YES;
+                    }
+
+                    // Cmd+Shift+R → rename tab
+                    if ch == "R" && has_shift && !has_option {
+                        self.start_rename_tab();
                         return objc2::runtime::Bool::YES;
                     }
 
@@ -389,6 +406,7 @@ impl KovaView {
             config: OnceCell::new(),
             drag_separator: Cell::new(None),
             filter: RefCell::new(None),
+            rename_tab: RefCell::new(None),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -671,6 +689,7 @@ impl KovaView {
         if let Some(tab) = tabs.get_mut(idx) {
             let tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(Pane::spawn(1, 1, config, None).unwrap()));
             tab.tree = tree.with_split(focused_id, new_pane, direction);
+            tab.tree.equalize();
             tab.focused_pane = new_id;
         }
         drop(tabs);
@@ -715,6 +734,8 @@ impl KovaView {
         match tree.remove_pane(focused_id) {
             Some(new_tree) => {
                 tabs[idx].focused_pane = new_tree.first_pane().id;
+                let mut new_tree = new_tree;
+                new_tree.equalize();
                 tabs[idx].tree = new_tree;
             }
             None => {
@@ -786,6 +807,12 @@ impl KovaView {
         }
     }
 
+    fn mark_dirty(&self) {
+        if let Some(pane) = self.focused_pane() {
+            pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn toggle_filter(&self) {
         let mut filter = self.ivars().filter.borrow_mut();
         if filter.is_some() {
@@ -853,6 +880,69 @@ impl KovaView {
             state.matches = term.search_lines(&state.query);
             term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    fn start_rename_tab(&self) {
+        // Pre-fill with current tab title
+        let current_title = {
+            let tabs = self.ivars().tabs.borrow();
+            let idx = self.ivars().active_tab.get();
+            tabs.get(idx).map(|t| t.title()).unwrap_or_default()
+        };
+        *self.ivars().rename_tab.borrow_mut() = Some(RenameTabState {
+            input: current_title,
+        });
+        self.mark_dirty();
+    }
+
+    fn handle_rename_tab_key(&self, event: &NSEvent) {
+        let chars = event.charactersIgnoringModifiers();
+        let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
+        let ch = ch_str.chars().next().unwrap_or('\0');
+
+        let mut rename = self.ivars().rename_tab.borrow_mut();
+        let state = match rename.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        match ch {
+            '\u{1B}' => {
+                // Escape → cancel rename
+                *rename = None;
+                drop(rename);
+                self.mark_dirty();
+                return;
+            }
+            '\r' => {
+                // Enter → apply rename (empty = reset to auto)
+                let new_title = if state.input.trim().is_empty() {
+                    None
+                } else {
+                    Some(state.input.clone())
+                };
+                *rename = None;
+                drop(rename);
+                let mut tabs = self.ivars().tabs.borrow_mut();
+                let idx = self.ivars().active_tab.get();
+                if let Some(tab) = tabs.get_mut(idx) {
+                    tab.custom_title = new_title;
+                }
+                drop(tabs);
+                self.mark_dirty();
+                return;
+            }
+            '\u{7F}' | '\u{08}' => {
+                // Backspace
+                state.input.pop();
+            }
+            c if c >= ' ' && !c.is_control() => {
+                state.input.push(c);
+            }
+            _ => return,
+        }
+        drop(rename);
+        self.mark_dirty();
     }
 
     fn handle_filter_click(&self, _px: f32, py: f32) {
@@ -993,7 +1083,8 @@ impl KovaView {
                                     Pane::spawn(1, 1, ivars.config.get().unwrap(), None).unwrap()
                                 ));
                                 match tree.remove_pane(*id) {
-                                    Some(new_tree) => {
+                                    Some(mut new_tree) => {
+                                        new_tree.equalize();
                                         tab.tree = new_tree;
                                     }
                                     None => {
@@ -1065,9 +1156,22 @@ impl KovaView {
                         let pty_ptr = focused.map(|p| &p.pty as *const crate::terminal::pty::Pty);
                         let focus_reporting = focused.map_or(false, |p| p.terminal.read().focus_reporting);
 
+                        let rename = ivars.rename_tab.borrow();
                         let tab_titles: Vec<(String, bool)> = tabs.iter().enumerate()
-                            .map(|(i, t)| (t.title(), i == active_idx))
+                            .map(|(i, t)| {
+                                let title = if i == active_idx {
+                                    if let Some(ref rs) = *rename {
+                                        format!("{}▏", rs.input)
+                                    } else {
+                                        t.title()
+                                    }
+                                } else {
+                                    t.title()
+                                };
+                                (title, i == active_idx)
+                            })
                             .collect();
+                        drop(rename);
                         (pane_data, pty_ptr, focus_reporting, tab_titles)
                     };
 

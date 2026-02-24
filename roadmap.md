@@ -64,8 +64,10 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Padding horizontal des panes (10px)
 - [x] Nouveau split hérite du CWD du pane focusé (via `proc_pidinfo`)
 - [x] Resize des splits (Cmd+Ctrl+arrows + drag souris sur séparateurs, clamp 0.1–0.9)
+- [x] Égalisation automatique des splits — après ajout/suppression d'un pane, tous les panes d'un même axe sont redistribués à taille égale (1/N chacun)
 - [x] Tabs (barre minimale en haut, Cmd+T nouveau tab, Cmd+W ferme pane/tab, rendu Metal, tab bar cliquable)
 - [x] Navigation entre tabs (Cmd+Shift+[/], Cmd+1..9)
+- [x] Renommage de tab (Cmd+Shift+R, nom custom prioritaire, vider pour revenir au nom auto)
 - [x] Fermeture split — `exit`/Cmd+W retire le pane de l'arbre, reporte le focus, `app.terminate` seulement quand plus aucun pane
 
 ## V2 — Polished

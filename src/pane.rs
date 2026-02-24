@@ -68,6 +68,7 @@ pub struct Tab {
     pub id: TabId,
     pub tree: SplitTree,
     pub focused_pane: PaneId,
+    pub custom_title: Option<String>,
 }
 
 impl Tab {
@@ -79,6 +80,7 @@ impl Tab {
             id: alloc_tab_id(),
             tree: SplitTree::Leaf(pane),
             focused_pane: focused,
+            custom_title: None,
         })
     }
 
@@ -90,11 +92,15 @@ impl Tab {
             id: alloc_tab_id(),
             tree: SplitTree::Leaf(pane),
             focused_pane: focused,
+            custom_title: None,
         })
     }
 
-    /// Title for this tab: OSC title of focused pane, or CWD basename, or "shell".
+    /// Title for this tab: custom title if set, then OSC title of focused pane, or CWD basename, or "shell".
     pub fn title(&self) -> String {
+        if let Some(ref custom) = self.custom_title {
+            return custom.clone();
+        }
         if let Some(pane) = self.tree.pane(self.focused_pane) {
             let term = pane.terminal.read();
             if let Some(ref title) = term.title {
@@ -291,6 +297,43 @@ impl SplitTree {
                 } else {
                     SplitTree::VSplit { top, bottom: Box::new(bottom.with_split(id, new_pane, direction)), ratio }
                 }
+            }
+        }
+    }
+
+    /// Count leaves in a chain of same-direction splits.
+    /// A split node of a different direction counts as a single unit.
+    fn chain_leaf_count(&self, horizontal: bool) -> usize {
+        match self {
+            SplitTree::Leaf(_) => 1,
+            SplitTree::HSplit { left, right, .. } if horizontal => {
+                left.chain_leaf_count(true) + right.chain_leaf_count(true)
+            }
+            SplitTree::VSplit { top, bottom, .. } if !horizontal => {
+                top.chain_leaf_count(false) + bottom.chain_leaf_count(false)
+            }
+            _ => 1,
+        }
+    }
+
+    /// Equalize ratios so that all panes along a same-direction chain get equal space.
+    /// For example, HSplit(A, HSplit(B, C)) gets ratios 1/3 and 1/2, giving each pane 1/3.
+    pub fn equalize(&mut self) {
+        match self {
+            SplitTree::Leaf(_) => {}
+            SplitTree::HSplit { left, right, ratio } => {
+                left.equalize();
+                right.equalize();
+                let left_count = left.chain_leaf_count(true);
+                let total = left_count + right.chain_leaf_count(true);
+                *ratio = left_count as f32 / total as f32;
+            }
+            SplitTree::VSplit { top, bottom, ratio } => {
+                top.equalize();
+                bottom.equalize();
+                let top_count = top.chain_leaf_count(false);
+                let total = top_count + bottom.chain_leaf_count(false);
+                *ratio = top_count as f32 / total as f32;
             }
         }
     }
