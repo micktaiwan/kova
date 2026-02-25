@@ -46,6 +46,10 @@ ln -sf ~/.cargo/target/release/kova /Applications/Kova.app/Contents/MacOS/kova
 
 - `notes/pty-spawn.md` — pourquoi `Command + pre_exec` plutôt que `posix_spawn` ou `fork` brut pour le controlling terminal
 
+## Pièges récurrents
+
+- **Bytes vs chars** — Les cellules du terminal sont indexées par colonne (1 Cell = 1 char), mais les `String` Rust sont indexées par byte. Ne JAMAIS faire `&text[i..i+n]` sur du texte issu des cellules (contient des emoji, box-drawing, etc.). Toujours travailler avec `Vec<char>` ou itérateurs de chars quand on manipule des positions de colonnes.
+
 ## Principes
 
 - Mac-only, pas de cross-platform

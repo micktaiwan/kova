@@ -214,7 +214,6 @@ impl TerminalState {
         if c >= '\u{2500}' && c <= '\u{257F}' {
             log::trace!("put_char box-drawing: '{}' U+{:04X} at ({}, {})", c, c as u32, self.cursor_x, self.cursor_y);
         }
-        self.selection = None;
         self.cursor_moved();
         self.scroll_offset = 0; // Auto-scroll on new output
 
@@ -263,7 +262,6 @@ impl TerminalState {
     }
 
     pub fn newline(&mut self) {
-        self.selection = None;
         self.advance_line();
     }
 
@@ -983,6 +981,64 @@ impl TerminalState {
             self.scroll_offset = offset.clamp(0, sb_len as i32);
         }
         self.cursor_moved();
+    }
+
+    /// Find a URL at the given visible row and column.
+    /// Returns (col_start, col_end_exclusive, url_string) if found.
+    /// Works on char indices (1 cell = 1 char = 1 column).
+    pub fn url_at(&self, visible_row: usize, col: u16) -> Option<(u16, u16, String)> {
+        let display = self.visible_lines();
+        let cells = display.get(visible_row)?;
+        let col = col as usize;
+        if col >= cells.len() {
+            return None;
+        }
+
+        // Build a Vec<char> from cells for easy scanning
+        let chars: Vec<char> = cells.iter().map(|c| c.c).collect();
+        let len = chars.len();
+
+        let mut i = 0;
+        while i < len {
+            // Check for "https://" (8 chars) or "http://" (7 chars)
+            let prefix_len = if i + 8 <= len && chars[i..i + 8] == ['h', 't', 't', 'p', 's', ':', '/', '/'] {
+                8
+            } else if i + 7 <= len && chars[i..i + 7] == ['h', 't', 't', 'p', ':', '/', '/'] {
+                7
+            } else {
+                i += 1;
+                continue;
+            };
+
+            let start = i;
+            let mut end = start + prefix_len;
+
+            // Extend to end of URL (stop at whitespace, common delimiters, or null/space)
+            while end < len {
+                let ch = chars[end];
+                if ch <= ' ' || ch == '"' || ch == '\'' || ch == '<' || ch == '>' || ch == '`' || ch == '\0' {
+                    break;
+                }
+                end += 1;
+            }
+            // Strip trailing punctuation
+            while end > start {
+                let ch = chars[end - 1];
+                if ch == '.' || ch == ',' || ch == ';' || ch == ':' || ch == ')' || ch == ']' {
+                    end -= 1;
+                } else {
+                    break;
+                }
+            }
+
+            if col >= start && col < end && end > start {
+                let url: String = chars[start..end].iter().collect();
+                return Some((start as u16, end as u16, url));
+            }
+
+            i = if end > start { end } else { start + 1 };
+        }
+        None
     }
 
     /// Number of empty rows at top when screen isn't full (for pixel→grid conversion)

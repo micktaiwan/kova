@@ -76,6 +76,10 @@ pub struct Renderer {
     tab_bar_bg: [f32; 3],
     tab_bar_fg: [f32; 3],
     tab_bar_active_bg: [f32; 3],
+    /// Hovered URL: (focused_pane_id, visible_row, col_start, col_end)
+    pub hovered_url: Option<(usize, u16, u16)>,
+    /// Hovered URL text (for status bar display)
+    pub hovered_url_text: Option<String>,
 }
 
 impl Renderer {
@@ -151,6 +155,8 @@ impl Renderer {
             tab_bar_bg: config.tab_bar.bg_color,
             tab_bar_fg: config.tab_bar.fg_color,
             tab_bar_active_bg: config.tab_bar.active_bg,
+            hovered_url: None,
+            hovered_url_text: None,
         }
     }
 
@@ -522,6 +528,16 @@ impl Renderer {
             }
         }
 
+        // Draw URL underline for hovered URL
+        if let Some((hover_row, col_start, col_end)) = self.hovered_url {
+            let uy = oy + y_offset + hover_row as f32 * cell_h + cell_h - 1.0;
+            let ux = ox + col_start as f32 * cell_w;
+            let uw = (col_end - col_start) as f32 * cell_w;
+            // Use a subtle blue underline color
+            let url_color = [0.4, 0.6, 1.0];
+            Self::push_bg_quad(&mut vertices, ux, uy, uw, 1.0, url_color);
+        }
+
         // Draw cursor (adjusted for scroll offset and y_offset)
         if term.cursor_visible && blink_on {
             let offset = term.scroll_offset();
@@ -617,15 +633,20 @@ impl Renderer {
         };
         self.render_status_text(vertices, &branch_display, cursor_x, bar_y, vp.x + vp.width * 0.6, actual_branch_fg, no_bg);
 
-        // Render title centered
-        if let Some(ref title) = term.title {
-            let char_count = title.chars().count();
+        // Render hovered URL or title centered
+        let center_text: Option<(String, [f32; 4])> = if let Some(ref url) = self.hovered_url_text {
+            Some((url.clone(), [0.4, 0.6, 1.0, 1.0]))
+        } else {
+            term.title.as_ref().map(|t| (t.clone(), title_fg))
+        };
+        if let Some((text, fg)) = center_text {
+            let char_count = text.chars().count();
             let text_w = char_count as f32 * cell_w;
             let center_x = vp.x + (vp.width - text_w) / 2.0;
             let min_x = vp.x + vp.width * 0.3;
             let max_x = vp.x + vp.width * 0.7;
             let start_x = center_x.max(min_x);
-            self.render_status_text(vertices, title, start_x, bar_y, max_x, title_fg, no_bg);
+            self.render_status_text(vertices, &text, start_x, bar_y, max_x, fg, no_bg);
         }
 
         // Right side: scroll indicator + time
