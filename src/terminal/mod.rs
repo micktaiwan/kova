@@ -71,6 +71,7 @@ pub struct TerminalState {
     pub cursor_x: u16,
     pub cursor_y: u16,
     scroll_offset: i32,
+    user_scrolled: bool,
     // Config colors used as defaults
     pub default_fg: [f32; 3],
     pub default_bg: [f32; 3],
@@ -145,6 +146,7 @@ impl TerminalState {
             cursor_x: 0,
             cursor_y: 0,
             scroll_offset: 0,
+            user_scrolled: false,
             default_fg: fg,
             default_bg: bg,
             blank,
@@ -207,6 +209,7 @@ impl TerminalState {
         }
         let max_offset = self.scrollback.len() as i32;
         self.scroll_offset = (self.scroll_offset + lines).clamp(0, max_offset);
+        self.user_scrolled = self.scroll_offset > 0;
         self.cursor_moved();
     }
 
@@ -215,7 +218,9 @@ impl TerminalState {
             log::trace!("put_char box-drawing: '{}' U+{:04X} at ({}, {})", c, c as u32, self.cursor_x, self.cursor_y);
         }
         self.cursor_moved();
-        self.scroll_offset = 0; // Auto-scroll on new output
+        if !self.user_scrolled {
+            self.reset_scroll();
+        }
 
         if self.cursor_x >= self.cols {
             if !self.auto_wrap {
@@ -459,7 +464,7 @@ impl TerminalState {
     pub fn clear_scrollback_and_screen(&mut self) {
         self.dirty.store(true, Ordering::Relaxed);
         self.scrollback.clear();
-        self.scroll_offset = 0;
+        self.reset_scroll();
         for row in &mut self.grid {
             for cell in row.cells.iter_mut() {
                 *cell = self.blank.clone();
@@ -628,7 +633,7 @@ impl TerminalState {
         self.alt_grid = Some(alt_grid);
         self.cursor_x = 0;
         self.cursor_y = 0;
-        self.scroll_offset = 0;
+        self.reset_scroll();
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -644,7 +649,7 @@ impl TerminalState {
             self.cursor_x = x;
             self.cursor_y = y;
         }
-        self.scroll_offset = 0;
+        self.reset_scroll();
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -655,6 +660,11 @@ impl TerminalState {
 
     pub fn scroll_offset(&self) -> i32 {
         self.scroll_offset
+    }
+
+    pub fn reset_scroll(&mut self) {
+        self.scroll_offset = 0;
+        self.user_scrolled = false;
     }
 
     pub fn resize(&mut self, new_cols: u16, new_rows: u16) {
@@ -685,7 +695,7 @@ impl TerminalState {
             self.cursor_y = self.cursor_y.min(new_rows.saturating_sub(1));
             self.scroll_top = 0;
             self.scroll_bottom = new_rows.saturating_sub(1);
-            self.scroll_offset = 0;
+            self.reset_scroll();
             self.dirty.store(true, Ordering::Relaxed);
             return;
         }
@@ -790,7 +800,7 @@ impl TerminalState {
         // Reset scroll region
         self.scroll_top = 0;
         self.scroll_bottom = new_rows.saturating_sub(1);
-        self.scroll_offset = 0;
+        self.reset_scroll();
 
         // Resize alt grid (no reflow)
         if let Some(ref mut alt_grid) = self.alt_grid {
@@ -973,7 +983,7 @@ impl TerminalState {
         let sb_len = self.scrollback.len();
         if abs_line >= sb_len {
             // Line is in the grid — scroll to bottom
-            self.scroll_offset = 0;
+            self.reset_scroll();
         } else {
             // Center the line in the viewport
             let half_screen = self.rows as i32 / 2;
