@@ -1,7 +1,7 @@
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSBackingStoreType, NSEvent, NSEventModifierFlags, NSPasteboard, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
+use objc2_app_kit::{NSApplication, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags, NSPasteboard, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
 use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -49,6 +49,10 @@ pub struct KovaViewIvars {
     /// Tab index targeted by right-click color menu.
     color_menu_tab: Cell<usize>,
     drag_tab: Cell<Option<DragTabState>>,
+    /// URL currently hovered (visible_row, col_start, col_end, url) — set by mouseMoved when Cmd held
+    hovered_url: RefCell<Option<(usize, u16, u16, String)>>,
+    /// Whether Cmd key is currently held (for URL hover detection)
+    cmd_held: Cell<bool>,
 }
 
 struct FilterState {
@@ -284,7 +288,19 @@ define_class!(
         }
 
         #[unsafe(method(flagsChanged:))]
-        fn flags_changed(&self, _event: &NSEvent) {}
+        fn flags_changed(&self, event: &NSEvent) {
+            let modifiers = event.modifierFlags();
+            let cmd = modifiers.contains(NSEventModifierFlags::Command);
+            self.ivars().cmd_held.set(cmd);
+            if !cmd {
+                let had_hover = self.ivars().hovered_url.borrow().is_some();
+                if had_hover {
+                    *self.ivars().hovered_url.borrow_mut() = None;
+                    NSCursor::arrowCursor().set();
+                    self.mark_dirty();
+                }
+            }
+        }
 
         #[unsafe(method(setFrameSize:))]
         fn set_frame_size(&self, new_size: CGSize) {
@@ -343,6 +359,15 @@ define_class!(
             if let Some(drag) = self.hit_test_separator(px, py) {
                 self.ivars().drag_separator.set(Some(drag));
                 return;
+            }
+
+            // Cmd+Click opens URL
+            let modifiers = event.modifierFlags();
+            if modifiers.contains(NSEventModifierFlags::Command) {
+                if let Some(url) = self.ivars().hovered_url.borrow().as_ref().map(|h| h.3.clone()) {
+                    let _ = std::process::Command::new("open").arg(&url).spawn();
+                    return;
+                }
             }
 
             // Click sets focus to the pane under the cursor
@@ -497,6 +522,35 @@ define_class!(
             // Default behavior for right-click outside tab bar
             unsafe { msg_send![super(self), rightMouseDown: event] }
         }
+
+        #[unsafe(method(mouseMoved:))]
+        fn mouse_moved(&self, event: &NSEvent) {
+            self.update_hovered_url(event);
+        }
+
+        #[unsafe(method(updateTrackingAreas))]
+        fn update_tracking_areas(&self) {
+            // Remove old tracking areas
+            let old_areas: Vec<_> = self.trackingAreas().to_vec();
+            for area in &old_areas {
+                self.removeTrackingArea(area);
+            }
+            // Add new one covering entire view
+            let options = NSTrackingAreaOptions::MouseMoved
+                | NSTrackingAreaOptions::ActiveInKeyWindow
+                | NSTrackingAreaOptions::InVisibleRect;
+            let area = unsafe {
+                let alloc: objc2::rc::Allocated<NSTrackingArea> = msg_send![objc2::class!(NSTrackingArea), alloc];
+                NSTrackingArea::initWithRect_options_owner_userInfo(
+                    alloc,
+                    self.bounds(),
+                    options,
+                    Some(self.as_ref()),
+                    None,
+                )
+            };
+            self.addTrackingArea(&area);
+        }
     }
 );
 
@@ -516,6 +570,8 @@ impl KovaView {
             tab_bar_left_inset: Cell::new(0.0),
             color_menu_tab: Cell::new(0),
             drag_tab: Cell::new(None),
+            hovered_url: RefCell::new(None),
+            cmd_held: Cell::new(false),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -529,6 +585,88 @@ impl KovaView {
         // SAFETY: The Tab/SplitTree lives in RefCell inside ivars, pinned in ObjC heap.
         // We only mutate in the render timer (pane removal), never while an event handler holds this ref.
         Some(unsafe { &*(pane as *const Pane) })
+    }
+
+    /// Convert pixel coords to (visible_row, col) within a pane viewport.
+    fn pixel_to_visible_row_col(&self, px: f32, py: f32, pane: &Pane, vp: &PaneViewport) -> Option<(usize, u16)> {
+        let renderer = self.ivars().renderer.get()?;
+        let renderer_r = renderer.read();
+        let (cell_w, cell_h) = renderer_r.cell_size();
+        drop(renderer_r);
+
+        let rel_x = px - vp.x - crate::renderer::PANE_H_PADDING;
+        let rel_y = py - vp.y;
+
+        let term = pane.terminal.read();
+        let y_offset = term.y_offset_rows();
+        let col = (rel_x / cell_w).floor() as i32;
+        let visible_row = (rel_y / cell_h).floor() as i32 - y_offset as i32;
+
+        if visible_row < 0 || col < 0 || visible_row >= term.rows as i32 {
+            return None;
+        }
+        Some((visible_row as usize, (col as u16).min(term.cols.saturating_sub(1))))
+    }
+
+    /// Update hovered URL state based on mouse position.
+    fn update_hovered_url(&self, event: &NSEvent) {
+        let modifiers = event.modifierFlags();
+        let cmd = modifiers.contains(NSEventModifierFlags::Command);
+        self.ivars().cmd_held.set(cmd);
+
+        if !cmd {
+            let had_hover = self.ivars().hovered_url.borrow().is_some();
+            if had_hover {
+                *self.ivars().hovered_url.borrow_mut() = None;
+                NSCursor::arrowCursor().set();
+                self.mark_dirty();
+            }
+            return;
+        }
+
+        let (px, py) = self.event_to_pixel(event);
+        let tabs = self.ivars().tabs.borrow();
+        let idx = self.ivars().active_tab.get();
+        let tab = match tabs.get(idx) {
+            Some(t) => t,
+            None => return,
+        };
+        let panes_vp = self.panes_viewport();
+        let hit = tab.tree.hit_test(px, py, panes_vp);
+        let (pane, vp) = match hit {
+            Some((p, v)) => (unsafe { &*(p as *const Pane) }, v),
+            None => {
+                let had_hover = self.ivars().hovered_url.borrow().is_some();
+                if had_hover {
+                    *self.ivars().hovered_url.borrow_mut() = None;
+                    NSCursor::arrowCursor().set();
+                    self.mark_dirty();
+                }
+                return;
+            }
+        };
+        drop(tabs);
+
+        if let Some((visible_row, col)) = self.pixel_to_visible_row_col(px, py, pane, &vp) {
+            let term = pane.terminal.read();
+            if let Some((start, end, url)) = term.url_at(visible_row, col) {
+                let old = self.ivars().hovered_url.borrow().clone();
+                let changed = old.as_ref().map_or(true, |o| o.0 != visible_row || o.1 != start || o.2 != end);
+                if changed {
+                    *self.ivars().hovered_url.borrow_mut() = Some((visible_row, start, end, url));
+                    NSCursor::pointingHandCursor().set();
+                    self.mark_dirty();
+                }
+                return;
+            }
+        }
+
+        let had_hover = self.ivars().hovered_url.borrow().is_some();
+        if had_hover {
+            *self.ivars().hovered_url.borrow_mut() = None;
+            NSCursor::arrowCursor().set();
+            self.mark_dirty();
+        }
     }
 
     /// Viewport for panes (below tab bar).
@@ -683,7 +821,7 @@ impl KovaView {
         let (cell_w, cell_h) = renderer_r.cell_size();
         drop(renderer_r);
 
-        let rel_x = pixel_x - vp.x;
+        let rel_x = pixel_x - vp.x - crate::renderer::PANE_H_PADDING;
         let rel_y = pixel_y - vp.y;
 
         let term = pane.terminal.read();
@@ -1543,7 +1681,17 @@ impl KovaView {
                         ivars.tab_bar_left_inset.set(inset);
                         inset
                     };
-                    renderer.write().render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset);
+                    let (hover_pos, hover_text) = {
+                        let h = ivars.hovered_url.borrow();
+                        (
+                            h.as_ref().map(|(row, start, end, _)| (*row, *start, *end)),
+                            h.as_ref().map(|(_, _, _, url)| url.clone()),
+                        )
+                    };
+                    let mut r = renderer.write();
+                    r.hovered_url = hover_pos;
+                    r.hovered_url_text = hover_text;
+                    r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset);
                 }),
             )
         };
@@ -1594,6 +1742,7 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config) -> Retained<NSWindo
     view.setup_metal(mtm, config);
     window.setContentView(Some(&view));
     window.makeFirstResponder(Some(&view));
+    window.setAcceptsMouseMovedEvents(true);
 
     window
 }
