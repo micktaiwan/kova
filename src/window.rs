@@ -10,7 +10,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::config::Config;
+use crate::config::{Config, TerminalConfig};
 use crate::input;
 use crate::pane::{NavDirection, Pane, SplitAxis, SplitDirection, SplitTree, Tab};
 use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
@@ -305,7 +305,7 @@ define_class!(
                 let lines = if event.hasPreciseScrollingDeltas() {
                     let sensitivity = self.ivars().config.get()
                         .map(|c| c.terminal.scroll_sensitivity)
-                        .unwrap_or(3.0);
+                        .unwrap_or(TerminalConfig::default().scroll_sensitivity);
                     let acc = pane.scroll_accumulator.get() + dy / sensitivity;
                     let discrete = acc as i32;
                     pane.scroll_accumulator.set(acc - discrete as f64);
@@ -762,6 +762,11 @@ impl KovaView {
         });
         drop(tabs);
         self.ivars().active_tab.set(idx);
+        // Clear bell/attention indicator on the newly focused tab
+        {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            tabs[idx].clear_bell();
+        }
         // Lazy resize: resize panes when switching to them
         self.resize_all_panes();
     }
@@ -1394,7 +1399,7 @@ impl KovaView {
                     // Build pane render list from active tab only
                     let active_idx = ivars.active_tab.get();
                     let (pane_data, pty_ptr, focus_reporting, tab_titles) = {
-                        let tabs = ivars.tabs.borrow();
+                        let mut tabs = ivars.tabs.borrow_mut();
                         if tabs.is_empty() {
                             return;
                         }
@@ -1424,8 +1429,15 @@ impl KovaView {
                         let pty_ptr = focused.map(|p| &p.pty as *const crate::terminal::pty::Pty);
                         let focus_reporting = focused.map_or(false, |p| p.terminal.read().focus_reporting);
 
+                        // Drain bell flags from panes into tabs
+                        for t in tabs.iter_mut() {
+                            t.check_bell();
+                        }
+                        // Active tab never shows bell indicator
+                        tabs[active_idx].clear_bell();
+
                         let rename = ivars.rename_tab.borrow();
-                        let tab_titles: Vec<(String, bool, Option<usize>, bool)> = tabs.iter().enumerate()
+                        let tab_titles: Vec<(String, bool, Option<usize>, bool, bool)> = tabs.iter().enumerate()
                             .map(|(i, t)| {
                                 let is_renaming = i == active_idx && rename.is_some();
                                 let title = if is_renaming {
@@ -1434,7 +1446,7 @@ impl KovaView {
                                 } else {
                                     t.title()
                                 };
-                                (title, i == active_idx, t.color, is_renaming)
+                                (title, i == active_idx, t.color, is_renaming, t.has_bell)
                             })
                             .collect();
                         drop(rename);
