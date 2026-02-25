@@ -723,14 +723,16 @@ impl Renderer {
                 Self::push_bg_quad(vertices, x, 0.0, tab_width, bar_h, bg);
             }
 
-            // Active tab with custom color: darker border at bottom
+            // Active tab: bright border at bottom
             if *is_active {
-                if let Some(idx) = color_idx {
+                let border_h = 6.0_f32;
+                let border_color = if let Some(idx) = color_idx {
                     let c = TAB_COLORS[*idx % TAB_COLORS.len()];
-                    let border_color = [(c[0] + 1.0) * 0.5, (c[1] + 1.0) * 0.5, (c[2] + 1.0) * 0.5];
-                    let border_h = 3.0_f32;
-                    Self::push_bg_quad(vertices, x, bar_h - border_h, tab_width, border_h, border_color);
-                }
+                    [(c[0] + 1.0) * 0.5, (c[1] + 1.0) * 0.5, (c[2] + 1.0) * 0.5]
+                } else {
+                    [0.7, 0.7, 0.7]
+                };
+                Self::push_bg_quad(vertices, x, bar_h - border_h, tab_width, border_h, border_color);
             }
 
             // Tab number + title: "1: title"
