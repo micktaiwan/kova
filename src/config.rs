@@ -142,7 +142,7 @@ impl Default for TerminalConfig {
             scrollback: 10_000,
             fps: 60,
             cursor_blink_frames: 60,
-            scroll_sensitivity: 3.0,
+            scroll_sensitivity: 6.0,
         }
     }
 }
