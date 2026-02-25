@@ -75,7 +75,9 @@ impl Perform for VteHandler {
                 self.term().newline();
             }
             0x0D => self.term().carriage_return(),  // CR
-            0x07 => {}                              // BEL - ignore
+            0x07 => {                               // BEL
+                self.term().bell.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             _ => log::debug!("unhandled execute: byte=0x{:02X}", byte),
         }
     }

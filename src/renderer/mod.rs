@@ -162,7 +162,7 @@ impl Renderer {
         layer: &CAMetalLayer,
         panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool)],
         separators: &[(f32, f32, f32, f32)],
-        tab_titles: &[(String, bool, Option<usize>, bool)],
+        tab_titles: &[(String, bool, Option<usize>, bool, bool)],
         filter: Option<&FilterRenderData>,
         tab_bar_left_inset: f32,
     ) {
@@ -666,7 +666,7 @@ impl Renderer {
         &mut self,
         vertices: &mut Vec<Vertex>,
         viewport_w: f32,
-        tab_titles: &[(String, bool, Option<usize>, bool)],
+        tab_titles: &[(String, bool, Option<usize>, bool, bool)],
         left_inset: f32,
     ) {
         let cell_w = self.atlas.cell_width;
@@ -683,7 +683,7 @@ impl Renderer {
         let tab_width = (available_w / tab_count as f32).min(max_tab_w);
         let no_bg = [0.0, 0.0, 0.0, 0.0];
 
-        for (i, (title, is_active, color_idx, is_renaming)) in tab_titles.iter().enumerate() {
+        for (i, (title, is_active, color_idx, is_renaming, has_bell)) in tab_titles.iter().enumerate() {
             let x = left_inset + i as f32 * tab_width;
 
             // Tab background color
@@ -740,6 +740,14 @@ impl Renderer {
             let text_y = (bar_h - cell_h) / 2.0;
             let max_x = x + tab_width - cell_w;
             self.render_status_text(vertices, &label, text_x.max(x + cell_w * 0.5), text_y, max_x, fg, no_bg);
+
+            // Bell indicator: orange dot in the top-right of the tab
+            if *has_bell && !is_active {
+                let dot_x = x + tab_width - cell_w * 1.2;
+                let dot_y = (bar_h - cell_h) / 2.0;
+                let dot_color = [1.0, 0.45, 0.1, 1.0]; // orange
+                self.render_status_text(vertices, "●", dot_x, dot_y, x + tab_width, dot_color, no_bg);
+            }
         }
     }
 
