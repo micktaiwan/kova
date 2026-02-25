@@ -631,9 +631,9 @@ impl Renderer {
             Some(_) => branch_fg,
             None => [branch_fg[0] * 0.5, branch_fg[1] * 0.5, branch_fg[2] * 0.5, 0.5],
         };
-        self.render_status_text(vertices, &branch_display, cursor_x, bar_y, vp.x + vp.width * 0.6, actual_branch_fg, no_bg);
+        let left_end = self.render_status_text(vertices, &branch_display, cursor_x, bar_y, vp.x + vp.width * 0.6, actual_branch_fg, no_bg);
 
-        // Render hovered URL or title centered
+        // Render hovered URL or title centered (only if it doesn't overlap with left content)
         let center_text: Option<(String, [f32; 4])> = if let Some(ref url) = self.hovered_url_text {
             Some((url.clone(), [0.4, 0.6, 1.0, 1.0]))
         } else {
@@ -646,7 +646,10 @@ impl Renderer {
             let min_x = vp.x + vp.width * 0.3;
             let max_x = vp.x + vp.width * 0.7;
             let start_x = center_x.max(min_x);
-            self.render_status_text(vertices, &text, start_x, bar_y, max_x, fg, no_bg);
+            // Don't render if left content (cwd + branch) would overlap
+            if start_x >= left_end + cell_w {
+                self.render_status_text(vertices, &text, start_x, bar_y, max_x, fg, no_bg);
+            }
         }
 
         // Right side: scroll indicator + time

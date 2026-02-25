@@ -103,6 +103,11 @@ define_class!(
 
             if let Some(pane) = self.focused_pane() {
                 let cursor_keys_app = pane.terminal.read().cursor_keys_application;
+                // User is typing — resume auto-scroll
+                {
+                    let mut term = pane.terminal.write();
+                    term.reset_scroll();
+                }
                 input::handle_key_event(event, &pane.pty, cursor_keys_app);
             }
         }
@@ -119,6 +124,7 @@ define_class!(
                 let chars = event.charactersIgnoringModifiers();
                 if let Some(chars) = chars {
                     let ch = chars.to_string();
+                    log::debug!("performKeyEquivalent: ch={:?} shift={} option={} ctrl={}", ch, has_shift, has_option, has_ctrl);
 
                     // Cmd+F → toggle filter
                     if ch == "f" && !has_shift && !has_option {
@@ -142,15 +148,27 @@ define_class!(
                         return objc2::runtime::Bool::YES;
                     }
 
-                    // Cmd+D → vsplit
-                    if ch == "d" && !has_shift && !has_option {
+                    // Cmd+D → vsplit (local, within focused pane)
+                    if ch == "d" && !has_shift && !has_option && !has_ctrl {
                         self.do_split(SplitDirection::Horizontal);
                         return objc2::runtime::Bool::YES;
                     }
 
-                    // Cmd+Shift+D → hsplit
-                    if ch == "D" && has_shift && !has_option {
+                    // Cmd+Shift+D → hsplit (local, within focused pane)
+                    if ch == "D" && has_shift && !has_option && !has_ctrl {
                         self.do_split(SplitDirection::Vertical);
+                        return objc2::runtime::Bool::YES;
+                    }
+
+                    // Cmd+E → vsplit at root (full-height column)
+                    if ch == "e" && !has_shift && !has_option {
+                        self.do_split_root(SplitDirection::Horizontal);
+                        return objc2::runtime::Bool::YES;
+                    }
+
+                    // Cmd+Shift+E → hsplit at root (full-width row)
+                    if ch == "E" && has_shift && !has_option {
+                        self.do_split_root(SplitDirection::Vertical);
                         return objc2::runtime::Bool::YES;
                     }
 
@@ -1029,6 +1047,77 @@ impl KovaView {
         if let Some(tab) = tabs.get_mut(idx) {
             let tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(Pane::spawn(1, 1, config, None).unwrap()));
             tab.tree = tree.with_split(focused_id, new_pane, direction);
+            tab.tree.equalize();
+            tab.focused_pane = new_id;
+        }
+        drop(tabs);
+
+        self.resize_all_panes();
+    }
+
+    /// Split at the root level: the new pane spans the full width/height.
+    fn do_split_root(&self, direction: SplitDirection) {
+        let config = match self.ivars().config.get() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let focused_cwd = {
+            let tabs = self.ivars().tabs.borrow();
+            let idx = self.ivars().active_tab.get();
+            tabs.get(idx).and_then(|tab| {
+                tab.tree.pane(tab.focused_pane).and_then(|p| p.cwd())
+            })
+        };
+
+        let panes_vp = self.panes_viewport();
+        let half_vp = match direction {
+            SplitDirection::Horizontal => PaneViewport {
+                x: panes_vp.x,
+                y: panes_vp.y,
+                width: panes_vp.width / 2.0,
+                height: panes_vp.height,
+            },
+            SplitDirection::Vertical => PaneViewport {
+                x: panes_vp.x,
+                y: panes_vp.y,
+                width: panes_vp.width,
+                height: panes_vp.height / 2.0,
+            },
+        };
+        let (cols, rows) = self.viewport_to_grid(&half_vp);
+
+        let dir_name = match direction {
+            SplitDirection::Horizontal => "horizontal",
+            SplitDirection::Vertical => "vertical",
+        };
+        log::debug!("Split root: direction={}, new size={}x{}", dir_name, cols, rows);
+
+        let new_pane = match Pane::spawn(cols, rows, config, focused_cwd.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("failed to spawn pane for root split: {}", e);
+                return;
+            }
+        };
+        let new_id = new_pane.id;
+
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        if let Some(tab) = tabs.get_mut(idx) {
+            let old_tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(Pane::spawn(1, 1, config, None).unwrap()));
+            tab.tree = match direction {
+                SplitDirection::Horizontal => SplitTree::HSplit {
+                    left: Box::new(old_tree),
+                    right: Box::new(SplitTree::Leaf(new_pane)),
+                    ratio: 0.5,
+                },
+                SplitDirection::Vertical => SplitTree::VSplit {
+                    top: Box::new(old_tree),
+                    bottom: Box::new(SplitTree::Leaf(new_pane)),
+                    ratio: 0.5,
+                },
+            };
             tab.tree.equalize();
             tab.focused_pane = new_id;
         }
