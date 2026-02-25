@@ -121,6 +121,8 @@ pub struct TerminalState {
     pub auto_wrap: bool,
     // Insert mode (SM 4) — true = insert, false = replace
     pub insert_mode: bool,
+    // Bell received (BEL 0x07) — used for tab attention indicator
+    pub bell: AtomicBool,
 }
 
 /// A single line matching a filter query.
@@ -173,6 +175,7 @@ impl TerminalState {
             cursor_keys_application: false,
             auto_wrap: true,
             insert_mode: false,
+            bell: AtomicBool::new(false),
         }
     }
 

@@ -71,6 +71,8 @@ pub struct Tab {
     pub custom_title: Option<String>,
     /// Index into TAB_COLORS palette, None = default bg.
     pub color: Option<usize>,
+    /// Bell received on a non-focused tab — show attention indicator.
+    pub has_bell: bool,
 }
 
 impl Tab {
@@ -84,6 +86,7 @@ impl Tab {
             focused_pane: focused,
             custom_title: None,
             color: None,
+            has_bell: false,
         })
     }
 
@@ -97,6 +100,7 @@ impl Tab {
             focused_pane: focused,
             custom_title: None,
             color: None,
+            has_bell: false,
         })
     }
 
@@ -118,6 +122,22 @@ impl Tab {
             }
         }
         "shell".to_string()
+    }
+
+    /// Drain bell flags from panes and accumulate into tab-level flag.
+    /// Returns true if this tab needs attention.
+    pub fn check_bell(&mut self) -> bool {
+        self.tree.for_each_pane(&mut |pane| {
+            if pane.terminal.read().bell.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                self.has_bell = true;
+            }
+        });
+        self.has_bell
+    }
+
+    /// Clear the bell/attention flag (call when switching to this tab).
+    pub fn clear_bell(&mut self) {
+        self.has_bell = false;
     }
 }
 

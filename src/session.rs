@@ -174,6 +174,7 @@ pub fn restore_session(session: Session, config: &Config) -> Option<(Vec<Tab>, u
                     focused_pane,
                     custom_title: saved_tab.custom_title.clone(),
                     color: saved_tab.color,
+                    has_bell: false,
                 });
             }
             None => {
