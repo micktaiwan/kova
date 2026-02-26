@@ -112,6 +112,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] Shell integration (marks, navigation prompt à prompt)
 - [ ] Complétion inline / suggestions
 - [ ] Metriques perf exposées (frame time, mémoire)
+- [ ] Optimisation RAM Cell — la struct Cell fait 32 bytes (fg/bg en `[f32; 3]` = 24 bytes). Passer à des indices palette `u8` ou `[u8; 3]` réduirait à ~8 bytes/cell. Avec 25 panes × 10k lignes scrollback, ça passe de ~640 MB à ~160 MB
 
 ## Non-goals
 
