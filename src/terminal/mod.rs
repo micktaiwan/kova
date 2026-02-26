@@ -124,6 +124,8 @@ pub struct TerminalState {
     pub insert_mode: bool,
     // Bell received (BEL 0x07) — used for tab attention indicator
     pub bell: AtomicBool,
+    // Last command executed (set via OSC 7777 from shell integration)
+    pub last_command: Option<String>,
 }
 
 /// A single line matching a filter query.
@@ -178,6 +180,7 @@ impl TerminalState {
             auto_wrap: true,
             insert_mode: false,
             bell: AtomicBool::new(false),
+            last_command: None,
         }
     }
 
