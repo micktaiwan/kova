@@ -83,9 +83,15 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool) {
     }
 
     if has_alt && !chars_str.is_empty() {
-        let mut bytes = vec![0x1b];
-        bytes.extend_from_slice(unmod_str.as_bytes());
-        pty.write(&bytes);
+        // If macOS produced a different character via Option (e.g. Option+Shift+L → |),
+        // send that character as-is instead of ESC+key.
+        if chars_str != unmod_str {
+            pty.write(chars_str.as_bytes());
+        } else {
+            let mut bytes = vec![0x1b];
+            bytes.extend_from_slice(unmod_str.as_bytes());
+            pty.write(&bytes);
+        }
         return;
     }
 
