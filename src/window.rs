@@ -1540,6 +1540,16 @@ impl KovaView {
                 &RcBlock::new(move |_timer: NonNull<NSTimer>| {
                     let ivars = &*ivars;
 
+                    // --- Inject pending commands for restored panes ---
+                    {
+                        let tabs = ivars.tabs.borrow();
+                        for tab in tabs.iter() {
+                            tab.tree.for_each_pane(&mut |pane| {
+                                pane.inject_pending_command();
+                            });
+                        }
+                    }
+
                     // --- Poll git branch for all panes with a CWD ---
                     let count = git_poll_counter.get() + 1;
                     git_poll_counter.set(count);
@@ -1725,15 +1735,14 @@ impl KovaView {
                         if let Some(tab) = tabs.get(active_idx) {
                             let renderer_r = renderer.read();
                             let cell_h = renderer_r.cell_size().1;
-                            let status_bar = renderer_r.status_bar_enabled();
                             drop(renderer_r);
                             let drawable_size = layer.drawableSize();
-                            let status_bar_h = if status_bar { cell_h } else { 0.0 };
+                            let tab_bar_h = (cell_h * 2.0).round();
                             let panes_vp = PaneViewport {
                                 x: 0.0,
-                                y: cell_h,
+                                y: tab_bar_h,
                                 width: drawable_size.width as f32,
-                                height: drawable_size.height as f32 - cell_h - status_bar_h,
+                                height: drawable_size.height as f32 - tab_bar_h,
                             };
                             let mut seps = Vec::new();
                             tab.tree.collect_separators(panes_vp, &mut seps);
