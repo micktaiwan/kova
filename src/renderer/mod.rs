@@ -444,7 +444,10 @@ impl Renderer {
             line.iter().any(|c| c.c != ' ' && c.c != '\0')
         ).map_or(0, |i| i + 1);
         let y_offset = if last_used < max_rows && term.scroll_offset() == 0 {
-            (max_rows - last_used) as f32 * cell_h
+            let raw = (max_rows - last_used) as f32 * cell_h;
+            // Clamp: never push content beyond the viewport
+            let max_offset = (vp.height - last_used as f32 * cell_h).max(0.0);
+            raw.min(max_offset)
         } else {
             0.0
         };
