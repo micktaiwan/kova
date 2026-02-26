@@ -149,6 +149,8 @@ pub struct Pane {
     pub shell_exited: Arc<AtomicBool>,
     pub shell_ready: Arc<AtomicBool>,
     pub scroll_accumulator: Cell<f64>,
+    /// Command to inject into PTY once shell is ready (for session restore).
+    pub pending_command: Cell<Option<String>>,
 }
 
 impl Pane {
@@ -180,6 +182,7 @@ impl Pane {
             shell_exited,
             shell_ready,
             scroll_accumulator: Cell::new(0.0),
+            pending_command: Cell::new(None),
         })
     }
 
@@ -193,6 +196,22 @@ impl Pane {
 
     pub fn is_ready(&self) -> bool {
         self.shell_ready.load(Ordering::Relaxed)
+    }
+
+    pub fn last_command(&self) -> Option<String> {
+        self.terminal.read().last_command.clone()
+    }
+
+    /// If the shell is ready and there's a pending command, write it to the PTY
+    /// (without \r so the user can review before pressing Enter).
+    pub fn inject_pending_command(&self) {
+        if !self.is_ready() {
+            return;
+        }
+        let cmd = self.pending_command.take();
+        if let Some(command) = cmd {
+            self.pty.write(command.as_bytes());
+        }
     }
 }
 

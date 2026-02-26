@@ -71,6 +71,7 @@ impl Pty {
                 .stderr(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
                 .env("TERM", "xterm-256color")
                 .env("TERM_PROGRAM", "Kova")
+                .env("KOVA_SHELL_INTEGRATION", "1")
                 .current_dir(&start_dir)
                 .pre_exec(move || {
                     // New session — required before TIOCSCTTY

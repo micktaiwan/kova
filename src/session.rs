@@ -24,7 +24,11 @@ pub struct SavedTab {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SavedTree {
-    Leaf { cwd: Option<String> },
+    Leaf {
+        cwd: Option<String>,
+        #[serde(default)]
+        last_command: Option<String>,
+    },
     HSplit { left: Box<SavedTree>, right: Box<SavedTree>, ratio: f32 },
     VSplit { top: Box<SavedTree>, bottom: Box<SavedTree>, ratio: f32 },
 }
@@ -36,7 +40,10 @@ fn session_path() -> PathBuf {
 
 fn snapshot_tree(tree: &SplitTree) -> SavedTree {
     match tree {
-        SplitTree::Leaf(pane) => SavedTree::Leaf { cwd: pane.cwd() },
+        SplitTree::Leaf(pane) => SavedTree::Leaf {
+            cwd: pane.cwd(),
+            last_command: pane.last_command(),
+        },
         SplitTree::HSplit { left, right, ratio } => SavedTree::HSplit {
             left: Box::new(snapshot_tree(left)),
             right: Box::new(snapshot_tree(right)),
@@ -127,9 +134,12 @@ pub fn load() -> Option<Session> {
 /// Restore a saved tree, spawning new panes. Returns the tree and a list of pane ids in depth-first order.
 fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Option<(SplitTree, Vec<PaneId>)> {
     match saved {
-        SavedTree::Leaf { cwd } => {
+        SavedTree::Leaf { cwd, last_command } => {
             let pane = Pane::spawn(cols, rows, config, cwd.as_deref()).ok()?;
             let id = pane.id;
+            if let Some(cmd) = last_command {
+                pane.pending_command.set(Some(cmd.clone()));
+            }
             Some((SplitTree::Leaf(pane), vec![id]))
         }
         SavedTree::HSplit { left, right, ratio } => {

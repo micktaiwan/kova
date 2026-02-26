@@ -124,6 +124,14 @@ impl Perform for VteHandler {
                         term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
+                b"7777" => {
+                    // Shell integration: preexec hook sends the command being executed
+                    let command = String::from_utf8_lossy(params[1]).into_owned();
+                    if !command.is_empty() {
+                        log::debug!("OSC 7777 last_command: {}", command);
+                        self.term().last_command = Some(command);
+                    }
+                }
                 _ => {
                     let cmd = String::from_utf8_lossy(params[0]);
                     log::debug!("unhandled OSC: cmd={}, params_count={}", cmd, params.len());
