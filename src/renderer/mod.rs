@@ -27,6 +27,7 @@ use std::time::SystemTime;
 use vertex::Vertex;
 
 use crate::config::Config;
+use crate::pane::PaneId;
 use crate::terminal::{CursorShape, FilterMatch, TerminalState};
 
 /// Data passed to the renderer for drawing filter overlay.
@@ -80,6 +81,8 @@ pub struct Renderer {
     pub hovered_url: Option<(usize, u16, u16)>,
     /// Hovered URL text (for status bar display)
     pub hovered_url_text: Option<String>,
+    /// Pane ID of the hovered URL (to show URL only in that pane's status bar)
+    pub hovered_url_pane_id: Option<PaneId>,
 }
 
 impl Renderer {
@@ -157,23 +160,24 @@ impl Renderer {
             tab_bar_active_bg: config.tab_bar.active_bg,
             hovered_url: None,
             hovered_url_text: None,
+            hovered_url_pane_id: None,
         }
     }
 
 
-    /// Render multiple panes. Each entry: (terminal, viewport, shell_ready, is_focused).
+    /// Render multiple panes. Each entry: (terminal, viewport, shell_ready, is_focused, pane_id).
     /// `separators` are line segments (x1, y1, x2, y2) drawn between splits.
     pub fn render_panes(
         &mut self,
         layer: &CAMetalLayer,
-        panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool)],
+        panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool, PaneId)],
         separators: &[(f32, f32, f32, f32)],
         tab_titles: &[(String, bool, Option<usize>, bool, bool)],
         filter: Option<&FilterRenderData>,
         tab_bar_left_inset: f32,
     ) {
         // Reset blink on cursor movement of focused pane
-        if let Some((term, _, _, _)) = panes.iter().find(|(_, _, _, focused)| *focused) {
+        if let Some((term, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _)| *focused) {
             let epoch = term.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed);
             if epoch != self.last_cursor_epoch {
                 self.last_cursor_epoch = epoch;
@@ -212,7 +216,7 @@ impl Renderer {
         let mut any_dirty = false;
         let mut any_not_ready = false;
         let mut any_sync_deferred = false;
-        for (term, _, ready, _) in panes {
+        for (term, _, ready, _, _) in panes {
             if !ready { any_not_ready = true; }
             let t = term.read();
             // Synchronized output: this pane wants to defer, but don't block others
@@ -247,7 +251,13 @@ impl Renderer {
 
         // Build vertices for all panes
         let mut all_vertices = Vec::new();
-        for (term, vp, shell_ready, is_focused) in panes {
+        let saved_hover_text = self.hovered_url_text.clone();
+        let saved_hover_pos = self.hovered_url;
+        for (term, vp, shell_ready, is_focused, pane_id) in panes {
+            // Scope hovered URL to the pane that owns it
+            let is_hover_pane = self.hovered_url_pane_id == Some(*pane_id);
+            self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
+            self.hovered_url = if is_hover_pane { saved_hover_pos } else { None };
             // Skip rendering focused pane content when filter overlay covers it
             if *is_focused && filter.is_some() {
                 continue;
@@ -263,6 +273,8 @@ impl Renderer {
                 all_vertices.append(&mut verts);
             }
         }
+        self.hovered_url_text = saved_hover_text;
+        self.hovered_url = saved_hover_pos;
 
         // Draw split separators (1px lines)
         if !separators.is_empty() {
@@ -302,7 +314,7 @@ impl Renderer {
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
-            if let Some((_, vp, _, _)) = panes.iter().find(|(_, _, _, focused)| *focused) {
+            if let Some((_, vp, _, _, _)) = panes.iter().find(|(_, _, _, focused, _)| *focused) {
                 self.build_filter_overlay_vertices(&mut all_vertices, vp, filter_data);
             }
         }
