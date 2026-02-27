@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::config::{Config, TerminalConfig};
 use crate::input;
-use crate::pane::{NavDirection, Pane, SplitAxis, SplitDirection, SplitTree, Tab};
+use crate::pane::{NavDirection, Pane, PaneId, SplitAxis, SplitDirection, SplitTree, Tab};
 use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
 use crate::terminal::{FilterMatch, GridPos, Selection};
 
@@ -49,10 +49,12 @@ pub struct KovaViewIvars {
     /// Tab index targeted by right-click color menu.
     color_menu_tab: Cell<usize>,
     drag_tab: Cell<Option<DragTabState>>,
-    /// URL currently hovered (visible_row, col_start, col_end, url) — set by mouseMoved when Cmd held
-    hovered_url: RefCell<Option<(usize, u16, u16, String)>>,
+    /// URL currently hovered (pane_id, visible_row, col_start, col_end, url) — set by mouseMoved when Cmd held
+    hovered_url: RefCell<Option<(PaneId, usize, u16, u16, String)>>,
     /// Whether Cmd key is currently held (for URL hover detection)
     cmd_held: Cell<bool>,
+    /// Auto-scroll speed during drag selection (lines/tick, positive = down, negative = up, 0 = inactive)
+    auto_scroll_speed: Cell<i32>,
 }
 
 struct FilterState {
@@ -382,7 +384,7 @@ define_class!(
             // Cmd+Click opens URL
             let modifiers = event.modifierFlags();
             if modifiers.contains(NSEventModifierFlags::Command) {
-                if let Some(url) = self.ivars().hovered_url.borrow().as_ref().map(|h| h.3.clone()) {
+                if let Some(url) = self.ivars().hovered_url.borrow().as_ref().map(|h| h.4.clone()) {
                     let _ = std::process::Command::new("open").arg(&url).spawn();
                     return;
                 }
@@ -473,10 +475,42 @@ define_class!(
                 };
                 if let Some(vp) = vp {
                     if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
+                        // Mouse is inside viewport — normal drag
+                        self.ivars().auto_scroll_speed.set(0);
                         let mut term = pane.terminal.write();
                         if let Some(ref mut sel) = term.selection {
                             sel.end = pos;
                             term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    } else {
+                        // Mouse is outside viewport — compute auto-scroll speed
+                        let renderer = self.ivars().renderer.get();
+                        if let Some(renderer) = renderer {
+                            let (_, pixel_y) = self.event_to_pixel(event);
+                            let renderer_r = renderer.read();
+                            let cell_h = renderer_r.cell_size().1;
+                            drop(renderer_r);
+
+                            let rel_y = pixel_y - vp.y;
+                            let term = pane.terminal.read();
+                            let y_offset = term.y_offset_rows() as f32 * cell_h;
+                            let bottom = y_offset + (term.rows as f32 * cell_h);
+
+                            if rel_y < y_offset {
+                                // Above viewport — scroll up
+                                let dist = y_offset - rel_y;
+                                let speed = -((dist / cell_h).ceil() as i32).clamp(1, 10);
+                                self.ivars().auto_scroll_speed.set(speed);
+                            } else if rel_y > bottom {
+                                // Below viewport — scroll down
+                                let dist = rel_y - bottom;
+                                let speed = ((dist / cell_h).ceil() as i32).clamp(1, 10);
+                                self.ivars().auto_scroll_speed.set(speed);
+                            } else {
+                                // Mouse is vertically inside viewport but pixel_to_grid_in
+                                // returned None (e.g. mouse to the left of the grid) — no scroll
+                                self.ivars().auto_scroll_speed.set(0);
+                            }
                         }
                     }
                 }
@@ -485,6 +519,7 @@ define_class!(
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
+            self.ivars().auto_scroll_speed.set(0);
             if self.ivars().drag_tab.get().is_some() {
                 self.ivars().drag_tab.set(None);
                 return;
@@ -590,6 +625,7 @@ impl KovaView {
             drag_tab: Cell::new(None),
             hovered_url: RefCell::new(None),
             cmd_held: Cell::new(false),
+            auto_scroll_speed: Cell::new(0),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -669,9 +705,9 @@ impl KovaView {
             let term = pane.terminal.read();
             if let Some((start, end, url)) = term.url_at(visible_row, col) {
                 let old = self.ivars().hovered_url.borrow().clone();
-                let changed = old.as_ref().map_or(true, |o| o.0 != visible_row || o.1 != start || o.2 != end);
+                let changed = old.as_ref().map_or(true, |o| o.1 != visible_row || o.2 != start || o.3 != end);
                 if changed {
-                    *self.ivars().hovered_url.borrow_mut() = Some((visible_row, start, end, url));
+                    *self.ivars().hovered_url.borrow_mut() = Some((pane.id, visible_row, start, end, url));
                     NSCursor::pointingHandCursor().set();
                     self.mark_dirty();
                 }
@@ -1550,6 +1586,44 @@ impl KovaView {
                         }
                     }
 
+                    // --- Auto-scroll during drag selection ---
+                    {
+                        let speed = ivars.auto_scroll_speed.get();
+                        if speed != 0 {
+                            let tabs = ivars.tabs.borrow();
+                            let idx = ivars.active_tab.get();
+                            if let Some(tab) = tabs.get(idx) {
+                                if let Some(pane) = tab.tree.pane(tab.focused_pane) {
+                                    let mut term = pane.terminal.write();
+                                    if term.selection.is_some() {
+                                        // scroll: positive = scroll up (towards scrollback)
+                                        // speed: positive = mouse below viewport = scroll down (show more content below)
+                                        // So we negate: scroll(-speed) to scroll "down" when speed > 0
+                                        term.scroll(-speed);
+                                        // Update selection end to track the edge
+                                        let sb_len = term.scrollback_len();
+                                        let scroll_off = term.scroll_offset();
+                                        if speed < 0 {
+                                            // Scrolling up — select to first visible line, col 0
+                                            let first_visible = (sb_len as i64 - scroll_off as i64) as usize;
+                                            if let Some(ref mut sel) = term.selection {
+                                                sel.end = crate::terminal::GridPos { line: first_visible, col: 0 };
+                                            }
+                                        } else {
+                                            // Scrolling down — select to last visible line, last col
+                                            let last_visible = (sb_len as i64 - scroll_off as i64 + term.rows as i64 - 1) as usize;
+                                            let last_col = term.cols.saturating_sub(1);
+                                            if let Some(ref mut sel) = term.selection {
+                                                sel.end = crate::terminal::GridPos { line: last_visible, col: last_col };
+                                            }
+                                        }
+                                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // --- Poll git branch for all panes with a CWD ---
                     let count = git_poll_counter.get() + 1;
                     git_poll_counter.set(count);
@@ -1643,7 +1717,7 @@ impl KovaView {
                         let tab = &tabs[active_idx];
                         let focused_id = tab.focused_pane;
 
-                        let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool)> = Vec::new();
+                        let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool, PaneId)> = Vec::new();
                         let drawable_size = layer.drawableSize();
                         let cell_h = renderer.read().cell_size().1;
                         let tab_bar_h = (cell_h * 2.0).round();
@@ -1659,6 +1733,7 @@ impl KovaView {
                                 vp,
                                 pane.is_ready(),
                                 pane.id == focused_id,
+                                pane.id,
                             ));
                         });
 
@@ -1706,7 +1781,7 @@ impl KovaView {
                     }
 
                     // Update NSWindow title from focused pane's OSC 0/2
-                    if let Some((terminal, _, _, _)) = pane_data.iter().find(|(_, _, _, f)| *f) {
+                    if let Some((terminal, _, _, _, _)) = pane_data.iter().find(|(_, _, _, f, _)| *f) {
                         let term = terminal.read();
                         let current = term.title.clone();
                         drop(term);
@@ -1779,16 +1854,18 @@ impl KovaView {
                         ivars.tab_bar_left_inset.set(inset);
                         inset
                     };
-                    let (hover_pos, hover_text) = {
+                    let (hover_pos, hover_text, hover_pane_id) = {
                         let h = ivars.hovered_url.borrow();
                         (
-                            h.as_ref().map(|(row, start, end, _)| (*row, *start, *end)),
-                            h.as_ref().map(|(_, _, _, url)| url.clone()),
+                            h.as_ref().map(|(_, row, start, end, _)| (*row, *start, *end)),
+                            h.as_ref().map(|(_, _, _, _, url)| url.clone()),
+                            h.as_ref().map(|(pid, _, _, _, _)| *pid),
                         )
                     };
                     let mut r = renderer.write();
                     r.hovered_url = hover_pos;
                     r.hovered_url_text = hover_text;
+                    r.hovered_url_pane_id = hover_pane_id;
                     r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset);
                 }),
             )
