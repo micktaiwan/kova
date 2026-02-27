@@ -105,14 +105,17 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] PTY cleanup non-bloquant — remplacer le `waitpid` bloquant dans `Drop for Pty` par une escalade SIGHUP → SIGTERM → SIGKILL avec timeouts (~200ms max), pour éviter un freeze UI si un process ignore SIGHUP
 - [ ] Font fallback (emoji, symboles) — CoreText fallback fonctionne mais block elements/box-drawing nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
 - [ ] Ligatures (optionnel)
+- [ ] Optimisation RAM Cell — la struct Cell fait 28 bytes (char 4B + fg/bg `[f32; 3]` = 24B). Avec 10k lignes scrollback × 200 cols = 53 MB/pane. Analyse vmmap montre ~400 MB footprint (peak 686 MB), dont ~70% scrollback. Pistes :
+  - **Compact Cell pour le scrollback** : stocker fg/bg en `u32` RGBA (`[u8; 4]`) → 12 bytes/cell (÷2.3), ou palette indexée `u8` → 6 bytes/cell (÷4.7). Le grid actif garde `[f32; 3]` pour le rendu direct, conversion à l'entrée dans le scrollback.
+  - **Trim trailing spaces** : la plupart des lignes scrollback ne remplissent pas toute la largeur. Tronquer les cellules vides en fin de ligne.
+  - **Run-length encoding** : beaucoup de lignes ont la même couleur sur de longues séquences, compressibles.
+- [ ] Metriques perf exposées (frame time, mémoire, allocations) — utile pour diagnostiquer sans avoir à lancer vmmap/heap manuellement
 
 ## V3 — Avancé
 
 - [ ] Support images (Sixel ou protocole Kitty)
 - [ ] Shell integration (marks, navigation prompt à prompt)
 - [ ] Complétion inline / suggestions
-- [ ] Metriques perf exposées (frame time, mémoire)
-- [ ] Optimisation RAM Cell — la struct Cell fait 32 bytes (fg/bg en `[f32; 3]` = 24 bytes). Passer à des indices palette `u8` ou `[u8; 3]` réduirait à ~8 bytes/cell. Avec 25 panes × 10k lignes scrollback, ça passe de ~640 MB à ~160 MB
 
 ## Non-goals
 
