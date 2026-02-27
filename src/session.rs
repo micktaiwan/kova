@@ -139,6 +139,7 @@ fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Opt
             let id = pane.id;
             if let Some(cmd) = last_command {
                 pane.pending_command.set(Some(cmd.clone()));
+                pane.terminal.write().last_command = Some(cmd.clone());
             }
             Some((SplitTree::Leaf(pane), vec![id]))
         }
