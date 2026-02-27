@@ -1,6 +1,7 @@
 pub mod parser;
 pub mod pty;
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
@@ -60,13 +61,80 @@ impl Row {
             wrapped: false,
         }
     }
+
+    pub fn to_compact(&self) -> CompactRow {
+        CompactRow {
+            cells: self.cells.iter().map(|c| c.to_compact()).collect(),
+            wrapped: self.wrapped,
+        }
+    }
+}
+
+/// Compact cell for scrollback storage: colors as u8 instead of f32.
+/// Size: 12 bytes (char 4B + fg 3B + bg 3B + padding 2B) vs 28 bytes for Cell.
+#[derive(Clone, Debug)]
+pub struct CompactCell {
+    pub c: char,
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+}
+
+#[derive(Clone, Debug)]
+pub struct CompactRow {
+    pub cells: Vec<CompactCell>,
+    pub wrapped: bool,
+}
+
+impl Cell {
+    pub fn to_compact(&self) -> CompactCell {
+        CompactCell {
+            c: self.c,
+            fg: [
+                (self.fg[0] * 255.0 + 0.5) as u8,
+                (self.fg[1] * 255.0 + 0.5) as u8,
+                (self.fg[2] * 255.0 + 0.5) as u8,
+            ],
+            bg: [
+                (self.bg[0] * 255.0 + 0.5) as u8,
+                (self.bg[1] * 255.0 + 0.5) as u8,
+                (self.bg[2] * 255.0 + 0.5) as u8,
+            ],
+        }
+    }
+}
+
+impl CompactCell {
+    pub fn to_cell(&self) -> Cell {
+        Cell {
+            c: self.c,
+            fg: [
+                self.fg[0] as f32 / 255.0,
+                self.fg[1] as f32 / 255.0,
+                self.fg[2] as f32 / 255.0,
+            ],
+            bg: [
+                self.bg[0] as f32 / 255.0,
+                self.bg[1] as f32 / 255.0,
+                self.bg[2] as f32 / 255.0,
+            ],
+        }
+    }
+}
+
+impl CompactRow {
+    pub fn to_row(&self) -> Row {
+        Row {
+            cells: self.cells.iter().map(|c| c.to_cell()).collect(),
+            wrapped: self.wrapped,
+        }
+    }
 }
 
 pub struct TerminalState {
     pub cols: u16,
     pub rows: u16,
     grid: Vec<Row>,
-    scrollback: VecDeque<Row>,
+    scrollback: VecDeque<CompactRow>,
     pub scrollback_limit: usize,
     pub cursor_x: u16,
     pub cursor_y: u16,
@@ -184,23 +252,22 @@ impl TerminalState {
         }
     }
 
-    pub fn visible_lines(&self) -> Vec<&[Cell]> {
+    pub fn visible_lines(&self) -> Vec<Cow<'_, [Cell]>> {
         if self.scroll_offset == 0 {
-            self.grid.iter().map(|r| r.cells.as_slice()).collect()
+            self.grid.iter().map(|r| Cow::Borrowed(r.cells.as_slice())).collect()
         } else {
             let sb_len = self.scrollback.len() as i32;
             let offset = self.scroll_offset.min(sb_len);
             let sb_start = (sb_len - offset) as usize;
             let grid_end = (self.rows as i32 - offset).max(0) as usize;
 
-            let mut lines: Vec<&[Cell]> = Vec::with_capacity(self.rows as usize);
+            let mut lines: Vec<Cow<'_, [Cell]>> = Vec::with_capacity(self.rows as usize);
             for i in sb_start..self.scrollback.len() {
-                lines.push(&self.scrollback[i].cells);
+                lines.push(Cow::Owned(self.scrollback[i].to_row().cells));
             }
             for i in 0..grid_end.min(self.grid.len()) {
-                lines.push(&self.grid[i].cells);
+                lines.push(Cow::Borrowed(self.grid[i].cells.as_slice()));
             }
-            // No padding — truncate handles the upper bound
             lines.truncate(self.rows as usize);
             lines
         }
@@ -307,7 +374,7 @@ impl TerminalState {
             if top < self.grid.len() {
                 let line = self.grid.remove(top);
                 if top == 0 && !self.in_alt_screen {
-                    self.scrollback.push_back(line);
+                    self.scrollback.push_back(line.to_compact());
                     if self.scrollback.len() > self.scrollback_limit {
                         self.scrollback.pop_front();
                     }
@@ -727,9 +794,9 @@ impl TerminalState {
                 }
             }
 
-            // Reflow scrollback
-            let sb: Vec<Row> = self.scrollback.drain(..).collect();
-            let reflowed_sb = Self::reflow_rows(sb, new_cols as usize, &self.blank);
+            // Reflow scrollback (compact)
+            let sb: Vec<CompactRow> = self.scrollback.drain(..).collect();
+            let reflowed_sb = Self::reflow_compact_rows(sb, new_cols as usize, &self.blank.to_compact());
             self.scrollback = reflowed_sb.into();
 
             // Reflow grid
@@ -788,7 +855,7 @@ impl TerminalState {
         // Push excess top rows into scrollback
         while self.grid.len() > nr {
             let line = self.grid.remove(0);
-            self.scrollback.push_back(line);
+            self.scrollback.push_back(line.to_compact());
             self.cursor_y = self.cursor_y.saturating_sub(1);
         }
         // Add blank rows if needed
@@ -875,6 +942,57 @@ impl TerminalState {
         result
     }
 
+    // --- Compact reflow helpers ---
+
+    fn compact_rows_to_logical_lines(rows: Vec<CompactRow>) -> Vec<Vec<CompactCell>> {
+        let mut lines: Vec<Vec<CompactCell>> = Vec::new();
+        let mut current: Vec<CompactCell> = Vec::new();
+        for row in rows {
+            current.extend(row.cells);
+            if !row.wrapped {
+                lines.push(current);
+                current = Vec::new();
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+        lines
+    }
+
+    fn wrap_compact_logical_line(cells: Vec<CompactCell>, new_cols: usize, blank: &CompactCell) -> Vec<CompactRow> {
+        let len = cells.iter().rposition(|c| c.c != ' ' && c.c != '\0')
+            .map_or(0, |i| i + 1);
+
+        if len == 0 {
+            return vec![CompactRow {
+                cells: vec![blank.clone(); new_cols],
+                wrapped: false,
+            }];
+        }
+
+        let trimmed = &cells[..len];
+        let mut rows = Vec::new();
+        for chunk in trimmed.chunks(new_cols) {
+            let mut row_cells = chunk.to_vec();
+            row_cells.resize(new_cols, blank.clone());
+            rows.push(CompactRow { cells: row_cells, wrapped: true });
+        }
+        if let Some(last) = rows.last_mut() {
+            last.wrapped = false;
+        }
+        rows
+    }
+
+    fn reflow_compact_rows(rows: Vec<CompactRow>, new_cols: usize, blank: &CompactCell) -> Vec<CompactRow> {
+        let logical = Self::compact_rows_to_logical_lines(rows);
+        let mut result = Vec::new();
+        for line in logical {
+            result.extend(Self::wrap_compact_logical_line(line, new_cols, blank));
+        }
+        result
+    }
+
     pub fn reverse_index(&mut self) {
         if self.cursor_y == self.scroll_top {
             self.scroll_down(1);
@@ -889,12 +1007,12 @@ impl TerminalState {
         self.scrollback.len()
     }
 
-    fn row_at(&self, abs_line: usize) -> Option<&Row> {
+    fn row_at(&self, abs_line: usize) -> Option<Cow<'_, Row>> {
         let sb_len = self.scrollback.len();
         if abs_line < sb_len {
-            Some(&self.scrollback[abs_line])
+            Some(Cow::Owned(self.scrollback[abs_line].to_row()))
         } else {
-            self.grid.get(abs_line - sb_len)
+            self.grid.get(abs_line - sb_len).map(Cow::Borrowed)
         }
     }
 
@@ -969,6 +1087,7 @@ impl TerminalState {
                 results.push(FilterMatch { abs_line: i, text });
             }
         }
+
 
         // Search grid
         for (i, row) in self.grid.iter().enumerate() {
