@@ -36,6 +36,9 @@ pub struct Selection {
 #[derive(Clone, Debug)]
 pub struct Cell {
     pub c: char,
+    /// Multi-codepoint grapheme cluster (e.g. flags, ZWJ sequences, skin tones).
+    /// None for single-codepoint characters (the common case).
+    pub cluster: Option<Box<str>>,
     pub fg: [f32; 3],
     pub bg: [f32; 3],
 }
@@ -44,6 +47,7 @@ impl Default for Cell {
     fn default() -> Self {
         Cell {
             c: ' ',
+            cluster: None,
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
         }
@@ -77,6 +81,7 @@ impl Row {
 #[derive(Clone, Debug)]
 pub struct CompactCell {
     pub c: char,
+    pub cluster: Option<Box<str>>,
     pub fg: [u8; 3],
     pub bg: [u8; 3],
 }
@@ -91,6 +96,7 @@ impl Cell {
     pub fn to_compact(&self) -> CompactCell {
         CompactCell {
             c: self.c,
+            cluster: self.cluster.clone(),
             fg: [
                 (self.fg[0] * 255.0 + 0.5) as u8,
                 (self.fg[1] * 255.0 + 0.5) as u8,
@@ -109,6 +115,7 @@ impl CompactCell {
     pub fn to_cell(&self) -> Cell {
         Cell {
             c: self.c,
+            cluster: self.cluster.clone(),
             fg: [
                 self.fg[0] as f32 / 255.0,
                 self.fg[1] as f32 / 255.0,
@@ -207,7 +214,7 @@ pub struct FilterMatch {
 
 impl TerminalState {
     pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [f32; 3], bg: [f32; 3]) -> Self {
-        let blank = Cell { c: ' ', fg, bg };
+        let blank = Cell { c: ' ', cluster: None, fg, bg };
         let grid = (0..rows as usize).map(|_| Row::new(cols as usize, &blank)).collect();
         TerminalState {
             cols,
@@ -348,6 +355,7 @@ impl TerminalState {
             }
             self.grid[row].cells[col] = Cell {
                 c,
+                cluster: None,
                 fg,
                 bg: self.current_bg,
             };
@@ -356,12 +364,97 @@ impl TerminalState {
             if char_width == 2 && col + 1 < self.grid[row].cells.len() {
                 self.grid[row].cells[col + 1] = Cell {
                     c: '\0',
+                    cluster: None,
                     fg,
                     bg: self.current_bg,
                 };
             }
         }
         self.cursor_x += char_width;
+    }
+
+    /// Write a grapheme cluster (possibly multi-codepoint) at the cursor position.
+    pub fn put_cluster(&mut self, cluster: &str) {
+        use unicode_width::UnicodeWidthStr;
+
+        let mut chars = cluster.chars();
+        let first = match chars.next() {
+            Some(c) => c,
+            None => return,
+        };
+
+        // Single-char cluster: delegate to put_char (fast path)
+        if chars.next().is_none() {
+            self.put_char(first);
+            return;
+        }
+
+        // Multi-codepoint cluster
+        let display_width = UnicodeWidthStr::width(cluster).max(1) as u16;
+
+        self.cursor_moved();
+        if !self.user_scrolled {
+            self.reset_scroll();
+        }
+
+        // Wide cluster at last column: wrap before writing
+        if display_width >= 2 && self.cursor_x + display_width > self.cols && self.auto_wrap {
+            let row = self.cursor_y as usize;
+            if row < self.grid.len() {
+                self.grid[row].wrapped = true;
+            }
+            self.cursor_x = 0;
+            self.advance_line();
+        }
+
+        if self.cursor_x >= self.cols {
+            if !self.auto_wrap {
+                self.cursor_x = self.cols - 1;
+            } else {
+                let row = self.cursor_y as usize;
+                if row < self.grid.len() {
+                    self.grid[row].wrapped = true;
+                }
+                self.cursor_x = 0;
+                self.advance_line();
+            }
+        }
+
+        let row = self.cursor_y as usize;
+        let col = self.cursor_x as usize;
+        if row < self.grid.len() && col < self.grid[row].cells.len() {
+            let mut fg = self.current_fg;
+            if self.dim {
+                fg = [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5];
+            }
+            if self.bold {
+                fg = [
+                    (fg[0] * 1.3).min(1.0),
+                    (fg[1] * 1.3).min(1.0),
+                    (fg[2] * 1.3).min(1.0),
+                ];
+            }
+
+            self.grid[row].cells[col] = Cell {
+                c: first,
+                cluster: Some(cluster.into()),
+                fg,
+                bg: self.current_bg,
+            };
+
+            // Write '\0' sentinel for remaining columns
+            for i in 1..display_width as usize {
+                if col + i < self.grid[row].cells.len() {
+                    self.grid[row].cells[col + i] = Cell {
+                        c: '\0',
+                        cluster: None,
+                        fg,
+                        bg: self.current_bg,
+                    };
+                }
+            }
+        }
+        self.cursor_x += display_width;
     }
 
     pub fn newline(&mut self) {
@@ -1080,7 +1173,15 @@ impl TerminalState {
                 cells.len().saturating_sub(1)
             };
             if col_start <= col_end {
-                let text: String = cells[col_start..=col_end].iter().map(|c| c.c).collect();
+                let text: String = cells[col_start..=col_end].iter().map(|c| {
+                    if let Some(ref cluster) = c.cluster {
+                        cluster.to_string()
+                    } else if c.c == '\0' {
+                        String::new()
+                    } else {
+                        c.c.to_string()
+                    }
+                }).collect();
                 result.push_str(text.trim_end());
             }
             // Only insert newline if this row is NOT soft-wrapped

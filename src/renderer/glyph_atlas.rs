@@ -25,6 +25,8 @@ pub struct GlyphInfo {
 pub struct GlyphAtlas {
     pub texture: Retained<ProtocolObject<dyn MTLTexture>>,
     pub glyphs: HashMap<char, GlyphInfo>,
+    /// Multi-codepoint grapheme cluster glyphs (flags, ZWJ sequences, skin tones)
+    pub cluster_glyphs: HashMap<Box<str>, GlyphInfo>,
     pub cell_width: f32,
     pub cell_height: f32,
     pub atlas_width: u32,
@@ -225,6 +227,7 @@ impl GlyphAtlas {
         GlyphAtlas {
             texture,
             glyphs,
+            cluster_glyphs: HashMap::new(),
             cell_width,
             cell_height,
             atlas_width,
@@ -587,8 +590,105 @@ impl GlyphAtlas {
         self.insert_bitmap(c, &bmp_buf, bmp_w, bmp_h, is_color)
     }
 
+    pub fn cluster_glyph(&self, cluster: &str) -> Option<&GlyphInfo> {
+        self.cluster_glyphs.get(cluster)
+    }
+
+    /// Rasterize a multi-codepoint grapheme cluster (flags, ZWJ, skin tones)
+    /// using CoreText CTLine for proper shaping.
+    pub fn rasterize_cluster(&mut self, cluster: &str) -> Option<GlyphInfo> {
+        if let Some(g) = self.cluster_glyphs.get(cluster) {
+            return Some(*g);
+        }
+
+        use unicode_width::UnicodeWidthStr;
+        let width_cells = UnicodeWidthStr::width(cluster).max(1);
+        let bmp_w = self.cell_width as usize * width_cells;
+        let bmp_h = self.cell_height as usize;
+        let bmp_bpr = bmp_w * 4;
+
+        // Create attributed string with the cluster text
+        let cf_str = CFString::from_str(cluster);
+
+        // Use CTLine for proper cluster shaping (handles flag sequences, ZWJ, etc.)
+        let attrs = unsafe {
+            use objc2_core_foundation::{CFDictionary, CFType};
+            let key = objc2_core_text::kCTFontAttributeName;
+            let font_val: &CFType = self.font.as_ref();
+            CFDictionary::from_slices(&[&*key], &[font_val])
+        };
+
+        let attr_str = unsafe {
+            use objc2_core_foundation::{CFAttributedString, CFDictionary};
+            // Cast typed dictionary to untyped for CFAttributedString API
+            let untyped: &CFDictionary = attrs.as_ref();
+            CFAttributedString::new(None, Some(&cf_str), Some(untyped))
+        }.expect("failed to create CFAttributedString");
+
+        let line = unsafe { CTLine::with_attributed_string(&attr_str) };
+
+        // Render into bitmap
+        let mut bmp_buf = vec![0u8; bmp_bpr * bmp_h];
+
+        // Use premultiplied alpha for color emoji rendering
+        let bmp_ctx = unsafe {
+            CGBitmapContextCreate(
+                bmp_buf.as_mut_ptr() as *mut c_void,
+                bmp_w,
+                bmp_h,
+                8,
+                bmp_bpr,
+                Some(&self.color_space),
+                // kCGImageAlphaPremultipliedLast = 1
+                1u32,
+            )
+        };
+        let bmp_ctx = match bmp_ctx {
+            Some(ctx) => ctx,
+            None => {
+                log::warn!("failed to create bitmap for cluster '{}'", cluster);
+                return None;
+            }
+        };
+
+        // Draw the CTLine at baseline
+        unsafe {
+            CGContext::set_text_position(Some(&bmp_ctx), 0.0, self.descent);
+            line.draw(&bmp_ctx);
+        }
+
+        // Cluster emoji are always color
+        let is_color = true;
+
+        // Un-premultiply alpha
+        for pixel in bmp_buf.chunks_exact_mut(4) {
+            let a = pixel[3] as f32;
+            if a > 0.0 && a < 255.0 {
+                let inv = 255.0 / a;
+                pixel[0] = (pixel[0] as f32 * inv).min(255.0) as u8;
+                pixel[1] = (pixel[1] as f32 * inv).min(255.0) as u8;
+                pixel[2] = (pixel[2] as f32 * inv).min(255.0) as u8;
+            }
+        }
+
+        let nonzero = bmp_buf.iter().filter(|&&b| b != 0).count();
+        log::trace!("rasterize_cluster '{}': bmp {}x{}, nonzero_bytes={}, width_cells={}", cluster, bmp_w, bmp_h, nonzero, width_cells);
+
+        let info = self.insert_bitmap_raw(&bmp_buf, bmp_w, bmp_h, is_color)?;
+        self.cluster_glyphs.insert(cluster.into(), info);
+        Some(info)
+    }
+
     /// Insert a rendered bitmap into the atlas and return glyph info.
     fn insert_bitmap(&mut self, c: char, bmp_buf: &[u8], bmp_w: usize, bmp_h: usize, is_color: bool) -> Option<GlyphInfo> {
+        let info = self.insert_bitmap_raw(bmp_buf, bmp_w, bmp_h, is_color)?;
+        self.glyphs.insert(c, info);
+        log::trace!("Rasterized '{}' (U+{:04X}) into atlas", c, c as u32);
+        Some(info)
+    }
+
+    /// Insert a rendered bitmap into the atlas, returning the GlyphInfo without storing it.
+    fn insert_bitmap_raw(&mut self, bmp_buf: &[u8], bmp_w: usize, bmp_h: usize, is_color: bool) -> Option<GlyphInfo> {
         let bmp_bpr = bmp_w * 4;
 
         // Check if we need to wrap to next row
@@ -640,12 +740,10 @@ impl GlyphAtlas {
             height: self.glyph_cell_h,
             is_color,
         };
-        self.glyphs.insert(c, info);
 
         // Advance cursor
         self.next_x += bmp_w as u32;
 
-        log::trace!("Rasterized '{}' (U+{:04X}) into atlas", c, c as u32);
         Some(info)
     }
 

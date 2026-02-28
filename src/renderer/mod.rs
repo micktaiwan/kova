@@ -420,26 +420,35 @@ impl Renderer {
         blink_on: bool,
         is_focused: bool,
     ) -> Vec<Vertex> {
-        // Pass 1: collect unknown chars for dynamic rasterization
+        // Pass 1: collect unknown chars/clusters for dynamic rasterization
         let display = term.visible_lines();
-        let unknown: Vec<char> = {
-            let mut seen = std::collections::HashSet::new();
-            display.iter()
-                .flat_map(|line| line.iter())
-                .filter_map(|cell| {
-                    let c = cell.c;
-                    if c != ' ' && c != '\0' && self.atlas.glyph(c).is_none() && seen.insert(c) {
-                        Some(c)
+        let mut unknown_chars: Vec<char> = Vec::new();
+        let mut unknown_clusters: Vec<Box<str>> = Vec::new();
+        {
+            let mut seen_chars = std::collections::HashSet::new();
+            let mut seen_clusters = std::collections::HashSet::new();
+            for line in display.iter() {
+                for cell in line.iter() {
+                    if let Some(ref cluster) = cell.cluster {
+                        if self.atlas.cluster_glyph(cluster).is_none() && seen_clusters.insert(cluster.clone()) {
+                            unknown_clusters.push(cluster.clone());
+                        }
                     } else {
-                        None
+                        let c = cell.c;
+                        if c != ' ' && c != '\0' && self.atlas.glyph(c).is_none() && seen_chars.insert(c) {
+                            unknown_chars.push(c);
+                        }
                     }
-                })
-                .collect()
-        };
+                }
+            }
+        }
 
         // Pass 2: rasterize unknowns
-        for c in unknown {
+        for c in unknown_chars {
             self.atlas.rasterize_char(c);
+        }
+        for cluster in unknown_clusters {
+            self.atlas.rasterize_cluster(&cluster);
         }
 
         // Pass 3: build vertices
@@ -512,9 +521,17 @@ impl Renderer {
                     log::trace!("render ─ at col={} row={} fg={:?} bg={:?}", col_idx, row_idx, cell.fg, cell.bg);
                 }
 
-                let glyph = match self.atlas.glyph(c) {
-                    Some(g) => *g,
-                    None => continue,
+                // Look up glyph: cluster first, then single char
+                let glyph = if let Some(ref cluster) = cell.cluster {
+                    match self.atlas.cluster_glyph(cluster) {
+                        Some(g) => *g,
+                        None => continue,
+                    }
+                } else {
+                    match self.atlas.glyph(c) {
+                        Some(g) => *g,
+                        None => continue,
+                    }
                 };
 
                 if glyph.width == 0 || glyph.height == 0 {
