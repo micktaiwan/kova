@@ -98,6 +98,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Recherche dans le scrollback (Cmd+F — filtre overlay, highlight query, click pour scroller)
 - [x] App icon dans Info.plist (`CFBundleIconFile`) — corrige l'icône surdimensionnée dans Alt-Tab
 - [x] Clickable URLs (Cmd+hover souligne en bleu + curseur main + URL en status bar, Cmd+click ouvre dans le navigateur)
+- [x] Wide characters (emojis, CJK) — détection via `unicode-width`, placeholder `'\0'` en col+1, rasterisation 2× cell_width dans l'atlas
 - [ ] Support multi-fenêtres (dont detach d'un split vers une nouvelle fenêtre)
 - [ ] Déplacer un split (réorganiser l'arbre de splits par drag ou raccourci, anchor visuelle pendant le drag)
 - [ ] Notifications visuelles (bell, activité dans un split inactif)
