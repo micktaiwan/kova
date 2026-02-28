@@ -32,11 +32,14 @@ pub struct VteHandler {
     // guaranteeing the RwLock outlives this guard. We transmute the lifetime to 'static
     // to allow storing it alongside the Arc.
     pending_guard: Option<RwLockWriteGuard<'static, TerminalState>>,
+    /// Buffer for consecutive print() calls. Flushed as grapheme clusters
+    /// before any non-print event.
+    print_buf: String,
 }
 
 impl VteHandler {
     pub fn new(terminal: Arc<RwLock<TerminalState>>, pty_writer: Arc<OwnedFd>) -> Self {
-        VteHandler { terminal, pty_writer, pending_guard: None }
+        VteHandler { terminal, pty_writer, pending_guard: None, print_buf: String::new() }
     }
 
     /// Lazily acquires the write lock on first call, reuses it on subsequent calls.
@@ -54,7 +57,22 @@ impl VteHandler {
     /// Releases the write lock (if held). Called after parser.advance() and
     /// before PTY writes that should not hold the lock.
     pub fn release_guard(&mut self) {
+        self.flush_print_buf();
         self.pending_guard = None;
+    }
+
+    /// Flush the print buffer: split into grapheme clusters and write each.
+    fn flush_print_buf(&mut self) {
+        if self.print_buf.is_empty() {
+            return;
+        }
+        use unicode_segmentation::UnicodeSegmentation;
+        // Take ownership to avoid borrow issues
+        let buf = std::mem::take(&mut self.print_buf);
+        let term = self.term();
+        for cluster in buf.graphemes(true) {
+            term.put_cluster(cluster);
+        }
     }
 
     fn write_to_pty(&self, data: &[u8]) {
@@ -64,10 +82,11 @@ impl VteHandler {
 
 impl Perform for VteHandler {
     fn print(&mut self, c: char) {
-        self.term().put_char(c);
+        self.print_buf.push(c);
     }
 
     fn execute(&mut self, byte: u8) {
+        self.flush_print_buf();
         match byte {
             0x08 => self.term().backspace(),        // BS
             0x09 => self.term().tab(),              // HT
@@ -83,6 +102,7 @@ impl Perform for VteHandler {
     }
 
     fn hook(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        self.flush_print_buf();
         let params: Vec<u16> = params.iter().flat_map(|p| p.iter().map(|&v| v)).collect();
         log::debug!(
             "unhandled DCS hook: action={}, params={:?}, intermediates={:?}",
@@ -91,10 +111,11 @@ impl Perform for VteHandler {
             intermediates
         );
     }
-    fn put(&mut self, _byte: u8) {}
-    fn unhook(&mut self) {}
+    fn put(&mut self, _byte: u8) { self.flush_print_buf(); }
+    fn unhook(&mut self) { self.flush_print_buf(); }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.flush_print_buf();
         // Handle OSC sequences (window title, etc.)
         if params.len() >= 2 {
             match params[0] {
@@ -141,6 +162,7 @@ impl Perform for VteHandler {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        self.flush_print_buf();
         let params: Vec<u16> = params.iter().flat_map(|p| p.iter().map(|&v| v)).collect();
 
         match (action, intermediates) {
@@ -373,6 +395,7 @@ impl Perform for VteHandler {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        self.flush_print_buf();
         match (byte, intermediates) {
             (b'M', []) => {
                 // Reverse Index
