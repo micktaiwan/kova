@@ -101,7 +101,8 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Clickable URLs (Cmd+hover souligne en bleu + curseur main + URL en status bar, Cmd+click ouvre dans le navigateur)
 - [x] Wide characters (emojis, CJK) — détection via `unicode-width`, placeholder `'\0'` en col+1, rasterisation 2× cell_width dans l'atlas
 - [ ] Support multi-fenêtres (dont detach d'un split vers une nouvelle fenêtre)
-- [ ] Déplacer un split (réorganiser l'arbre de splits par drag ou raccourci, anchor visuelle pendant le drag)
+- [x] Déplacer un split par raccourci (Cmd+Shift+Arrows — swap le pane focusé avec son voisin)
+- [ ] Déplacer un split par drag (anchor visuelle pendant le drag)
 - [x] Bell indicator sur tabs inactifs (point orange sur les tabs non focusés quand bell reçu)
 - [ ] Notifications visuelles avancées (activité dans un split inactif)
 - [ ] Batching du parser VT — le pty-reader prend un write lock sur `TerminalState` à chaque caractère parsé (`print`, `execute`, `csi_dispatch`…). Quand un pane en background reçoit beaucoup de données (build, logs…), ces write locks en rafale bloquent les read locks du render timer au moment du switch de tab (parking_lot donne priorité aux writers). Solution : parser dans un buffer local puis flusher en un seul write lock par read() de 4 Ko.
