@@ -531,7 +531,8 @@ impl Renderer {
                 let tw = glyph.width as f32 / atlas_w;
                 let th = glyph.height as f32 / atlas_h;
 
-                let fg = [cell.fg[0], cell.fg[1], cell.fg[2], 1.0];
+                let alpha = if glyph.is_color { 2.0 } else { 1.0 };
+                let fg = [cell.fg[0], cell.fg[1], cell.fg[2], alpha];
                 let no_bg = [0.0, 0.0, 0.0, 0.0];
 
                 vertices.push(Vertex { position: [gx, gy], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
@@ -716,10 +717,17 @@ impl Renderer {
         // Full-width background
         Self::push_bg_quad(vertices, 0.0, 0.0, viewport_w, bar_h, self.tab_bar_bg);
 
-        // Fixed width per tab, capped at cell_w * 15
+        // Fixed width per tab, capped at cell_w * 20
         let max_tab_w = cell_w * 20.0;
-        let available_w = viewport_w - left_inset;
-        let tab_width = (available_w / tab_count as f32).min(max_tab_w);
+        let full_available_w = viewport_w - left_inset;
+        let tab_width = (full_available_w / tab_count as f32).min(max_tab_w);
+
+        // Version label: show only if tabs don't reach its area
+        let version_label = format!("Kova v{}", env!("CARGO_PKG_VERSION"));
+        let version_chars = version_label.chars().count() as f32;
+        let version_padding = cell_w * (version_chars + 2.0);
+        let tabs_right_edge = left_inset + tab_count as f32 * tab_width;
+        let show_version = tabs_right_edge <= viewport_w - version_padding;
         let no_bg = [0.0, 0.0, 0.0, 0.0];
 
         for (i, (title, is_active, color_idx, is_renaming, has_bell)) in tab_titles.iter().enumerate() {
@@ -789,6 +797,14 @@ impl Renderer {
                 let dot_color = [1.0, 0.45, 0.1, 1.0]; // orange
                 self.render_status_text(vertices, "●", dot_x, dot_y, x + tab_width, dot_color, no_bg);
             }
+        }
+
+        // Render version label on the right (if space allows)
+        if show_version {
+            let version_fg = [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 0.5];
+            let version_x = viewport_w - version_padding + cell_w;
+            let version_y = (bar_h - cell_h) / 2.0;
+            self.render_status_text(vertices, &version_label, version_x, version_y, viewport_w - cell_w * 0.5, version_fg, no_bg);
         }
     }
 
