@@ -83,7 +83,6 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Tab bar redesign — couleurs de tabs, refonte visuelle
 - [x] Navigation cross-tab (Cmd+Shift+Arrows entre splits de différents tabs)
 - [x] Lazy write lock dans le parser VTE — acquisition du write lock uniquement quand nécessaire, réduit la contention
-- [ ] Config keybindings (raccourcis hardcodés suffisent pour V1)
 - [x] Synchronized output (mode 2026) — bufferiser le rendu entre h/l pour éviter le tearing
 - [x] CPR (Cursor Position Report, CSI 6 n) — réponse position curseur
 - [x] DA1 (Device Attributes, CSI c) — identification VT220 + ANSI color
@@ -94,26 +93,27 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Insert mode (SM/RM 4) — décale les caractères au lieu d'écraser
 - [x] ICH (CSI @) — insertion de caractères blancs à la position curseur
 - [x] DECSCUSR (CSI Ps SP q) — cursor shape block/underline/bar
-- [ ] Thèmes de couleurs (quelques built-in + custom)
-- [ ] Support ProMotion (120Hz)
 - [x] Recherche dans le scrollback (Cmd+F — filtre overlay, highlight query, click pour scroller)
 - [x] App icon dans Info.plist (`CFBundleIconFile`) — corrige l'icône surdimensionnée dans Alt-Tab
 - [x] Clickable URLs (Cmd+hover souligne en bleu + curseur main + URL en status bar, Cmd+click ouvre dans le navigateur)
 - [x] Wide characters (emojis, CJK) — détection via `unicode-width`, placeholder `'\0'` en col+1, rasterisation 2× cell_width dans l'atlas
-- [ ] Support multi-fenêtres (dont detach d'un split vers une nouvelle fenêtre)
 - [x] Déplacer un split par raccourci (Cmd+Shift+Arrows — swap le pane focusé avec son voisin)
-- [ ] Déplacer un split par drag (anchor visuelle pendant le drag)
 - [x] Bell indicator sur tabs inactifs (point orange sur les tabs non focusés quand bell reçu)
+- [x] Color emoji rendering via CoreText fallback fonts
+- [x] Grapheme cluster emoji (flags, ZWJ sequences, skin tones)
+- [x] Optimisation RAM Cell — compact cell storage pour le scrollback (28→12 bytes/cell, -57% RAM). fg/bg stockés en `u32` RGBA au lieu de `[f32; 3]`.
+- [ ] Config keybindings (raccourcis hardcodés suffisent pour V1)
+- [ ] Thèmes de couleurs (quelques built-in + custom)
+- [ ] Support ProMotion (120Hz)
+- [ ] Support multi-fenêtres (dont detach d'un split vers une nouvelle fenêtre)
+- [ ] Déplacer un split par drag (anchor visuelle pendant le drag)
 - [ ] Notifications visuelles avancées (activité dans un split inactif)
 - [ ] Batching du parser VT — le pty-reader prend un write lock sur `TerminalState` à chaque caractère parsé (`print`, `execute`, `csi_dispatch`…). Quand un pane en background reçoit beaucoup de données (build, logs…), ces write locks en rafale bloquent les read locks du render timer au moment du switch de tab (parking_lot donne priorité aux writers). Solution : parser dans un buffer local puis flusher en un seul write lock par read() de 4 Ko.
 - [ ] PTY cleanup non-bloquant — remplacer le `waitpid` bloquant dans `Drop for Pty` par une escalade SIGHUP → SIGTERM → SIGKILL avec timeouts (~200ms max), pour éviter un freeze UI si un process ignore SIGHUP
-- [x] Color emoji rendering via CoreText fallback fonts
-- [x] Grapheme cluster emoji (flags, ZWJ sequences, skin tones)
 - [ ] Font fallback (block elements/box-drawing) — nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
 - [ ] Ligatures (optionnel)
-- [x] Optimisation RAM Cell — compact cell storage pour le scrollback (28→12 bytes/cell, -57% RAM). fg/bg stockés en `u32` RGBA au lieu de `[f32; 3]`.
-  - [ ] **Trim trailing spaces** : tronquer les cellules vides en fin de ligne.
-  - [ ] **Run-length encoding** : compresser les séquences de même couleur.
+- [ ] **Trim trailing spaces** : tronquer les cellules vides en fin de ligne.
+- [ ] **Run-length encoding** : compresser les séquences de même couleur.
 - [ ] Metriques perf exposées (frame time, mémoire, allocations) — utile pour diagnostiquer sans avoir à lancer vmmap/heap manuellement
 
 ## V3 — Avancé
