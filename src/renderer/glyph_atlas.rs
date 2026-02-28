@@ -8,6 +8,7 @@ use objc2_metal::{
     MTLDevice, MTLPixelFormat, MTLRegion, MTLSize, MTLTexture, MTLTextureDescriptor,
     MTLTextureUsage, MTLOrigin,
 };
+use unicode_width::UnicodeWidthChar;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
@@ -506,8 +507,10 @@ impl GlyphAtlas {
             return Some(*g);
         }
 
+        let width_cells = UnicodeWidthChar::width(c).unwrap_or(1).max(1);
+
         // Try builtin drawing for block elements and box-drawing first
-        let bmp_w = self.cell_width as usize;
+        let bmp_w = self.cell_width as usize * width_cells;
         let bmp_h = self.cell_height as usize;
         let bmp_bpr = bmp_w * 4;
         let mut builtin_buf = vec![0u8; bmp_bpr * bmp_h];
@@ -519,7 +522,7 @@ impl GlyphAtlas {
 
         let (mut glyph_id, draw_font) = self.resolve_glyph(c)?;
 
-        // Render glyph into cell-sized bitmap with fixed baseline
+        // Render glyph into bitmap (wide chars get width_cells * cell_width)
         let mut bmp_buf = vec![0u8; bmp_bpr * bmp_h];
 
         let bmp_ctx = unsafe {
@@ -554,7 +557,7 @@ impl GlyphAtlas {
 
         // Debug: count non-zero pixels
         let nonzero = bmp_buf.iter().filter(|&&b| b != 0).count();
-        log::trace!("rasterize '{}' U+{:04X}: bmp {}x{}, nonzero_bytes={}", c, c as u32, bmp_w, bmp_h, nonzero);
+        log::trace!("rasterize '{}' U+{:04X}: bmp {}x{}, nonzero_bytes={}, width_cells={}", c, c as u32, bmp_w, bmp_h, nonzero, width_cells);
 
         self.insert_bitmap(c, &bmp_buf, bmp_w, bmp_h)
     }
@@ -564,7 +567,8 @@ impl GlyphAtlas {
         let bmp_bpr = bmp_w * 4;
 
         // Check if we need to wrap to next row
-        if self.next_x + self.glyph_cell_w > self.atlas_width {
+        let slot_w = bmp_w as u32;
+        if self.next_x + slot_w > self.atlas_width {
             self.next_x = 0;
             self.next_y += self.glyph_cell_h;
         }
@@ -607,13 +611,13 @@ impl GlyphAtlas {
         let info = GlyphInfo {
             x: atlas_x,
             y: atlas_y,
-            width: self.glyph_cell_w,
+            width: bmp_w as u32,
             height: self.glyph_cell_h,
         };
         self.glyphs.insert(c, info);
 
         // Advance cursor
-        self.next_x += self.glyph_cell_w;
+        self.next_x += bmp_w as u32;
 
         log::trace!("Rasterized '{}' (U+{:04X}) into atlas", c, c as u32);
         Some(info)

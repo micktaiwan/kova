@@ -6,6 +6,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::terminal::parser::AnsiColor;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -292,6 +294,23 @@ impl TerminalState {
             self.reset_scroll();
         }
 
+        let char_width = UnicodeWidthChar::width(c).unwrap_or(1) as u16;
+
+        // Wide char at last column: wrap before writing
+        if char_width == 2 && self.cursor_x == self.cols - 1 && self.auto_wrap {
+            // Fill last column with space, then wrap
+            let row = self.cursor_y as usize;
+            if row < self.grid.len() {
+                let col = self.cursor_x as usize;
+                if col < self.grid[row].cells.len() {
+                    self.grid[row].cells[col] = self.blank.clone();
+                }
+                self.grid[row].wrapped = true;
+            }
+            self.cursor_x = 0;
+            self.advance_line();
+        }
+
         if self.cursor_x >= self.cols {
             if !self.auto_wrap {
                 // DECAWM off: stay at last column, overwrite
@@ -332,8 +351,17 @@ impl TerminalState {
                 fg,
                 bg: self.current_bg,
             };
+
+            // Wide char: write placeholder '\0' in the next column
+            if char_width == 2 && col + 1 < self.grid[row].cells.len() {
+                self.grid[row].cells[col + 1] = Cell {
+                    c: '\0',
+                    fg,
+                    bg: self.current_bg,
+                };
+            }
         }
-        self.cursor_x += 1;
+        self.cursor_x += char_width;
     }
 
     pub fn newline(&mut self) {
