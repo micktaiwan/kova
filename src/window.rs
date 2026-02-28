@@ -57,7 +57,9 @@ pub struct KovaViewIvars {
     auto_scroll_speed: Cell<i32>,
     /// Marked text from IME composition (dead keys, etc.)
     marked_text: RefCell<Option<String>>,
-    /// Current NSEvent being processed by interpretKeyEvents, so doCommandBySelector can access it
+    /// Current NSEvent being processed by interpretKeyEvents, so doCommandBySelector can access it.
+    /// SAFETY: pointer is only live during the synchronous keyDown → interpretKeyEvents → doCommandBySelector
+    /// call chain, and cleared immediately after. Never accessed outside that stack frame.
     current_event: Cell<Option<*const NSEvent>>,
 }
 
