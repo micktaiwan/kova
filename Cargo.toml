@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSNotification", "NSRunLoop", "NSThread", "NSArray", "NSDictionary", "NSValue", "NSRange", "NSData"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSNotification", "NSRunLoop", "NSThread", "NSArray", "NSDictionary", "NSValue", "NSRange", "NSData", "NSAttributedString"] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSWindow",
@@ -23,6 +23,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSImage",
     "NSTrackingArea",
     "NSCursor",
+    "NSTextInputClient",
 ] }
 objc2-metal = { version = "0.3", features = [
     "MTLDevice",

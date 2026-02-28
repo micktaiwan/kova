@@ -2,6 +2,13 @@ use objc2_app_kit::{NSEvent, NSEventModifierFlags};
 
 use crate::terminal::pty::Pty;
 
+/// Write raw UTF-8 text to PTY (used by insertText: from NSTextInputClient).
+pub fn write_text(text: &str, pty: &Pty) {
+    if !text.is_empty() {
+        pty.write(text.as_bytes());
+    }
+}
+
 pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool) {
     let modifiers = event.modifierFlags();
 

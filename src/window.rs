@@ -1,9 +1,9 @@
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags, NSPasteboard, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
+use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2_app_kit::{NSApplication, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
+use objc2_foundation::{NSArray, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
 use objc2_metal::MTLCreateSystemDefaultDevice;
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::{Cell, OnceCell, RefCell};
@@ -55,6 +55,10 @@ pub struct KovaViewIvars {
     cmd_held: Cell<bool>,
     /// Auto-scroll speed during drag selection (lines/tick, positive = down, negative = up, 0 = inactive)
     auto_scroll_speed: Cell<i32>,
+    /// Marked text from IME composition (dead keys, etc.)
+    marked_text: RefCell<Option<String>>,
+    /// Current NSEvent being processed by interpretKeyEvents, so doCommandBySelector can access it
+    current_event: Cell<Option<*const NSEvent>>,
 }
 
 struct FilterState {
@@ -74,6 +78,108 @@ define_class!(
     pub struct KovaView;
 
     unsafe impl NSObjectProtocol for KovaView {}
+    unsafe impl NSTextInputClient for KovaView {
+        #[unsafe(method(insertText:replacementRange:))]
+        unsafe fn insert_text_replacement_range(&self, string: &objc2::runtime::AnyObject, _replacement_range: objc2_foundation::NSRange) {
+            let text = unsafe { nsstring_from_input(string) };
+            // Clear marked text
+            *self.ivars().marked_text.borrow_mut() = None;
+            // Write to PTY
+            if let Some(pane) = self.focused_pane() {
+                pane.terminal.write().reset_scroll();
+                input::write_text(&text, &pane.pty);
+            }
+        }
+
+        #[unsafe(method(doCommandBySelector:))]
+        unsafe fn do_command_by_selector(&self, _selector: objc2::runtime::Sel) {
+            if let Some(event_ptr) = self.ivars().current_event.get() {
+                let event = unsafe { &*event_ptr };
+                if let Some(pane) = self.focused_pane() {
+                    let cursor_keys_app = pane.terminal.read().cursor_keys_application;
+                    pane.terminal.write().reset_scroll();
+                    input::handle_key_event(event, &pane.pty, cursor_keys_app);
+                }
+            }
+        }
+
+        #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
+        unsafe fn set_marked_text_selected_range_replacement_range(
+            &self,
+            string: &objc2::runtime::AnyObject,
+            _selected_range: objc2_foundation::NSRange,
+            _replacement_range: objc2_foundation::NSRange,
+        ) {
+            let text = unsafe { nsstring_from_input(string) };
+            *self.ivars().marked_text.borrow_mut() = if text.is_empty() { None } else { Some(text) };
+        }
+
+        #[unsafe(method(unmarkText))]
+        fn unmark_text(&self) {
+            *self.ivars().marked_text.borrow_mut() = None;
+        }
+
+        #[unsafe(method(hasMarkedText))]
+        fn has_marked_text(&self) -> bool {
+            self.ivars().marked_text.borrow().is_some()
+        }
+
+        #[unsafe(method(markedRange))]
+        fn marked_range(&self) -> objc2_foundation::NSRange {
+            if self.ivars().marked_text.borrow().is_some() {
+                objc2_foundation::NSRange { location: 0, length: 1 }
+            } else {
+                objc2_foundation::NSRange { location: objc2_foundation::NSNotFound as usize, length: 0 }
+            }
+        }
+
+        #[unsafe(method(selectedRange))]
+        fn selected_range(&self) -> objc2_foundation::NSRange {
+            objc2_foundation::NSRange { location: objc2_foundation::NSNotFound as usize, length: 0 }
+        }
+
+        #[unsafe(method_id(attributedSubstringForProposedRange:actualRange:))]
+        #[unsafe(method_family = none)]
+        unsafe fn attributed_substring_for_proposed_range(
+            &self,
+            _range: objc2_foundation::NSRange,
+            _actual_range: objc2_foundation::NSRangePointer,
+        ) -> Option<objc2::rc::Retained<objc2_foundation::NSAttributedString>> {
+            None
+        }
+
+        #[unsafe(method_id(validAttributesForMarkedText))]
+        #[unsafe(method_family = none)]
+        fn valid_attributes_for_marked_text(&self) -> objc2::rc::Retained<objc2_foundation::NSArray<objc2_foundation::NSAttributedStringKey>> {
+            objc2_foundation::NSArray::new()
+        }
+
+        #[unsafe(method(firstRectForCharacterRange:actualRange:))]
+        unsafe fn first_rect_for_character_range(
+            &self,
+            _range: objc2_foundation::NSRange,
+            _actual_range: objc2_foundation::NSRangePointer,
+        ) -> objc2_core_foundation::CGRect {
+            let frame = self.frame();
+            let window_frame = if let Some(window) = self.window() {
+                window.frame()
+            } else {
+                return objc2_core_foundation::CGRect::ZERO;
+            };
+            objc2_core_foundation::CGRect {
+                origin: objc2_core_foundation::CGPoint {
+                    x: window_frame.origin.x + frame.origin.x,
+                    y: window_frame.origin.y + frame.origin.y,
+                },
+                size: objc2_core_foundation::CGSize { width: 0.0, height: 0.0 },
+            }
+        }
+
+        #[unsafe(method(characterIndexForPoint:))]
+        fn character_index_for_point(&self, _point: objc2_core_foundation::CGPoint) -> usize {
+            objc2_foundation::NSNotFound as usize
+        }
+    }
 
     impl KovaView {
         #[unsafe(method(acceptsFirstResponder))]
@@ -103,14 +209,14 @@ define_class!(
                 return;
             }
 
-            if let Some(pane) = self.focused_pane() {
-                let cursor_keys_app = pane.terminal.read().cursor_keys_application;
-                // User is typing — resume auto-scroll
-                {
-                    let mut term = pane.terminal.write();
-                    term.reset_scroll();
-                }
-                input::handle_key_event(event, &pane.pty, cursor_keys_app);
+            if self.focused_pane().is_some() {
+                // Store the event so doCommandBySelector can access it
+                self.ivars().current_event.set(Some(event as *const NSEvent));
+                // Route through macOS input handling for dead key / IME composition
+                let event_retained: Retained<NSEvent> = event.retain();
+                let events = NSArray::from_retained_slice(&[event_retained]);
+                self.interpretKeyEvents(&events);
+                self.ivars().current_event.set(None);
             }
         }
 
@@ -604,8 +710,21 @@ define_class!(
             };
             self.addTrackingArea(&area);
         }
+
     }
 );
+
+/// Extract a String from an NSTextInputClient input object (NSString or NSAttributedString).
+unsafe fn nsstring_from_input(obj: &objc2::runtime::AnyObject) -> String {
+    let responds: bool = unsafe { msg_send![obj, respondsToSelector: objc2::sel!(string)] };
+    if responds {
+        let ns_str: *const NSString = unsafe { msg_send![obj, string] };
+        unsafe { &*ns_str }.to_string()
+    } else {
+        let ns_str: &NSString = unsafe { &*(obj as *const objc2::runtime::AnyObject as *const NSString) };
+        ns_str.to_string()
+    }
+}
 
 impl KovaView {
     fn new(mtm: MainThreadMarker, frame: CGRect) -> Retained<Self> {
@@ -626,6 +745,8 @@ impl KovaView {
             hovered_url: RefCell::new(None),
             cmd_held: Cell::new(false),
             auto_scroll_speed: Cell::new(0),
+            marked_text: RefCell::new(None),
+            current_event: Cell::new(None),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
