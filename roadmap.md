@@ -50,6 +50,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Option+Left/Right — déplacement mot par mot (envoie `\x1bb`/`\x1bf`)
 - [x] Cmd+Backspace — effacer toute la ligne (envoie `\x15` Ctrl+U)
 - [x] Cmd+Left/Right — début/fin de ligne (envoie Home `\x1b[H` / End `\x1b[F`)
+- [x] Option key — envoie le caractère composé macOS quand différent du caractère de base
 
 ### Refacto multi-pane (prérequis splits)
 
@@ -101,15 +102,17 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Wide characters (emojis, CJK) — détection via `unicode-width`, placeholder `'\0'` en col+1, rasterisation 2× cell_width dans l'atlas
 - [ ] Support multi-fenêtres (dont detach d'un split vers une nouvelle fenêtre)
 - [ ] Déplacer un split (réorganiser l'arbre de splits par drag ou raccourci, anchor visuelle pendant le drag)
-- [ ] Notifications visuelles (bell, activité dans un split inactif)
+- [x] Bell indicator sur tabs inactifs (point orange sur les tabs non focusés quand bell reçu)
+- [ ] Notifications visuelles avancées (activité dans un split inactif)
 - [ ] Batching du parser VT — le pty-reader prend un write lock sur `TerminalState` à chaque caractère parsé (`print`, `execute`, `csi_dispatch`…). Quand un pane en background reçoit beaucoup de données (build, logs…), ces write locks en rafale bloquent les read locks du render timer au moment du switch de tab (parking_lot donne priorité aux writers). Solution : parser dans un buffer local puis flusher en un seul write lock par read() de 4 Ko.
 - [ ] PTY cleanup non-bloquant — remplacer le `waitpid` bloquant dans `Drop for Pty` par une escalade SIGHUP → SIGTERM → SIGKILL avec timeouts (~200ms max), pour éviter un freeze UI si un process ignore SIGHUP
-- [ ] Font fallback (emoji, symboles) — CoreText fallback fonctionne mais block elements/box-drawing nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
+- [x] Color emoji rendering via CoreText fallback fonts
+- [x] Grapheme cluster emoji (flags, ZWJ sequences, skin tones)
+- [ ] Font fallback (block elements/box-drawing) — nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
 - [ ] Ligatures (optionnel)
-- [ ] Optimisation RAM Cell — la struct Cell fait 28 bytes (char 4B + fg/bg `[f32; 3]` = 24B). Avec 10k lignes scrollback × 200 cols = 53 MB/pane. Analyse vmmap montre ~400 MB footprint (peak 686 MB), dont ~70% scrollback. Pistes :
-  - **Compact Cell pour le scrollback** : stocker fg/bg en `u32` RGBA (`[u8; 4]`) → 12 bytes/cell (÷2.3), ou palette indexée `u8` → 6 bytes/cell (÷4.7). Le grid actif garde `[f32; 3]` pour le rendu direct, conversion à l'entrée dans le scrollback.
-  - **Trim trailing spaces** : la plupart des lignes scrollback ne remplissent pas toute la largeur. Tronquer les cellules vides en fin de ligne.
-  - **Run-length encoding** : beaucoup de lignes ont la même couleur sur de longues séquences, compressibles.
+- [x] Optimisation RAM Cell — compact cell storage pour le scrollback (28→12 bytes/cell, -57% RAM). fg/bg stockés en `u32` RGBA au lieu de `[f32; 3]`.
+  - [ ] **Trim trailing spaces** : tronquer les cellules vides en fin de ligne.
+  - [ ] **Run-length encoding** : compresser les séquences de même couleur.
 - [ ] Metriques perf exposées (frame time, mémoire, allocations) — utile pour diagnostiquer sans avoir à lancer vmmap/heap manuellement
 
 ## V3 — Avancé
