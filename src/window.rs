@@ -319,15 +319,16 @@ define_class!(
 
                     // Cmd+Option+arrows → navigate panes
                     if has_option && !has_ctrl {
-                        let nav = match ch.as_str() {
-                            "\u{f702}" => Some(NavDirection::Left),   // left arrow
-                            "\u{f703}" => Some(NavDirection::Right),  // right arrow
-                            "\u{f700}" => Some(NavDirection::Up),     // up arrow
-                            "\u{f701}" => Some(NavDirection::Down),   // down arrow
-                            _ => None,
-                        };
-                        if let Some(dir) = nav {
+                        if let Some(dir) = NavDirection::from_arrow_char(&ch) {
                             self.do_navigate(dir);
+                            return objc2::runtime::Bool::YES;
+                        }
+                    }
+
+                    // Cmd+Shift+arrows → swap panes
+                    if has_shift && !has_option && !has_ctrl {
+                        if let Some(dir) = NavDirection::from_arrow_char(&ch) {
+                            self.do_swap_pane(dir);
                             return objc2::runtime::Bool::YES;
                         }
                     }
@@ -1387,6 +1388,31 @@ impl KovaView {
                     NavDirection::Left | NavDirection::Up => new_tab.tree.last_pane().id,
                 };
                 new_tab.focused_pane = target_id;
+            }
+        }
+    }
+
+    /// Swap the focused pane with its neighbor in the given direction.
+    fn do_swap_pane(&self, dir: NavDirection) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        let tab = match tabs.get_mut(idx) {
+            Some(t) => t,
+            None => return,
+        };
+        let focused_id = tab.focused_pane;
+        let vp = self.panes_viewport();
+        if let Some(neighbor_id) = tab.tree.neighbor(focused_id, dir, vp) {
+            if tab.tree.swap_panes(focused_id, neighbor_id) {
+                // Mark both panes dirty so they redraw in their new positions
+                if let Some(p) = tab.tree.pane(focused_id) {
+                    p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(p) = tab.tree.pane(neighbor_id) {
+                    p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                drop(tabs);
+                self.resize_all_panes();
             }
         }
     }
