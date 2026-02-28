@@ -49,6 +49,19 @@ pub enum NavDirection {
     Down,
 }
 
+impl NavDirection {
+    /// Parse a macOS arrow key character (NSEvent PUA) into a NavDirection.
+    pub fn from_arrow_char(ch: &str) -> Option<Self> {
+        match ch {
+            "\u{f702}" => Some(NavDirection::Left),
+            "\u{f703}" => Some(NavDirection::Right),
+            "\u{f700}" => Some(NavDirection::Up),
+            "\u{f701}" => Some(NavDirection::Down),
+            _ => None,
+        }
+    }
+}
+
 pub type TabId = u32;
 
 static NEXT_PANE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
@@ -614,6 +627,41 @@ impl SplitTree {
                 let bot_vp = PaneViewport { x: vp.x, y: vp.y + top_h, width: vp.width, height: vp.height - top_h };
                 top.hit_test(x, y, top_vp)
                     .or_else(|| bottom.hit_test(x, y, bot_vp))
+            }
+        }
+    }
+
+    /// Swap the Pane values of two leaves identified by their PaneIds.
+    /// Returns true if both were found and swapped.
+    pub fn swap_panes(&mut self, id1: PaneId, id2: PaneId) -> bool {
+        if id1 == id2 {
+            return false;
+        }
+        // Get raw pointers to the two leaf Panes, then swap.
+        let ptr1 = self.pane_leaf_mut(id1);
+        let ptr2 = self.pane_leaf_mut(id2);
+        match (ptr1, ptr2) {
+            (Some(p1), Some(p2)) => {
+                // SAFETY: PaneIds are globally unique (monotonic allocator) so id1 != id2
+                // guarantees p1 and p2 point to non-overlapping Pane values.
+                // Both pointers remain valid: self is exclusively borrowed and no
+                // structural mutation occurs between pointer acquisition and swap.
+                unsafe { std::ptr::swap(p1, p2) };
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Return a raw mutable pointer to the Pane inside a Leaf node.
+    fn pane_leaf_mut(&mut self, id: PaneId) -> Option<*mut Pane> {
+        match self {
+            SplitTree::Leaf(p) => {
+                if p.id == id { Some(p as *mut Pane) } else { None }
+            }
+            SplitTree::HSplit { left, right, .. }
+            | SplitTree::VSplit { top: left, bottom: right, .. } => {
+                left.pane_leaf_mut(id).or_else(|| right.pane_leaf_mut(id))
             }
         }
     }
