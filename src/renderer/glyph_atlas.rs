@@ -19,6 +19,7 @@ pub struct GlyphInfo {
     pub y: u32,
     pub width: u32,
     pub height: u32,
+    pub is_color: bool,
 }
 
 pub struct GlyphAtlas {
@@ -110,6 +111,7 @@ impl GlyphAtlas {
                 glyphs.insert(c, GlyphInfo {
                     x: atlas_x, y: atlas_y,
                     width: glyph_cell_w, height: glyph_cell_h,
+                    is_color: false,
                 });
                 continue;
             }
@@ -135,6 +137,7 @@ impl GlyphAtlas {
                     glyphs.insert(c, GlyphInfo {
                         x: atlas_x, y: atlas_y,
                         width: glyph_cell_w, height: glyph_cell_h,
+                        is_color: false,
                     });
                     continue;
                 }
@@ -169,6 +172,7 @@ impl GlyphAtlas {
                 y: atlas_y,
                 width: glyph_cell_w,
                 height: glyph_cell_h,
+                is_color: false,
             });
         }
 
@@ -515,10 +519,18 @@ impl GlyphAtlas {
 
         if Self::draw_builtin_glyph(c, &mut builtin_buf, bmp_w, bmp_h) {
             log::trace!("builtin glyph for '{}' U+{:04X}", c, c as u32);
-            return self.insert_bitmap(c, &builtin_buf, bmp_w, bmp_h);
+            return self.insert_bitmap(c, &builtin_buf, bmp_w, bmp_h, false);
         }
 
         let (mut glyph_id, draw_font) = self.resolve_glyph(c)?;
+
+        // Detect if the resolved font is a color (emoji) font via symbolic traits
+        let is_color = unsafe {
+            let font_ref = &*draw_font;
+            let traits = font_ref.symbolic_traits();
+            // kCTFontTraitColorGlyphs = 1 << 13 = 0x2000
+            (traits.0 & (1 << 13)) != 0
+        };
 
         // Render glyph into bitmap (wide chars get width_cells * cell_width)
         let mut bmp_buf = vec![0u8; bmp_bpr * bmp_h];
@@ -539,7 +551,9 @@ impl GlyphAtlas {
             None => return None,
         };
 
-        CGContext::set_rgb_fill_color(Some(&bmp_ctx), 1.0, 1.0, 1.0, 1.0);
+        if !is_color {
+            CGContext::set_rgb_fill_color(Some(&bmp_ctx), 1.0, 1.0, 1.0, 1.0);
+        }
 
         // Draw with the resolved font (primary or fallback) but keep primary baseline
         let mut pos = CGPoint { x: 0.0, y: self.descent };
@@ -553,15 +567,28 @@ impl GlyphAtlas {
             );
         }
 
+        // For color emoji, un-premultiply alpha so the straight-alpha blend mode works
+        if is_color {
+            for pixel in bmp_buf.chunks_exact_mut(4) {
+                let a = pixel[3] as f32;
+                if a > 0.0 && a < 255.0 {
+                    let inv = 255.0 / a;
+                    pixel[0] = (pixel[0] as f32 * inv).min(255.0) as u8;
+                    pixel[1] = (pixel[1] as f32 * inv).min(255.0) as u8;
+                    pixel[2] = (pixel[2] as f32 * inv).min(255.0) as u8;
+                }
+            }
+        }
+
         // Debug: count non-zero pixels
         let nonzero = bmp_buf.iter().filter(|&&b| b != 0).count();
-        log::trace!("rasterize '{}' U+{:04X}: bmp {}x{}, nonzero_bytes={}, width_cells={}", c, c as u32, bmp_w, bmp_h, nonzero, width_cells);
+        log::trace!("rasterize '{}' U+{:04X}: bmp {}x{}, nonzero_bytes={}, width_cells={}, is_color={}", c, c as u32, bmp_w, bmp_h, nonzero, width_cells, is_color);
 
-        self.insert_bitmap(c, &bmp_buf, bmp_w, bmp_h)
+        self.insert_bitmap(c, &bmp_buf, bmp_w, bmp_h, is_color)
     }
 
     /// Insert a rendered bitmap into the atlas and return glyph info.
-    fn insert_bitmap(&mut self, c: char, bmp_buf: &[u8], bmp_w: usize, bmp_h: usize) -> Option<GlyphInfo> {
+    fn insert_bitmap(&mut self, c: char, bmp_buf: &[u8], bmp_w: usize, bmp_h: usize, is_color: bool) -> Option<GlyphInfo> {
         let bmp_bpr = bmp_w * 4;
 
         // Check if we need to wrap to next row
@@ -611,6 +638,7 @@ impl GlyphAtlas {
             y: atlas_y,
             width: bmp_w as u32,
             height: self.glyph_cell_h,
+            is_color,
         };
         self.glyphs.insert(c, info);
 

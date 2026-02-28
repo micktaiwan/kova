@@ -56,7 +56,12 @@ fragment float4 fragment_main(
     constexpr sampler s(mag_filter::linear, min_filter::linear);
     float4 tex_color = atlas.sample(s, in.tex_coords);
 
-    // Use luminance of the glyph texture as alpha mask
+    // Color emoji: color.a == 2.0 signals color glyph — use texture directly
+    if (in.color.a > 1.5) {
+        return tex_color;
+    }
+
+    // Grayscale glyph: use luminance as alpha mask
     float alpha = max(max(tex_color.r, tex_color.g), tex_color.b);
 
     return float4(in.color.rgb, in.color.a * alpha);
