@@ -1197,13 +1197,22 @@ impl TerminalState {
         None
     }
 
-    /// Number of empty rows at top when screen isn't full (for pixel→grid conversion)
+    /// Number of empty rows to push content down when screen isn't full.
+    /// Used by both renderer and hit-test to keep visual and logical positions in sync.
+    /// Disabled in alt screen (TUI apps) and when content doesn't start at line 0
+    /// (explicit cursor positioning via escape sequences).
     pub fn y_offset_rows(&self) -> usize {
-        if self.scroll_offset != 0 { return 0; }
+        if self.in_alt_screen || self.scroll_offset != 0 {
+            return 0;
+        }
         let display = self.visible_lines();
-        let last_used = display.iter().rposition(|line|
-            line.iter().any(|c| c.c != ' ' && c.c != '\0')
-        ).map_or(0, |i| i + 1);
+        let has_content = |line: &[Cell]| line.iter().any(|c| c.c != ' ' && c.c != '\0');
+        let first_used = display.iter().position(|line| has_content(line));
+        if first_used != Some(0) {
+            return 0;
+        }
+        let last_used = display.iter().rposition(|line| has_content(line))
+            .map_or(0, |i| i + 1);
         if last_used < self.rows as usize {
             self.rows as usize - last_used
         } else {

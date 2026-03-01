@@ -476,26 +476,9 @@ impl Renderer {
         let ox = vp.x + PANE_H_PADDING;
         let oy = vp.y;
 
-        // Calculate y_offset: push content to bottom when screen isn't full
-        // Disabled in alt screen (TUI apps) and when content doesn't start at line 0
-        // (explicit cursor positioning via escape sequences like \033[5;10H)
-        let max_rows = term.rows as usize;
-        let has_content = |line: &[crate::terminal::Cell]| line.iter().any(|c| c.c != ' ' && c.c != '\0');
-        let first_used = display.iter().position(|line| has_content(line));
-        let last_used = display.iter().rposition(|line| has_content(line))
-            .map_or(0, |i| i + 1);
-        let y_offset = if !term.in_alt_screen
-            && first_used == Some(0)
-            && last_used < max_rows
-            && term.scroll_offset() == 0
-        {
-            let raw = (max_rows - last_used) as f32 * cell_h;
-            // Clamp: never push content beyond the viewport
-            let max_offset = (vp.height - last_used as f32 * cell_h).max(0.0);
-            raw.min(max_offset)
-        } else {
-            0.0
-        };
+        // Push content to bottom when screen isn't full (single source of truth in Terminal)
+        let y_offset_rows = term.y_offset_rows() as f32;
+        let y_offset = (y_offset_rows * cell_h).min((vp.height - (term.rows as f32 - y_offset_rows) * cell_h).max(0.0));
 
         let mut vertices = Vec::with_capacity(display.len() * term.cols as usize * 6);
 
