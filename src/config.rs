@@ -11,6 +11,7 @@ pub struct Config {
     pub status_bar: StatusBarConfig,
     pub tab_bar: TabBarConfig,
     pub splits: SplitsConfig,
+    pub global_status_bar: GlobalStatusBarConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,7 +58,15 @@ pub struct StatusBarConfig {
     pub cwd_color: [f32; 3],
     pub branch_color: [f32; 3],
     pub scroll_color: [f32; 3],
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GlobalStatusBarConfig {
+    pub bg_color: [f32; 3],
+    pub fg_color: [f32; 3],
     pub time_color: [f32; 3],
+    pub scroll_indicator_color: [f32; 3],
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,7 +108,17 @@ impl Default for StatusBarConfig {
             cwd_color: [0.6, 0.6, 0.65],
             branch_color: [0.4, 0.7, 0.5],
             scroll_color: [0.8, 0.6, 0.3],
+        }
+    }
+}
+
+impl Default for GlobalStatusBarConfig {
+    fn default() -> Self {
+        GlobalStatusBarConfig {
+            bg_color: [0.10, 0.10, 0.12],
+            fg_color: [0.8, 0.8, 0.85],
             time_color: [0.65, 0.65, 0.7],
+            scroll_indicator_color: [0.8, 0.6, 0.3],
         }
     }
 }
@@ -114,6 +133,7 @@ impl Default for Config {
             status_bar: StatusBarConfig::default(),
             tab_bar: TabBarConfig::default(),
             splits: SplitsConfig::default(),
+            global_status_bar: GlobalStatusBarConfig::default(),
         }
     }
 }
