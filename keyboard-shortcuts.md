@@ -55,6 +55,7 @@
 | Cmd+click | Open URL in browser |
 | Drag separator | Resize splits |
 | Drag tab | Reorder tabs |
+| Trackpad horizontal scroll | Scroll virtual viewport when splits overflow |
 
 ## Special Keys
 

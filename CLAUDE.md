@@ -41,6 +41,10 @@ cp Info.plist /Applications/Kova.app/Contents/
 ln -sf ~/.cargo/target/release/kova /Applications/Kova.app/Contents/MacOS/kova
 ```
 
+## Logs
+
+`~/Library/Logs/Kova/kova.log` (level DEBUG par défaut, configurable via `RUST_LOG`).
+
 ## Notes techniques
 
 - `notes/pty-spawn.md` — pourquoi `Command + pre_exec` plutôt que `posix_spawn` ou `fork` brut pour le controlling terminal

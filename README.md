@@ -13,8 +13,10 @@ Every frame is drawn on the GPU via Apple's Metal API. Glyph atlas with on-deman
 - Binary tree splits — horizontal and vertical, nested arbitrarily
 - Drag-to-resize separators or use keyboard shortcuts (Cmd+Ctrl+Arrows)
 - Auto-equalize: splits rebalance to equal sizes when adding/removing panes
+- Horizontal scroll — when splits exceed the screen width, trackpad horizontal scroll navigates the virtual viewport. Configurable minimum split width.
 - Tabs with colored tab bar, drag-to-reorder, and rename (Cmd+Shift+R)
-- Cross-tab split navigation (Cmd+Shift+Arrows)
+- Cross-tab split navigation (Cmd+Option+Arrows)
+- Swap panes between splits (Cmd+Shift+Arrows)
 - New splits and tabs inherit the CWD of the focused pane
 
 ### Session persistence
@@ -69,6 +71,9 @@ branch_color = [0.4, 0.7, 0.5]
 
 [tab_bar]
 active_bg = [0.22, 0.22, 0.26]
+
+[splits]
+min_width = 300.0  # minimum pane width in points before horizontal scroll activates
 ```
 
 ### Keyboard shortcuts
@@ -77,14 +82,18 @@ active_bg = [0.22, 0.22, 0.26]
 |---|---|
 | Cmd+T | New tab |
 | Cmd+W | Close pane/tab |
-| Cmd+D | Split horizontally |
-| Cmd+Shift+D | Split vertically |
+| Cmd+D | Vertical split (side by side) |
+| Cmd+Shift+D | Horizontal split (stacked) |
+| Cmd+E | Vertical split at root (full-height column) |
+| Cmd+Shift+E | Horizontal split at root (full-width row) |
 | Cmd+Shift+[ / ] | Previous/next tab |
 | Cmd+1..9 | Jump to tab |
-| Cmd+Shift+Arrows | Navigate between splits |
+| Cmd+Option+Arrows | Navigate between splits (cross-tab) |
+| Cmd+Shift+Arrows | Swap pane with neighbor |
 | Cmd+Ctrl+Arrows | Resize split |
 | Cmd+Shift+R | Rename tab |
 | Cmd+F | Search scrollback |
+| Cmd+K | Clear scrollback and screen |
 | Cmd+C | Copy selection |
 | Cmd+V | Paste |
 
