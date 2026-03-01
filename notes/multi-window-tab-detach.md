@@ -6,159 +6,140 @@ Détacher un tab entier (avec tous ses splits) vers une nouvelle fenêtre, et po
 
 ## État actuel
 
-### Ce qui est compatible
+### Implémenté (étapes 1-3)
 
-- `TerminalState` est déjà `Arc<RwLock<TerminalState>>` → partageable sans refacto.
-- `Tab` est une struct indépendante (id, tree, focus, title) → facile à move entre fenêtres.
-- `Pane` est owned dans `SplitTree::Leaf(Pane)` → pour un move de tab entier, pas besoin d'Arc-wrapper. Le move Rust transfère le PTY, le reader thread et tout le state d'un coup.
+- **Multi-window** : `AppDelegate` gère un `Vec<Retained<NSWindow>>` au lieu d'un `OnceCell`.
+- **Timer global unique** : un seul `NSTimer` dans `AppDelegate` itère toutes les fenêtres et appelle `view.tick()`. Chaque `tick()` retourne `bool` — `false` = fenêtre morte (plus de tabs), le timer la ferme et la retire du Vec.
+- **`create_window(mtm, config, tabs, active_tab)`** : fonction unique pour créer une fenêtre avec des tabs donnés. Plus de session restore implicite dans `setup_metal`.
+- **Session restore multi-window** : `AppDelegate::did_finish_launching` charge la session et crée N fenêtres avec leurs tabs et positions (`setFrame_display`).
+- **Session save multi-window** : format v2 avec `Vec<WindowSession>` (backward compat v1). Chaque fenêtre sauvegarde tabs + active_tab + frame (x, y, w, h).
+- **Cmd+N** : nouvelle fenêtre vide (tab + shell frais). Accède à l'AppDelegate via `msg_send![self]` pour enregistrer la fenêtre.
+- **Autosave name unique** : chaque fenêtre a un `KovaWindow-{id}` via `AtomicU32`, évite les collisions NSUserDefaults.
+- **`kova_view()`** : pub dans `app.rs`, réutilisable.
+- **Cmd+Shift+T** : detach le tab actif vers une nouvelle fenêtre (no-op si un seul tab). Nouvelle fenêtre décalée +20x/-20y (cascade).
+- **Cmd+Q = fermer fenêtre active** : flag `closing` vérifié par `tick()`, confirmation si processes en cours. L'app termine quand la dernière fenêtre est fermée.
+- **Dealloc différé** : les fenêtres fermées sont déplacées dans `pending_close` (Vec) avec `orderOut`, puis dealloc'ées au tick suivant pour éviter les segfaults AppKit.
 
-### Ce qui bloque
+### Ce qui reste à faire
 
-| Composant | Problème | Fichier |
-|-----------|----------|---------|
-| `AppDelegate` | Une seule `NSWindow` dans un `OnceCell` | `src/app.rs` |
-| `KovaView` | Tabs, renderer, timer, config tous dans les ivars d'une seule view | `src/window.rs` |
-| `Renderer` | Un seul, lié à un `CAMetalLayer` unique | `src/renderer/mod.rs` |
-| `GlyphAtlas` | Textures GPU device-specific, non partageables | `src/renderer/glyph_atlas.rs` |
-| Render timer | `NSTimer` qui capture un pointeur brut vers un seul `KovaViewIvars` | `src/window.rs` |
+- Drag detach avec preview fantôme
+- Drop reattach sur tab bar d'une autre fenêtre
 
-## Approche : move ownership (pas shared)
-
-Le détach de tab entier permet une approche simple : **move, pas clone ni share**.
+## Architecture
 
 ```
-Fenêtre A                         Fenêtre B (nouvelle)
-┌─────────────────┐               ┌─────────────────┐
-│ tabs: [T1, T2]  │  ── move T2 → │ tabs: [T2]      │
-│ renderer A      │               │ renderer B      │
-│ atlas A         │               │ atlas B         │
-│ timer A         │               │ timer B         │
-└─────────────────┘               └─────────────────┘
-```
+AppDelegate (src/app.rs)
+├── windows: RefCell<Vec<Retained<NSWindow>>>
+├── pending_close: RefCell<Vec<Retained<NSWindow>>>  ← dealloc différé d'un tick
+├── closed_sessions: RefCell<Vec<WindowSession>>     ← sessions des fenêtres fermées
+├── config: OnceCell<Config>
+├── start_global_timer(fps)     ← un seul NSTimer pour toutes les fenêtres
+├── app_delegate(mtm)           ← helper pour accéder à l'AppDelegate
+├── create_new_window(mtm)      ← Cmd+N
+├── detach_tab_to_new_window()  ← Cmd+Shift+T
+└── did_finish_launching()      ← session restore → N fenêtres
 
-Le PTY reader thread ne sait pas dans quelle fenêtre il vit — il écrit dans `Arc<RwLock<TerminalState>>` qui suit le move. Le render timer de la nouvelle fenêtre le lira naturellement.
+KovaView (src/window.rs)
+├── setup_metal(mtm, config, tabs, active_tab)  ← plus de session::load ici
+├── tick() -> bool              ← appelé par le timer global, false = à fermer
+├── do_close_window()           ← Cmd+Q, set closing flag
+├── do_detach_tab()             ← Cmd+Shift+T, retire tab et crée fenêtre
+├── append_session_data(&mut Vec<WindowSession>) ← collecte pour save
+├── confirm_running_processes() ← alerte partagée (should_terminate + close)
+└── ivars: closing, git_poll_interval, git_poll_counter, last_title, ...
+
+Session (src/session.rs)
+├── Session { version: 2, windows: Vec<WindowSession> }
+├── WindowSession { tabs, active_tab, frame }
+├── WindowSession::from_tabs()  ← helper pour save
+├── save(&[WindowSession])      ← un seul fichier pour toutes les fenêtres
+├── load() + restore_session()  ← backward compat v1 → v2
+└── RestoredWindow { tabs, active_tab, frame }
+```
 
 ## Décisions UX
 
-- **Detach uniquement par drag souris** — pas de raccourci clavier (Cmd+Shift+D déjà pris pour le swap de split).
+- **Cmd+N = nouvelle fenêtre vide** — ouvre une nouvelle fenêtre avec un tab + shell frais.
+- **Cmd+Shift+T = detach tab actif** — raccourci clavier pour détacher le tab actif vers une nouvelle fenêtre. Sert de premier pas avant le drag.
+- **Detach par drag souris (phase 2)** — drag un tab hors de la tab bar pour le détacher. Preview fantôme du tab pendant le drag.
 - **Pas de detach si un seul tab** — ça n'a pas de sens, le tab est déjà seul dans sa fenêtre.
-- **Position de la nouvelle fenêtre** — là où la souris drop le tab. Permet de placer sur un deuxième écran naturellement.
+- **Position de la nouvelle fenêtre** — pour le drag : là où la souris drop le tab. Pour Cmd+Shift+T/Cmd+N : décalée par rapport à la fenêtre active.
 - **Drop sur une tab bar existante = reattach** — si le tab est droppé sur la tab bar d'une autre fenêtre, il est rattaché à cette fenêtre au lieu de créer une 3e fenêtre.
 - **Drop ailleurs = nouvelle fenêtre** — si le tab est droppé hors d'une tab bar, une nouvelle fenêtre est créée à la position du curseur.
-- **Session restore multi-écran** — les positions de toutes les fenêtres sont mémorisées. Un Cmd+Q + réouverture restaure chaque fenêtre avec ses tabs/splits à la bonne position, y compris sur le bon écran.
+- **Cmd+Q ferme la fenêtre active** — ferme tous les tabs de la fenêtre courante, pas toute l'app. L'app se termine quand plus aucune fenêtre n'est ouverte. Session sauvegardée.
+- **Cmd+Option+Q = kill fenêtre** — ferme la fenêtre sans sauvegarder sa session (la fenêtre ne sera pas restaurée au prochain lancement).
+- **Session restore multi-écran** — les positions de toutes les fenêtres sont mémorisées. Un quit + réouverture restaure chaque fenêtre avec ses tabs/splits à la bonne position, y compris sur le bon écran.
 - **Config par fenêtre (futur)** — pour l'instant config globale, mais l'architecture doit permettre à terme des couleurs/thèmes différents par fenêtre.
 
 ## Étapes d'implémentation
 
-### 1. Refacto multi-window (`AppDelegate`)
+### ~~1. Refacto multi-window~~ ✅
 
-**Fichier** : `src/app.rs`
+- `AppDelegate` : `OnceCell<NSWindow>` → `RefCell<Vec<Retained<NSWindow>>>`
+- Timer global unique dans `AppDelegate` qui appelle `tick()` sur chaque `KovaView`
+- `tick()` retourne `bool` ; le timer ferme les fenêtres mortes et les retire du Vec
+- `create_window(mtm, config, tabs, active_tab)` — signature unifiée
+- `setup_metal` ne fait plus de session restore — il prend des tabs explicites
+- Session restore dans `did_finish_launching` avec positions de fenêtres
+- `applicationShouldTerminateAfterLastWindowClosed` → `true`
+- `should_terminate` collecte les processes de toutes les fenêtres
+- `will_terminate` sauvegarde toutes les fenêtres dans un seul fichier session
 
-Passer de `OnceCell<Retained<NSWindow>>` à une gestion multi-fenêtres :
+### ~~2. Cmd+N~~ ✅
 
-```rust
-// Avant
-window: OnceCell<Retained<NSWindow>>
+- `Cmd+N` dans `performKeyEquivalent` → `crate::app::create_new_window(mtm)`
+- `create_new_window` accède à l'AppDelegate via `msg_send![&*delegate, self]`
+- Crée un tab frais, appelle `create_window`, enregistre dans le Vec
+- Autosave name unique par fenêtre (`KovaWindow-{AtomicU32}`)
 
-// Après — par exemple un Vec global ou un registre
-windows: RefCell<Vec<Retained<NSWindow>>>
-```
+### ~~Session v2~~ ✅
 
-Extraire la logique de création de fenêtre (`NSWindow` + `KovaView` + Metal setup + render timer) dans une fonction réutilisable `create_window(tabs: Vec<Tab>) -> Retained<NSWindow>`.
+- `Session { version: 2, windows: Vec<WindowSession> }`
+- `WindowSession { tabs, active_tab, frame: Option<(f64,f64,f64,f64)> }`
+- Backward compat v1 : `SessionV1` deserialize → migration automatique
+- `WindowSession::from_tabs()` helper pour construire depuis live data
+- `save(&[WindowSession])` — un fichier unique
+- `restore_session()` → `Vec<RestoredWindow>`
 
-Gérer la fermeture : quand une fenêtre n'a plus de tabs, elle se ferme. Quand plus aucune fenêtre, `app.terminate`.
+### ~~3. Cmd+Shift+T — detach tab actif~~ ✅
 
-### 2. Factoriser la création de `KovaView`
+Retirer le tab actif du Vec source, créer une nouvelle fenêtre avec ce tab. Bloquer si un seul tab. Inclut aussi Cmd+Q = fermer la fenêtre active (pas l'app entière), avec dealloc différé d'un tick via `pending_close` pour éviter les segfaults AppKit.
 
-**Fichier** : `src/window.rs`
+### 4. Drag detach avec preview fantôme
 
-Aujourd'hui le setup Metal, la création du renderer et le timer sont dans `viewDidMoveToWindow` ou l'init. Extraire en fonctions appelables pour une nouvelle fenêtre :
+Tab drag hors tab bar → nouvelle fenêtre à la position du drop. Nécessite un seuil de distance pour distinguer reorder de detach.
 
-- `setup_metal(layer) -> Renderer`
-- `start_render_timer(ivars) -> Retained<NSTimer>`
+### 5. Drop reattach
 
-Le `Config` peut être partagé (clone ou `Arc<Config>`) entre fenêtres — pas de raison d'en avoir un par fenêtre.
-
-### 3. Detach : move d'un tab
-
-Quand l'utilisateur drag un tab hors de la tab bar :
-
-```rust
-fn detach_tab(source_view: &KovaView, tab_index: usize) {
-    // 1. Retirer le tab du Vec<Tab> source
-    let tab = source_view.tabs.borrow_mut().remove(tab_index);
-
-    // 2. Créer une nouvelle fenêtre à la position du curseur
-    create_window_at(vec![tab], mouse_position);
-
-    // 3. Si la source n'a plus de tabs, fermer la fenêtre source
-    // (ne devrait pas arriver car detach bloqué si un seul tab)
-}
-```
-
-L'atlas de la nouvelle fenêtre se construit progressivement (rasterisation à la demande, comme aujourd'hui). Premier frame un peu plus lent, imperceptible.
-
-### 4. Reattach : move inverse
-
-Le drag est un geste unifié — c'est la destination du drop qui détermine le résultat :
-
-- **Drop sur tab bar d'une autre fenêtre** → reattach (move dans le `Vec<Tab>` cible)
-- **Drop ailleurs** → nouvelle fenêtre à la position du curseur
-
-```rust
-fn reattach_tab(target_view: &KovaView, tab: Tab, insert_index: usize) {
-    // 1. Insérer le tab à la position du drop dans la tab bar
-    target_view.tabs.borrow_mut().insert(insert_index, tab);
-
-    // 2. Activer le tab importé
-    target_view.active_tab.set(insert_index);
-
-    // 3. Fermer la fenêtre source si elle n'a plus de tabs
-}
-```
-
-Le drag cross-window nécessite `NSDraggingSource`/`NSDraggingDestination` d'AppKit, ou un mécanisme custom avec détection de hit-test sur les tab bars de toutes les fenêtres au moment du drop.
-
-### 5. Session save/restore
-
-**Fichier** : `src/session.rs`
-
-Adapter pour sauvegarder N fenêtres au lieu d'une :
-
-```rust
-struct SessionData {
-    windows: Vec<WindowSession>,
-}
-
-struct WindowSession {
-    tabs: Vec<TabSession>,
-    frame: NSRect,  // position/taille de la fenêtre
-    screen: Option<String>,  // identifiant écran pour restore multi-monitor
-}
-```
-
-Chaque fenêtre sauvegarde sa position et son écran. Au restore, si l'écran n'est plus disponible, fallback sur l'écran principal avec la même taille.
+Drop sur tab bar d'une autre fenêtre → rattachement. Via `NSDraggingSource`/`NSDraggingDestination` d'AppKit ou hit-test custom sur les tab bars de toutes les fenêtres.
 
 ## Compromis
 
 | Aspect | Choix | Justification |
 |--------|-------|---------------|
 | Atlas GPU | Dupliqué par fenêtre | ~2-4 Mo par fenêtre, simple et propre. Partager entre devices Metal est complexe pour un gain négligeable. |
-| Config | Globale pour l'instant | Une seule config partagée. L'architecture doit permettre à terme une config/thème par fenêtre. |
+| Config | Globale pour l'instant | Une seule config clonée par fenêtre. L'architecture doit permettre à terme une config/thème par fenêtre. |
 | PTY ownership | Move avec le tab | Pas de refacto Arc. Le reader thread continue d'écrire dans le même `Arc<RwLock<TerminalState>>`. |
-| Drag cross-window | Via AppKit dragging | Plus natif que du custom hit-testing. |
+| Timer | Global unique | Un seul `NSTimer` dans `AppDelegate` itère toutes les fenêtres. Évite N timers idle. |
+| Session file | Un seul fichier multi-window | `~/.config/kova/session.json` avec `Vec<WindowSession>`. Backward compat v1. |
+| Autosave names | `KovaWindow-{id}` | Compteur `AtomicU32` global, unique par session. |
+| Dealloc fenêtre | Différé d'un tick | `pending_close` + `orderOut` immédiat. Drop au tick suivant pour éviter segfault AppKit (callbacks sur vue dealloc'ée). |
+| Session save | Eager + terminate | `closed_sessions` collecte au moment du close. `will_terminate` merge closed + live + pending. |
 
 ## Risques
 
-- **Thread safety** : le render timer de la nouvelle fenêtre accède aux mêmes `Arc<RwLock<TerminalState>>` que le PTY reader thread. C'est déjà le cas aujourd'hui, pas de changement.
-- **PaneId unicité** : le compteur global `PaneId` garantit l'unicité cross-fenêtres. OK.
-- **TabId unicité** : idem, compteur global. OK.
+- **Thread safety** : le timer global accède aux `KovaView` via cast de `contentView` — même pattern que `kova_view()`, pas de nouveau risque.
+- **PaneId/TabId unicité** : compteurs globaux, OK cross-fenêtres.
 - **Focus cross-window** : `NSWindow.keyWindow` gère ça nativement. Le pane focusé est par-tab, donc pas d'ambiguïté.
-- **Fermeture app** : il faut `app.terminate` uniquement quand toutes les fenêtres sont fermées, pas juste la dernière. Utiliser `applicationShouldTerminateAfterLastWindowClosed` ou un compteur.
+- **Fermeture app** : `applicationShouldTerminateAfterLastWindowClosed` = `true` + le timer appelle `app.terminate` quand le Vec est vide.
+- **Double borrow** : `tick()` ne ferme jamais de fenêtre directement — il retourne `false` et le timer gère la fermeture après avoir relâché le borrow.
+- **Segfault dealloc AppKit** : dropper une `Retained<NSWindow>` dans le même tick que `close()`/`orderOut()` cause un segfault (AppKit garde des refs internes à la vue dans la run loop). Résolu par `pending_close` : dealloc différé au tick suivant.
+- **Session perdue au close** : les fenêtres fermées avant le quit perdaient leurs données. Résolu par `closed_sessions` qui collecte au moment du close.
 
 ## Ordre de priorité
 
-1. Multi-window — refacto `AppDelegate` + factorisation création fenêtre (prérequis à tout)
-2. Drag detach — tab drag hors tab bar → nouvelle fenêtre à la position du drop
-3. Drop reattach — drop sur tab bar d'une autre fenêtre → rattachement
-4. Session save/restore multi-window — positions + écrans mémorisés
+1. ~~Multi-window — refacto `AppDelegate` + factorisation création fenêtre + timer global unique~~ ✅
+2. ~~Cmd+N — nouvelle fenêtre vide~~ ✅
+3. ~~Cmd+Shift+T — detach tab actif vers nouvelle fenêtre (valide le move de tab sans drag)~~ ✅
+4. Drag detach avec preview fantôme — tab drag hors tab bar → nouvelle fenêtre à la position du drop
+5. Drop reattach — drop sur tab bar d'une autre fenêtre → rattachement
