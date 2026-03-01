@@ -498,6 +498,8 @@ impl TerminalState {
                     self.scrollback.push_back(line.to_compact());
                     if self.scrollback.len() > self.scrollback_limit {
                         self.scrollback.pop_front();
+                    } else if self.user_scrolled {
+                        self.scroll_offset += 1;
                     }
                 }
             }
