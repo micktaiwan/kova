@@ -10,6 +10,7 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub status_bar: StatusBarConfig,
     pub tab_bar: TabBarConfig,
+    pub splits: SplitsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +62,18 @@ pub struct StatusBarConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct SplitsConfig {
+    pub min_width: f32,
+}
+
+impl Default for SplitsConfig {
+    fn default() -> Self {
+        SplitsConfig { min_width: 300.0 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct TabBarConfig {
     pub bg_color: [f32; 3],
     pub fg_color: [f32; 3],
@@ -100,6 +113,7 @@ impl Default for Config {
             terminal: TerminalConfig::default(),
             status_bar: StatusBarConfig::default(),
             tab_bar: TabBarConfig::default(),
+            splits: SplitsConfig::default(),
         }
     }
 }

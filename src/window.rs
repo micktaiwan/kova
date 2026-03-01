@@ -467,6 +467,26 @@ define_class!(
                     }
                 }
             }
+
+            // Horizontal scroll for virtual viewport (trackpad only)
+            if event.hasPreciseScrollingDeltas() {
+                let dx = event.scrollingDeltaX();
+                if dx != 0.0 {
+                    let screen_w = self.drawable_viewport().width;
+                    let min_w = self.min_split_width_px();
+                    let mut tabs = self.ivars().tabs.borrow_mut();
+                    let idx = self.ivars().active_tab.get();
+                    if let Some(tab) = tabs.get_mut(idx) {
+                        let vw = tab.virtual_width(screen_w, min_w);
+                        if vw > screen_w {
+                            tab.scroll_offset_x = (tab.scroll_offset_x - dx as f32)
+                                .clamp(0.0, vw - screen_w);
+                            drop(tabs);
+                            self.mark_dirty();
+                        }
+                    }
+                }
+            }
         }
 
         #[unsafe(method(mouseDown:))]
@@ -562,7 +582,13 @@ define_class!(
             // Handle separator drag
             if let Some(drag) = self.ivars().drag_separator.get() {
                 let (px, py) = self.event_to_pixel(event);
-                let current_pixel = if drag.is_hsplit { px } else { py };
+                // Translate to virtual space for horizontal separators
+                let scroll_x = {
+                    let tabs = self.ivars().tabs.borrow();
+                    let idx = self.ivars().active_tab.get();
+                    tabs.get(idx).map(|t| t.scroll_offset_x).unwrap_or(0.0)
+                };
+                let current_pixel = if drag.is_hsplit { px + scroll_x } else { py };
                 let new_ratio = drag.origin_ratio + (current_pixel - drag.origin_pixel) / drag.parent_dim;
                 let mut tabs = self.ivars().tabs.borrow_mut();
                 let idx = self.ivars().active_tab.get();
@@ -580,7 +606,7 @@ define_class!(
                 let vp = {
                     let tabs = self.ivars().tabs.borrow();
                     let idx = self.ivars().active_tab.get();
-                    tabs.get(idx).and_then(|t| t.tree.viewport_for_pane(pane.id, self.panes_viewport()))
+                    tabs.get(idx).and_then(|t| t.tree.viewport_for_pane(pane.id, self.panes_viewport_for_tab(t)))
                 };
                 if let Some(vp) = vp {
                     if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
@@ -809,8 +835,9 @@ impl KovaView {
             Some(t) => t,
             None => return,
         };
-        let panes_vp = self.panes_viewport();
-        let hit = tab.tree.hit_test(px, py, panes_vp);
+        let panes_vp = self.panes_viewport_for_tab(tab);
+        let virtual_px = px + tab.scroll_offset_x;
+        let hit = tab.tree.hit_test(virtual_px, py, panes_vp);
         let (pane, vp) = match hit {
             Some((p, v)) => (unsafe { &*(p as *const Pane) }, v),
             None => {
@@ -847,16 +874,48 @@ impl KovaView {
         }
     }
 
-    /// Viewport for panes (below tab bar).
+    /// Viewport for panes (below tab bar), reading scroll state from the active tab.
+    /// WARNING: borrows tabs — do NOT call while tabs is already borrowed.
     fn panes_viewport(&self) -> PaneViewport {
+        let tabs = self.ivars().tabs.borrow();
+        let idx = self.ivars().active_tab.get();
+        if let Some(tab) = tabs.get(idx) {
+            let screen_w = self.drawable_viewport().width;
+            let vw = tab.virtual_width(screen_w, self.min_split_width_px());
+            self.panes_viewport_inner(tab.scroll_offset_x, vw)
+        } else {
+            self.panes_viewport_inner(0.0, self.drawable_viewport().width)
+        }
+    }
+
+    /// Viewport for panes using a tab reference (no extra borrow on tabs).
+    fn panes_viewport_for_tab(&self, tab: &crate::pane::Tab) -> PaneViewport {
+        let screen_w = self.drawable_viewport().width;
+        let vw = tab.virtual_width(screen_w, self.min_split_width_px());
+        self.panes_viewport_inner(tab.scroll_offset_x, vw)
+    }
+
+    fn panes_viewport_inner(&self, scroll_offset_x: f32, virtual_width: f32) -> PaneViewport {
         let full = self.drawable_viewport();
         let tab_bar_h = self.tab_bar_height();
         PaneViewport {
-            x: full.x,
+            x: -scroll_offset_x,
             y: full.y + tab_bar_h,
-            width: full.width,
+            width: virtual_width,
             height: full.height - tab_bar_h,
         }
+    }
+
+    fn backing_scale(&self) -> f32 {
+        self.window().map_or(2.0, |w| w.backingScaleFactor()) as f32
+    }
+
+    /// Compute scaled min_split_width in pixels.
+    fn min_split_width_px(&self) -> f32 {
+        let min_w = self.ivars().config.get()
+            .map(|c| c.splits.min_width)
+            .unwrap_or(300.0);
+        min_w * self.backing_scale()
     }
 
     fn get_tab_bar_left_inset(&self) -> f32 {
@@ -880,19 +939,22 @@ impl KovaView {
         let tabs = self.ivars().tabs.borrow();
         let idx = self.ivars().active_tab.get();
         let tab = tabs.get(idx)?;
-        let vp = self.panes_viewport();
+        let vp = self.panes_viewport_for_tab(tab);
         let mut seps = Vec::new();
         tab.tree.collect_separator_info(vp, &mut seps);
 
-        let scale = self.window().map_or(2.0, |w| w.backingScaleFactor()) as f32;
+        let scale = self.backing_scale();
         let tolerance = 4.0 * scale;
+
+        // Translate screen x to virtual space for hit-testing
+        let virtual_px = px + tab.scroll_offset_x;
 
         for sep in &seps {
             if sep.is_hsplit {
-                if (px - sep.pos).abs() < tolerance && py >= sep.cross_start && py <= sep.cross_end {
+                if (virtual_px - sep.pos).abs() < tolerance && py >= sep.cross_start && py <= sep.cross_end {
                     return Some(SeparatorDrag {
                         is_hsplit: true,
-                        origin_pixel: px,
+                        origin_pixel: virtual_px,
                         origin_ratio: sep.origin_ratio,
                         parent_dim: sep.parent_dim,
                         node_ptr: sep.node_ptr,
@@ -974,7 +1036,7 @@ impl KovaView {
         let location = event.locationInWindow();
         let local: CGPoint = unsafe { msg_send![self, convertPoint: location, fromView: std::ptr::null::<objc2::runtime::AnyObject>()] };
         let frame = self.frame();
-        let scale = self.window().map_or(2.0, |w| w.backingScaleFactor()) as f32;
+        let scale = self.backing_scale();
         let pixel_x = local.x as f32 * scale;
         let pixel_y = (frame.size.height as f32 - local.y as f32) * scale;
         (pixel_x, pixel_y)
@@ -986,7 +1048,9 @@ impl KovaView {
         let idx = self.ivars().active_tab.get();
         let tab = tabs.get(idx)?;
         let (px, py) = self.event_to_pixel(event);
-        let (pane, vp) = tab.tree.hit_test(px, py, self.panes_viewport())?;
+        // Translate screen x to virtual space
+        let virtual_px = px + tab.scroll_offset_x;
+        let (pane, vp) = tab.tree.hit_test(virtual_px, py, self.panes_viewport_for_tab(tab))?;
         Some((unsafe { &*(pane as *const Pane) }, vp))
     }
 
@@ -1163,7 +1227,7 @@ impl KovaView {
                 None => return,
             };
             let fid = tab.focused_pane;
-            let vp = match tab.tree.viewport_for_pane(fid, self.panes_viewport()) {
+            let vp = match tab.tree.viewport_for_pane(fid, self.panes_viewport_for_tab(tab)) {
                 Some(vp) => vp,
                 None => return,
             };
@@ -1209,6 +1273,11 @@ impl KovaView {
             tab.tree = tree.with_split(focused_id, new_pane, direction);
             tab.tree.equalize();
             tab.focused_pane = new_id;
+            // Auto-scroll to reveal the new pane
+            let panes_vp = self.panes_viewport_for_tab(tab);
+            if let Some(vp) = tab.tree.viewport_for_pane(new_id, panes_vp) {
+                tab.scroll_to_reveal(&vp, self.drawable_viewport().width);
+            }
         }
         drop(tabs);
 
@@ -1280,6 +1349,15 @@ impl KovaView {
             };
             tab.tree.equalize();
             tab.focused_pane = new_id;
+            if direction == SplitDirection::Horizontal {
+                // Auto-scroll to reveal the new pane (rightmost)
+                let full = self.drawable_viewport();
+                let min_w = self.min_split_width_px();
+                let vw = tab.virtual_width(full.width, min_w);
+                if vw > full.width {
+                    tab.scroll_offset_x = (vw - full.width).max(0.0);
+                }
+            }
         }
         drop(tabs);
 
@@ -1319,15 +1397,35 @@ impl KovaView {
         // Multiple panes → close focused pane
         let focused_id = tabs[idx].focused_pane;
         log::debug!("Closing pane {} in tab {}", focused_id, idx);
+
+        // Find a neighbor to focus before removing (prefer right, then left, then any)
+        let panes_vp = self.panes_viewport_for_tab(&tabs[idx]);
+        let next_focus = tabs[idx].tree.neighbor(focused_id, NavDirection::Right, panes_vp)
+            .or_else(|| tabs[idx].tree.neighbor(focused_id, NavDirection::Left, panes_vp))
+            .or_else(|| tabs[idx].tree.neighbor(focused_id, NavDirection::Down, panes_vp))
+            .or_else(|| tabs[idx].tree.neighbor(focused_id, NavDirection::Up, panes_vp));
+
         let config = self.ivars().config.get().unwrap();
         let dummy = Pane::spawn(1, 1, config, None).unwrap();
         let tree = std::mem::replace(&mut tabs[idx].tree, SplitTree::Leaf(dummy));
         match tree.remove_pane(focused_id) {
             Some(new_tree) => {
-                tabs[idx].focused_pane = new_tree.first_pane().id;
+                let new_focus = next_focus
+                    .filter(|id| new_tree.contains(*id))
+                    .unwrap_or_else(|| new_tree.first_pane().id);
+                tabs[idx].focused_pane = new_focus;
                 let mut new_tree = new_tree;
                 new_tree.equalize();
                 tabs[idx].tree = new_tree;
+                // Clamp scroll and auto-scroll to reveal focused pane
+                let full = self.drawable_viewport();
+                let min_w = self.min_split_width_px();
+                tabs[idx].clamp_scroll(full.width, min_w);
+                let tab = &mut tabs[idx];
+                let panes_vp = self.panes_viewport_for_tab(tab);
+                if let Some(vp) = tab.tree.viewport_for_pane(new_focus, panes_vp) {
+                    tab.scroll_to_reveal(&vp, full.width);
+                }
             }
             None => {
                 // Tab became empty (shouldn't happen given check above)
@@ -1358,13 +1456,18 @@ impl KovaView {
             None => return,
         };
         let focused_id = tab.focused_pane;
-        if let Some(neighbor_id) = tab.tree.neighbor(focused_id, dir, self.panes_viewport()) {
+        let panes_vp = self.panes_viewport_for_tab(tab);
+        if let Some(neighbor_id) = tab.tree.neighbor(focused_id, dir, panes_vp) {
             tab.focused_pane = neighbor_id;
             if let Some(old) = tab.tree.pane(focused_id) {
                 old.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             if let Some(new) = tab.tree.pane(neighbor_id) {
                 new.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Auto-scroll to reveal the newly focused pane
+            if let Some(vp) = tab.tree.viewport_for_pane(neighbor_id, panes_vp) {
+                tab.scroll_to_reveal(&vp, self.drawable_viewport().width);
             }
         } else {
             // No neighbor in this direction → overflow to adjacent tab
@@ -1401,7 +1504,7 @@ impl KovaView {
             None => return,
         };
         let focused_id = tab.focused_pane;
-        let vp = self.panes_viewport();
+        let vp = self.panes_viewport_for_tab(tab);
         if let Some(neighbor_id) = tab.tree.neighbor(focused_id, dir, vp) {
             if tab.tree.swap_panes(focused_id, neighbor_id) {
                 // Mark both panes dirty so they redraw in their new positions
@@ -1873,7 +1976,11 @@ impl KovaView {
 
                     // Build pane render list from active tab only
                     let active_idx = ivars.active_tab.get();
-                    let (pane_data, pty_ptr, focus_reporting, tab_titles) = {
+                    let split_min_w = ivars.config.get()
+                        .map(|c| c.splits.min_width)
+                        .unwrap_or(300.0)
+                        * ivars.last_scale.get().max(1.0) as f32;
+                    let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp) = {
                         let mut tabs = ivars.tabs.borrow_mut();
                         if tabs.is_empty() {
                             return;
@@ -1882,13 +1989,15 @@ impl KovaView {
                         let focused_id = tab.focused_pane;
 
                         let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool, PaneId)> = Vec::new();
-                        let drawable_size = layer.drawableSize();
                         let cell_h = renderer.read().cell_size().1;
                         let tab_bar_h = (cell_h * 2.0).round();
+                        let drawable_size = layer.drawableSize();
+                        let screen_width = drawable_size.width as f32;
+                        let virtual_width = tab.virtual_width(screen_width, split_min_w);
                         let panes_vp = PaneViewport {
-                            x: 0.0,
+                            x: -tab.scroll_offset_x,
                             y: tab_bar_h,
-                            width: drawable_size.width as f32,
+                            width: virtual_width,
                             height: drawable_size.height as f32 - tab_bar_h,
                         };
                         tab.tree.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
@@ -1926,7 +2035,7 @@ impl KovaView {
                             })
                             .collect();
                         drop(rename);
-                        (pane_data, pty_ptr, focus_reporting, tab_titles)
+                        (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp)
                     };
 
                     // Focus reporting (DEC mode 1004) — send to focused pane only
@@ -1972,19 +2081,8 @@ impl KovaView {
                     let separators = {
                         let tabs = ivars.tabs.borrow();
                         if let Some(tab) = tabs.get(active_idx) {
-                            let renderer_r = renderer.read();
-                            let cell_h = renderer_r.cell_size().1;
-                            drop(renderer_r);
-                            let drawable_size = layer.drawableSize();
-                            let tab_bar_h = (cell_h * 2.0).round();
-                            let panes_vp = PaneViewport {
-                                x: 0.0,
-                                y: tab_bar_h,
-                                width: drawable_size.width as f32,
-                                height: drawable_size.height as f32 - tab_bar_h,
-                            };
                             let mut seps = Vec::new();
-                            tab.tree.collect_separators(panes_vp, &mut seps);
+                            tab.tree.collect_separators(active_panes_vp, &mut seps);
                             seps
                         } else {
                             Vec::new()
