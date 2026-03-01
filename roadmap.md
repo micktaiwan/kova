@@ -104,8 +104,6 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Grapheme cluster emoji (flags, ZWJ sequences, skin tones)
 - [x] Optimisation RAM Cell — compact cell storage pour le scrollback (28→12 bytes/cell, -57% RAM). fg/bg stockés en `u32` RGBA au lieu de `[f32; 3]`.
 - [ ] Config keybindings (raccourcis hardcodés suffisent pour V1)
-- [ ] Thèmes de couleurs (quelques built-in + custom)
-- [ ] Support ProMotion (120Hz)
 - [ ] Support multi-fenêtres (dont detach d'un split vers une nouvelle fenêtre)
 - [ ] Déplacer un split par drag (anchor visuelle pendant le drag — le swap par raccourci Cmd+Shift+Arrows existe déjà)
 - [ ] Notifications visuelles avancées (activité dans un split inactif)
@@ -122,6 +120,13 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] Support images (Sixel ou protocole Kitty)
 - [ ] Shell integration (marks, navigation prompt à prompt)
 - [ ] Complétion inline / suggestions
+
+## Nice to have
+
+Items intéressants mais non prioritaires — le gain ne justifie pas l'effort à court terme.
+
+- [ ] Support ProMotion (120Hz) — le dirty flag fait déjà que le rendu est skip quand rien ne change, donc le surcoût est limité au scroll/grosses sorties. Mais la différence 60→120 Hz est marginale pour un terminal (texte statique 99% du temps).
+- [ ] Thèmes de couleurs — les couleurs sont déjà configurables individuellement dans `config.toml`. Les thèmes ajouteraient un niveau d'abstraction (`theme = "catppuccin-mocha"`) pour switcher toute la palette d'un coup (16 ANSI + fg/bg/cursor/sélection). Pratique mais pas bloquant : l'utilisateur peut déjà copier-coller un bloc de couleurs dans son config.
 
 ## Non-goals
 
