@@ -369,6 +369,12 @@ define_class!(
                         return objc2::runtime::Bool::YES;
                     }
 
+                    // Cmd+Shift+M → merge window into another
+                    if ch == "M" && has_shift && !has_option && !has_ctrl {
+                        self.do_merge_window();
+                        return objc2::runtime::Bool::YES;
+                    }
+
                     // Cmd+1..9 → switch to tab N
                     if !has_shift && !has_option && !has_ctrl {
                         if let Some(digit) = ch.chars().next() {
@@ -1596,6 +1602,30 @@ impl KovaView {
         let source_frame = self.window().map(|w| w.frame());
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         crate::app::detach_tab_to_new_window(mtm, tab, source_frame);
+    }
+
+    /// Merge all tabs from this window into another window.
+    /// No-op if this is the only window.
+    fn do_merge_window(&self) {
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let source = self.window().unwrap();
+        // Check+merge in one call; tabs are only drained if a target exists
+        if !crate::app::merge_tabs_from(mtm, &self.ivars().tabs, &source) {
+            log::debug!("do_merge_window: no other window, ignoring");
+            return;
+        }
+        self.ivars().skip_session_save.set(true);
+        self.ivars().closing.set(true);
+    }
+
+    /// Append external tabs (used by merge window).
+    pub fn append_tabs(&self, new_tabs: Vec<crate::pane::Tab>) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let first_new = tabs.len();
+        tabs.extend(new_tabs);
+        drop(tabs);
+        self.ivars().active_tab.set(first_new);
+        self.resize_all_panes();
     }
 
     /// Navigate focus to an adjacent pane.

@@ -23,6 +23,14 @@
 | Cmd+Shift+Arrows | Swap focused pane with neighbor |
 | Cmd+Ctrl+Arrows | Resize splits |
 
+## Windows
+
+| Shortcut | Action |
+|----------|--------|
+| Cmd+N | New window |
+| Cmd+Shift+T | Detach tab to new window |
+| Cmd+Shift+M | Merge all tabs into another window |
+
 ## Editing
 
 | Shortcut | Action |
