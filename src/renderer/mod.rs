@@ -71,8 +71,12 @@ pub struct Renderer {
     status_bar_cwd_color: [f32; 3],
     status_bar_branch_color: [f32; 3],
     status_bar_scroll_color: [f32; 3],
-    status_bar_time_color: [f32; 3],
+    global_bar_bg: [f32; 3],
+    global_bar_fg: [f32; 3],
+    global_bar_time_color: [f32; 3],
+    global_bar_scroll_color: [f32; 3],
     last_minute: u32,
+    cached_time_str: String,
     selection_color: [f32; 3],
     tab_bar_bg: [f32; 3],
     tab_bar_fg: [f32; 3],
@@ -152,8 +156,12 @@ impl Renderer {
             status_bar_cwd_color: config.status_bar.cwd_color,
             status_bar_branch_color: config.status_bar.branch_color,
             status_bar_scroll_color: config.status_bar.scroll_color,
-            status_bar_time_color: config.status_bar.time_color,
+            global_bar_bg: config.global_status_bar.bg_color,
+            global_bar_fg: config.global_status_bar.fg_color,
+            global_bar_time_color: config.global_status_bar.time_color,
+            global_bar_scroll_color: config.global_status_bar.scroll_indicator_color,
             last_minute: u32::MAX,
+            cached_time_str: String::new(),
             selection_color: [0.45, 0.42, 0.20],
             tab_bar_bg: config.tab_bar.bg_color,
             tab_bar_fg: config.tab_bar.fg_color,
@@ -175,6 +183,9 @@ impl Renderer {
         tab_titles: &[(String, bool, Option<usize>, bool, bool)],
         filter: Option<&FilterRenderData>,
         tab_bar_left_inset: f32,
+        hidden_left: usize,
+        hidden_right: usize,
+        min_pane_width_px: f32,
     ) {
         // Reset blink on cursor movement of focused pane
         if let Some((term, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _)| *focused) {
@@ -196,20 +207,22 @@ impl Renderer {
             (true, false)
         };
 
-        // Check if minute changed for status bar update
-        let minute_changed = if self.status_bar_enabled {
+        // Check if minute changed for global status bar time
+        let minute_changed = {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default();
             let current_minute = (now.as_secs() / 60) as u32;
             if current_minute != self.last_minute {
                 self.last_minute = current_minute;
+                let t = now.as_secs() as libc::time_t;
+                let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                unsafe { libc::localtime_r(&t, &mut tm) };
+                self.cached_time_str = format!("{:02}:{:02}", tm.tm_hour, tm.tm_min);
                 true
             } else {
                 false
             }
-        } else {
-            false
         };
 
         // Check if any pane is dirty (consume ALL flags, no short-circuit)
@@ -311,6 +324,9 @@ impl Renderer {
         if tab_titles.len() > 0 {
             self.build_tab_bar_vertices(&mut all_vertices, viewport_w, tab_titles, tab_bar_left_inset);
         }
+
+        // Draw global status bar
+        self.build_global_status_bar_vertices(&mut all_vertices, viewport_w, viewport_h, hidden_left, hidden_right, min_pane_width_px);
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
@@ -639,7 +655,6 @@ impl Renderer {
         let cwd_fg = [self.status_bar_cwd_color[0], self.status_bar_cwd_color[1], self.status_bar_cwd_color[2], 1.0];
         let branch_fg = [self.status_bar_branch_color[0], self.status_bar_branch_color[1], self.status_bar_branch_color[2], 1.0];
         let scroll_fg = [self.status_bar_scroll_color[0], self.status_bar_scroll_color[1], self.status_bar_scroll_color[2], 1.0];
-        let time_fg = [self.status_bar_time_color[0], self.status_bar_time_color[1], self.status_bar_time_color[2], 1.0];
         let title_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 1.0];
 
         // Render CWD aligned to the left
@@ -685,38 +700,64 @@ impl Renderer {
             }
         }
 
-        // Right side: scroll indicator + time
-        let time_str = {
-            let secs = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let t = secs as libc::time_t;
-            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-            unsafe { libc::localtime_r(&t, &mut tm) };
-            format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
-        };
-
+        // Right side: scroll indicator only
         let scroll_off = term.scroll_offset();
-        let scroll_str = if scroll_off > 0 {
-            format!("↑{}", scroll_off)
-        } else {
-            String::new()
-        };
-
-        // Calculate total right width to align from right edge
-        let time_w = time_str.chars().count() as f32 * cell_w;
-        let scroll_w = scroll_str.chars().count() as f32 * cell_w;
-        let gap = if scroll_off > 0 { cell_w * 2.0 } else { 0.0 };
-        let total_right_w = scroll_w + gap + time_w;
-        let right_edge = vp.x + vp.width;
-        let mut right_x = right_edge - total_right_w - cell_w;
-
         if scroll_off > 0 {
-            right_x = self.render_status_text(vertices, &scroll_str, right_x, bar_y, right_edge, scroll_fg, no_bg);
-            right_x += cell_w * 2.0; // gap
+            let scroll_str = format!("↑{}", scroll_off);
+            let scroll_w = scroll_str.chars().count() as f32 * cell_w;
+            let right_edge = vp.x + vp.width;
+            let right_x = right_edge - scroll_w - cell_w;
+            self.render_status_text(vertices, &scroll_str, right_x, bar_y, right_edge, scroll_fg, no_bg);
         }
-        self.render_status_text(vertices, &time_str, right_x, bar_y, right_edge, time_fg, no_bg);
+    }
+
+    fn build_global_status_bar_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        viewport_w: f32,
+        viewport_h: f32,
+        hidden_left: usize,
+        hidden_right: usize,
+        min_pane_width_px: f32,
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+        let bar_y = viewport_h - cell_h;
+
+        // Background quad
+        Self::push_bg_quad(vertices, 0.0, bar_y, viewport_w, cell_h, self.global_bar_bg);
+
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let time_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 1.0];
+        let scroll_fg = [self.global_bar_scroll_color[0], self.global_bar_scroll_color[1], self.global_bar_scroll_color[2], 1.0];
+        let fg = [self.global_bar_fg[0], self.global_bar_fg[1], self.global_bar_fg[2], 1.0];
+
+        // Left: min pane width in pixels
+        let min_w_str = format!("min {}px", min_pane_width_px as u32);
+        let left_x = cell_w;
+        self.render_status_text(vertices, &min_w_str, left_x, bar_y, viewport_w * 0.3, fg, no_bg);
+
+        // Center: scroll indicator when panes are hidden
+        if hidden_left > 0 || hidden_right > 0 {
+            let indicator = match (hidden_left > 0, hidden_right > 0) {
+                (true, true) => format!("⟵ {} | {} ⟶", hidden_left, hidden_right),
+                (true, false) => format!("⟵ {}", hidden_left),
+                (false, true) => format!("{} ⟶", hidden_right),
+                _ => unreachable!(),
+            };
+            let char_count = indicator.chars().count() as f32;
+            let text_w = char_count * cell_w;
+            let center_x = (viewport_w - text_w) / 2.0;
+            self.render_status_text(vertices, &indicator, center_x, bar_y, viewport_w, scroll_fg, no_bg);
+        }
+
+        // Right: time HH:MM (cached, updated once per minute)
+        if !self.cached_time_str.is_empty() {
+            let time_str = self.cached_time_str.clone();
+            let time_w = time_str.chars().count() as f32 * cell_w;
+            let right_x = viewport_w - time_w - cell_w;
+            self.render_status_text(vertices, &time_str, right_x, bar_y, viewport_w, time_fg, no_bg);
+        }
     }
 
     fn build_tab_bar_vertices(

@@ -898,12 +898,23 @@ impl KovaView {
     fn panes_viewport_inner(&self, scroll_offset_x: f32, virtual_width: f32) -> PaneViewport {
         let full = self.drawable_viewport();
         let tab_bar_h = self.tab_bar_height();
+        let global_bar_h = self.global_bar_height();
         PaneViewport {
             x: -scroll_offset_x,
             y: full.y + tab_bar_h,
             width: virtual_width,
-            height: full.height - tab_bar_h,
+            height: full.height - tab_bar_h - global_bar_h,
         }
+    }
+
+    /// Global status bar height in pixels (1x cell height).
+    fn global_bar_height(&self) -> f32 {
+        let renderer = match self.ivars().renderer.get() {
+            Some(r) => r,
+            None => return 0.0,
+        };
+        let r = renderer.read();
+        r.cell_size().1
     }
 
     fn backing_scale(&self) -> f32 {
@@ -1980,7 +1991,7 @@ impl KovaView {
                         .map(|c| c.splits.min_width)
                         .unwrap_or(300.0)
                         * ivars.last_scale.get().max(1.0) as f32;
-                    let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp) = {
+                    let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width) = {
                         let mut tabs = ivars.tabs.borrow_mut();
                         if tabs.is_empty() {
                             return;
@@ -1994,11 +2005,12 @@ impl KovaView {
                         let drawable_size = layer.drawableSize();
                         let screen_width = drawable_size.width as f32;
                         let virtual_width = tab.virtual_width(screen_width, split_min_w);
+                        let global_bar_h = cell_h;
                         let panes_vp = PaneViewport {
                             x: -tab.scroll_offset_x,
                             y: tab_bar_h,
                             width: virtual_width,
-                            height: drawable_size.height as f32 - tab_bar_h,
+                            height: drawable_size.height as f32 - tab_bar_h - global_bar_h,
                         };
                         tab.tree.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
                             pane_data.push((
@@ -2035,7 +2047,7 @@ impl KovaView {
                             })
                             .collect();
                         drop(rename);
-                        (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp)
+                        (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width)
                     };
 
                     // Focus reporting (DEC mode 1004) — send to focused pane only
@@ -2128,7 +2140,17 @@ impl KovaView {
                     r.hovered_url = hover_pos;
                     r.hovered_url_text = hover_text;
                     r.hovered_url_pane_id = hover_pane_id;
-                    r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset);
+                    // Count hidden panes (fully off-screen)
+                    let mut hidden_left = 0usize;
+                    let mut hidden_right = 0usize;
+                    for (_, vp, _, _, _) in &pane_data {
+                        if vp.x + vp.width <= 0.0 {
+                            hidden_left += 1;
+                        } else if vp.x >= screen_width {
+                            hidden_right += 1;
+                        }
+                    }
+                    r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, split_min_w);
                 }),
             )
         };
