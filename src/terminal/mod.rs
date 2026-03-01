@@ -487,6 +487,15 @@ impl TerminalState {
         }
     }
 
+    fn push_to_scrollback(&mut self, row: CompactRow) {
+        self.scrollback.push_back(row);
+        if self.scrollback.len() > self.scrollback_limit {
+            self.scrollback.pop_front();
+        } else if self.scroll_offset > 0 {
+            self.scroll_offset += 1;
+        }
+    }
+
     fn scroll_up(&mut self, n: u16) {
         let top = self.scroll_top as usize;
         let bottom = self.scroll_bottom as usize;
@@ -495,12 +504,7 @@ impl TerminalState {
             if top < self.grid.len() {
                 let line = self.grid.remove(top);
                 if top == 0 && !self.in_alt_screen {
-                    self.scrollback.push_back(line.to_compact());
-                    if self.scrollback.len() > self.scrollback_limit {
-                        self.scrollback.pop_front();
-                    } else if self.scroll_offset > 0 {
-                        self.scroll_offset += 1;
-                    }
+                    self.push_to_scrollback(line.to_compact());
                 }
             }
             let new_line = Row::new(self.cols as usize, &self.blank);
@@ -641,7 +645,19 @@ impl TerminalState {
                 }
             }
             2 | 3 => {
-                // Erase entire display
+                // Erase entire display — push current content to scrollback first
+                if !self.in_alt_screen {
+                    // Find last row with visible content to avoid trailing blanks
+                    let last_content = self.grid.iter().rposition(|row|
+                        row.cells.iter().any(|c| c.c != ' ' && c.c != '\0')
+                    );
+                    if let Some(last) = last_content {
+                        let compact: Vec<_> = self.grid[..=last].iter().map(|r| r.to_compact()).collect();
+                        for row in compact {
+                            self.push_to_scrollback(row);
+                        }
+                    }
+                }
                 for row in &mut self.grid {
                     for cell in row.cells.iter_mut() {
                         *cell = self.blank.clone();
