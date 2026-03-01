@@ -41,8 +41,8 @@ if git -C "$ROOT" tag -l "$TAG" | grep -q "$TAG"; then
     exit 1
 fi
 
-# Update Cargo.toml
-sed -i '' "0,/^version = \".*\"/s//version = \"$NEW\"/" "$CARGO"
+# Update Cargo.toml (replace exact current version to avoid matching dependencies)
+sed -i '' "s/^version = \"$CURRENT\"/version = \"$NEW\"/" "$CARGO"
 
 # Update Info.plist (both CFBundleVersion and CFBundleShortVersionString)
 sed -i '' "/<key>CFBundleVersion<\/key>/{n;s/<string>.*<\/string>/<string>$NEW<\/string>/;}" "$PLIST"
