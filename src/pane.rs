@@ -499,7 +499,12 @@ impl SplitTree {
         let src_cx = src_vp.x + src_vp.width / 2.0;
         let src_cy = src_vp.y + src_vp.height / 2.0;
 
-        let mut best: Option<(PaneId, f32)> = None;
+        // For directional navigation, prioritize panes that overlap on the
+        // perpendicular axis (e.g. going Down, prefer panes whose x-range
+        // overlaps with ours). Among overlapping panes, pick the closest on
+        // the main axis. Fall back to Manhattan distance if no overlap.
+        let mut best_overlap: Option<(PaneId, f32)> = None;
+        let mut best_fallback: Option<(PaneId, f32)> = None;
         for &(pid, ref vp) in &panes {
             if pid == id { continue; }
             let cx = vp.x + vp.width / 2.0;
@@ -513,12 +518,42 @@ impl SplitTree {
             };
             if !valid { continue; }
 
-            let dist = (cx - src_cx).abs() + (cy - src_cy).abs();
-            if best.map_or(true, |(_, d)| dist < d) {
-                best = Some((pid, dist));
+            let overlaps = match dir {
+                NavDirection::Left | NavDirection::Right => {
+                    // Check y-range overlap
+                    let s_top = src_vp.y;
+                    let s_bot = src_vp.y + src_vp.height;
+                    let c_top = vp.y;
+                    let c_bot = vp.y + vp.height;
+                    s_top < c_bot && c_top < s_bot
+                }
+                NavDirection::Up | NavDirection::Down => {
+                    // Check x-range overlap
+                    let s_left = src_vp.x;
+                    let s_right = src_vp.x + src_vp.width;
+                    let c_left = vp.x;
+                    let c_right = vp.x + vp.width;
+                    s_left < c_right && c_left < s_right
+                }
+            };
+
+            let main_dist = match dir {
+                NavDirection::Left | NavDirection::Right => (cx - src_cx).abs(),
+                NavDirection::Up | NavDirection::Down => (cy - src_cy).abs(),
+            };
+
+            if overlaps {
+                if best_overlap.map_or(true, |(_, d)| main_dist < d) {
+                    best_overlap = Some((pid, main_dist));
+                }
+            } else {
+                let dist = (cx - src_cx).abs() + (cy - src_cy).abs();
+                if best_fallback.map_or(true, |(_, d)| dist < d) {
+                    best_fallback = Some((pid, dist));
+                }
             }
         }
-        best.map(|(pid, _)| pid)
+        best_overlap.or(best_fallback).map(|(pid, _)| pid)
     }
 
     /// Check if this tree contains a pane with the given id.
