@@ -185,7 +185,6 @@ impl Renderer {
         tab_bar_left_inset: f32,
         hidden_left: usize,
         hidden_right: usize,
-        pane_widths: &[f32],
     ) {
         // Reset blink on cursor movement of focused pane
         if let Some((term, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _)| *focused) {
@@ -326,7 +325,7 @@ impl Renderer {
         }
 
         // Draw global status bar
-        self.build_global_status_bar_vertices(&mut all_vertices, viewport_w, viewport_h, hidden_left, hidden_right, pane_widths);
+        self.build_global_status_bar_vertices(&mut all_vertices, viewport_w, viewport_h, hidden_left, hidden_right);
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
@@ -718,7 +717,6 @@ impl Renderer {
         viewport_h: f32,
         hidden_left: usize,
         hidden_right: usize,
-        pane_widths: &[f32],
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
@@ -730,19 +728,6 @@ impl Renderer {
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let time_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 1.0];
         let scroll_fg = [self.global_bar_scroll_color[0], self.global_bar_scroll_color[1], self.global_bar_scroll_color[2], 1.0];
-        let fg = [self.global_bar_fg[0], self.global_bar_fg[1], self.global_bar_fg[2], 1.0];
-
-        // Left: show visible pane widths
-        let widths_str = if pane_widths.is_empty() {
-            String::new()
-        } else {
-            pane_widths.iter()
-                .map(|w| format!("{}", *w as u32))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        };
-        let left_x = cell_w;
-        self.render_status_text(vertices, &widths_str, left_x, bar_y, viewport_w * 0.4, fg, no_bg);
 
         // Center: scroll indicator when panes are hidden
         if hidden_left > 0 || hidden_right > 0 {
