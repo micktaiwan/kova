@@ -41,6 +41,10 @@ cp Info.plist /Applications/Kova.app/Contents/
 ln -sf ~/.cargo/target/release/kova /Applications/Kova.app/Contents/MacOS/kova
 ```
 
+## Release
+
+`./scripts/release.sh <major|minor|patch>` — bump la version dans Cargo.toml + Info.plist, commit, tag `vX.Y.Z`, push.
+
 ## Logs
 
 `~/Library/Logs/Kova/kova.log` (level DEBUG par défaut, configurable via `RUST_LOG`).
