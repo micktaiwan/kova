@@ -809,9 +809,21 @@ impl Renderer {
 
             // Bell indicator: orange dot in the top-right of the tab
             if *has_bell && !is_active {
-                let dot_x = x + tab_width - cell_w * 1.2;
+                let dot_x = x + tab_width - cell_w * 2.0;
                 let dot_y = (bar_h - cell_h) / 2.0;
-                let dot_color = [1.0, 0.45, 0.1, 1.0]; // orange
+                let default_dot = [1.0, 0.45, 0.1]; // orange
+                let dot_rgb = if let Some(bg) = tab_bg {
+                    // Luminance distance between dot and tab bg
+                    let lum = |c: [f32; 3]| 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+                    if (lum(default_dot) - lum(bg)).abs() < 0.25 {
+                        [1.0, 1.0, 1.0] // white when too close
+                    } else {
+                        default_dot
+                    }
+                } else {
+                    default_dot
+                };
+                let dot_color = [dot_rgb[0], dot_rgb[1], dot_rgb[2], 1.0];
                 self.render_status_text(vertices, "●", dot_x, dot_y, x + tab_width, dot_color, no_bg);
             }
         }
