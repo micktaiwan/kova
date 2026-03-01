@@ -43,7 +43,7 @@ ln -sf ~/.cargo/target/release/kova /Applications/Kova.app/Contents/MacOS/kova
 
 ## Release
 
-`./scripts/release.sh <major|minor|patch>` — bump la version dans Cargo.toml + Info.plist, commit, tag `vX.Y.Z`, push.
+`/release <major|minor|patch>` — skill Claude Code qui bump la version dans Cargo.toml + Info.plist, commit avec un message basé sur le changelog, tag `vX.Y.Z`, push, et crée une GitHub release.
 
 ## Logs
 
