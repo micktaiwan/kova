@@ -55,4 +55,7 @@ git -C "$ROOT" tag "$TAG"
 git -C "$ROOT" push
 git -C "$ROOT" push origin "$TAG"
 
+# Create GitHub release with auto-generated notes
+gh release create "$TAG" --generate-notes
+
 echo "Released $TAG"
