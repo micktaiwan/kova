@@ -29,8 +29,8 @@ pub enum SavedTree {
         #[serde(default)]
         last_command: Option<String>,
     },
-    HSplit { left: Box<SavedTree>, right: Box<SavedTree>, ratio: f32 },
-    VSplit { top: Box<SavedTree>, bottom: Box<SavedTree>, ratio: f32 },
+    HSplit { left: Box<SavedTree>, right: Box<SavedTree>, ratio: f32, #[serde(default)] root: bool },
+    VSplit { top: Box<SavedTree>, bottom: Box<SavedTree>, ratio: f32, #[serde(default)] root: bool },
 }
 
 fn session_path() -> PathBuf {
@@ -44,15 +44,17 @@ fn snapshot_tree(tree: &SplitTree) -> SavedTree {
             cwd: pane.cwd(),
             last_command: pane.last_command(),
         },
-        SplitTree::HSplit { left, right, ratio } => SavedTree::HSplit {
+        SplitTree::HSplit { left, right, ratio, root } => SavedTree::HSplit {
             left: Box::new(snapshot_tree(left)),
             right: Box::new(snapshot_tree(right)),
             ratio: *ratio,
+            root: *root,
         },
-        SplitTree::VSplit { top, bottom, ratio } => SavedTree::VSplit {
+        SplitTree::VSplit { top, bottom, ratio, root } => SavedTree::VSplit {
             top: Box::new(snapshot_tree(top)),
             bottom: Box::new(snapshot_tree(bottom)),
             ratio: *ratio,
+            root: *root,
         },
     }
 }
@@ -143,7 +145,7 @@ fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Opt
             }
             Some((SplitTree::Leaf(pane), vec![id]))
         }
-        SavedTree::HSplit { left, right, ratio } => {
+        SavedTree::HSplit { left, right, ratio, root } => {
             let (left_tree, mut left_ids) = restore_tree(left, cols, rows, config)?;
             let (right_tree, right_ids) = restore_tree(right, cols, rows, config)?;
             left_ids.extend(right_ids);
@@ -151,9 +153,10 @@ fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Opt
                 left: Box::new(left_tree),
                 right: Box::new(right_tree),
                 ratio: *ratio,
+                root: *root,
             }, left_ids))
         }
-        SavedTree::VSplit { top, bottom, ratio } => {
+        SavedTree::VSplit { top, bottom, ratio, root } => {
             let (top_tree, mut top_ids) = restore_tree(top, cols, rows, config)?;
             let (bottom_tree, bottom_ids) = restore_tree(bottom, cols, rows, config)?;
             top_ids.extend(bottom_ids);
@@ -161,6 +164,7 @@ fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Opt
                 top: Box::new(top_tree),
                 bottom: Box::new(bottom_tree),
                 ratio: *ratio,
+                root: *root,
             }, top_ids))
         }
     }

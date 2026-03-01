@@ -61,6 +61,8 @@ pub struct KovaViewIvars {
     /// SAFETY: pointer is only live during the synchronous keyDown → interpretKeyEvents → doCommandBySelector
     /// call chain, and cleared immediately after. Never accessed outside that stack frame.
     current_event: Cell<Option<*const NSEvent>>,
+    /// Runtime override for min_split_width (in points). 0.0 = use config value.
+    min_split_width_override: Cell<f32>,
 }
 
 struct FilterState {
@@ -413,6 +415,46 @@ define_class!(
                     }
                 }
             }
+
+            // Ctrl+Option+arrows → adjust min_split_width
+            if has_ctrl && has_option && !has_cmd {
+                let chars = event.charactersIgnoringModifiers();
+                if let Some(chars) = chars {
+                    let ch = chars.to_string();
+                    let step = match ch.as_str() {
+                        "\u{f703}" => Some(1.0_f32),  // right → increase
+                        "\u{f702}" => Some(-1.0_f32), // left → decrease
+                        _ => None,
+                    };
+                    if let Some(dir) = step {
+                        let cell_w = self.ivars().renderer.get()
+                            .map(|r| r.read().cell_size().0 / self.backing_scale())
+                            .unwrap_or(8.0);
+                        let current = {
+                            let ov = self.ivars().min_split_width_override.get();
+                            if ov > 0.0 { ov } else {
+                                self.ivars().config.get().map(|c| c.splits.min_width).unwrap_or(300.0)
+                            }
+                        };
+                        let new_val = (current + dir * cell_w).max(cell_w * 10.0);
+                        self.ivars().min_split_width_override.set(new_val);
+                        log::debug!("min_split_width adjusted to {}pt", new_val);
+                        // Reclamp scroll and resize
+                        {
+                            let screen_w = self.drawable_viewport().width;
+                            let min_w = self.min_split_width_px();
+                            let mut tabs = self.ivars().tabs.borrow_mut();
+                            let idx = self.ivars().active_tab.get();
+                            if let Some(tab) = tabs.get_mut(idx) {
+                                tab.clamp_scroll(screen_w, min_w);
+                            }
+                        }
+                        self.resize_all_panes();
+                        return objc2::runtime::Bool::YES;
+                    }
+                }
+            }
+
             objc2::runtime::Bool::NO
         }
 
@@ -776,6 +818,7 @@ impl KovaView {
             auto_scroll_speed: Cell::new(0),
             marked_text: RefCell::new(None),
             current_event: Cell::new(None),
+            min_split_width_override: Cell::new(0.0),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -923,9 +966,14 @@ impl KovaView {
 
     /// Compute scaled min_split_width in pixels.
     fn min_split_width_px(&self) -> f32 {
-        let min_w = self.ivars().config.get()
-            .map(|c| c.splits.min_width)
-            .unwrap_or(300.0);
+        let override_val = self.ivars().min_split_width_override.get();
+        let min_w = if override_val > 0.0 {
+            override_val
+        } else {
+            self.ivars().config.get()
+                .map(|c| c.splits.min_width)
+                .unwrap_or(300.0)
+        };
         min_w * self.backing_scale()
     }
 
@@ -1351,11 +1399,13 @@ impl KovaView {
                     left: Box::new(old_tree),
                     right: Box::new(SplitTree::Leaf(new_pane)),
                     ratio: 0.5,
+                    root: true,
                 },
                 SplitDirection::Vertical => SplitTree::VSplit {
                     top: Box::new(old_tree),
                     bottom: Box::new(SplitTree::Leaf(new_pane)),
                     ratio: 0.5,
+                    root: true,
                 },
             };
             tab.tree.equalize();
@@ -2150,7 +2200,12 @@ impl KovaView {
                             hidden_right += 1;
                         }
                     }
-                    r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, split_min_w);
+                    // Collect visible pane widths for the global bar
+                    let pane_widths: Vec<f32> = pane_data.iter()
+                        .filter(|(_, vp, _, _, _)| vp.x + vp.width > 0.0 && vp.x < screen_width)
+                        .map(|(_, vp, _, _, _)| vp.width)
+                        .collect();
+                    r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, &pane_widths);
                 }),
             )
         };
