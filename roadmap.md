@@ -99,6 +99,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Wide characters (emojis, CJK) — détection via `unicode-width`, placeholder `'\0'` en col+1, rasterisation 2× cell_width dans l'atlas
 - [x] Déplacer un split par raccourci (Cmd+Shift+Arrows — swap le pane focusé avec son voisin)
 - [x] Bell indicator sur tabs inactifs (point orange sur les tabs non focusés quand bell reçu)
+- [x] Horizontal scroll splits — quand les splits dépassent la largeur écran, scroll horizontal trackpad + auto-reveal du pane focusé. `min_split_width` configurable.
 - [x] Color emoji rendering via CoreText fallback fonts
 - [x] Grapheme cluster emoji (flags, ZWJ sequences, skin tones)
 - [x] Optimisation RAM Cell — compact cell storage pour le scrollback (28→12 bytes/cell, -57% RAM). fg/bg stockés en `u32` RGBA au lieu de `[f32; 3]`.
