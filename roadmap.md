@@ -104,13 +104,13 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Grapheme cluster emoji (flags, ZWJ sequences, skin tones)
 - [x] Optimisation RAM Cell — compact cell storage pour le scrollback (28→12 bytes/cell, -57% RAM). fg/bg stockés en `u32` RGBA au lieu de `[f32; 3]`.
 - [x] Multi-fenêtres — Cmd+N nouvelle fenêtre, Cmd+Q ferme fenêtre active, Cmd+Option+Q kill sans save, Cmd+Shift+T detach tab vers nouvelle fenêtre. Session restore multi-window. Dealloc différé pour éviter segfault AppKit.
-- [ ] Config keybindings (raccourcis hardcodés suffisent pour V1)
+- [x] Config keybindings (raccourcis configurables via `[keys]` dans config.toml)
 - [ ] Déplacer un split par drag (anchor visuelle pendant le drag — le swap par raccourci Cmd+Shift+Arrows existe déjà)
 - [ ] Notifications visuelles avancées (activité dans un split inactif)
 - [ ] Batching du parser VT — le pty-reader prend un write lock sur `TerminalState` à chaque caractère parsé (`print`, `execute`, `csi_dispatch`…). Quand un pane en background reçoit beaucoup de données (build, logs…), ces write locks en rafale bloquent les read locks du render timer au moment du switch de tab (parking_lot donne priorité aux writers). Solution : parser dans un buffer local puis flusher en un seul write lock par read() de 4 Ko.
 - [ ] PTY cleanup non-bloquant — remplacer le `waitpid` bloquant dans `Drop for Pty` par une escalade SIGHUP → SIGTERM → SIGKILL avec timeouts (~200ms max), pour éviter un freeze UI si un process ignore SIGHUP
 - [ ] Font fallback (block elements/box-drawing) — nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
-- [ ] Ligatures (optionnel)
+- [ ] **Tab bar font size** : taille de fonte des tabs configurable indépendamment (`tab_bar.font_size`), override possible par fenêtre. Voir `notes/tab-font-size.md`.
 - [ ] **Trim trailing spaces** : tronquer les cellules vides en fin de ligne.
 - [ ] **Run-length encoding** : compresser les séquences de même couleur.
 - [ ] Metriques perf exposées (frame time, mémoire, allocations) — utile pour diagnostiquer sans avoir à lancer vmmap/heap manuellement
@@ -127,6 +127,7 @@ Items intéressants mais non prioritaires — le gain ne justifie pas l'effort �
 
 - [ ] Support ProMotion (120Hz) — le dirty flag fait déjà que le rendu est skip quand rien ne change, donc le surcoût est limité au scroll/grosses sorties. Mais la différence 60→120 Hz est marginale pour un terminal (texte statique 99% du temps).
 - [ ] Thèmes de couleurs — les couleurs sont déjà configurables individuellement dans `config.toml`. Les thèmes ajouteraient un niveau d'abstraction (`theme = "catppuccin-mocha"`) pour switcher toute la palette d'un coup (16 ANSI + fg/bg/cursor/sélection). Pratique mais pas bloquant : l'utilisateur peut déjà copier-coller un bloc de couleurs dans son config.
+- [ ] Ligatures — complexe (shaping CoreText par groupes de glyphes vs 1 cell = 1 glyph actuel)
 
 ## Non-goals
 

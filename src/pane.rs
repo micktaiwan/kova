@@ -16,7 +16,7 @@ pub enum SplitDirection {
     Vertical,   // stacked (top / bottom)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitAxis {
     Horizontal, // resize left/right
     Vertical,   // resize up/down
@@ -41,7 +41,7 @@ pub struct SeparatorInfo {
     pub node_ptr: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavDirection {
     Left,
     Right,
@@ -49,18 +49,6 @@ pub enum NavDirection {
     Down,
 }
 
-impl NavDirection {
-    /// Parse a macOS arrow key character (NSEvent PUA) into a NavDirection.
-    pub fn from_arrow_char(ch: &str) -> Option<Self> {
-        match ch {
-            "\u{f702}" => Some(NavDirection::Left),
-            "\u{f703}" => Some(NavDirection::Right),
-            "\u{f700}" => Some(NavDirection::Up),
-            "\u{f701}" => Some(NavDirection::Down),
-            _ => None,
-        }
-    }
-}
 
 pub type TabId = u32;
 

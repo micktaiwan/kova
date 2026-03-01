@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod input;
+mod keybindings;
 mod pane;
 mod renderer;
 mod session;

@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use crate::config::{Config, TerminalConfig};
 use crate::input;
-use crate::pane::{NavDirection, Pane, PaneId, SplitAxis, SplitDirection, SplitTree, Tab};
+use crate::keybindings::{Action, Keybindings, KeyCombo};
+use crate::pane::{NavDirection, Pane, PaneId, SplitDirection, SplitTree, Tab};
 use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
 use crate::terminal::{FilterMatch, GridPos, Selection};
 
@@ -39,6 +40,7 @@ pub struct KovaViewIvars {
     last_scale: Cell<f64>,
     last_focused: Cell<bool>,
     config: OnceCell<Config>,
+    keybindings: OnceCell<Keybindings>,
     drag_separator: Cell<Option<SeparatorDrag>>,
     filter: RefCell<Option<FilterState>>,
     rename_tab: RefCell<Option<RenameTabState>>,
@@ -117,7 +119,9 @@ define_class!(
                 if let Some(pane) = self.focused_pane() {
                     let cursor_keys_app = pane.terminal.read().cursor_keys_application;
                     pane.terminal.write().reset_scroll();
-                    input::handle_key_event(event, &pane.pty, cursor_keys_app);
+                    if let Some(kb) = self.ivars().keybindings.get() {
+                        input::handle_key_event(event, &pane.pty, cursor_keys_app, kb);
+                    }
                 }
             }
         }
@@ -262,171 +266,55 @@ define_class!(
 
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> objc2::runtime::Bool {
-            let modifiers = event.modifierFlags();
-            let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
-            let has_shift = modifiers.contains(NSEventModifierFlags::Shift);
-            let has_option = modifiers.contains(NSEventModifierFlags::Option);
-            let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
+            let combo = KeyCombo::from_event(event);
 
-            if has_cmd {
-                let chars = event.charactersIgnoringModifiers();
-                if let Some(chars) = chars {
-                    let ch = chars.to_string();
-                    log::debug!("performKeyEquivalent: ch={:?} shift={} option={} ctrl={}", ch, has_shift, has_option, has_ctrl);
+            let keybindings = match self.ivars().keybindings.get() {
+                Some(kb) => kb,
+                None => return objc2::runtime::Bool::NO,
+            };
 
-                    // Cmd+F → toggle filter
-                    if ch == "f" && !has_shift && !has_option {
-                        self.toggle_filter();
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+K → clear scrollback and screen
-                    if ch == "k" && !has_shift && !has_option {
+            if let Some(action) = keybindings.window_map.get(&combo) {
+                log::debug!("performKeyEquivalent: combo={:?} action={:?}", combo, action);
+                match action {
+                    Action::ToggleFilter => self.toggle_filter(),
+                    Action::ClearScrollback => {
                         if let Some(pane) = self.focused_pane() {
                             pane.terminal.write().clear_scrollback_and_screen();
-                            // Send Ctrl+L (form feed) so the shell redraws its prompt
                             pane.pty.write(b"\x0c");
                         }
-                        return objc2::runtime::Bool::YES;
                     }
-
-                    // Cmd+N → new window
-                    if ch == "n" && !has_shift && !has_option {
+                    Action::NewWindow => {
                         let mtm = unsafe { MainThreadMarker::new_unchecked() };
                         crate::app::create_new_window(mtm);
-                        return objc2::runtime::Bool::YES;
                     }
-
-                    // Cmd+T → new tab
-                    if ch == "t" && !has_shift && !has_option {
-                        self.do_new_tab();
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+D → vsplit (local, within focused pane)
-                    if ch == "d" && !has_shift && !has_option && !has_ctrl {
-                        self.do_split(SplitDirection::Horizontal);
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+Shift+D → hsplit (local, within focused pane)
-                    if ch == "D" && has_shift && !has_option && !has_ctrl {
-                        self.do_split(SplitDirection::Vertical);
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+E → vsplit at root (full-height column)
-                    if ch == "e" && !has_shift && !has_option {
-                        self.do_split_root(SplitDirection::Horizontal);
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+Shift+E → hsplit at root (full-width row)
-                    if ch == "E" && has_shift && !has_option {
-                        self.do_split_root(SplitDirection::Vertical);
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+Q → close active window (not the whole app)
-                    if ch == "q" && !has_shift && !has_option && !has_ctrl {
-                        self.do_close_window();
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+Option+Q → kill window without saving session
-                    if ch == "q" && !has_shift && has_option && !has_ctrl {
-                        self.do_kill_window();
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+W → close pane or tab
-                    if ch == "w" && !has_shift && !has_option {
-                        self.do_close_pane_or_tab();
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+Shift+[ → previous tab
-                    if ch == "{" && has_shift && !has_option {
-                        self.do_switch_tab_relative(-1);
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+Shift+] → next tab
-                    if ch == "}" && has_shift && !has_option {
-                        self.do_switch_tab_relative(1);
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+Shift+R → rename tab
-                    if ch == "R" && has_shift && !has_option {
-                        self.start_rename_tab();
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+Shift+T → detach tab to new window
-                    if ch == "T" && has_shift && !has_option && !has_ctrl {
-                        self.do_detach_tab();
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+Shift+M → merge window into another
-                    if ch == "M" && has_shift && !has_option && !has_ctrl {
-                        self.do_merge_window();
-                        return objc2::runtime::Bool::YES;
-                    }
-
-                    // Cmd+1..9 → switch to tab N
-                    if !has_shift && !has_option && !has_ctrl {
-                        if let Some(digit) = ch.chars().next() {
-                            if ('1'..='9').contains(&digit) {
-                                let idx = (digit as usize) - ('1' as usize);
-                                self.do_switch_tab(idx);
-                                return objc2::runtime::Bool::YES;
+                    Action::NewTab => self.do_new_tab(),
+                    Action::VSplit => self.do_split(SplitDirection::Horizontal),
+                    Action::HSplit => self.do_split(SplitDirection::Vertical),
+                    Action::VSplitRoot => self.do_split_root(SplitDirection::Horizontal),
+                    Action::HSplitRoot => self.do_split_root(SplitDirection::Vertical),
+                    Action::CloseWindow => self.do_close_window(),
+                    Action::KillWindow => self.do_kill_window(),
+                    Action::ClosePaneOrTab => self.do_close_pane_or_tab(),
+                    Action::PrevTab => self.do_switch_tab_relative(-1),
+                    Action::NextTab => self.do_switch_tab_relative(1),
+                    Action::RenameTab => self.start_rename_tab(),
+                    Action::DetachTab => self.do_detach_tab(),
+                    Action::MergeWindow => self.do_merge_window(),
+                    Action::SwitchTab(idx) => self.do_switch_tab(*idx),
+                    Action::Navigate(dir) => self.do_navigate(*dir),
+                    Action::SwapPane(dir) => self.do_swap_pane(*dir),
+                    Action::Resize(axis, delta) => {
+                        let mut tabs = self.ivars().tabs.borrow_mut();
+                        let idx = self.ivars().active_tab.get();
+                        if let Some(tab) = tabs.get_mut(idx) {
+                            let focused_id = tab.focused_pane;
+                            if tab.tree.adjust_ratio_for_pane(focused_id, *delta, *axis) {
+                                drop(tabs);
+                                self.resize_all_panes();
                             }
                         }
                     }
-
-                    // Cmd+Option+arrows → navigate panes
-                    if has_option && !has_ctrl {
-                        if let Some(dir) = NavDirection::from_arrow_char(&ch) {
-                            self.do_navigate(dir);
-                            return objc2::runtime::Bool::YES;
-                        }
-                    }
-
-                    // Cmd+Shift+arrows → swap panes
-                    if has_shift && !has_option && !has_ctrl {
-                        if let Some(dir) = NavDirection::from_arrow_char(&ch) {
-                            self.do_swap_pane(dir);
-                            return objc2::runtime::Bool::YES;
-                        }
-                    }
-
-                    // Cmd+Ctrl+arrows → resize splits
-                    if has_ctrl && !has_option {
-                        let resize = match ch.as_str() {
-                            "\u{f702}" => Some((SplitAxis::Horizontal, -0.05_f32)), // left
-                            "\u{f703}" => Some((SplitAxis::Horizontal, 0.05)),       // right
-                            "\u{f700}" => Some((SplitAxis::Vertical, -0.05)),        // up
-                            "\u{f701}" => Some((SplitAxis::Vertical, 0.05)),         // down
-                            _ => None,
-                        };
-                        if let Some((axis, delta)) = resize {
-                            let mut tabs = self.ivars().tabs.borrow_mut();
-                            let idx = self.ivars().active_tab.get();
-                            if let Some(tab) = tabs.get_mut(idx) {
-                                let focused_id = tab.focused_pane;
-                                if tab.tree.adjust_ratio_for_pane(focused_id, delta, axis) {
-                                    drop(tabs);
-                                    self.resize_all_panes();
-                                }
-                            }
-                            return objc2::runtime::Bool::YES;
-                        }
-                    }
-
-                    // Cmd+C → copy
-                    if ch == "c" && !has_shift && !has_option {
+                    Action::Copy => {
                         if let Some(pane) = self.focused_pane() {
                             let mut term = pane.terminal.write();
                             let text = term.selected_text();
@@ -438,17 +326,14 @@ define_class!(
                                     pasteboard.setString_forType(&ns_str, objc2_app_kit::NSPasteboardTypeString);
                                 }
                                 term.clear_selection();
-                                return objc2::runtime::Bool::YES;
+                            } else {
+                                return objc2::runtime::Bool::NO;
                             }
                         }
                     }
-
-                    // Cmd+V → paste
-                    if ch == "v" && !has_shift && !has_option {
+                    Action::Paste => {
                         if let Some(pane) = self.focused_pane() {
                             let pasteboard = NSPasteboard::generalPasteboard();
-
-                            // Try image paste first (PNG from clipboard)
                             let pasted_image = unsafe { pasteboard.dataForType(objc2_app_kit::NSPasteboardTypePNG) }
                                 .and_then(|data| {
                                     if data.is_empty() { return None; }
@@ -469,18 +354,14 @@ define_class!(
                             } else if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
                                 let text = text.to_string();
                                 let bracketed = pane.terminal.read().bracketed_paste;
-                                if bracketed {
-                                    pane.pty.write(b"\x1b[200~");
-                                }
+                                if bracketed { pane.pty.write(b"\x1b[200~"); }
                                 pane.pty.write(text.as_bytes());
-                                if bracketed {
-                                    pane.pty.write(b"\x1b[201~");
-                                }
+                                if bracketed { pane.pty.write(b"\x1b[201~"); }
                             }
                         }
-                        return objc2::runtime::Bool::YES;
                     }
                 }
+                return objc2::runtime::Bool::YES;
             }
 
             objc2::runtime::Bool::NO
@@ -532,7 +413,9 @@ define_class!(
                     let mut term = pane.terminal.write();
                     term.scroll(lines);
                     // Reset accumulator when hitting bounds to avoid residual drift
-                    if term.scroll_offset() == 0 {
+                    let at_bound = term.scroll_offset() == 0
+                        || term.scroll_offset() == term.scrollback_len() as i32;
+                    if at_bound {
                         pane.scroll_accumulator.set(0.0);
                     }
                 }
@@ -652,13 +535,8 @@ define_class!(
             // Handle separator drag
             if let Some(drag) = self.ivars().drag_separator.get() {
                 let (px, py) = self.event_to_pixel(event);
-                // Translate to virtual space for horizontal separators
-                let scroll_x = {
-                    let tabs = self.ivars().tabs.borrow();
-                    let idx = self.ivars().active_tab.get();
-                    tabs.get(idx).map(|t| t.scroll_offset_x).unwrap_or(0.0)
-                };
-                let current_pixel = if drag.is_hsplit { px + scroll_x } else { py };
+                // Both origin_pixel and current_pixel are in screen space
+                let current_pixel = if drag.is_hsplit { px } else { py };
                 let new_ratio = drag.origin_ratio + (current_pixel - drag.origin_pixel) / drag.parent_dim;
                 let mut tabs = self.ivars().tabs.borrow_mut();
                 let idx = self.ivars().active_tab.get();
@@ -851,6 +729,7 @@ impl KovaView {
             last_title: RefCell::new(None),
             git_poll_counter: Cell::new(0),
             git_poll_interval: Cell::new(120), // updated in setup_metal
+            keybindings: OnceCell::new(),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -911,8 +790,8 @@ impl KovaView {
             None => return,
         };
         let panes_vp = self.panes_viewport_for_tab(tab);
-        let virtual_px = px + tab.scroll_offset_x;
-        let hit = tab.tree.hit_test(virtual_px, py, panes_vp);
+        // Viewport is already in screen space (x: -scroll_offset_x), so use px directly
+        let hit = tab.tree.hit_test(px, py, panes_vp);
         let (pane, vp) = match hit {
             Some((p, v)) => (unsafe { &*(p as *const Pane) }, v),
             None => {
@@ -1050,15 +929,13 @@ impl KovaView {
         let scale = self.backing_scale();
         let tolerance = 4.0 * scale;
 
-        // Translate screen x to virtual space for hit-testing
-        let virtual_px = px + tab.scroll_offset_x;
-
+        // Separators are in screen space (viewport uses x: -scroll_offset_x)
         for sep in &seps {
             if sep.is_hsplit {
-                if (virtual_px - sep.pos).abs() < tolerance && py >= sep.cross_start && py <= sep.cross_end {
+                if (px - sep.pos).abs() < tolerance && py >= sep.cross_start && py <= sep.cross_end {
                     return Some(SeparatorDrag {
                         is_hsplit: true,
-                        origin_pixel: virtual_px,
+                        origin_pixel: px,
                         origin_ratio: sep.origin_ratio,
                         parent_dim: sep.parent_dim,
                         node_ptr: sep.node_ptr,
@@ -1152,9 +1029,8 @@ impl KovaView {
         let idx = self.ivars().active_tab.get();
         let tab = tabs.get(idx)?;
         let (px, py) = self.event_to_pixel(event);
-        // Translate screen x to virtual space
-        let virtual_px = px + tab.scroll_offset_x;
-        let (pane, vp) = tab.tree.hit_test(virtual_px, py, self.panes_viewport_for_tab(tab))?;
+        // Viewport is already in screen space (x: -scroll_offset_x), so use px directly
+        let (pane, vp) = tab.tree.hit_test(px, py, self.panes_viewport_for_tab(tab))?;
         Some((unsafe { &*(pane as *const Pane) }, vp))
     }
 
@@ -1992,6 +1868,7 @@ impl KovaView {
 
         self.ivars().renderer.set(renderer).ok();
         self.ivars().config.set(config.clone()).ok();
+        self.ivars().keybindings.set(Keybindings::from_config(&config.keys)).ok();
         self.ivars().git_poll_interval.set(config.terminal.fps * 2);
         *self.ivars().tabs.borrow_mut() = tabs;
         self.ivars().active_tab.set(active_tab);

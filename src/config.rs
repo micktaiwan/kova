@@ -12,6 +12,7 @@ pub struct Config {
     pub tab_bar: TabBarConfig,
     pub splits: SplitsConfig,
     pub global_status_bar: GlobalStatusBarConfig,
+    pub keys: KeysConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -134,6 +135,7 @@ impl Default for Config {
             tab_bar: TabBarConfig::default(),
             splits: SplitsConfig::default(),
             global_status_bar: GlobalStatusBarConfig::default(),
+            keys: KeysConfig::default(),
         }
     }
 }
@@ -206,7 +208,124 @@ impl Config {
     }
 }
 
+
 fn config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".config/kova/config.toml")
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct KeysConfig {
+    pub new_tab: String,
+    pub close_pane_or_tab: String,
+    pub vsplit: String,
+    pub hsplit: String,
+    pub vsplit_root: String,
+    pub hsplit_root: String,
+    pub new_window: String,
+    pub close_window: String,
+    pub kill_window: String,
+    pub copy: String,
+    pub paste: String,
+    pub toggle_filter: String,
+    pub clear_scrollback: String,
+    pub prev_tab: String,
+    pub next_tab: String,
+    pub rename_tab: String,
+    pub detach_tab: String,
+    pub merge_window: String,
+    pub switch_tab_1: String,
+    pub switch_tab_2: String,
+    pub switch_tab_3: String,
+    pub switch_tab_4: String,
+    pub switch_tab_5: String,
+    pub switch_tab_6: String,
+    pub switch_tab_7: String,
+    pub switch_tab_8: String,
+    pub switch_tab_9: String,
+    pub navigate_up: String,
+    pub navigate_down: String,
+    pub navigate_left: String,
+    pub navigate_right: String,
+    pub swap_up: String,
+    pub swap_down: String,
+    pub swap_left: String,
+    pub swap_right: String,
+    pub resize_left: String,
+    pub resize_right: String,
+    pub resize_up: String,
+    pub resize_down: String,
+    pub terminal: TerminalKeysConfig,
+}
+
+impl Default for KeysConfig {
+    fn default() -> Self {
+        KeysConfig {
+            new_tab: "cmd+t".into(),
+            close_pane_or_tab: "cmd+w".into(),
+            vsplit: "cmd+d".into(),
+            hsplit: "cmd+shift+d".into(),
+            vsplit_root: "cmd+e".into(),
+            hsplit_root: "cmd+shift+e".into(),
+            new_window: "cmd+n".into(),
+            close_window: "cmd+q".into(),
+            kill_window: "cmd+option+q".into(),
+            copy: "cmd+c".into(),
+            paste: "cmd+v".into(),
+            toggle_filter: "cmd+f".into(),
+            clear_scrollback: "cmd+k".into(),
+            prev_tab: "cmd+shift+[".into(),
+            next_tab: "cmd+shift+]".into(),
+            rename_tab: "cmd+shift+r".into(),
+            detach_tab: "cmd+shift+t".into(),
+            merge_window: "cmd+shift+m".into(),
+            switch_tab_1: "cmd+1".into(),
+            switch_tab_2: "cmd+2".into(),
+            switch_tab_3: "cmd+3".into(),
+            switch_tab_4: "cmd+4".into(),
+            switch_tab_5: "cmd+5".into(),
+            switch_tab_6: "cmd+6".into(),
+            switch_tab_7: "cmd+7".into(),
+            switch_tab_8: "cmd+8".into(),
+            switch_tab_9: "cmd+9".into(),
+            navigate_up: "cmd+option+up".into(),
+            navigate_down: "cmd+option+down".into(),
+            navigate_left: "cmd+option+left".into(),
+            navigate_right: "cmd+option+right".into(),
+            swap_up: "cmd+shift+up".into(),
+            swap_down: "cmd+shift+down".into(),
+            swap_left: "cmd+shift+left".into(),
+            swap_right: "cmd+shift+right".into(),
+            resize_left: "cmd+ctrl+left".into(),
+            resize_right: "cmd+ctrl+right".into(),
+            resize_up: "cmd+ctrl+up".into(),
+            resize_down: "cmd+ctrl+down".into(),
+            terminal: TerminalKeysConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TerminalKeysConfig {
+    pub kill_line: String,
+    pub home: String,
+    pub end: String,
+    pub word_back: String,
+    pub word_forward: String,
+    pub shift_enter: String,
+}
+
+impl Default for TerminalKeysConfig {
+    fn default() -> Self {
+        TerminalKeysConfig {
+            kill_line: "cmd+backspace".into(),
+            home: "cmd+left".into(),
+            end: "cmd+right".into(),
+            word_back: "option+left".into(),
+            word_forward: "option+right".into(),
+            shift_enter: "shift+enter".into(),
+        }
+    }
 }
