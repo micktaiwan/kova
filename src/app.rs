@@ -253,6 +253,26 @@ pub fn detach_tab_to_new_window(
     ad.ivars().windows.borrow_mut().push(win);
 }
 
+/// Drain all tabs from `source_tabs` and append them to the first other window.
+/// Returns `false` (no-op) if there is no other window; tabs are untouched in that case.
+pub fn merge_tabs_from(
+    mtm: MainThreadMarker,
+    source_tabs: &std::cell::RefCell<Vec<crate::pane::Tab>>,
+    source: &NSWindow,
+) -> bool {
+    let ad = app_delegate(mtm);
+    let windows = ad.ivars().windows.borrow();
+    let Some(target) = windows.iter().find(|w| !w.isEqual(Some(source))) else {
+        return false;
+    };
+    let tabs: Vec<crate::pane::Tab> = source_tabs.borrow_mut().drain(..).collect();
+    if let Some(view) = kova_view(target) {
+        view.append_tabs(tabs);
+    }
+    target.makeKeyAndOrderFront(None);
+    true
+}
+
 /// Cast the window's contentView to our KovaView.
 /// SAFETY: contentView is always a KovaView (set in `create_window`).
 pub fn kova_view(window: &NSWindow) -> Option<&crate::window::KovaView> {
