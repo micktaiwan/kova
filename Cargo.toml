@@ -24,6 +24,9 @@ objc2-app-kit = { version = "0.3", features = [
     "NSTrackingArea",
     "NSCursor",
     "NSTextInputClient",
+    "NSAlert",
+    "NSButton",
+    "NSControl",
 ] }
 objc2-metal = { version = "0.3", features = [
     "MTLDevice",

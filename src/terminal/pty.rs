@@ -180,6 +180,24 @@ impl Pty {
         // established (setsid + TIOCSCTTY in pre_exec).
     }
 
+    /// Returns the name of the foreground process if it differs from the shell
+    /// (i.e. a command like vim, cargo, etc. is running).
+    pub fn foreground_process_name(&self) -> Option<String> {
+        let fg_pgid = unsafe { libc::tcgetpgrp(self.master_fd.as_raw_fd()) };
+        if fg_pgid <= 0 || fg_pgid == self.child_pid as i32 {
+            return None; // shell is in foreground = idle
+        }
+        let mut name_buf = [0u8; 256];
+        let len = unsafe {
+            libc::proc_name(fg_pgid, name_buf.as_mut_ptr() as *mut libc::c_void, 256)
+        };
+        if len > 0 {
+            Some(String::from_utf8_lossy(&name_buf[..len as usize]).to_string())
+        } else {
+            None
+        }
+    }
+
     /// Returns the current working directory of the child shell process.
     /// Uses macOS `proc_pidinfo` with `PROC_PIDVNODEPATHINFO`.
     pub fn cwd(&self) -> Option<String> {

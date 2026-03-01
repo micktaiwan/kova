@@ -1644,6 +1644,21 @@ impl KovaView {
         self.resize_all_panes();
     }
 
+    /// Returns (tab_title, process_name) for each pane with a running foreground process.
+    pub fn running_processes(&self) -> Vec<(String, String)> {
+        let tabs = self.ivars().tabs.borrow();
+        let mut result = Vec::new();
+        for tab in tabs.iter() {
+            let title = tab.title();
+            tab.tree.for_each_pane(&mut |pane| {
+                if let Some(name) = pane.foreground_process_name() {
+                    result.push((title.clone(), name));
+                }
+            });
+        }
+        result
+    }
+
     pub fn save_session(&self) {
         let tabs = self.ivars().tabs.borrow();
         let active_tab = self.ivars().active_tab.get();

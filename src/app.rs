@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly, MainThreadMarker};
-use objc2_app_kit::{NSApplication, NSApplicationDelegate, NSMenu, NSMenuItem, NSWindow};
+use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSApplicationDelegate, NSApplicationTerminateReply, NSMenu, NSMenuItem, NSWindow};
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString};
 use std::cell::OnceCell;
 
@@ -39,6 +39,39 @@ define_class!(
             self.ivars().window.set(win).ok();
         }
 
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn should_terminate(&self, _sender: &NSApplication) -> NSApplicationTerminateReply {
+            let mtm = MainThreadMarker::from(self);
+            if let Some(window) = self.ivars().window.get() {
+                if let Some(view) = kova_view(window) {
+                    let procs = view.running_processes();
+                    if !procs.is_empty() {
+                        let alert = NSAlert::new(mtm);
+                        alert.setAlertStyle(NSAlertStyle::Warning);
+                        alert.setMessageText(&NSString::from_str("Do you want to quit Kova?"));
+
+                        let mut lines = String::from("The following processes are running:");
+                        for (tab, name) in &procs {
+                            lines.push_str(&format!("\n\u{2022} Tab \u{ab}{}\u{bb}: {}", tab, name));
+                        }
+                        alert.setInformativeText(&NSString::from_str(&lines));
+
+                        alert.addButtonWithTitle(&NSString::from_str("Quit"));
+                        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+
+                        let response = alert.runModal();
+                        // NSAlertFirstButtonReturn = 1000
+                        if response == 1000 {
+                            return NSApplicationTerminateReply::TerminateNow;
+                        } else {
+                            return NSApplicationTerminateReply::TerminateCancel;
+                        }
+                    }
+                }
+            }
+            NSApplicationTerminateReply::TerminateNow
+        }
+
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
         fn should_terminate_after_last_window_closed(
             &self,
@@ -52,11 +85,7 @@ define_class!(
             log::info!("Kova shutting down");
             // Save session BEFORE shutting down PTYs (we need them alive for CWD detection)
             if let Some(window) = self.ivars().window.get() {
-                if let Some(content_view) = window.contentView() {
-                    let ptr: *const objc2_app_kit::NSView = &*content_view;
-                    let view: &crate::window::KovaView = unsafe {
-                        &*(ptr as *const crate::window::KovaView)
-                    };
+                if let Some(view) = kova_view(window) {
                     view.save_session();
                 }
             }
@@ -75,6 +104,15 @@ impl AppDelegate {
         retained.ivars().config.set(config).ok();
         retained
     }
+}
+
+/// Cast the window's contentView to our KovaView.
+/// SAFETY: contentView is always a KovaView (set in `create_window`).
+fn kova_view(window: &NSWindow) -> Option<&crate::window::KovaView> {
+    window.contentView().map(|cv| {
+        let ptr: *const objc2_app_kit::NSView = &*cv;
+        unsafe { &*(ptr as *const crate::window::KovaView) }
+    })
 }
 
 fn setup_menu(mtm: MainThreadMarker) {

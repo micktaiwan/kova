@@ -203,6 +203,10 @@ impl Pane {
         self.pty.cwd()
     }
 
+    pub fn foreground_process_name(&self) -> Option<String> {
+        self.pty.foreground_process_name()
+    }
+
     pub fn is_alive(&self) -> bool {
         !self.shell_exited.load(Ordering::Relaxed)
     }
