@@ -1,0 +1,69 @@
+# Kova configuration
+# Copy to ~/.config/kova/config.toml and uncomment to override defaults.
+
+# [font]
+# family = "Hack"
+# size = 13.0
+
+# [window]
+# width = 800.0
+# height = 600.0
+# x = 200.0
+# y = 200.0
+
+# [terminal]
+# columns = 80
+# rows = 24
+# scrollback = 10000
+# fps = 60
+# cursor_blink_frames = 60
+# scroll_sensitivity = 6.0
+
+# [keys]
+# new_tab = "cmd+t"
+# close_pane_or_tab = "cmd+w"
+# vsplit = "cmd+d"
+# hsplit = "cmd+shift+d"
+# vsplit_root = "cmd+e"
+# hsplit_root = "cmd+shift+e"
+# new_window = "cmd+n"
+# close_window = "cmd+q"
+# kill_window = "cmd+option+q"
+# copy = "cmd+c"
+# paste = "cmd+v"
+# toggle_filter = "cmd+f"
+# clear_scrollback = "cmd+k"
+# prev_tab = "cmd+shift+["
+# next_tab = "cmd+shift+]"
+# rename_tab = "cmd+shift+r"
+# detach_tab = "cmd+shift+t"
+# merge_window = "cmd+shift+m"
+# switch_tab_1 = "cmd+1"
+# switch_tab_2 = "cmd+2"
+# switch_tab_3 = "cmd+3"
+# switch_tab_4 = "cmd+4"
+# switch_tab_5 = "cmd+5"
+# switch_tab_6 = "cmd+6"
+# switch_tab_7 = "cmd+7"
+# switch_tab_8 = "cmd+8"
+# switch_tab_9 = "cmd+9"
+# navigate_up = "cmd+option+up"
+# navigate_down = "cmd+option+down"
+# navigate_left = "cmd+option+left"
+# navigate_right = "cmd+option+right"
+# swap_up = "cmd+shift+up"
+# swap_down = "cmd+shift+down"
+# swap_left = "cmd+shift+left"
+# swap_right = "cmd+shift+right"
+# resize_left = "cmd+ctrl+left"
+# resize_right = "cmd+ctrl+right"
+# resize_up = "cmd+ctrl+up"
+# resize_down = "cmd+ctrl+down"
+
+# [keys.terminal]
+# kill_line = "cmd+backspace"
+# home = "cmd+left"
+# end = "cmd+right"
+# word_back = "option+left"
+# word_forward = "option+right"
+# shift_enter = "shift+enter"
