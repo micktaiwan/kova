@@ -242,9 +242,17 @@ pub fn shutdown_all() {
 impl Drop for Pty {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        let pid = self.child_pid as i32;
         unsafe {
-            libc::kill(self.child_pid as i32, libc::SIGHUP);
-            libc::waitpid(self.child_pid as i32, std::ptr::null_mut(), 0);
+            libc::kill(pid, libc::SIGHUP);
+            // Non-blocking reap — don't hang the main thread if the child is slow to die
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) == 0 {
+                // Still alive — force kill and reap non-blocking
+                libc::kill(pid, libc::SIGKILL);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG);
+            }
         }
         PTY_REGISTRY
             .lock()
