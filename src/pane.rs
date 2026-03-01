@@ -124,7 +124,7 @@ impl Tab {
     /// Compute the virtual width for this tab's split layout.
     /// virtual_width = max(screen_width, column_count * min_split_width)
     pub fn virtual_width(&self, screen_width: f32, min_split_width: f32) -> f32 {
-        let columns = self.tree.chain_leaf_count(true) as f32;
+        let columns = self.tree.root_chain_count(true) as f32;
         (columns * min_split_width).max(screen_width)
     }
 
@@ -270,12 +270,16 @@ pub enum SplitTree {
         right: Box<SplitTree>,
         /// Fraction of width allocated to the left child (0.0–1.0).
         ratio: f32,
+        /// Whether this split was created at root level (Cmd+E).
+        root: bool,
     },
     VSplit {
         top: Box<SplitTree>,
         bottom: Box<SplitTree>,
         /// Fraction of height allocated to the top child (0.0–1.0).
         ratio: f32,
+        /// Whether this split was created at root level (Cmd+Shift+E).
+        root: bool,
     },
 }
 
@@ -343,28 +347,28 @@ impl SplitTree {
             SplitTree::Leaf(p) => {
                 if p.id == id { None } else { Some(SplitTree::Leaf(p)) }
             }
-            SplitTree::HSplit { left, right, ratio } => {
+            SplitTree::HSplit { left, right, ratio, root } => {
                 if left.contains(id) {
                     match left.remove_pane(id) {
-                        Some(new_left) => Some(SplitTree::HSplit { left: Box::new(new_left), right, ratio }),
+                        Some(new_left) => Some(SplitTree::HSplit { left: Box::new(new_left), right, ratio, root }),
                         None => Some(*right), // left was a leaf that got removed, promote right
                     }
                 } else {
                     match right.remove_pane(id) {
-                        Some(new_right) => Some(SplitTree::HSplit { left, right: Box::new(new_right), ratio }),
+                        Some(new_right) => Some(SplitTree::HSplit { left, right: Box::new(new_right), ratio, root }),
                         None => Some(*left),
                     }
                 }
             }
-            SplitTree::VSplit { top, bottom, ratio } => {
+            SplitTree::VSplit { top, bottom, ratio, root } => {
                 if top.contains(id) {
                     match top.remove_pane(id) {
-                        Some(new_top) => Some(SplitTree::VSplit { top: Box::new(new_top), bottom, ratio }),
+                        Some(new_top) => Some(SplitTree::VSplit { top: Box::new(new_top), bottom, ratio, root }),
                         None => Some(*bottom),
                     }
                 } else {
                     match bottom.remove_pane(id) {
-                        Some(new_bottom) => Some(SplitTree::VSplit { top, bottom: Box::new(new_bottom), ratio }),
+                        Some(new_bottom) => Some(SplitTree::VSplit { top, bottom: Box::new(new_bottom), ratio, root }),
                         None => Some(*top),
                     }
                 }
@@ -381,23 +385,23 @@ impl SplitTree {
                 let old = Box::new(SplitTree::Leaf(p));
                 let new = Box::new(SplitTree::Leaf(new_pane));
                 match direction {
-                    SplitDirection::Horizontal => SplitTree::HSplit { left: old, right: new, ratio: 0.5 },
-                    SplitDirection::Vertical => SplitTree::VSplit { top: old, bottom: new, ratio: 0.5 },
+                    SplitDirection::Horizontal => SplitTree::HSplit { left: old, right: new, ratio: 0.5, root: false },
+                    SplitDirection::Vertical => SplitTree::VSplit { top: old, bottom: new, ratio: 0.5, root: false },
                 }
             }
             SplitTree::Leaf(_) => self,
-            SplitTree::HSplit { left, right, ratio } => {
+            SplitTree::HSplit { left, right, ratio, root } => {
                 if left.contains(id) {
-                    SplitTree::HSplit { left: Box::new(left.with_split(id, new_pane, direction)), right, ratio }
+                    SplitTree::HSplit { left: Box::new(left.with_split(id, new_pane, direction)), right, ratio, root }
                 } else {
-                    SplitTree::HSplit { left, right: Box::new(right.with_split(id, new_pane, direction)), ratio }
+                    SplitTree::HSplit { left, right: Box::new(right.with_split(id, new_pane, direction)), ratio, root }
                 }
             }
-            SplitTree::VSplit { top, bottom, ratio } => {
+            SplitTree::VSplit { top, bottom, ratio, root } => {
                 if top.contains(id) {
-                    SplitTree::VSplit { top: Box::new(top.with_split(id, new_pane, direction)), bottom, ratio }
+                    SplitTree::VSplit { top: Box::new(top.with_split(id, new_pane, direction)), bottom, ratio, root }
                 } else {
-                    SplitTree::VSplit { top, bottom: Box::new(bottom.with_split(id, new_pane, direction)), ratio }
+                    SplitTree::VSplit { top, bottom: Box::new(bottom.with_split(id, new_pane, direction)), ratio, root }
                 }
             }
         }
@@ -418,19 +422,34 @@ impl SplitTree {
         }
     }
 
+    /// Count root-flagged splits in a chain. Non-root splits and leaves count as 1.
+    /// Used for virtual_width calculation so only root columns enforce min_split_width.
+    pub(crate) fn root_chain_count(&self, horizontal: bool) -> usize {
+        match self {
+            SplitTree::Leaf(_) => 1,
+            SplitTree::HSplit { left, right, root, .. } if horizontal && *root => {
+                left.root_chain_count(true) + right.root_chain_count(true)
+            }
+            SplitTree::VSplit { top, bottom, root, .. } if !horizontal && *root => {
+                top.root_chain_count(false) + bottom.root_chain_count(false)
+            }
+            _ => 1,
+        }
+    }
+
     /// Equalize ratios so that all panes along a same-direction chain get equal space.
     /// For example, HSplit(A, HSplit(B, C)) gets ratios 1/3 and 1/2, giving each pane 1/3.
     pub fn equalize(&mut self) {
         match self {
             SplitTree::Leaf(_) => {}
-            SplitTree::HSplit { left, right, ratio } => {
+            SplitTree::HSplit { left, right, ratio, .. } => {
                 left.equalize();
                 right.equalize();
                 let left_count = left.chain_leaf_count(true);
                 let total = left_count + right.chain_leaf_count(true);
                 *ratio = left_count as f32 / total as f32;
             }
-            SplitTree::VSplit { top, bottom, ratio } => {
+            SplitTree::VSplit { top, bottom, ratio, .. } => {
                 top.equalize();
                 bottom.equalize();
                 let top_count = top.chain_leaf_count(false);
@@ -445,14 +464,14 @@ impl SplitTree {
     pub fn for_each_pane_with_viewport<F: FnMut(&Pane, PaneViewport)>(&self, vp: PaneViewport, f: &mut F) {
         match self {
             SplitTree::Leaf(p) => f(p, vp),
-            SplitTree::HSplit { left, right, ratio } => {
+            SplitTree::HSplit { left, right, ratio, .. } => {
                 let left_w = vp.width * ratio;
                 let left_vp = PaneViewport { x: vp.x, y: vp.y, width: left_w, height: vp.height };
                 let right_vp = PaneViewport { x: vp.x + left_w, y: vp.y, width: vp.width - left_w, height: vp.height };
                 left.for_each_pane_with_viewport(left_vp, f);
                 right.for_each_pane_with_viewport(right_vp, f);
             }
-            SplitTree::VSplit { top, bottom, ratio } => {
+            SplitTree::VSplit { top, bottom, ratio, .. } => {
                 let top_h = vp.height * ratio;
                 let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: top_h };
                 let bot_vp = PaneViewport { x: vp.x, y: vp.y + top_h, width: vp.width, height: vp.height - top_h };
@@ -466,7 +485,7 @@ impl SplitTree {
     pub fn collect_separators(&self, vp: PaneViewport, out: &mut Vec<(f32, f32, f32, f32)>) {
         match self {
             SplitTree::Leaf(_) => {}
-            SplitTree::HSplit { left, right, ratio } => {
+            SplitTree::HSplit { left, right, ratio, .. } => {
                 let split_x = vp.x + vp.width * ratio;
                 out.push((split_x, vp.y, split_x, vp.y + vp.height));
                 let left_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width * ratio, height: vp.height };
@@ -474,7 +493,7 @@ impl SplitTree {
                 left.collect_separators(left_vp, out);
                 right.collect_separators(right_vp, out);
             }
-            SplitTree::VSplit { top, bottom, ratio } => {
+            SplitTree::VSplit { top, bottom, ratio, .. } => {
                 let split_y = vp.y + vp.height * ratio;
                 out.push((vp.x, split_y, vp.x + vp.width, split_y));
                 let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: vp.height * ratio };
@@ -568,7 +587,7 @@ impl SplitTree {
     pub fn adjust_ratio_for_pane(&mut self, id: PaneId, delta: f32, axis: SplitAxis) -> bool {
         match self {
             SplitTree::Leaf(_) => false,
-            SplitTree::HSplit { left, right, ratio } if axis == SplitAxis::Horizontal => {
+            SplitTree::HSplit { left, right, ratio, .. } if axis == SplitAxis::Horizontal => {
                 if left.contains(id) {
                     if left.adjust_ratio_for_pane(id, delta, axis) {
                         return true;
@@ -585,7 +604,7 @@ impl SplitTree {
                     false
                 }
             }
-            SplitTree::VSplit { top, bottom, ratio } if axis == SplitAxis::Vertical => {
+            SplitTree::VSplit { top, bottom, ratio, .. } if axis == SplitAxis::Vertical => {
                 if top.contains(id) {
                     if top.adjust_ratio_for_pane(id, delta, axis) {
                         return true;
@@ -614,7 +633,7 @@ impl SplitTree {
     pub fn collect_separator_info(&self, vp: PaneViewport, out: &mut Vec<SeparatorInfo>) {
         match self {
             SplitTree::Leaf(_) => {}
-            SplitTree::HSplit { left, right, ratio } => {
+            SplitTree::HSplit { left, right, ratio, .. } => {
                 let split_x = vp.x + vp.width * ratio;
                 out.push(SeparatorInfo {
                     pos: split_x,
@@ -630,7 +649,7 @@ impl SplitTree {
                 left.collect_separator_info(left_vp, out);
                 right.collect_separator_info(right_vp, out);
             }
-            SplitTree::VSplit { top, bottom, ratio } => {
+            SplitTree::VSplit { top, bottom, ratio, .. } => {
                 let split_y = vp.y + vp.height * ratio;
                 out.push(SeparatorInfo {
                     pos: split_y,
@@ -654,7 +673,7 @@ impl SplitTree {
         let self_ptr = self as *const SplitTree as usize;
         match self {
             SplitTree::Leaf(_) => false,
-            SplitTree::HSplit { left, right, ratio } => {
+            SplitTree::HSplit { left, right, ratio, .. } => {
                 if self_ptr == ptr {
                     *ratio = new_ratio.clamp(0.1, 0.9);
                     true
@@ -663,7 +682,7 @@ impl SplitTree {
                         || right.set_ratio_by_ptr(ptr, new_ratio)
                 }
             }
-            SplitTree::VSplit { top, bottom, ratio } => {
+            SplitTree::VSplit { top, bottom, ratio, .. } => {
                 if self_ptr == ptr {
                     *ratio = new_ratio.clamp(0.1, 0.9);
                     true
@@ -683,14 +702,14 @@ impl SplitTree {
         }
         match self {
             SplitTree::Leaf(p) => Some((p, vp)),
-            SplitTree::HSplit { left, right, ratio } => {
+            SplitTree::HSplit { left, right, ratio, .. } => {
                 let left_w = vp.width * ratio;
                 let left_vp = PaneViewport { x: vp.x, y: vp.y, width: left_w, height: vp.height };
                 let right_vp = PaneViewport { x: vp.x + left_w, y: vp.y, width: vp.width - left_w, height: vp.height };
                 left.hit_test(x, y, left_vp)
                     .or_else(|| right.hit_test(x, y, right_vp))
             }
-            SplitTree::VSplit { top, bottom, ratio } => {
+            SplitTree::VSplit { top, bottom, ratio, .. } => {
                 let top_h = vp.height * ratio;
                 let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: top_h };
                 let bot_vp = PaneViewport { x: vp.x, y: vp.y + top_h, width: vp.width, height: vp.height - top_h };
@@ -741,14 +760,14 @@ impl SplitTree {
             SplitTree::Leaf(p) => {
                 if p.id == id { Some(vp) } else { None }
             }
-            SplitTree::HSplit { left, right, ratio } => {
+            SplitTree::HSplit { left, right, ratio, .. } => {
                 let left_w = vp.width * ratio;
                 let left_vp = PaneViewport { x: vp.x, y: vp.y, width: left_w, height: vp.height };
                 let right_vp = PaneViewport { x: vp.x + left_w, y: vp.y, width: vp.width - left_w, height: vp.height };
                 left.viewport_for_pane(id, left_vp)
                     .or_else(|| right.viewport_for_pane(id, right_vp))
             }
-            SplitTree::VSplit { top, bottom, ratio } => {
+            SplitTree::VSplit { top, bottom, ratio, .. } => {
                 let top_h = vp.height * ratio;
                 let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: top_h };
                 let bot_vp = PaneViewport { x: vp.x, y: vp.y + top_h, width: vp.width, height: vp.height - top_h };
