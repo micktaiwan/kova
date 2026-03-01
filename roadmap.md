@@ -103,8 +103,8 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Color emoji rendering via CoreText fallback fonts
 - [x] Grapheme cluster emoji (flags, ZWJ sequences, skin tones)
 - [x] Optimisation RAM Cell — compact cell storage pour le scrollback (28→12 bytes/cell, -57% RAM). fg/bg stockés en `u32` RGBA au lieu de `[f32; 3]`.
+- [x] Multi-fenêtres — Cmd+N nouvelle fenêtre, Cmd+Q ferme fenêtre active, Cmd+Option+Q kill sans save, Cmd+Shift+T detach tab vers nouvelle fenêtre. Session restore multi-window. Dealloc différé pour éviter segfault AppKit.
 - [ ] Config keybindings (raccourcis hardcodés suffisent pour V1)
-- [ ] Support multi-fenêtres (dont detach d'un split vers une nouvelle fenêtre)
 - [ ] Déplacer un split par drag (anchor visuelle pendant le drag — le swap par raccourci Cmd+Shift+Arrows existe déjà)
 - [ ] Notifications visuelles avancées (activité dans un split inactif)
 - [ ] Batching du parser VT — le pty-reader prend un write lock sur `TerminalState` à chaque caractère parsé (`print`, `execute`, `csi_dispatch`…). Quand un pane en background reçoit beaucoup de données (build, logs…), ces write locks en rafale bloquent les read locks du render timer au moment du switch de tab (parking_lot donne priorité aux writers). Solution : parser dans un buffer local puis flusher en un seul write lock par read() de 4 Ko.

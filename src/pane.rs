@@ -88,6 +88,8 @@ pub struct Tab {
     pub has_bell: bool,
     /// Horizontal scroll offset in pixels (0 = no scroll).
     pub scroll_offset_x: f32,
+    /// Manual override of virtual width (0.0 = auto from min_split_width).
+    pub virtual_width_override: f32,
 }
 
 impl Tab {
@@ -103,6 +105,7 @@ impl Tab {
             color: None,
             has_bell: false,
             scroll_offset_x: 0.0,
+            virtual_width_override: 0.0,
         })
     }
 
@@ -118,14 +121,26 @@ impl Tab {
             color: None,
             has_bell: false,
             scroll_offset_x: 0.0,
+            virtual_width_override: 0.0,
         })
     }
 
     /// Compute the virtual width for this tab's split layout.
-    /// virtual_width = max(screen_width, column_count * min_split_width)
+    /// If a manual override is set, use it. Otherwise: max(screen_width, root_columns * min_split_width).
     pub fn virtual_width(&self, screen_width: f32, min_split_width: f32) -> f32 {
-        let columns = self.tree.root_chain_count(true) as f32;
-        (columns * min_split_width).max(screen_width)
+        if self.virtual_width_override > 0.0 {
+            self.virtual_width_override.max(screen_width)
+        } else {
+            let columns = self.tree.chain_count(true, true) as f32;
+            (columns * min_split_width).max(screen_width)
+        }
+    }
+
+    /// Scale virtual_width_override proportionally when column count changes (e.g. pane close).
+    pub fn scale_virtual_width(&mut self, old_columns: usize, new_columns: usize) {
+        if self.virtual_width_override > 0.0 && old_columns > 0 {
+            self.virtual_width_override *= new_columns as f32 / old_columns as f32;
+        }
     }
 
     /// Clamp scroll_offset_x after a tree change.
@@ -407,31 +422,17 @@ impl SplitTree {
         }
     }
 
-    /// Count leaves in a chain of same-direction splits.
-    /// A split node of a different direction counts as a single unit.
-    pub(crate) fn chain_leaf_count(&self, horizontal: bool) -> usize {
+    /// Count units in a chain of same-direction splits.
+    /// When `root_only` is true, only root-flagged splits are traversed (non-root subtrees count as 1).
+    /// When `root_only` is false, all same-direction splits are traversed (counts all leaves).
+    pub(crate) fn chain_count(&self, horizontal: bool, root_only: bool) -> usize {
         match self {
             SplitTree::Leaf(_) => 1,
-            SplitTree::HSplit { left, right, .. } if horizontal => {
-                left.chain_leaf_count(true) + right.chain_leaf_count(true)
+            SplitTree::HSplit { left, right, root, .. } if horizontal && (!root_only || *root) => {
+                left.chain_count(true, root_only) + right.chain_count(true, root_only)
             }
-            SplitTree::VSplit { top, bottom, .. } if !horizontal => {
-                top.chain_leaf_count(false) + bottom.chain_leaf_count(false)
-            }
-            _ => 1,
-        }
-    }
-
-    /// Count root-flagged splits in a chain. Non-root splits and leaves count as 1.
-    /// Used for virtual_width calculation so only root columns enforce min_split_width.
-    pub(crate) fn root_chain_count(&self, horizontal: bool) -> usize {
-        match self {
-            SplitTree::Leaf(_) => 1,
-            SplitTree::HSplit { left, right, root, .. } if horizontal && *root => {
-                left.root_chain_count(true) + right.root_chain_count(true)
-            }
-            SplitTree::VSplit { top, bottom, root, .. } if !horizontal && *root => {
-                top.root_chain_count(false) + bottom.root_chain_count(false)
+            SplitTree::VSplit { top, bottom, root, .. } if !horizontal && (!root_only || *root) => {
+                top.chain_count(false, root_only) + bottom.chain_count(false, root_only)
             }
             _ => 1,
         }
@@ -445,15 +446,15 @@ impl SplitTree {
             SplitTree::HSplit { left, right, ratio, .. } => {
                 left.equalize();
                 right.equalize();
-                let left_count = left.chain_leaf_count(true);
-                let total = left_count + right.chain_leaf_count(true);
+                let left_count = left.chain_count(true, false);
+                let total = left_count + right.chain_count(true, false);
                 *ratio = left_count as f32 / total as f32;
             }
             SplitTree::VSplit { top, bottom, ratio, .. } => {
                 top.equalize();
                 bottom.equalize();
-                let top_count = top.chain_leaf_count(false);
-                let total = top_count + bottom.chain_leaf_count(false);
+                let top_count = top.chain_count(false, false);
+                let total = top_count + bottom.chain_count(false, false);
                 *ratio = top_count as f32 / total as f32;
             }
         }

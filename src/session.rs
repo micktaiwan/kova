@@ -4,16 +4,33 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::pane::{alloc_tab_id, Pane, PaneId, SplitTree, Tab};
 
-const SESSION_VERSION: u32 = 1;
+const SESSION_VERSION: u32 = 2;
 
+/// Multi-window session format (v2).
 #[derive(Serialize, Deserialize)]
 pub struct Session {
+    pub version: u32,
+    pub windows: Vec<WindowSession>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WindowSession {
+    pub tabs: Vec<SavedTab>,
+    pub active_tab: usize,
+    /// Window frame: (x, y, width, height) in screen points.
+    #[serde(default)]
+    pub frame: Option<(f64, f64, f64, f64)>,
+}
+
+/// Legacy single-window session format (v1) — kept for backward compat loading.
+#[derive(Deserialize)]
+struct SessionV1 {
     pub version: u32,
     pub active_tab: usize,
     pub tabs: Vec<SavedTab>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SavedTab {
     pub tree: SavedTree,
     pub focused_leaf_index: usize,
@@ -21,7 +38,7 @@ pub struct SavedTab {
     pub color: Option<usize>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SavedTree {
     Leaf {
@@ -80,19 +97,34 @@ fn leaf_index_of(tree: &SplitTree, target: PaneId) -> Option<usize> {
     walk(tree, target, &mut 0)
 }
 
-pub fn save(tabs: &[Tab], active_tab: usize) {
+fn snapshot_tabs(tabs: &[Tab]) -> Vec<SavedTab> {
+    tabs.iter().map(|tab| {
+        let focused_leaf_index = leaf_index_of(&tab.tree, tab.focused_pane).unwrap_or(0);
+        SavedTab {
+            tree: snapshot_tree(&tab.tree),
+            focused_leaf_index,
+            custom_title: tab.custom_title.clone(),
+            color: tab.color,
+        }
+    }).collect()
+}
+
+impl WindowSession {
+    /// Build a WindowSession from live tab data.
+    pub fn from_tabs(tabs: &[Tab], active_tab: usize, frame: Option<(f64, f64, f64, f64)>) -> Self {
+        Self {
+            tabs: snapshot_tabs(tabs),
+            active_tab,
+            frame,
+        }
+    }
+}
+
+/// Save all windows to a single session file.
+pub fn save(windows: &[WindowSession]) {
     let session = Session {
         version: SESSION_VERSION,
-        active_tab,
-        tabs: tabs.iter().map(|tab| {
-            let focused_leaf_index = leaf_index_of(&tab.tree, tab.focused_pane).unwrap_or(0);
-            SavedTab {
-                tree: snapshot_tree(&tab.tree),
-                focused_leaf_index,
-                custom_title: tab.custom_title.clone(),
-                color: tab.color,
-            }
-        }).collect(),
+        windows: windows.to_vec(),
     };
 
     let path = session_path();
@@ -107,27 +139,56 @@ pub fn save(tabs: &[Tab], active_tab: usize) {
             if let Err(e) = std::fs::write(&path, json) {
                 log::warn!("Failed to write session file: {}", e);
             } else {
-                log::info!("Session saved to {}", path.display());
+                log::info!("Session saved to {} ({} window(s))", path.display(), windows.len());
             }
         }
         Err(e) => log::warn!("Failed to serialize session: {}", e),
     }
 }
 
+/// Loaded window data ready for restoration.
+pub struct RestoredWindow {
+    pub tabs: Vec<Tab>,
+    pub active_tab: usize,
+    pub frame: Option<(f64, f64, f64, f64)>,
+}
+
 pub fn load() -> Option<Session> {
     let path = session_path();
     let data = std::fs::read_to_string(&path).ok()?;
-    let session: Session = match serde_json::from_str(&data) {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("Failed to parse session file: {}", e);
+
+    // Try v2 first, then fall back to v1
+    let session: Session = if let Ok(s) = serde_json::from_str::<Session>(&data) {
+        if s.version == SESSION_VERSION {
+            s
+        } else if s.version == 1 {
+            // Shouldn't happen (v1 doesn't have `windows` field), but handle gracefully
+            log::warn!("Session v1 with windows field, ignoring");
+            return None;
+        } else {
+            log::warn!("Unknown session version {}, ignoring", s.version);
             return None;
         }
-    };
-    if session.version != SESSION_VERSION {
-        log::warn!("Unknown session version {}, ignoring", session.version);
+    } else if let Ok(v1) = serde_json::from_str::<SessionV1>(&data) {
+        if v1.version == 1 {
+            log::info!("Migrating v1 session to v2");
+            Session {
+                version: SESSION_VERSION,
+                windows: vec![WindowSession {
+                    tabs: v1.tabs,
+                    active_tab: v1.active_tab,
+                    frame: None,
+                }],
+            }
+        } else {
+            log::warn!("Unknown session version {}, ignoring", v1.version);
+            return None;
+        }
+    } else {
+        log::warn!("Failed to parse session file");
         return None;
-    }
+    };
+
     // Remove session file after loading so a crash during restore doesn't loop
     let _ = std::fs::remove_file(&path);
     Some(session)
@@ -170,12 +231,12 @@ fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Opt
     }
 }
 
-pub fn restore_session(session: Session, config: &Config) -> Option<(Vec<Tab>, usize)> {
+fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>, usize)> {
     let cols = config.terminal.columns;
     let rows = config.terminal.rows;
     let mut tabs = Vec::new();
 
-    for saved_tab in &session.tabs {
+    for saved_tab in &ws.tabs {
         match restore_tree(&saved_tab.tree, cols, rows, config) {
             Some((tree, pane_ids)) => {
                 let focused_pane = if saved_tab.focused_leaf_index < pane_ids.len() {
@@ -191,6 +252,7 @@ pub fn restore_session(session: Session, config: &Config) -> Option<(Vec<Tab>, u
                     color: saved_tab.color,
                     has_bell: false,
                     scroll_offset_x: 0.0,
+                    virtual_width_override: 0.0,
                 });
             }
             None => {
@@ -203,11 +265,32 @@ pub fn restore_session(session: Session, config: &Config) -> Option<(Vec<Tab>, u
         return None;
     }
 
-    let active_tab = if session.active_tab < tabs.len() {
-        session.active_tab
+    let active_tab = if ws.active_tab < tabs.len() {
+        ws.active_tab
     } else {
         tabs.len() - 1
     };
 
     Some((tabs, active_tab))
+}
+
+/// Restore a multi-window session. Returns a list of windows to create.
+pub fn restore_session(session: Session, config: &Config) -> Option<Vec<RestoredWindow>> {
+    let mut windows = Vec::new();
+
+    for ws in &session.windows {
+        if let Some((tabs, active_tab)) = restore_window_tabs(ws, config) {
+            windows.push(RestoredWindow {
+                tabs,
+                active_tab,
+                frame: ws.frame,
+            });
+        }
+    }
+
+    if windows.is_empty() {
+        return None;
+    }
+
+    Some(windows)
 }

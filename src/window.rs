@@ -1,13 +1,11 @@
-use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSApplication, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
+use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSArray, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
+use objc2_foundation::{NSArray, NSObjectProtocol, NSString};
 use objc2_metal::MTLCreateSystemDefaultDevice;
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::{Cell, OnceCell, RefCell};
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::config::{Config, TerminalConfig};
@@ -61,8 +59,16 @@ pub struct KovaViewIvars {
     /// SAFETY: pointer is only live during the synchronous keyDown → interpretKeyEvents → doCommandBySelector
     /// call chain, and cleared immediately after. Never accessed outside that stack frame.
     current_event: Cell<Option<*const NSEvent>>,
-    /// Runtime override for min_split_width (in points). 0.0 = use config value.
-    min_split_width_override: Cell<f32>,
+    /// Window is closing — tick() should return false immediately.
+    closing: Cell<bool>,
+    /// Skip session save for this window (Cmd+Shift+Q kill).
+    skip_session_save: Cell<bool>,
+    /// Cached last window title (for OSC 0/2 dedup).
+    last_title: RefCell<Option<String>>,
+    /// Git branch poll counter (ticks since last poll).
+    git_poll_counter: Cell<u32>,
+    /// Git branch poll interval in ticks (fps * 2 ≈ every 2 seconds).
+    git_poll_interval: Cell<u32>,
 }
 
 struct FilterState {
@@ -82,6 +88,15 @@ define_class!(
     pub struct KovaView;
 
     unsafe impl NSObjectProtocol for KovaView {}
+    unsafe impl NSWindowDelegate for KovaView {
+        /// Intercept the close button (traffic light) to use our closing flow
+        /// instead of letting AppKit destroy the window directly.
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, _sender: &objc2::runtime::AnyObject) -> bool {
+            self.do_close_window();
+            false // we handle closing via the closing flag + timer
+        }
+    }
     unsafe impl NSTextInputClient for KovaView {
         #[unsafe(method(insertText:replacementRange:))]
         unsafe fn insert_text_replacement_range(&self, string: &objc2::runtime::AnyObject, _replacement_range: objc2_foundation::NSRange) {
@@ -213,6 +228,27 @@ define_class!(
                 return;
             }
 
+            // Ctrl+Option+arrows → adjust virtual width
+            {
+                let modifiers = event.modifierFlags();
+                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
+                let has_option = modifiers.contains(NSEventModifierFlags::Option);
+                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
+                if has_ctrl && has_option && !has_cmd {
+                    if let Some(chars) = event.charactersIgnoringModifiers() {
+                        let dir = match chars.to_string().as_str() {
+                            "\u{f703}" => Some(1.0_f32),
+                            "\u{f702}" => Some(-1.0_f32),
+                            _ => None,
+                        };
+                        if let Some(dir) = dir {
+                            self.adjust_virtual_width(dir);
+                            return;
+                        }
+                    }
+                }
+            }
+
             if self.focused_pane().is_some() {
                 // Store the event so doCommandBySelector can access it
                 self.ivars().current_event.set(Some(event as *const NSEvent));
@@ -254,6 +290,13 @@ define_class!(
                         return objc2::runtime::Bool::YES;
                     }
 
+                    // Cmd+N → new window
+                    if ch == "n" && !has_shift && !has_option {
+                        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                        crate::app::create_new_window(mtm);
+                        return objc2::runtime::Bool::YES;
+                    }
+
                     // Cmd+T → new tab
                     if ch == "t" && !has_shift && !has_option {
                         self.do_new_tab();
@@ -284,6 +327,18 @@ define_class!(
                         return objc2::runtime::Bool::YES;
                     }
 
+                    // Cmd+Q → close active window (not the whole app)
+                    if ch == "q" && !has_shift && !has_option && !has_ctrl {
+                        self.do_close_window();
+                        return objc2::runtime::Bool::YES;
+                    }
+
+                    // Cmd+Option+Q → kill window without saving session
+                    if ch == "q" && !has_shift && has_option && !has_ctrl {
+                        self.do_kill_window();
+                        return objc2::runtime::Bool::YES;
+                    }
+
                     // Cmd+W → close pane or tab
                     if ch == "w" && !has_shift && !has_option {
                         self.do_close_pane_or_tab();
@@ -305,6 +360,12 @@ define_class!(
                     // Cmd+Shift+R → rename tab
                     if ch == "R" && has_shift && !has_option {
                         self.start_rename_tab();
+                        return objc2::runtime::Bool::YES;
+                    }
+
+                    // Cmd+Shift+T → detach tab to new window
+                    if ch == "T" && has_shift && !has_option && !has_ctrl {
+                        self.do_detach_tab();
                         return objc2::runtime::Bool::YES;
                     }
 
@@ -411,45 +472,6 @@ define_class!(
                                 }
                             }
                         }
-                        return objc2::runtime::Bool::YES;
-                    }
-                }
-            }
-
-            // Ctrl+Option+arrows → adjust min_split_width
-            if has_ctrl && has_option && !has_cmd {
-                let chars = event.charactersIgnoringModifiers();
-                if let Some(chars) = chars {
-                    let ch = chars.to_string();
-                    let step = match ch.as_str() {
-                        "\u{f703}" => Some(1.0_f32),  // right → increase
-                        "\u{f702}" => Some(-1.0_f32), // left → decrease
-                        _ => None,
-                    };
-                    if let Some(dir) = step {
-                        let cell_w = self.ivars().renderer.get()
-                            .map(|r| r.read().cell_size().0 / self.backing_scale())
-                            .unwrap_or(8.0);
-                        let current = {
-                            let ov = self.ivars().min_split_width_override.get();
-                            if ov > 0.0 { ov } else {
-                                self.ivars().config.get().map(|c| c.splits.min_width).unwrap_or(300.0)
-                            }
-                        };
-                        let new_val = (current + dir * cell_w).max(cell_w * 10.0);
-                        self.ivars().min_split_width_override.set(new_val);
-                        log::debug!("min_split_width adjusted to {}pt", new_val);
-                        // Reclamp scroll and resize
-                        {
-                            let screen_w = self.drawable_viewport().width;
-                            let min_w = self.min_split_width_px();
-                            let mut tabs = self.ivars().tabs.borrow_mut();
-                            let idx = self.ivars().active_tab.get();
-                            if let Some(tab) = tabs.get_mut(idx) {
-                                tab.clamp_scroll(screen_w, min_w);
-                            }
-                        }
-                        self.resize_all_panes();
                         return objc2::runtime::Bool::YES;
                     }
                 }
@@ -818,7 +840,11 @@ impl KovaView {
             auto_scroll_speed: Cell::new(0),
             marked_text: RefCell::new(None),
             current_event: Cell::new(None),
-            min_split_width_override: Cell::new(0.0),
+            closing: Cell::new(false),
+            skip_session_save: Cell::new(false),
+            last_title: RefCell::new(None),
+            git_poll_counter: Cell::new(0),
+            git_poll_interval: Cell::new(120), // updated in setup_metal
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -966,15 +992,28 @@ impl KovaView {
 
     /// Compute scaled min_split_width in pixels.
     fn min_split_width_px(&self) -> f32 {
-        let override_val = self.ivars().min_split_width_override.get();
-        let min_w = if override_val > 0.0 {
-            override_val
-        } else {
-            self.ivars().config.get()
-                .map(|c| c.splits.min_width)
-                .unwrap_or(300.0)
-        };
+        let min_w = self.ivars().config.get()
+            .map(|c| c.splits.min_width)
+            .unwrap_or(300.0);
         min_w * self.backing_scale()
+    }
+
+    /// Adjust the virtual width override of the active tab.
+    fn adjust_virtual_width(&self, dir: f32) {
+        let step = 200.0 * self.backing_scale();
+        let screen_w = self.drawable_viewport().width;
+        let min_w = self.min_split_width_px();
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        if let Some(tab) = tabs.get_mut(idx) {
+            let current_vw = tab.virtual_width(screen_w, min_w);
+            let new_vw = (current_vw + dir * step).max(screen_w);
+            tab.virtual_width_override = if new_vw > screen_w { new_vw } else { 0.0 };
+            tab.clamp_scroll(screen_w, min_w);
+            log::debug!("virtual_width override: {}px", tab.virtual_width_override);
+        }
+        drop(tabs);
+        self.resize_all_panes();
     }
 
     fn get_tab_bar_left_inset(&self) -> f32 {
@@ -1467,6 +1506,7 @@ impl KovaView {
             .or_else(|| tabs[idx].tree.neighbor(focused_id, NavDirection::Up, panes_vp));
 
         let config = self.ivars().config.get().unwrap();
+        let old_columns = tabs[idx].tree.chain_count(true, false);
         let dummy = Pane::spawn(1, 1, config, None).unwrap();
         let tree = std::mem::replace(&mut tabs[idx].tree, SplitTree::Leaf(dummy));
         match tree.remove_pane(focused_id) {
@@ -1477,6 +1517,8 @@ impl KovaView {
                 tabs[idx].focused_pane = new_focus;
                 let mut new_tree = new_tree;
                 new_tree.equalize();
+                let new_columns = new_tree.chain_count(true, false);
+                tabs[idx].scale_virtual_width(old_columns, new_columns);
                 tabs[idx].tree = new_tree;
                 // Clamp scroll and auto-scroll to reveal focused pane
                 let full = self.drawable_viewport();
@@ -1506,6 +1548,54 @@ impl KovaView {
         }
         drop(tabs);
         self.resize_all_panes();
+    }
+
+    /// Close the active window (all its tabs). The timer will detect
+    /// the empty tab list and remove the window. App terminates when
+    /// the last window is closed (via `applicationShouldTerminateAfterLastWindowClosed`).
+    fn do_close_window(&self) {
+        // Check for running processes and confirm
+        let procs = self.running_processes();
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        if !confirm_running_processes(mtm, &procs, "Close this window?", "Close") {
+            return;
+        }
+        // Signal closing — tick() will return false and the timer will close the window
+        self.ivars().closing.set(true);
+    }
+
+    /// Kill the active window immediately without saving its session.
+    fn do_kill_window(&self) {
+        self.ivars().skip_session_save.set(true);
+        self.ivars().closing.set(true);
+    }
+
+    /// Whether this window should be excluded from session save.
+    pub fn skip_session_save(&self) -> bool {
+        self.ivars().skip_session_save.get()
+    }
+
+    /// Detach the active tab to a new window.
+    /// No-op if only one tab remains.
+    fn do_detach_tab(&self) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        if tabs.len() <= 1 {
+            log::debug!("do_detach_tab: only {} tab(s), ignoring", tabs.len());
+            return;
+        }
+        let idx = self.ivars().active_tab.get();
+        if idx >= tabs.len() {
+            return;
+        }
+        let tab = tabs.remove(idx);
+        let new_idx = if idx >= tabs.len() { tabs.len() - 1 } else { idx };
+        self.ivars().active_tab.set(new_idx);
+        drop(tabs);
+        self.resize_all_panes();
+
+        let source_frame = self.window().map(|w| w.frame());
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        crate::app::detach_tab_to_new_window(mtm, tab, source_frame);
     }
 
     /// Navigate focus to an adjacent pane.
@@ -1823,13 +1913,20 @@ impl KovaView {
         result
     }
 
-    pub fn save_session(&self) {
+    /// Append this window's session data to the given Vec.
+    /// Called by AppDelegate to collect all windows before saving.
+    pub fn append_session_data(&self, out: &mut Vec<crate::session::WindowSession>) {
         let tabs = self.ivars().tabs.borrow();
         let active_tab = self.ivars().active_tab.get();
-        crate::session::save(&tabs, active_tab);
+        let frame = self.window().map(|win| {
+            let f = win.frame();
+            (f.origin.x, f.origin.y, f.size.width, f.size.height)
+        });
+        out.push(crate::session::WindowSession::from_tabs(&tabs, active_tab, frame));
     }
 
-    pub fn setup_metal(&self, _mtm: MainThreadMarker, config: &Config) {
+    /// Initialize Metal rendering with the given tabs.
+    pub fn setup_metal(&self, _mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, active_tab: usize) {
         log::info!("Setting up Metal");
         let device = MTLCreateSystemDefaultDevice()
             .expect("no Metal device");
@@ -1857,18 +1954,6 @@ impl KovaView {
 
         self.ivars().last_scale.set(scale);
 
-        // Try to restore previous session, fallback to fresh tab
-        let (tabs, active_tab) = match crate::session::load().and_then(|s| crate::session::restore_session(s, config)) {
-            Some((tabs, active)) => {
-                log::info!("Restored session: {} tabs, active={}", tabs.len(), active);
-                (tabs, active)
-            }
-            None => {
-                let tab = Tab::new(config).expect("failed to create initial tab");
-                (vec![tab], 0)
-            }
-        };
-
         let terminal_for_renderer = tabs[active_tab].tree.first_pane().terminal.clone();
 
         let renderer = Arc::new(parking_lot::RwLock::new(
@@ -1877,345 +1962,337 @@ impl KovaView {
 
         self.ivars().renderer.set(renderer).ok();
         self.ivars().config.set(config.clone()).ok();
+        self.ivars().git_poll_interval.set(config.terminal.fps * 2);
         *self.ivars().tabs.borrow_mut() = tabs;
         self.ivars().active_tab.set(active_tab);
-
-        self.start_render_timer(config.terminal.fps);
     }
 
-    /// # Safety
-    /// The ivars pointer is stable for the lifetime of the ObjC view (heap-allocated,
-    /// retained by the window). The timer is invalidated when the window closes,
-    /// so the pointer remains valid for every tick.
-    fn start_render_timer(&self, fps: u32) {
-        let renderer = self.ivars().renderer.get().unwrap().clone();
-        let layer = self.ivars().metal_layer.get().expect("metal_layer not initialized").clone();
-        let ivars = self.ivars() as *const KovaViewIvars;
+    /// Called by the global render timer in AppDelegate for each window.
+    /// Handles all per-frame work: command injection, auto-scroll, git polling,
+    /// pane reaping, rendering, focus reporting, and window title updates.
+    /// Returns `false` if the window has no tabs left and should be closed.
+    pub fn tick(&self) -> bool {
+        let ivars = self.ivars();
+        if ivars.closing.get() {
+            return false;
+        }
+        let renderer = match ivars.renderer.get() {
+            Some(r) => r.clone(),
+            None => return true, // not yet initialized
+        };
+        let layer = match ivars.metal_layer.get() {
+            Some(l) => l.clone(),
+            None => return true,
+        };
 
-        let last_title: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
-        let window_for_title: std::cell::OnceCell<Retained<NSWindow>> = std::cell::OnceCell::new();
-        let git_poll_counter: Cell<u32> = Cell::new(0);
-        let git_poll_interval: u32 = fps * 2; // poll git branch every ~2 seconds
+        // --- Inject pending commands for restored panes ---
+        {
+            let tabs = ivars.tabs.borrow();
+            for tab in tabs.iter() {
+                tab.tree.for_each_pane(&mut |pane| {
+                    pane.inject_pending_command();
+                });
+            }
+        }
 
-        let timer = unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_repeats_block(
-                1.0 / fps as f64,
-                true,
-                &RcBlock::new(move |_timer: NonNull<NSTimer>| {
-                    let ivars = &*ivars;
-
-                    // --- Inject pending commands for restored panes ---
-                    {
-                        let tabs = ivars.tabs.borrow();
-                        for tab in tabs.iter() {
-                            tab.tree.for_each_pane(&mut |pane| {
-                                pane.inject_pending_command();
-                            });
-                        }
-                    }
-
-                    // --- Auto-scroll during drag selection ---
-                    {
-                        let speed = ivars.auto_scroll_speed.get();
-                        if speed != 0 {
-                            let tabs = ivars.tabs.borrow();
-                            let idx = ivars.active_tab.get();
-                            if let Some(tab) = tabs.get(idx) {
-                                if let Some(pane) = tab.tree.pane(tab.focused_pane) {
-                                    let mut term = pane.terminal.write();
-                                    if term.selection.is_some() {
-                                        // scroll: positive = scroll up (towards scrollback)
-                                        // speed: positive = mouse below viewport = scroll down (show more content below)
-                                        // So we negate: scroll(-speed) to scroll "down" when speed > 0
-                                        term.scroll(-speed);
-                                        // Update selection end to track the edge
-                                        let sb_len = term.scrollback_len();
-                                        let scroll_off = term.scroll_offset();
-                                        if speed < 0 {
-                                            // Scrolling up — select to first visible line, col 0
-                                            let first_visible = (sb_len as i64 - scroll_off as i64) as usize;
-                                            if let Some(ref mut sel) = term.selection {
-                                                sel.end = crate::terminal::GridPos { line: first_visible, col: 0 };
-                                            }
-                                        } else {
-                                            // Scrolling down — select to last visible line, last col
-                                            let last_visible = (sb_len as i64 - scroll_off as i64 + term.rows as i64 - 1) as usize;
-                                            let last_col = term.cols.saturating_sub(1);
-                                            if let Some(ref mut sel) = term.selection {
-                                                sel.end = crate::terminal::GridPos { line: last_visible, col: last_col };
-                                            }
-                                        }
-                                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    }
+        // --- Auto-scroll during drag selection ---
+        {
+            let speed = ivars.auto_scroll_speed.get();
+            if speed != 0 {
+                let tabs = ivars.tabs.borrow();
+                let idx = ivars.active_tab.get();
+                if let Some(tab) = tabs.get(idx) {
+                    if let Some(pane) = tab.tree.pane(tab.focused_pane) {
+                        let mut term = pane.terminal.write();
+                        if term.selection.is_some() {
+                            term.scroll(-speed);
+                            let sb_len = term.scrollback_len();
+                            let scroll_off = term.scroll_offset();
+                            if speed < 0 {
+                                let first_visible = (sb_len as i64 - scroll_off as i64) as usize;
+                                if let Some(ref mut sel) = term.selection {
+                                    sel.end = crate::terminal::GridPos { line: first_visible, col: 0 };
+                                }
+                            } else {
+                                let last_visible = (sb_len as i64 - scroll_off as i64 + term.rows as i64 - 1) as usize;
+                                let last_col = term.cols.saturating_sub(1);
+                                if let Some(ref mut sel) = term.selection {
+                                    sel.end = crate::terminal::GridPos { line: last_visible, col: last_col };
                                 }
                             }
+                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
+                }
+            }
+        }
 
-                    // --- Poll git branch for all panes with a CWD ---
-                    let count = git_poll_counter.get() + 1;
-                    git_poll_counter.set(count);
-                    if count >= git_poll_interval {
-                        git_poll_counter.set(0);
-                        let tabs = ivars.tabs.borrow();
-                        for tab in tabs.iter() {
-                            tab.tree.for_each_pane(&mut |pane| {
-                                let term = pane.terminal.read();
-                                let cwd = term.cwd.clone();
-                                let old_branch = term.git_branch.clone();
-                                drop(term);
-                                if let Some(ref cwd) = cwd {
-                                    let new_branch = crate::terminal::parser::resolve_git_branch(cwd);
-                                    if new_branch != old_branch {
-                                        let mut term = pane.terminal.write();
-                                        term.git_branch = new_branch;
-                                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                }
-                            });
+        // --- Poll git branch for all panes with a CWD ---
+        let git_poll_interval = ivars.git_poll_interval.get();
+        let count = ivars.git_poll_counter.get() + 1;
+        ivars.git_poll_counter.set(count);
+        if count >= git_poll_interval {
+            ivars.git_poll_counter.set(0);
+            let tabs = ivars.tabs.borrow();
+            for tab in tabs.iter() {
+                tab.tree.for_each_pane(&mut |pane| {
+                    let term = pane.terminal.read();
+                    let cwd = term.cwd.clone();
+                    let old_branch = term.git_branch.clone();
+                    drop(term);
+                    if let Some(ref cwd) = cwd {
+                        let new_branch = crate::terminal::parser::resolve_git_branch(cwd);
+                        if new_branch != old_branch {
+                            let mut term = pane.terminal.write();
+                            term.git_branch = new_branch;
+                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
+                });
+            }
+        }
 
-                    // --- Reap exited panes across ALL tabs ---
-                    let mut any_removed = false;
-                    let mut tabs_to_remove: Vec<usize> = Vec::new();
-                    {
-                        let mut tabs = ivars.tabs.borrow_mut();
-                        for (tab_idx, tab) in tabs.iter_mut().enumerate() {
-                            let exited = tab.tree.exited_pane_ids();
-                            if exited.is_empty() {
-                                continue;
-                            }
-                            any_removed = true;
-                            log::debug!("Reaping exited panes in tab {}: {:?}", tab_idx, exited);
-                            for id in &exited {
-                                let tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(
-                                    // We need a dummy — but remove_pane might return None
-                                    // So we take the tree and put back the result
-                                    Pane::spawn(1, 1, ivars.config.get().unwrap(), None).unwrap()
-                                ));
-                                match tree.remove_pane(*id) {
-                                    Some(mut new_tree) => {
-                                        new_tree.equalize();
-                                        tab.tree = new_tree;
-                                    }
-                                    None => {
-                                        // Tab is now empty
-                                        tabs_to_remove.push(tab_idx);
-                                        break;
-                                    }
-                                }
-                            }
-                            // Fix focused pane if it was removed
-                            if exited.contains(&tab.focused_pane) {
-                                if !tabs_to_remove.contains(&tab_idx) {
-                                    tab.focused_pane = tab.tree.first_pane().id;
-                                }
-                            }
+        // --- Reap exited panes across ALL tabs ---
+        let mut any_removed = false;
+        let mut tabs_to_remove: Vec<usize> = Vec::new();
+        {
+            let mut tabs = ivars.tabs.borrow_mut();
+            for (tab_idx, tab) in tabs.iter_mut().enumerate() {
+                let exited = tab.tree.exited_pane_ids();
+                if exited.is_empty() {
+                    continue;
+                }
+                any_removed = true;
+                log::debug!("Reaping exited panes in tab {}: {:?}", tab_idx, exited);
+                for id in &exited {
+                    let old_cols = tab.tree.chain_count(true, false);
+                    let tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(
+                        Pane::spawn(1, 1, ivars.config.get().unwrap(), None).unwrap()
+                    ));
+                    match tree.remove_pane(*id) {
+                        Some(mut new_tree) => {
+                            new_tree.equalize();
+                            let new_cols = new_tree.chain_count(true, false);
+                            tab.scale_virtual_width(old_cols, new_cols);
+                            tab.tree = new_tree;
                         }
-                        // Remove empty tabs (in reverse to preserve indices)
-                        for &idx in tabs_to_remove.iter().rev() {
-                            tabs.remove(idx);
+                        None => {
+                            tabs_to_remove.push(tab_idx);
+                            break;
                         }
                     }
-
-                    // Adjust active_tab if needed
-                    if any_removed {
-                        let tabs = ivars.tabs.borrow();
-                        if tabs.is_empty() {
-                            drop(tabs);
-                            let mtm = MainThreadMarker::new_unchecked();
-                            let app = NSApplication::sharedApplication(mtm);
-                            app.terminate(None);
-                            return;
-                        }
-                        let active = ivars.active_tab.get();
-                        if active >= tabs.len() {
-                            ivars.active_tab.set(tabs.len() - 1);
-                        }
+                }
+                if exited.contains(&tab.focused_pane) {
+                    if !tabs_to_remove.contains(&tab_idx) {
+                        tab.focused_pane = tab.tree.first_pane().id;
                     }
+                }
+            }
+            for &idx in tabs_to_remove.iter().rev() {
+                tabs.remove(idx);
+            }
+        }
 
-                    // Build pane render list from active tab only
-                    let active_idx = ivars.active_tab.get();
-                    let split_min_w = ivars.config.get()
-                        .map(|c| c.splits.min_width)
-                        .unwrap_or(300.0)
-                        * ivars.last_scale.get().max(1.0) as f32;
-                    let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width) = {
-                        let mut tabs = ivars.tabs.borrow_mut();
-                        if tabs.is_empty() {
-                            return;
-                        }
-                        let tab = &tabs[active_idx];
-                        let focused_id = tab.focused_pane;
+        // Adjust active_tab if needed; signal close if no tabs left
+        if any_removed {
+            let tabs = ivars.tabs.borrow();
+            if tabs.is_empty() {
+                drop(tabs);
+                return false;
+            }
+            let active = ivars.active_tab.get();
+            if active >= tabs.len() {
+                ivars.active_tab.set(tabs.len() - 1);
+            }
+        }
 
-                        let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool, PaneId)> = Vec::new();
-                        let cell_h = renderer.read().cell_size().1;
-                        let tab_bar_h = (cell_h * 2.0).round();
-                        let drawable_size = layer.drawableSize();
-                        let screen_width = drawable_size.width as f32;
-                        let virtual_width = tab.virtual_width(screen_width, split_min_w);
-                        let global_bar_h = cell_h;
-                        let panes_vp = PaneViewport {
-                            x: -tab.scroll_offset_x,
-                            y: tab_bar_h,
-                            width: virtual_width,
-                            height: drawable_size.height as f32 - tab_bar_h - global_bar_h,
-                        };
-                        tab.tree.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
-                            pane_data.push((
-                                pane.terminal.clone(),
-                                vp,
-                                pane.is_ready(),
-                                pane.id == focused_id,
-                                pane.id,
-                            ));
-                        });
+        // Build pane render list from active tab only
+        let active_idx = ivars.active_tab.get();
+        let split_min_w = ivars.config.get()
+            .map(|c| c.splits.min_width)
+            .unwrap_or(300.0)
+            * ivars.last_scale.get().max(1.0) as f32;
+        let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width) = {
+            let mut tabs = ivars.tabs.borrow_mut();
+            if tabs.is_empty() {
+                return false;
+            }
+            let tab = &tabs[active_idx];
+            let focused_id = tab.focused_pane;
 
-                        let focused = tab.tree.pane(focused_id);
-                        let pty_ptr = focused.map(|p| &p.pty as *const crate::terminal::pty::Pty);
-                        let focus_reporting = focused.map_or(false, |p| p.terminal.read().focus_reporting);
+            let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool, PaneId)> = Vec::new();
+            let cell_h = renderer.read().cell_size().1;
+            let tab_bar_h = (cell_h * 2.0).round();
+            let drawable_size = layer.drawableSize();
+            let screen_width = drawable_size.width as f32;
+            let virtual_width = tab.virtual_width(screen_width, split_min_w);
+            let global_bar_h = cell_h;
+            let panes_vp = PaneViewport {
+                x: -tab.scroll_offset_x,
+                y: tab_bar_h,
+                width: virtual_width,
+                height: drawable_size.height as f32 - tab_bar_h - global_bar_h,
+            };
+            tab.tree.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
+                pane_data.push((
+                    pane.terminal.clone(),
+                    vp,
+                    pane.is_ready(),
+                    pane.id == focused_id,
+                    pane.id,
+                ));
+            });
 
-                        // Drain bell flags from panes into tabs
-                        for t in tabs.iter_mut() {
-                            t.check_bell();
-                        }
-                        // Active tab never shows bell indicator
-                        tabs[active_idx].clear_bell();
+            let focused = tab.tree.pane(focused_id);
+            let pty_ptr = focused.map(|p| &p.pty as *const crate::terminal::pty::Pty);
+            let focus_reporting = focused.map_or(false, |p| p.terminal.read().focus_reporting);
 
-                        let rename = ivars.rename_tab.borrow();
-                        let tab_titles: Vec<(String, bool, Option<usize>, bool, bool)> = tabs.iter().enumerate()
-                            .map(|(i, t)| {
-                                let is_renaming = i == active_idx && rename.is_some();
-                                let title = if is_renaming {
-                                    let rs = rename.as_ref().unwrap();
-                                    format!("{}▏", rs.input)
-                                } else {
-                                    t.title()
-                                };
-                                (title, i == active_idx, t.color, is_renaming, t.has_bell)
-                            })
-                            .collect();
-                        drop(rename);
-                        (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width)
+            for t in tabs.iter_mut() {
+                t.check_bell();
+            }
+            tabs[active_idx].clear_bell();
+
+            let rename = ivars.rename_tab.borrow();
+            let tab_titles: Vec<(String, bool, Option<usize>, bool, bool)> = tabs.iter().enumerate()
+                .map(|(i, t)| {
+                    let is_renaming = i == active_idx && rename.is_some();
+                    let title = if is_renaming {
+                        let rs = rename.as_ref().unwrap();
+                        format!("{}▏", rs.input)
+                    } else {
+                        t.title()
                     };
+                    (title, i == active_idx, t.color, is_renaming, t.has_bell)
+                })
+                .collect();
+            drop(rename);
+            (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width)
+        };
 
-                    // Focus reporting (DEC mode 1004) — send to focused pane only
-                    let mtm = MainThreadMarker::new_unchecked();
-                    let app = NSApplication::sharedApplication(mtm);
-                    let focused = app.isActive();
-                    let prev = ivars.last_focused.get();
-                    if focused != prev {
-                        ivars.last_focused.set(focused);
-                        if focus_reporting {
-                            if let Some(pty_ptr) = pty_ptr {
-                                let seq = if focused { b"\x1b[I" as &[u8] } else { b"\x1b[O" };
-                                (*pty_ptr).write(seq);
-                            }
-                        }
+        // Focus reporting (DEC mode 1004) — send to focused pane only
+        unsafe {
+            let mtm = MainThreadMarker::new_unchecked();
+            let app = NSApplication::sharedApplication(mtm);
+            let focused = app.isActive();
+            let prev = ivars.last_focused.get();
+            if focused != prev {
+                ivars.last_focused.set(focused);
+                if focus_reporting {
+                    if let Some(pty_ptr) = pty_ptr {
+                        let seq = if focused { b"\x1b[I" as &[u8] } else { b"\x1b[O" };
+                        (*pty_ptr).write(seq);
                     }
+                }
+            }
+        }
 
-                    // Update NSWindow title from focused pane's OSC 0/2
-                    if let Some((terminal, _, _, _, _)) = pane_data.iter().find(|(_, _, _, f, _)| *f) {
-                        let term = terminal.read();
-                        let current = term.title.clone();
-                        drop(term);
-                        let mut prev = last_title.borrow_mut();
-                        if current != *prev {
-                            let mtm2 = MainThreadMarker::new_unchecked();
-                            let app2 = NSApplication::sharedApplication(mtm2);
-                            if let Some(win) = window_for_title.get().or_else(|| {
-                                let w = app2.mainWindow()?;
-                                let _ = window_for_title.set(w);
-                                window_for_title.get()
-                            }) {
-                                let title_str = match current {
-                                    Some(ref t) => format!("Kova — {}", t),
-                                    None => "Kova".to_string(),
-                                };
-                                win.setTitle(&NSString::from_str(&title_str));
-                            }
-                            *prev = current;
-                        }
-                    }
-
-                    // Collect split separators from active tab
-                    let separators = {
-                        let tabs = ivars.tabs.borrow();
-                        if let Some(tab) = tabs.get(active_idx) {
-                            let mut seps = Vec::new();
-                            tab.tree.collect_separators(active_panes_vp, &mut seps);
-                            seps
-                        } else {
-                            Vec::new()
-                        }
+        // Update NSWindow title from focused pane's OSC 0/2
+        if let Some((terminal, _, _, _, _)) = pane_data.iter().find(|(_, _, _, f, _)| *f) {
+            let term = terminal.read();
+            let current = term.title.clone();
+            drop(term);
+            let mut prev = ivars.last_title.borrow_mut();
+            if current != *prev {
+                if let Some(win) = self.window() {
+                    let title_str = match current {
+                        Some(ref t) => format!("Kova — {}", t),
+                        None => "Kova".to_string(),
                     };
+                    win.setTitle(&NSString::from_str(&title_str));
+                }
+                *prev = current;
+            }
+        }
 
-                    // Build filter render data if active
-                    let filter_data = {
-                        let filter = ivars.filter.borrow();
-                        filter.as_ref().map(|f| FilterRenderData {
-                            query: f.query.clone(),
-                            matches: f.matches.clone(),
+        // Collect split separators from active tab
+        let separators = {
+            let tabs = ivars.tabs.borrow();
+            if let Some(tab) = tabs.get(active_idx) {
+                let mut seps = Vec::new();
+                tab.tree.collect_separators(active_panes_vp, &mut seps);
+                seps
+            } else {
+                Vec::new()
+            }
+        };
+
+        // Build filter render data if active
+        let filter_data = {
+            let filter = ivars.filter.borrow();
+            filter.as_ref().map(|f| FilterRenderData {
+                query: f.query.clone(),
+                matches: f.matches.clone(),
+            })
+        };
+
+        // Compute left_inset from traffic light buttons
+        let left_inset = {
+            let inset = self.window()
+                .and_then(|win| {
+                    let scale = win.backingScaleFactor() as f32;
+                    win.standardWindowButton(NSWindowButton::ZoomButton)
+                        .map(|btn| {
+                            let frame = btn.frame();
+                            let right_edge = (frame.origin.x + frame.size.width) as f32;
+                            (right_edge + 8.0) * scale
                         })
-                    };
-
-                    // Compute left_inset from traffic light buttons
-                    let left_inset = {
-                        let mtm2 = MainThreadMarker::new_unchecked();
-                        let app2 = NSApplication::sharedApplication(mtm2);
-                        let inset = app2.mainWindow()
-                            .and_then(|win| {
-                                let scale = win.backingScaleFactor() as f32;
-                                win.standardWindowButton(NSWindowButton::ZoomButton)
-                                    .map(|btn| {
-                                        let frame = btn.frame();
-                                        let right_edge = (frame.origin.x + frame.size.width) as f32;
-                                        (right_edge + 8.0) * scale
-                                    })
-                            })
-                            .unwrap_or(140.0);
-                        ivars.tab_bar_left_inset.set(inset);
-                        inset
-                    };
-                    let (hover_pos, hover_text, hover_pane_id) = {
-                        let h = ivars.hovered_url.borrow();
-                        (
-                            h.as_ref().map(|(_, row, start, end, _)| (*row, *start, *end)),
-                            h.as_ref().map(|(_, _, _, _, url)| url.clone()),
-                            h.as_ref().map(|(pid, _, _, _, _)| *pid),
-                        )
-                    };
-                    let mut r = renderer.write();
-                    r.hovered_url = hover_pos;
-                    r.hovered_url_text = hover_text;
-                    r.hovered_url_pane_id = hover_pane_id;
-                    // Count hidden panes (fully off-screen)
-                    let mut hidden_left = 0usize;
-                    let mut hidden_right = 0usize;
-                    for (_, vp, _, _, _) in &pane_data {
-                        if vp.x + vp.width <= 0.0 {
-                            hidden_left += 1;
-                        } else if vp.x >= screen_width {
-                            hidden_right += 1;
-                        }
-                    }
-                    // Collect visible pane widths for the global bar
-                    let pane_widths: Vec<f32> = pane_data.iter()
-                        .filter(|(_, vp, _, _, _)| vp.x + vp.width > 0.0 && vp.x < screen_width)
-                        .map(|(_, vp, _, _, _)| vp.width)
-                        .collect();
-                    r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, &pane_widths);
-                }),
+                })
+                .unwrap_or(140.0);
+            ivars.tab_bar_left_inset.set(inset);
+            inset
+        };
+        let (hover_pos, hover_text, hover_pane_id) = {
+            let h = ivars.hovered_url.borrow();
+            (
+                h.as_ref().map(|(_, row, start, end, _)| (*row, *start, *end)),
+                h.as_ref().map(|(_, _, _, _, url)| url.clone()),
+                h.as_ref().map(|(pid, _, _, _, _)| *pid),
             )
         };
-        let run_loop = NSRunLoop::currentRunLoop();
-        unsafe { run_loop.addTimer_forMode(&timer, NSRunLoopCommonModes) };
+        let mut r = renderer.write();
+        r.hovered_url = hover_pos;
+        r.hovered_url_text = hover_text;
+        r.hovered_url_pane_id = hover_pane_id;
+        // Count hidden panes (fully off-screen)
+        let mut hidden_left = 0usize;
+        let mut hidden_right = 0usize;
+        for (_, vp, _, _, _) in &pane_data {
+            if vp.x + vp.width <= 0.0 {
+                hidden_left += 1;
+            } else if vp.x >= screen_width {
+                hidden_right += 1;
+            }
+        }
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right);
+        true
     }
 
 }
 
-pub fn create_window(mtm: MainThreadMarker, config: &Config) -> Retained<NSWindow> {
+/// Global counter for unique window autosave names.
+static WINDOW_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Show a confirmation alert listing running processes.
+/// Returns `true` if the user confirmed (or no processes are running).
+pub fn confirm_running_processes(mtm: MainThreadMarker, procs: &[(String, String)], message: &str, confirm_button: &str) -> bool {
+    if procs.is_empty() {
+        return true;
+    }
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Warning);
+    alert.setMessageText(&NSString::from_str(message));
+    let mut lines = String::from("The following processes are running:");
+    for (tab, name) in procs {
+        lines.push_str(&format!("\n\u{2022} Tab \u{ab}{}\u{bb}: {}", tab, name));
+    }
+    alert.setInformativeText(&NSString::from_str(&lines));
+    alert.addButtonWithTitle(&NSString::from_str(confirm_button));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    alert.runModal() == 1000 // NSAlertFirstButtonReturn
+}
+
+/// Create a new Kova window with the given tabs.
+pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, active_tab: usize) -> Retained<NSWindow> {
     let content_rect = CGRect {
         origin: CGPoint { x: config.window.x, y: config.window.y },
         size: CGSize {
@@ -2249,12 +2326,15 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config) -> Retained<NSWindo
         height: 150.0,
     });
 
-    // Persist and restore window position/size automatically via NSUserDefaults
-    window.setFrameAutosaveName(&NSString::from_str("KovaMainWindow"));
+    // Unique autosave name per window so NSUserDefaults doesn't collide
+    let win_id = WINDOW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let autosave = format!("KovaWindow-{}", win_id);
+    window.setFrameAutosaveName(&NSString::from_str(&autosave));
 
     let view = KovaView::new(mtm, content_rect);
-    view.setup_metal(mtm, config);
+    view.setup_metal(mtm, config, tabs, active_tab);
     window.setContentView(Some(&view));
+    window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*view)));
     window.makeFirstResponder(Some(&view));
     window.setAcceptsMouseMovedEvents(true);
 
