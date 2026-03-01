@@ -1,5 +1,6 @@
-use objc2_app_kit::{NSEvent, NSEventModifierFlags};
+use objc2_app_kit::NSEvent;
 
+use crate::keybindings::{Keybindings, KeyCombo, TerminalAction};
 use crate::terminal::pty::Pty;
 
 /// Write raw UTF-8 text to PTY (used by insertText: from NSTextInputClient).
@@ -9,31 +10,32 @@ pub fn write_text(text: &str, pty: &Pty) {
     }
 }
 
-pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool) {
-    let modifiers = event.modifierFlags();
+pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool, keybindings: &Keybindings) {
+    let combo = KeyCombo::from_event(event);
 
-    let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
-    let has_alt = modifiers.contains(NSEventModifierFlags::Option);
-    let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
-    let has_shift = modifiers.contains(NSEventModifierFlags::Shift);
+    // Check configurable terminal keybindings first
+    if let Some(action) = keybindings.terminal_map.get(&combo) {
+        match action {
+            TerminalAction::KillLine => pty.write(b"\x15"),
+            TerminalAction::Home => pty.write(b"\x1b[H"),
+            TerminalAction::End => pty.write(b"\x1b[F"),
+            TerminalAction::WordBack => pty.write(b"\x1bb"),
+            TerminalAction::WordForward => pty.write(b"\x1bf"),
+            TerminalAction::ShiftEnter => pty.write(b"\x1b[13;2u"),
+        }
+        return;
+    }
+
+    let has_ctrl = combo.ctrl;
+    let has_alt = combo.option;
+    let has_cmd = combo.cmd;
 
     let chars_unmod = event.charactersIgnoringModifiers();
     let unmod_str = chars_unmod.map(|s| s.to_string()).unwrap_or_default();
     let unmod_char = unmod_str.chars().next().unwrap_or('\0');
 
-    // Shift+Enter → newline without executing (CSI u: \e[13;2u)
-    if has_shift && unmod_char == '\r' {
-        pty.write(b"\x1b[13;2u");
-        return;
-    }
-
+    // Cmd key with no matching terminal binding — ignore (handled by performKeyEquivalent)
     if has_cmd {
-        match unmod_char {
-            '\u{7F}' => pty.write(b"\x15"),         // Cmd+Backspace → kill line (Ctrl+U)
-            '\u{F702}' => pty.write(b"\x1b[H"),     // Cmd+Left → Home (beginning of line)
-            '\u{F703}' => pty.write(b"\x1b[F"),     // Cmd+Right → End (end of line)
-            _ => {}
-        }
         return;
     }
 
@@ -61,15 +63,6 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool) {
         }
     }
 
-    // Option+Arrow → word movement
-    if has_alt {
-        match unmod_char {
-            '\u{F702}' => { pty.write(b"\x1bb"); return; } // Option+Left → word back
-            '\u{F703}' => { pty.write(b"\x1bf"); return; } // Option+Right → word forward
-            _ => {}
-        }
-    }
-
     match unmod_char {
         '\u{F700}' => { pty.write(if cursor_keys_app { b"\x1bOA" } else { b"\x1b[A" }); return; }
         '\u{F701}' => { pty.write(if cursor_keys_app { b"\x1bOB" } else { b"\x1b[B" }); return; }
@@ -81,7 +74,7 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool) {
         '\u{F72B}' => { pty.write(b"\x1b[F"); return; }
         '\u{F72C}' => { pty.write(b"\x1b[5~"); return; }
         '\u{F72D}' => { pty.write(b"\x1b[6~"); return; }
-        '\u{0019}' => { pty.write(b"\x1b[Z"); return; } // Shift+Tab (backtab)
+        '\u{0019}' => { pty.write(b"\x1b[Z"); return; }
         '\u{F704}' => { pty.write(b"\x1bOP"); return; }
         '\u{F705}' => { pty.write(b"\x1bOQ"); return; }
         '\u{F706}' => { pty.write(b"\x1bOR"); return; }
@@ -90,8 +83,6 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool) {
     }
 
     if has_alt && !chars_str.is_empty() {
-        // If macOS produced a different character via Option (e.g. Option+Shift+L → |),
-        // send that character as-is instead of ESC+key.
         if chars_str != unmod_str {
             pty.write(chars_str.as_bytes());
         } else {

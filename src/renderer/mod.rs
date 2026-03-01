@@ -72,7 +72,6 @@ pub struct Renderer {
     status_bar_branch_color: [f32; 3],
     status_bar_scroll_color: [f32; 3],
     global_bar_bg: [f32; 3],
-    global_bar_fg: [f32; 3],
     global_bar_time_color: [f32; 3],
     global_bar_scroll_color: [f32; 3],
     last_minute: u32,
@@ -157,7 +156,6 @@ impl Renderer {
             status_bar_branch_color: config.status_bar.branch_color,
             status_bar_scroll_color: config.status_bar.scroll_color,
             global_bar_bg: config.global_status_bar.bg_color,
-            global_bar_fg: config.global_status_bar.fg_color,
             global_bar_time_color: config.global_status_bar.time_color,
             global_bar_scroll_color: config.global_status_bar.scroll_indicator_color,
             last_minute: u32::MAX,
@@ -270,6 +268,10 @@ impl Renderer {
             let is_hover_pane = self.hovered_url_pane_id == Some(*pane_id);
             self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
             self.hovered_url = if is_hover_pane { saved_hover_pos } else { None };
+            // Skip panes entirely off-screen (hidden by horizontal scroll)
+            if vp.x + vp.width <= 0.0 || vp.x >= viewport_w {
+                continue;
+            }
             // Skip rendering focused pane content when filter overlay covers it
             if *is_focused && filter.is_some() {
                 continue;
@@ -475,11 +477,18 @@ impl Renderer {
         let oy = vp.y;
 
         // Calculate y_offset: push content to bottom when screen isn't full
+        // Disabled in alt screen (TUI apps) and when content doesn't start at line 0
+        // (explicit cursor positioning via escape sequences like \033[5;10H)
         let max_rows = term.rows as usize;
-        let last_used = display.iter().rposition(|line|
-            line.iter().any(|c| c.c != ' ' && c.c != '\0')
-        ).map_or(0, |i| i + 1);
-        let y_offset = if last_used < max_rows && term.scroll_offset() == 0 {
+        let has_content = |line: &[crate::terminal::Cell]| line.iter().any(|c| c.c != ' ' && c.c != '\0');
+        let first_used = display.iter().position(|line| has_content(line));
+        let last_used = display.iter().rposition(|line| has_content(line))
+            .map_or(0, |i| i + 1);
+        let y_offset = if !term.in_alt_screen
+            && first_used == Some(0)
+            && last_used < max_rows
+            && term.scroll_offset() == 0
+        {
             let raw = (max_rows - last_used) as f32 * cell_h;
             // Clamp: never push content beyond the viewport
             let max_offset = (vp.height - last_used as f32 * cell_h).max(0.0);

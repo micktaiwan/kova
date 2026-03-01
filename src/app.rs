@@ -289,17 +289,16 @@ fn setup_menu(mtm: MainThreadMarker) {
 
     // Cmd+Q is handled in KovaView::performKeyEquivalent (close window, not app).
     // Menu item with empty key so it doesn't compete with performKeyEquivalent.
-    let quit_title = NSString::from_str("Close Window");
-    let quit_key = NSString::from_str("q");
     let quit_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc(),
-            &quit_title,
+            &NSString::from_str("Close Window"),
             None,
-            &quit_key,
+            &NSString::from_str(""),
         )
     };
     app_menu.addItem(&quit_item);
+
     app_menu_item.setSubmenu(Some(&app_menu));
     menu_bar.addItem(&app_menu_item);
 
