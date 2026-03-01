@@ -86,6 +86,8 @@ pub struct Tab {
     pub color: Option<usize>,
     /// Bell received on a non-focused tab — show attention indicator.
     pub has_bell: bool,
+    /// Horizontal scroll offset in pixels (0 = no scroll).
+    pub scroll_offset_x: f32,
 }
 
 impl Tab {
@@ -100,6 +102,7 @@ impl Tab {
             custom_title: None,
             color: None,
             has_bell: false,
+            scroll_offset_x: 0.0,
         })
     }
 
@@ -114,7 +117,34 @@ impl Tab {
             custom_title: None,
             color: None,
             has_bell: false,
+            scroll_offset_x: 0.0,
         })
+    }
+
+    /// Compute the virtual width for this tab's split layout.
+    /// virtual_width = max(screen_width, column_count * min_split_width)
+    pub fn virtual_width(&self, screen_width: f32, min_split_width: f32) -> f32 {
+        let columns = self.tree.chain_leaf_count(true) as f32;
+        (columns * min_split_width).max(screen_width)
+    }
+
+    /// Clamp scroll_offset_x after a tree change.
+    pub fn clamp_scroll(&mut self, screen_width: f32, min_split_width: f32) {
+        let vw = self.virtual_width(screen_width, min_split_width);
+        let max_scroll = (vw - screen_width).max(0.0);
+        self.scroll_offset_x = self.scroll_offset_x.clamp(0.0, max_scroll);
+    }
+
+    /// Adjust scroll_offset_x so that the given pane viewport is fully visible.
+    /// `pane_vp` is in virtual-space coordinates (from panes_viewport_for_tab).
+    pub fn scroll_to_reveal(&mut self, pane_vp: &PaneViewport, screen_width: f32) {
+        let pane_left = pane_vp.x + self.scroll_offset_x;
+        let pane_right = pane_left + pane_vp.width;
+        if pane_left < self.scroll_offset_x {
+            self.scroll_offset_x = pane_left;
+        } else if pane_right > self.scroll_offset_x + screen_width {
+            self.scroll_offset_x = pane_right - screen_width;
+        }
     }
 
     /// Title for this tab: custom title if set, then OSC title of focused pane, or CWD basename, or "shell".
@@ -375,7 +405,7 @@ impl SplitTree {
 
     /// Count leaves in a chain of same-direction splits.
     /// A split node of a different direction counts as a single unit.
-    fn chain_leaf_count(&self, horizontal: bool) -> usize {
+    pub(crate) fn chain_leaf_count(&self, horizontal: bool) -> usize {
         match self {
             SplitTree::Leaf(_) => 1,
             SplitTree::HSplit { left, right, .. } if horizontal => {
