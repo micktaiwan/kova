@@ -43,6 +43,12 @@ pub struct Cell {
     pub bg: [f32; 3],
 }
 
+impl Cell {
+    pub fn is_blank(&self) -> bool {
+        self.c == ' ' || self.c == '\0'
+    }
+}
+
 impl Default for Cell {
     fn default() -> Self {
         Cell {
@@ -574,7 +580,7 @@ impl TerminalState {
                 if !self.in_alt_screen {
                     // Find last row with visible content to avoid trailing blanks
                     let last_content = self.grid.iter().rposition(|row|
-                        row.cells.iter().any(|c| c.c != ' ' && c.c != '\0')
+                        row.cells.iter().any(|c| !c.is_blank())
                     );
                     if let Some(last) = last_content {
                         let rows: Vec<Row> = self.grid[..=last].to_vec();
@@ -908,7 +914,7 @@ impl TerminalState {
         // Remove blank rows from bottom first
         while self.grid.len() > nr {
             let is_blank = self.grid.last()
-                .map(|row| row.cells.iter().all(|c| c.c == ' ' || c.c == '\0'))
+                .map(|row| row.cells.iter().all(|c| c.is_blank()))
                 .unwrap_or(true);
             if is_blank && self.grid.len() > self.cursor_y as usize + 1 {
                 self.grid.pop();
@@ -922,7 +928,22 @@ impl TerminalState {
             self.scrollback.push_back(line);
             self.cursor_y = self.cursor_y.saturating_sub(1);
         }
-        // Add blank rows if needed
+        // Pull rows back from scrollback (O(n) via collect + splice)
+        let mut pulled: Vec<Row> = Vec::new();
+        while self.grid.len() + pulled.len() < nr {
+            if let Some(row) = self.scrollback.pop_back() {
+                pulled.push(row);
+            } else {
+                break;
+            }
+        }
+        if !pulled.is_empty() {
+            let count = pulled.len();
+            pulled.reverse();
+            self.grid.splice(0..0, pulled);
+            self.cursor_y = ((self.cursor_y as usize + count).min(new_rows as usize - 1)) as u16;
+        }
+        // Add blank rows if still needed
         while self.grid.len() < nr {
             self.grid.push(Row::new(new_cols as usize, &self.blank));
         }
@@ -974,7 +995,7 @@ impl TerminalState {
     /// Wrap a logical line to new_cols, trimming trailing blanks
     fn wrap_logical_line(cells: Vec<Cell>, new_cols: usize, blank: &Cell) -> Vec<Row> {
         // Trim trailing blank cells
-        let len = cells.iter().rposition(|c| c.c != ' ' && c.c != '\0')
+        let len = cells.iter().rposition(|c| !c.is_blank())
             .map_or(0, |i| i + 1);
 
         if len == 0 {
@@ -1205,13 +1226,13 @@ impl TerminalState {
         if self.in_alt_screen || self.scroll_offset != 0 {
             return 0;
         }
-        let display = self.visible_lines();
-        let has_content = |line: &[Cell]| line.iter().any(|c| c.c != ' ' && c.c != '\0');
-        let first_used = display.iter().position(|line| has_content(line));
+        // Use self.grid directly (scroll_offset == 0 means visible_lines() == grid)
+        let has_content = |row: &Row| row.cells.iter().any(|c| !c.is_blank());
+        let first_used = self.grid.iter().position(has_content);
         if first_used != Some(0) {
             return 0;
         }
-        let last_used = display.iter().rposition(|line| has_content(line))
+        let last_used = self.grid.iter().rposition(has_content)
             .map_or(0, |i| i + 1);
         if last_used < self.rows as usize {
             self.rows as usize - last_used

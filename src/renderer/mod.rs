@@ -478,7 +478,8 @@ impl Renderer {
 
         // Push content to bottom when screen isn't full (single source of truth in Terminal)
         let y_offset_rows = term.y_offset_rows() as f32;
-        let y_offset = (y_offset_rows * cell_h).min((vp.height - (term.rows as f32 - y_offset_rows) * cell_h).max(0.0));
+        let content_height = (term.rows as f32 - y_offset_rows) * cell_h;
+        let y_offset = (y_offset_rows * cell_h).min((vp.height - content_height).max(0.0));
 
         let mut vertices = Vec::with_capacity(display.len() * term.cols as usize * 6);
 
@@ -519,10 +520,10 @@ impl Renderer {
                     continue;
                 };
 
-                let c = cell.c;
-                if c == ' ' || c == '\0' {
+                if cell.is_blank() {
                     continue;
                 }
+                let c = cell.c;
 
                 if c == '─' && row_idx == 2 && col_idx < 3 {
                     log::trace!("render ─ at col={} row={} fg={:?} bg={:?}", col_idx, row_idx, cell.fg, cell.bg);
