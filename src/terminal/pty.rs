@@ -219,22 +219,49 @@ impl Pty {
     }
 }
 
+/// Escalate signals to reap a child process: SIGHUP → SIGTERM → SIGKILL.
+/// Each step waits `step_ms` before checking with `waitpid(WNOHANG)`.
+fn reap_child(pid: i32, step_ms: u64) {
+    let signals = [
+        (libc::SIGHUP, "SIGHUP"),
+        (libc::SIGTERM, "SIGTERM"),
+        (libc::SIGKILL, "SIGKILL"),
+    ];
+    for (sig, name) in &signals {
+        unsafe {
+            if libc::kill(pid, *sig) != 0 {
+                log::debug!("reap_child: pid {} already gone before {}", pid, name);
+                return;
+            }
+        }
+        log::debug!("reap_child: sent {} to pid {}", name, pid);
+        std::thread::sleep(std::time::Duration::from_millis(step_ms));
+        let ret = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        if ret != 0 {
+            log::info!("reap_child: pid {} reaped after {}", pid, name);
+            return;
+        }
+    }
+    log::warn!("reap_child: pid {} still alive after SIGKILL (should not happen)", pid);
+}
+
 /// Signal all live PTY reader threads to stop and kill their child processes.
 /// Called once from `AppDelegate::will_terminate`.
 pub fn shutdown_all() {
     let entries = PTY_REGISTRY.lock().clone();
     log::info!("Shutting down {} PTY(s)", entries.len());
-    for (pid, shutdown) in &entries {
-        shutdown.store(true, Ordering::Relaxed);
-        unsafe {
-            libc::kill(*pid as i32, libc::SIGHUP);
-        }
-    }
-    // Give children a moment to exit, then reap
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    for (pid, _) in &entries {
-        unsafe {
-            libc::waitpid(*pid as i32, std::ptr::null_mut(), libc::WNOHANG);
+    let handles: Vec<_> = entries
+        .into_iter()
+        .map(|(pid, shutdown)| {
+            shutdown.store(true, Ordering::Relaxed);
+            std::thread::Builder::new()
+                .name(format!("pty-reaper-{}", pid))
+                .spawn(move || reap_child(pid as i32, 25))
+        })
+        .collect();
+    for h in handles {
+        if let Ok(h) = h {
+            let _ = h.join();
         }
     }
 }
@@ -242,21 +269,15 @@ pub fn shutdown_all() {
 impl Drop for Pty {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        let pid = self.child_pid as i32;
-        unsafe {
-            libc::kill(pid, libc::SIGHUP);
-            // Non-blocking reap — don't hang the main thread if the child is slow to die
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            if libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) == 0 {
-                // Still alive — force kill and reap non-blocking
-                libc::kill(pid, libc::SIGKILL);
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG);
-            }
+        let pid = self.child_pid;
+        PTY_REGISTRY.lock().retain(|(p, _)| *p != pid);
+        let result = std::thread::Builder::new()
+            .name(format!("pty-reaper-{}", pid))
+            .spawn(move || reap_child(pid as i32, 50));
+        if let Err(e) = result {
+            log::warn!("Failed to spawn reaper for pid {}: {}, reaping synchronously", pid, e);
+            reap_child(pid as i32, 50);
         }
-        PTY_REGISTRY
-            .lock()
-            .retain(|(pid, _)| *pid != self.child_pid);
-        log::info!("PTY child {} cleaned up", self.child_pid);
+        log::info!("PTY child {} cleanup delegated to reaper thread", pid);
     }
 }
