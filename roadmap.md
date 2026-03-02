@@ -108,7 +108,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] Déplacer un split par drag (anchor visuelle pendant le drag — le swap par raccourci Cmd+Shift+Arrows existe déjà)
 - [ ] Notifications visuelles avancées (activité dans un split inactif)
 - [ ] Batching du parser VT — le pty-reader tient le write lock sur `TerminalState` pendant tout `parser.advance()` d'un chunk 4 Ko. Quand un pane en background reçoit beaucoup de données (build, logs…), le write lock bloque les read locks du renderer (parking_lot donne priorité aux writers). Solution : op-buffer local (`Vec<TermOp>`) parsé sans lock, flush en un seul write lock. Voir `notes/vt-parser-batching.md`.
-- [ ] PTY cleanup non-bloquant — remplacer le `waitpid` bloquant dans `Drop for Pty` par une escalade SIGHUP → SIGTERM → SIGKILL avec timeouts (~200ms max), pour éviter un freeze UI si un process ignore SIGHUP
+- [x] PTY cleanup sur thread dédié — `Drop for Pty` délègue l'escalade SIGHUP → SIGTERM → SIGKILL à un thread détaché (`pty-reaper-{pid}`), zéro sleep sur le main thread. `shutdown_all()` fait la même escalade en synchrone avec timeouts réduits (25ms/étape)
 - [ ] Font fallback (block elements/box-drawing) — nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
 - [ ] **Tab bar font size** : taille de fonte des tabs configurable indépendamment (`tab_bar.font_size`), override possible par fenêtre. Voir `notes/tab-font-size.md`.
 - [ ] **Trim trailing spaces** : tronquer les cellules vides en fin de ligne.
