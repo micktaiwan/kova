@@ -75,8 +75,8 @@ impl GlyphAtlas {
         let cell_width = advance.width.ceil() as f32;
 
         let chars_per_row = 16u32;
-        let glyph_cell_w = cell_width as u32;
-        let glyph_cell_h = cell_height as u32;
+        let glyph_cell_w = cell_width.round() as u32;
+        let glyph_cell_h = cell_height.round() as u32;
         let num_chars = 95u32; // ' ' to '~'
         let rows = (num_chars + chars_per_row - 1) / chars_per_row;
         let atlas_width = chars_per_row * glyph_cell_w;

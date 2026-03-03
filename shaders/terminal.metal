@@ -53,7 +53,7 @@ fragment float4 fragment_main(
         return in.bg_color;
     }
 
-    constexpr sampler s(mag_filter::linear, min_filter::linear);
+    constexpr sampler s(mag_filter::nearest, min_filter::nearest);
     float4 tex_color = atlas.sample(s, in.tex_coords);
 
     // Color emoji: color.a == 2.0 signals color glyph — use texture directly

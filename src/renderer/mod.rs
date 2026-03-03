@@ -495,10 +495,10 @@ impl Renderer {
         // Pass 1: backgrounds + selection highlights (under text)
         for (row_idx, line) in display.iter().enumerate() {
             let abs_line = (abs_line_base + row_idx as i64) as usize;
-            let y = oy + y_offset + row_idx as f32 * cell_h;
+            let y = (oy + y_offset + row_idx as f32 * cell_h).round();
 
             for col_idx in 0..term.cols as usize {
-                let x = ox + col_idx as f32 * cell_w;
+                let x = (ox + col_idx as f32 * cell_w).round();
 
                 // Cell background
                 if col_idx < line.len() && line[col_idx].bg != self.bg_color {
@@ -547,8 +547,8 @@ impl Renderer {
                     continue;
                 }
 
-                let gx = ox + col_idx as f32 * cell_w;
-                let gy = oy + y_offset + row_idx as f32 * cell_h;
+                let gx = (ox + col_idx as f32 * cell_w).round();
+                let gy = (oy + y_offset + row_idx as f32 * cell_h).round();
                 let gw = glyph.width as f32;
                 let gh = glyph.height as f32;
 
@@ -572,8 +572,8 @@ impl Renderer {
 
         // Draw URL underline for hovered URL
         if let Some((hover_row, col_start, col_end)) = self.hovered_url {
-            let uy = oy + y_offset + hover_row as f32 * cell_h + cell_h - 1.0;
-            let ux = ox + col_start as f32 * cell_w;
+            let uy = (oy + y_offset + hover_row as f32 * cell_h + cell_h - 1.0).round();
+            let ux = (ox + col_start as f32 * cell_w).round();
             let uw = (col_end - col_start) as f32 * cell_w;
             // Use a subtle blue underline color
             let url_color = [0.4, 0.6, 1.0];
@@ -585,8 +585,8 @@ impl Renderer {
             let offset = term.scroll_offset();
             let screen_y = offset + term.cursor_y as i32;
             if screen_y >= 0 && screen_y < term.rows as i32 {
-                let cx = ox + term.cursor_x as f32 * cell_w;
-                let cy = oy + y_offset + screen_y as f32 * cell_h;
+                let cx = (ox + term.cursor_x as f32 * cell_w).round();
+                let cy = (oy + y_offset + screen_y as f32 * cell_h).round();
                 match term.cursor_shape {
                     CursorShape::Block => {
                         Self::push_bg_quad(&mut vertices, cx, cy, cell_w, cell_h, self.cursor_color);
