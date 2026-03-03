@@ -3,7 +3,7 @@ use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSApplicationDelegate, NSApplicationTerminateReply, NSMenu, NSMenuItem, NSWindow};
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ptr::NonNull;
 
 use crate::config::Config;
@@ -18,6 +18,10 @@ pub struct AppDelegateIvars {
     /// their state when they're deallocated before app termination.
     closed_sessions: RefCell<Vec<crate::session::WindowSession>>,
     config: OnceCell<Config>,
+    /// Frame counter for periodic session save (every 30s).
+    tick_count: Cell<u64>,
+    /// Optional session backup number to restore (--session N).
+    session_backup: Option<usize>,
 }
 
 define_class!(
@@ -40,7 +44,7 @@ define_class!(
             log::debug!("Config loaded: {}x{} cols/rows, {} scrollback", config.terminal.columns, config.terminal.rows, config.terminal.scrollback);
 
             // Restore session (all windows) or create a single fresh window
-            let restored = crate::session::load()
+            let restored = crate::session::load(self.ivars().session_backup)
                 .and_then(|s| crate::session::restore_session(s, config));
 
             match restored {
@@ -109,14 +113,7 @@ define_class!(
             // Start with sessions saved when windows were closed during this run
             // (pending_close windows are already in closed_sessions — no need to re-collect)
             let mut window_sessions = self.ivars().closed_sessions.borrow().clone();
-            // Add still-live windows only
-            let wins = self.ivars().windows.borrow();
-            for win in wins.iter() {
-                if let Some(view) = kova_view(win) {
-                    view.append_session_data(&mut window_sessions);
-                }
-            }
-            drop(wins);
+            window_sessions.extend(collect_window_sessions(&self.ivars().windows.borrow()));
             crate::session::save(&window_sessions);
             crate::terminal::pty::shutdown_all();
         }
@@ -124,12 +121,14 @@ define_class!(
 );
 
 impl AppDelegate {
-    pub fn new(mtm: MainThreadMarker, config: Config) -> Retained<Self> {
+    pub fn new(mtm: MainThreadMarker, config: Config, session_backup: Option<usize>) -> Retained<Self> {
         let this = mtm.alloc::<Self>().set_ivars(AppDelegateIvars {
             windows: RefCell::new(Vec::new()),
             pending_close: RefCell::new(Vec::new()),
+            tick_count: Cell::new(0),
             closed_sessions: RefCell::new(Vec::new()),
             config: OnceCell::new(),
+            session_backup,
         });
         let retained: Retained<Self> = unsafe { msg_send![super(this), init] };
         retained.ivars().config.set(config).ok();
@@ -161,6 +160,19 @@ impl AppDelegate {
                                     dead_indices.push(i);
                                 }
                             }
+                        }
+                    }
+
+                    // Periodic session save (every ~30s) to survive crashes.
+                    // Serialization + I/O is offloaded to a thread to avoid frame drops.
+                    let count = ivars.tick_count.get() + 1;
+                    ivars.tick_count.set(count);
+                    if count % (fps as u64 * 30) == 0 {
+                        let sessions = collect_window_sessions(&ivars.windows.borrow());
+                        if !sessions.is_empty() {
+                            std::thread::spawn(move || {
+                                crate::session::save(&sessions);
+                            });
                         }
                     }
 
@@ -199,6 +211,17 @@ impl AppDelegate {
         let run_loop = NSRunLoop::currentRunLoop();
         unsafe { run_loop.addTimer_forMode(&timer, NSRunLoopCommonModes) };
     }
+}
+
+/// Collect session data from all live windows.
+fn collect_window_sessions(windows: &[Retained<NSWindow>]) -> Vec<crate::session::WindowSession> {
+    let mut sessions = Vec::new();
+    for win in windows.iter() {
+        if let Some(view) = kova_view(win) {
+            view.append_session_data(&mut sessions);
+        }
+    }
+    sessions
 }
 
 /// Get a reference to our AppDelegate from the shared NSApplication.
