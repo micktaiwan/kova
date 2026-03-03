@@ -1361,20 +1361,29 @@ impl KovaView {
 
     /// Close focused pane. If it's the last pane in the tab, close the tab.
     fn do_close_pane_or_tab(&self) {
-        let mut tabs = self.ivars().tabs.borrow_mut();
-        let idx = self.ivars().active_tab.get();
-        if idx >= tabs.len() {
-            return;
-        }
-
-        // Check if the pane being closed has a running foreground process
-        let proc = tabs[idx].tree.pane(tabs[idx].focused_pane)
-            .and_then(|p| p.foreground_process_name().map(|name| (tabs[idx].title(), name)));
+        // Collect info for confirmation dialog BEFORE holding the borrow,
+        // because NSAlert runs a modal run loop that can dispatch events
+        // which access tabs → would panic on double borrow.
+        let proc = {
+            let tabs = self.ivars().tabs.borrow();
+            let idx = self.ivars().active_tab.get();
+            if idx >= tabs.len() {
+                return;
+            }
+            tabs[idx].tree.pane(tabs[idx].focused_pane)
+                .and_then(|p| p.foreground_process_name().map(|name| (tabs[idx].title(), name)))
+        };
         if let Some(proc) = proc {
             let mtm = unsafe { MainThreadMarker::new_unchecked() };
             if !confirm_running_processes(mtm, &[proc], "Close this pane?", "Close") {
                 return;
             }
+        }
+
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        if idx >= tabs.len() {
+            return;
         }
 
         let is_single_pane = matches!(tabs[idx].tree, SplitTree::Leaf(_));
