@@ -156,6 +156,9 @@ impl Tab {
             return custom.clone();
         }
         if let Some(pane) = self.tree.pane(self.focused_pane) {
+            if let Some(ref custom) = pane.custom_title {
+                return custom.clone();
+            }
             let term = pane.terminal.read();
             if let Some(ref title) = term.title {
                 return title.clone();
@@ -197,6 +200,8 @@ pub struct Pane {
     pub scroll_accumulator: Cell<f64>,
     /// Command to inject into PTY once shell is ready (for session restore).
     pub pending_command: Cell<Option<String>>,
+    /// Custom pane title set by user (overrides OSC title).
+    pub custom_title: Option<String>,
 }
 
 impl Pane {
@@ -229,6 +234,7 @@ impl Pane {
             shell_ready,
             scroll_accumulator: Cell::new(0.0),
             pending_command: Cell::new(None),
+            custom_title: None,
         })
     }
 
@@ -296,6 +302,18 @@ impl SplitTree {
             SplitTree::HSplit { left, right, .. }
             | SplitTree::VSplit { top: left, bottom: right, .. } => {
                 left.pane(id).or_else(|| right.pane(id))
+            }
+        }
+    }
+
+    pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
+        match self {
+            SplitTree::Leaf(p) => {
+                if p.id == id { Some(p) } else { None }
+            }
+            SplitTree::HSplit { left, right, .. }
+            | SplitTree::VSplit { top: left, bottom: right, .. } => {
+                left.pane_mut(id).or_else(|| right.pane_mut(id))
             }
         }
     }

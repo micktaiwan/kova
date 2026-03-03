@@ -176,7 +176,7 @@ impl Renderer {
     pub fn render_panes(
         &mut self,
         layer: &CAMetalLayer,
-        panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool, PaneId)],
+        panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>)],
         separators: &[(f32, f32, f32, f32)],
         tab_titles: &[(String, bool, Option<usize>, bool, bool)],
         filter: Option<&FilterRenderData>,
@@ -185,7 +185,7 @@ impl Renderer {
         hidden_right: usize,
     ) {
         // Reset blink on cursor movement of focused pane
-        if let Some((term, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _)| *focused) {
+        if let Some((term, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _)| *focused) {
             let epoch = term.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed);
             if epoch != self.last_cursor_epoch {
                 self.last_cursor_epoch = epoch;
@@ -226,7 +226,7 @@ impl Renderer {
         let mut any_dirty = false;
         let mut any_not_ready = false;
         let mut any_sync_deferred = false;
-        for (term, _, ready, _, _) in panes {
+        for (term, _, ready, _, _, _) in panes {
             if !ready { any_not_ready = true; }
             let t = term.read();
             // Synchronized output: this pane wants to defer, but don't block others
@@ -263,7 +263,7 @@ impl Renderer {
         let mut all_vertices = Vec::new();
         let saved_hover_text = self.hovered_url_text.clone();
         let saved_hover_pos = self.hovered_url;
-        for (term, vp, shell_ready, is_focused, pane_id) in panes {
+        for (term, vp, shell_ready, is_focused, pane_id, custom_title) in panes {
             // Scope hovered URL to the pane that owns it
             let is_hover_pane = self.hovered_url_pane_id == Some(*pane_id);
             self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
@@ -280,7 +280,7 @@ impl Renderer {
                 let t = term.read();
                 // Only blink cursor on focused pane
                 let show_blink = if *is_focused { blink_on } else { true };
-                let mut verts = self.build_vertices(&t, vp, show_blink, *is_focused);
+                let mut verts = self.build_vertices(&t, vp, show_blink, *is_focused, custom_title.as_deref());
                 all_vertices.append(&mut verts);
             } else {
                 let mut verts = self.build_loading_vertices(vp);
@@ -331,7 +331,7 @@ impl Renderer {
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
-            if let Some((_, vp, _, _, _)) = panes.iter().find(|(_, _, _, focused, _)| *focused) {
+            if let Some((_, vp, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _)| *focused) {
                 self.build_filter_overlay_vertices(&mut all_vertices, vp, filter_data);
             }
         }
@@ -436,6 +436,7 @@ impl Renderer {
         vp: &PaneViewport,
         blink_on: bool,
         is_focused: bool,
+        custom_title: Option<&str>,
     ) -> Vec<Vertex> {
         // Pass 1: collect unknown chars/clusters for dynamic rasterization
         let display = term.visible_lines();
@@ -624,7 +625,7 @@ impl Renderer {
 
         // Status bar
         if self.status_bar_enabled {
-            self.build_status_bar_vertices(&mut vertices, vp, term);
+            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title);
         }
 
         vertices
@@ -635,6 +636,7 @@ impl Renderer {
         vertices: &mut Vec<Vertex>,
         vp: &PaneViewport,
         term: &TerminalState,
+        custom_title: Option<&str>,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
@@ -673,33 +675,37 @@ impl Renderer {
         };
         let left_end = self.render_status_text(vertices, &branch_display, cursor_x, bar_y, vp.x + vp.width * 0.6, actual_branch_fg, no_bg);
 
-        // Render hovered URL or title centered (only if it doesn't overlap with left content)
-        let center_text: Option<(String, [f32; 4])> = if let Some(ref url) = self.hovered_url_text {
+        // Right side: title (custom or hovered URL or OSC) + scroll indicator
+        let right_edge = vp.x + vp.width - cell_w; // 1 cell padding from right
+
+        // Scroll indicator (rightmost)
+        let scroll_off = term.scroll_offset();
+        let right_after_scroll = if scroll_off > 0 {
+            let scroll_str = format!("↑{}", scroll_off);
+            let scroll_w = scroll_str.chars().count() as f32 * cell_w;
+            let right_x = right_edge - scroll_w;
+            self.render_status_text(vertices, &scroll_str, right_x, bar_y, right_edge + cell_w, scroll_fg, no_bg);
+            right_x - cell_w * 2.0 // gap before title
+        } else {
+            right_edge
+        };
+
+        // Title: hovered URL > custom_title > OSC title
+        let right_text: Option<(String, [f32; 4])> = if let Some(ref url) = self.hovered_url_text {
             Some((url.clone(), [0.4, 0.6, 1.0, 1.0]))
+        } else if let Some(title) = custom_title {
+            Some((title.to_string(), title_fg))
         } else {
             term.title.as_ref().map(|t| (t.clone(), title_fg))
         };
-        if let Some((text, fg)) = center_text {
+        if let Some((text, fg)) = right_text {
             let char_count = text.chars().count();
             let text_w = char_count as f32 * cell_w;
-            let center_x = vp.x + (vp.width - text_w) / 2.0;
-            let min_x = vp.x + vp.width * 0.3;
-            let max_x = vp.x + vp.width * 0.7;
-            let start_x = center_x.max(min_x);
-            // Don't render if left content (cwd + branch) would overlap
-            if start_x >= left_end + cell_w {
-                self.render_status_text(vertices, &text, start_x, bar_y, max_x, fg, no_bg);
+            let title_x = right_after_scroll - text_w;
+            // Only render if it doesn't overlap with left content
+            if title_x >= left_end + cell_w * 2.0 {
+                self.render_status_text(vertices, &text, title_x, bar_y, right_after_scroll, fg, no_bg);
             }
-        }
-
-        // Right side: scroll indicator only
-        let scroll_off = term.scroll_offset();
-        if scroll_off > 0 {
-            let scroll_str = format!("↑{}", scroll_off);
-            let scroll_w = scroll_str.chars().count() as f32 * cell_w;
-            let right_edge = vp.x + vp.width;
-            let right_x = right_edge - scroll_w - cell_w;
-            self.render_status_text(vertices, &scroll_str, right_x, bar_y, right_edge, scroll_fg, no_bg);
         }
     }
 

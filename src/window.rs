@@ -44,6 +44,7 @@ pub struct KovaViewIvars {
     drag_separator: Cell<Option<SeparatorDrag>>,
     filter: RefCell<Option<FilterState>>,
     rename_tab: RefCell<Option<RenameTabState>>,
+    rename_pane: RefCell<Option<RenamePaneState>>,
     /// Left inset (pixels) for tab bar, cached from traffic light button positions.
     tab_bar_left_inset: Cell<f32>,
     /// Tab index targeted by right-click color menu.
@@ -79,6 +80,10 @@ struct FilterState {
 }
 
 struct RenameTabState {
+    input: String,
+}
+
+struct RenamePaneState {
     input: String,
 }
 
@@ -226,6 +231,12 @@ define_class!(
                 return;
             }
 
+            // If rename pane is active, route keys to rename
+            if self.ivars().rename_pane.borrow().is_some() {
+                self.handle_rename_pane_key(event);
+                return;
+            }
+
             // If filter is active, route keys to filter
             if self.ivars().filter.borrow().is_some() {
                 self.handle_filter_key(event);
@@ -298,6 +309,7 @@ define_class!(
                     Action::PrevTab => self.do_switch_tab_relative(-1),
                     Action::NextTab => self.do_switch_tab_relative(1),
                     Action::RenameTab => self.start_rename_tab(),
+                    Action::RenamePane => self.start_rename_pane(),
                     Action::DetachTab => self.do_detach_tab(),
                     Action::MergeWindow => self.do_merge_window(),
                     Action::SwitchTab(idx) => self.do_switch_tab(*idx),
@@ -716,6 +728,7 @@ impl KovaView {
             drag_separator: Cell::new(None),
             filter: RefCell::new(None),
             rename_tab: RefCell::new(None),
+            rename_pane: RefCell::new(None),
             tab_bar_left_inset: Cell::new(0.0),
             color_menu_tab: Cell::new(0),
             drag_tab: Cell::new(None),
@@ -1354,6 +1367,16 @@ impl KovaView {
             return;
         }
 
+        // Check if the pane being closed has a running foreground process
+        let proc = tabs[idx].tree.pane(tabs[idx].focused_pane)
+            .and_then(|p| p.foreground_process_name().map(|name| (tabs[idx].title(), name)));
+        if let Some(proc) = proc {
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            if !confirm_running_processes(mtm, &[proc], "Close this pane?", "Close") {
+                return;
+            }
+        }
+
         let is_single_pane = matches!(tabs[idx].tree, SplitTree::Leaf(_));
 
         if is_single_pane {
@@ -1548,6 +1571,11 @@ impl KovaView {
                     NavDirection::Left | NavDirection::Up => new_tab.tree.last_pane().id,
                 };
                 new_tab.focused_pane = target_id;
+                // Auto-scroll to reveal the focused pane in the new tab
+                let panes_vp = self.panes_viewport_for_tab(new_tab);
+                if let Some(vp) = new_tab.tree.viewport_for_pane(target_id, panes_vp) {
+                    new_tab.scroll_to_reveal(&vp, self.drawable_viewport().width);
+                }
             }
         }
     }
@@ -1726,6 +1754,77 @@ impl KovaView {
                 let idx = self.ivars().active_tab.get();
                 if let Some(tab) = tabs.get_mut(idx) {
                     tab.custom_title = new_title;
+                }
+                drop(tabs);
+                self.mark_dirty();
+                return;
+            }
+            '\u{7F}' | '\u{08}' => {
+                // Backspace
+                state.input.pop();
+            }
+            c if c >= ' ' && !c.is_control() => {
+                state.input.push(c);
+            }
+            _ => return,
+        }
+        drop(rename);
+        self.mark_dirty();
+    }
+
+    fn start_rename_pane(&self) {
+        let current_title = {
+            let tabs = self.ivars().tabs.borrow();
+            let idx = self.ivars().active_tab.get();
+            tabs.get(idx).and_then(|tab| {
+                let pane = tab.tree.pane(tab.focused_pane)?;
+                if let Some(ref custom) = pane.custom_title {
+                    Some(custom.clone())
+                } else {
+                    pane.terminal.read().title.clone()
+                }
+            }).unwrap_or_default()
+        };
+        *self.ivars().rename_pane.borrow_mut() = Some(RenamePaneState {
+            input: current_title,
+        });
+        self.mark_dirty();
+    }
+
+    fn handle_rename_pane_key(&self, event: &NSEvent) {
+        let chars = event.charactersIgnoringModifiers();
+        let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
+        let ch = ch_str.chars().next().unwrap_or('\0');
+
+        let mut rename = self.ivars().rename_pane.borrow_mut();
+        let state = match rename.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        match ch {
+            '\u{1B}' => {
+                // Escape → cancel rename
+                *rename = None;
+                drop(rename);
+                self.mark_dirty();
+                return;
+            }
+            '\r' => {
+                // Enter → apply rename (empty = reset to auto)
+                let new_title = if state.input.trim().is_empty() {
+                    None
+                } else {
+                    Some(state.input.clone())
+                };
+                *rename = None;
+                drop(rename);
+                let mut tabs = self.ivars().tabs.borrow_mut();
+                let idx = self.ivars().active_tab.get();
+                if let Some(tab) = tabs.get_mut(idx) {
+                    if let Some(pane) = tab.tree.pane_mut(tab.focused_pane) {
+                        pane.custom_title = new_title;
+                    }
                 }
                 drop(tabs);
                 self.mark_dirty();
@@ -2027,7 +2126,7 @@ impl KovaView {
             let tab = &tabs[active_idx];
             let focused_id = tab.focused_pane;
 
-            let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool, PaneId)> = Vec::new();
+            let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>)> = Vec::new();
             let cell_h = renderer.read().cell_size().1;
             let tab_bar_h = (cell_h * 2.0).round();
             let drawable_size = layer.drawableSize();
@@ -2047,8 +2146,21 @@ impl KovaView {
                     pane.is_ready(),
                     pane.id == focused_id,
                     pane.id,
+                    pane.custom_title.clone(),
                 ));
             });
+
+            // Override custom_title for focused pane when rename_pane is active
+            {
+                let rename_pane = ivars.rename_pane.borrow();
+                if let Some(ref rs) = *rename_pane {
+                    for entry in &mut pane_data {
+                        if entry.3 { // is_focused
+                            entry.5 = Some(format!("{}▏", rs.input));
+                        }
+                    }
+                }
+            }
 
             let focused = tab.tree.pane(focused_id);
             let pty_ptr = focused.map(|p| &p.pty as *const crate::terminal::pty::Pty);
@@ -2094,7 +2206,7 @@ impl KovaView {
         }
 
         // Update NSWindow title from focused pane's OSC 0/2
-        if let Some((terminal, _, _, _, _)) = pane_data.iter().find(|(_, _, _, f, _)| *f) {
+        if let Some((terminal, _, _, _, _, _)) = pane_data.iter().find(|(_, _, _, f, _, _)| *f) {
             let term = terminal.read();
             let current = term.title.clone();
             drop(term);
@@ -2163,7 +2275,7 @@ impl KovaView {
         // Count hidden panes (fully off-screen)
         let mut hidden_left = 0usize;
         let mut hidden_right = 0usize;
-        for (_, vp, _, _, _) in &pane_data {
+        for (_, vp, _, _, _, _) in &pane_data {
             if vp.x + vp.width <= 0.0 {
                 hidden_left += 1;
             } else if vp.x >= screen_width {

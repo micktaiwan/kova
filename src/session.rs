@@ -45,6 +45,8 @@ pub enum SavedTree {
         cwd: Option<String>,
         #[serde(default)]
         last_command: Option<String>,
+        #[serde(default)]
+        custom_title: Option<String>,
     },
     HSplit { left: Box<SavedTree>, right: Box<SavedTree>, ratio: f32, #[serde(default)] root: bool },
     VSplit { top: Box<SavedTree>, bottom: Box<SavedTree>, ratio: f32, #[serde(default)] root: bool },
@@ -60,6 +62,7 @@ fn snapshot_tree(tree: &SplitTree) -> SavedTree {
         SplitTree::Leaf(pane) => SavedTree::Leaf {
             cwd: pane.cwd(),
             last_command: pane.last_command(),
+            custom_title: pane.custom_title.clone(),
         },
         SplitTree::HSplit { left, right, ratio, root } => SavedTree::HSplit {
             left: Box::new(snapshot_tree(left)),
@@ -197,13 +200,14 @@ pub fn load() -> Option<Session> {
 /// Restore a saved tree, spawning new panes. Returns the tree and a list of pane ids in depth-first order.
 fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Option<(SplitTree, Vec<PaneId>)> {
     match saved {
-        SavedTree::Leaf { cwd, last_command } => {
-            let pane = Pane::spawn(cols, rows, config, cwd.as_deref()).ok()?;
+        SavedTree::Leaf { cwd, last_command, custom_title } => {
+            let mut pane = Pane::spawn(cols, rows, config, cwd.as_deref()).ok()?;
             let id = pane.id;
             if let Some(cmd) = last_command {
                 pane.pending_command.set(Some(cmd.clone()));
                 pane.terminal.write().last_command = Some(cmd.clone());
             }
+            pane.custom_title = custom_title.clone();
             Some((SplitTree::Leaf(pane), vec![id]))
         }
         SavedTree::HSplit { left, right, ratio, root } => {
