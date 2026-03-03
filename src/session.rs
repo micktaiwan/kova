@@ -123,6 +123,9 @@ impl WindowSession {
     }
 }
 
+/// Maximum number of session backups to keep.
+const SESSION_HISTORY_COUNT: usize = 10;
+
 /// Save all windows to a single session file.
 pub fn save(windows: &[WindowSession]) {
     let session = Session {
@@ -139,6 +142,7 @@ pub fn save(windows: &[WindowSession]) {
     }
     match serde_json::to_string_pretty(&session) {
         Ok(json) => {
+            rotate_session_backups(&path, json.as_bytes());
             if let Err(e) = std::fs::write(&path, json) {
                 log::warn!("Failed to write session file: {}", e);
             } else {
@@ -149,6 +153,34 @@ pub fn save(windows: &[WindowSession]) {
     }
 }
 
+/// Rotate session.json → session.1.json → session.2.json → ... → session.N.json
+/// Only rotates if the current file differs from the latest backup (avoids
+/// filling history with identical periodic saves).
+fn rotate_session_backups(path: &std::path::Path, new_content: &[u8]) {
+    if !path.exists() {
+        return;
+    }
+    let parent = path.parent().unwrap();
+    let backup = |n: usize| {
+        if n == 0 { path.to_path_buf() }
+        else { parent.join(format!("session.{}.json", n)) }
+    };
+
+    // Skip rotation if new content is identical to most recent backup
+    if let Ok(latest) = std::fs::read(&backup(1)) {
+        if new_content == latest {
+            return;
+        }
+    }
+
+    // Drop oldest, shift everything down
+    let _ = std::fs::remove_file(backup(SESSION_HISTORY_COUNT));
+    for i in (1..SESSION_HISTORY_COUNT).rev() {
+        let _ = std::fs::rename(backup(i), backup(i + 1));
+    }
+    let _ = std::fs::rename(backup(0), backup(1));
+}
+
 /// Loaded window data ready for restoration.
 pub struct RestoredWindow {
     pub tabs: Vec<Tab>,
@@ -156,8 +188,48 @@ pub struct RestoredWindow {
     pub frame: Option<(f64, f64, f64, f64)>,
 }
 
-pub fn load() -> Option<Session> {
-    let path = session_path();
+/// Print available session backups to stdout.
+pub fn list_session_backups() {
+    let main_path = session_path();
+    let dir = main_path.parent().unwrap();
+
+    print_session_entry(&main_path, "current");
+    for i in 1..=SESSION_HISTORY_COUNT {
+        let path = dir.join(format!("session.{}.json", i));
+        print_session_entry(&path, &format!("{:>7}", i));
+    }
+}
+
+fn print_session_entry(path: &std::path::Path, label: &str) {
+    let Ok(data) = std::fs::read_to_string(path) else { return };
+    let modified = std::fs::metadata(path).ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| {
+            let secs = d.as_secs();
+            format!("{}h{:02} UTC", (secs % 86400) / 3600, (secs % 3600) / 60)
+        })
+        .unwrap_or_default();
+    let summary = match serde_json::from_str::<Session>(&data) {
+        Ok(s) => {
+            let tabs: usize = s.windows.iter().map(|w| w.tabs.len()).sum();
+            format!("{} window(s), {} tab(s)", s.windows.len(), tabs)
+        }
+        Err(_) => "(invalid)".into(),
+    };
+    println!("  {}  {} {}", label, modified, summary);
+}
+
+pub fn load(backup: Option<usize>) -> Option<Session> {
+    let path = match backup {
+        Some(n) => {
+            let dir = session_path().parent().unwrap().to_path_buf();
+            let p = dir.join(format!("session.{}.json", n));
+            log::info!("Restoring session backup #{}", n);
+            p
+        }
+        None => session_path(),
+    };
     let data = std::fs::read_to_string(&path).ok()?;
 
     // Try v2 first, then fall back to v1

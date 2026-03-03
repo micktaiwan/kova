@@ -48,6 +48,18 @@ fn setup_logging() {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--list-sessions") {
+        session::list_session_backups();
+        return;
+    }
+
+    // --session N → restore session.N.json instead of session.json
+    let session_backup = args.windows(2)
+        .find(|w| w[0] == "--session")
+        .and_then(|w| w[1].parse::<usize>().ok());
+
     setup_logging();
 
     // Log panics to file before aborting
@@ -67,7 +79,7 @@ fn main() {
         unsafe { app.setApplicationIconImage(Some(&icon)) };
     }
 
-    let delegate = app::AppDelegate::new(mtm, config);
+    let delegate = app::AppDelegate::new(mtm, config, session_backup);
     let delegate_proto = ProtocolObject::from_ref(&*delegate);
     app.setDelegate(Some(delegate_proto));
 
