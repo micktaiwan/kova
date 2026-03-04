@@ -49,6 +49,7 @@ pub enum Action {
     SwitchTab(usize),
     Navigate(NavDirection),
     SwapPane(NavDirection),
+    ReparentPane(NavDirection),
     Resize(SplitAxis, f32),
 }
 
@@ -206,6 +207,11 @@ impl Keybindings {
         bind(&keys.swap_down, Action::SwapPane(NavDirection::Down));
         bind(&keys.swap_left, Action::SwapPane(NavDirection::Left));
         bind(&keys.swap_right, Action::SwapPane(NavDirection::Right));
+
+        bind(&keys.reparent_up, Action::ReparentPane(NavDirection::Up));
+        bind(&keys.reparent_down, Action::ReparentPane(NavDirection::Down));
+        bind(&keys.reparent_left, Action::ReparentPane(NavDirection::Left));
+        bind(&keys.reparent_right, Action::ReparentPane(NavDirection::Right));
 
         bind(&keys.resize_left, Action::Resize(SplitAxis::Horizontal, -0.05));
         bind(&keys.resize_right, Action::Resize(SplitAxis::Horizontal, 0.05));

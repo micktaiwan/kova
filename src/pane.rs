@@ -748,6 +748,99 @@ impl SplitTree {
         }
     }
 
+    /// Reparent pane: rotate split orientation or swap children (2-leaf case only).
+    /// Returns true if the tree was modified.
+    pub fn reparent_pane(&mut self, focused_id: PaneId, dir: NavDirection) -> bool {
+        match self {
+            SplitTree::Leaf(_) => false,
+            SplitTree::HSplit { left, right, .. } => {
+                if let (SplitTree::Leaf(_), SplitTree::Leaf(_)) = (left.as_ref(), right.as_ref()) {
+                    let focused_is_first = left.contains(focused_id);
+                    if !focused_is_first && !right.contains(focused_id) {
+                        return false;
+                    }
+                    self.reparent_2leaf(focused_is_first, dir)
+                } else {
+                    left.reparent_pane(focused_id, dir)
+                        || right.reparent_pane(focused_id, dir)
+                }
+            }
+            SplitTree::VSplit { top, bottom, .. } => {
+                if let (SplitTree::Leaf(_), SplitTree::Leaf(_)) = (top.as_ref(), bottom.as_ref()) {
+                    let focused_is_first = top.contains(focused_id);
+                    if !focused_is_first && !bottom.contains(focused_id) {
+                        return false;
+                    }
+                    self.reparent_2leaf(focused_is_first, dir)
+                } else {
+                    top.reparent_pane(focused_id, dir)
+                        || bottom.reparent_pane(focused_id, dir)
+                }
+            }
+        }
+    }
+
+    /// Core reparent logic for a split node with exactly 2 Leaf children.
+    /// `focused_is_first`: whether the focused pane is the first child (left/top).
+    /// Handles both HSplit and VSplit uniformly via axis abstraction.
+    fn reparent_2leaf(&mut self, focused_is_first: bool, dir: NavDirection) -> bool {
+        let is_hsplit = matches!(self, SplitTree::HSplit { .. });
+        let is_perpendicular = match dir {
+            NavDirection::Up | NavDirection::Down => is_hsplit,
+            NavDirection::Left | NavDirection::Right => !is_hsplit,
+        };
+
+        if is_perpendicular {
+            // Rotate orientation: HSplit↔VSplit
+            // Focused goes to the "target" position (e.g. Right→right, Down→bottom).
+            // "target is second" means the direction points to the second slot.
+            let target_is_second = matches!(dir,
+                NavDirection::Right | NavDirection::Down);
+            let swap = target_is_second == focused_is_first;
+            if swap {
+                self.swap_children();
+            }
+            self.flip_orientation();
+            true
+        } else {
+            // Aligned direction: swap if moving toward sibling, no-op if at border.
+            let moving_forward = matches!(dir,
+                NavDirection::Right | NavDirection::Down);
+            if moving_forward == focused_is_first {
+                self.swap_children();
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    /// Swap the two children of a split node.
+    fn swap_children(&mut self) {
+        match self {
+            SplitTree::HSplit { left, right, .. } => std::mem::swap(left, right),
+            SplitTree::VSplit { top, bottom, .. } => std::mem::swap(top, bottom),
+            SplitTree::Leaf(_) => {}
+        }
+    }
+
+    /// Flip HSplit↔VSplit in place, preserving children, ratio, and root flag.
+    fn flip_orientation(&mut self) {
+        // SAFETY: ptr::read + ptr::write avoids needing a valid intermediate value.
+        // The old value is consumed (not dropped) and a new value is written immediately.
+        let old = unsafe { std::ptr::read(self) };
+        let new = match old {
+            SplitTree::HSplit { left, right, ratio, root } => {
+                SplitTree::VSplit { top: left, bottom: right, ratio, root }
+            }
+            SplitTree::VSplit { top, bottom, ratio, root } => {
+                SplitTree::HSplit { left: top, right: bottom, ratio, root }
+            }
+            leaf => leaf,
+        };
+        unsafe { std::ptr::write(self, new) };
+    }
+
     /// Return a raw mutable pointer to the Pane inside a Leaf node.
     fn pane_leaf_mut(&mut self, id: PaneId) -> Option<*mut Pane> {
         match self {

@@ -315,6 +315,7 @@ define_class!(
                     Action::SwitchTab(idx) => self.do_switch_tab(*idx),
                     Action::Navigate(dir) => self.do_navigate(*dir),
                     Action::SwapPane(dir) => self.do_swap_pane(*dir),
+                    Action::ReparentPane(dir) => self.do_reparent_pane(*dir),
                     Action::Resize(axis, delta) => {
                         let mut tabs = self.ivars().tabs.borrow_mut();
                         let idx = self.ivars().active_tab.get();
@@ -1611,6 +1612,21 @@ impl KovaView {
                 drop(tabs);
                 self.resize_all_panes();
             }
+        }
+    }
+
+    /// Reparent the focused pane: rotate split orientation or swap (2-leaf case only).
+    fn do_reparent_pane(&self, dir: NavDirection) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        let tab = match tabs.get_mut(idx) {
+            Some(t) => t,
+            None => return,
+        };
+        let focused_id = tab.focused_pane;
+        if tab.tree.reparent_pane(focused_id, dir) {
+            drop(tabs);
+            self.resize_all_panes();
         }
     }
 
