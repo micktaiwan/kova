@@ -21,6 +21,7 @@
 | Cmd+Shift+E | Horizontal split at root (full-width row) |
 | Cmd+Option+Arrows | Navigate between panes (cross-tab if at edge) |
 | Cmd+Shift+Arrows | Swap focused pane with neighbor |
+| Cmd+Ctrl+Shift+Arrows | Rotate split orientation (2-pane splits only) |
 | Cmd+Ctrl+Arrows | Resize splits |
 
 ## Windows
