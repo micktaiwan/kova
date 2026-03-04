@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use vertex::Vertex;
 
-use crate::config::Config;
+use crate::config::{Config, KeysConfig};
 use crate::pane::PaneId;
 use crate::terminal::{CursorShape, FilterMatch, TerminalState};
 
@@ -86,6 +86,10 @@ pub struct Renderer {
     pub hovered_url_text: Option<String>,
     /// Pane ID of the hovered URL (to show URL only in that pane's status bar)
     pub hovered_url_pane_id: Option<PaneId>,
+    /// Cached help hint text for status bar (avoid per-frame allocation).
+    cached_help_hint: String,
+    /// Cached formatted shortcuts for help overlay (label, formatted key combo).
+    cached_help_shortcuts: Vec<(String, String)>,
 }
 
 impl Renderer {
@@ -167,6 +171,8 @@ impl Renderer {
             hovered_url: None,
             hovered_url_text: None,
             hovered_url_pane_id: None,
+            cached_help_hint: String::new(),
+            cached_help_shortcuts: Vec::new(),
         }
     }
 
@@ -183,6 +189,9 @@ impl Renderer {
         tab_bar_left_inset: f32,
         hidden_left: usize,
         hidden_right: usize,
+        show_help: bool,
+        help_hint_remaining: u32,
+        keys_config: Option<&KeysConfig>,
     ) {
         // Reset blink on cursor movement of focused pane
         if let Some((term, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _)| *focused) {
@@ -246,7 +255,7 @@ impl Renderer {
         // If only sync-deferred panes were dirty, still need to render the others
         let all_ready = !any_not_ready;
         let has_filter = filter.is_some();
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !has_filter {
+        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !has_filter && !show_help && help_hint_remaining == 0 {
             return;
         }
 
@@ -327,12 +336,19 @@ impl Renderer {
         }
 
         // Draw global status bar
-        self.build_global_status_bar_vertices(&mut all_vertices, viewport_w, viewport_h, hidden_left, hidden_right);
+        self.build_global_status_bar_vertices(&mut all_vertices, viewport_w, viewport_h, hidden_left, hidden_right, help_hint_remaining, keys_config);
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
             if let Some((_, vp, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _)| *focused) {
                 self.build_filter_overlay_vertices(&mut all_vertices, vp, filter_data);
+            }
+        }
+
+        // Draw help overlay (on top of everything)
+        if show_help {
+            if let Some(keys_config) = keys_config {
+                self.build_help_overlay_vertices(&mut all_vertices, viewport_w, viewport_h, keys_config);
             }
         }
 
@@ -716,6 +732,8 @@ impl Renderer {
         viewport_h: f32,
         hidden_left: usize,
         hidden_right: usize,
+        help_hint_remaining: u32,
+        keys_config: Option<&KeysConfig>,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
@@ -740,6 +758,26 @@ impl Renderer {
             let text_w = char_count * cell_w;
             let center_x = (viewport_w - text_w) / 2.0;
             self.render_status_text(vertices, &indicator, center_x, bar_y, viewport_w, scroll_fg, no_bg);
+        }
+
+        // Left: help hint with fade
+        if help_hint_remaining > 0 {
+            if self.cached_help_hint.is_empty() {
+                if let Some(kc) = keys_config {
+                    self.cached_help_hint = format_key_combo(&kc.toggle_help);
+                }
+            }
+            if !self.cached_help_hint.is_empty() {
+                let fade_frames = 30u32;
+                let alpha = if help_hint_remaining <= fade_frames {
+                    help_hint_remaining as f32 / fade_frames as f32
+                } else {
+                    1.0
+                };
+                let hint_fg = [0.6, 0.75, 1.0, alpha];
+                let hint_text = format!("{} for help", &self.cached_help_hint);
+                self.render_status_text(vertices, &hint_text, cell_w, bar_y, viewport_w, hint_fg, no_bg);
+            }
         }
 
         // Right: time HH:MM (cached, updated once per minute)
@@ -866,10 +904,10 @@ impl Renderer {
         }
     }
 
-    /// Render a string in the status bar at the given x position.
+    /// Render a string at the given position with optional scale factor.
     /// Returns the x position after the last rendered character.
     /// Stops rendering if x exceeds max_x.
-    fn render_status_text(
+    fn render_text(
         &mut self,
         vertices: &mut Vec<Vertex>,
         text: &str,
@@ -878,8 +916,9 @@ impl Renderer {
         max_x: f32,
         fg: [f32; 4],
         no_bg: [f32; 4],
+        scale: f32,
     ) -> f32 {
-        let cell_w = self.atlas.cell_width;
+        let cell_w = self.atlas.cell_width * scale;
         let atlas_w = self.atlas.atlas_width as f32;
         let atlas_h = self.atlas.atlas_height as f32;
 
@@ -898,8 +937,8 @@ impl Renderer {
             };
             if glyph.width == 0 || glyph.height == 0 { x += cell_w; continue; }
 
-            let gw = glyph.width as f32;
-            let gh = glyph.height as f32;
+            let gw = glyph.width as f32 * scale;
+            let gh = glyph.height as f32 * scale;
             let tx = glyph.x as f32 / atlas_w;
             let ty = glyph.y as f32 / atlas_h;
             let tw = glyph.width as f32 / atlas_w;
@@ -916,6 +955,19 @@ impl Renderer {
         x
     }
 
+    fn render_status_text(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        text: &str,
+        start_x: f32,
+        y: f32,
+        max_x: f32,
+        fg: [f32; 4],
+        no_bg: [f32; 4],
+    ) -> f32 {
+        self.render_text(vertices, text, start_x, y, max_x, fg, no_bg, 1.0)
+    }
+
     fn build_filter_overlay_vertices(
         &mut self,
         vertices: &mut Vec<Vertex>,
@@ -926,15 +978,7 @@ impl Renderer {
         let cell_h = self.atlas.cell_height;
 
         // 1. Semi-transparent dark overlay covering the entire pane
-        let overlay_bg = [0.0, 0.0, 0.0, 0.85];
-        let no_tex = [0.0_f32, 0.0];
-        let white = [1.0_f32, 1.0, 1.0, 0.0];
-        vertices.push(Vertex { position: [vp.x, vp.y], tex_coords: no_tex, color: white, bg_color: overlay_bg });
-        vertices.push(Vertex { position: [vp.x + vp.width, vp.y], tex_coords: no_tex, color: white, bg_color: overlay_bg });
-        vertices.push(Vertex { position: [vp.x, vp.y + vp.height], tex_coords: no_tex, color: white, bg_color: overlay_bg });
-        vertices.push(Vertex { position: [vp.x + vp.width, vp.y], tex_coords: no_tex, color: white, bg_color: overlay_bg });
-        vertices.push(Vertex { position: [vp.x + vp.width, vp.y + vp.height], tex_coords: no_tex, color: white, bg_color: overlay_bg });
-        vertices.push(Vertex { position: [vp.x, vp.y + vp.height], tex_coords: no_tex, color: white, bg_color: overlay_bg });
+        Self::push_bg_quad_alpha(vertices, vp.x, vp.y, vp.width, vp.height, [0.0, 0.0, 0.0], 0.85);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
 
@@ -1058,6 +1102,118 @@ impl Renderer {
         }
     }
 
+    fn build_help_overlay_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        viewport_w: f32,
+        viewport_h: f32,
+        keys_config: &KeysConfig,
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+
+        // Semi-transparent dark overlay
+        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let title_fg = [1.0, 0.85, 0.3, 1.0]; // accent yellow
+        let label_fg = [0.7, 0.7, 0.75, 1.0];
+        let key_fg = [1.0, 1.0, 1.0, 1.0];
+
+        let title_scale = 1.8_f32;
+        let body_scale = 1.3_f32;
+        let scaled_cell_w = cell_w * body_scale;
+        let scaled_cell_h = cell_h * body_scale;
+
+        // Title centered
+        let title = "Keyboard Shortcuts";
+        let title_chars = title.chars().count() as f32;
+        let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
+        let mut y = cell_h * 3.0;
+        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        y += cell_h * title_scale * 2.0;
+
+        // Subtitle
+        if self.cached_help_hint.is_empty() {
+            self.cached_help_hint = format_key_combo(&keys_config.toggle_help);
+        }
+        let subtitle = format!("Press {} or Esc to close", &self.cached_help_hint);
+        let sub_chars = subtitle.chars().count() as f32;
+        let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
+        self.render_text(vertices, &subtitle, sub_x, y, viewport_w, label_fg, no_bg, body_scale);
+        drop(subtitle);
+        y += scaled_cell_h * 2.5;
+
+        // Build shortcut list (cached to avoid per-frame allocation)
+        if self.cached_help_shortcuts.is_empty() {
+            let raw: Vec<(&str, &str)> = vec![
+                ("New Tab", &keys_config.new_tab),
+                ("Close Pane/Tab", &keys_config.close_pane_or_tab),
+                ("Vertical Split", &keys_config.vsplit),
+                ("Horizontal Split", &keys_config.hsplit),
+                ("V Split (Root)", &keys_config.vsplit_root),
+                ("H Split (Root)", &keys_config.hsplit_root),
+                ("New Window", &keys_config.new_window),
+                ("Close Window", &keys_config.close_window),
+                ("Copy", &keys_config.copy),
+                ("Paste", &keys_config.paste),
+                ("Find", &keys_config.toggle_filter),
+                ("Clear Scrollback", &keys_config.clear_scrollback),
+                ("Previous Tab", &keys_config.prev_tab),
+                ("Next Tab", &keys_config.next_tab),
+                ("Rename Tab", &keys_config.rename_tab),
+                ("Rename Pane", &keys_config.rename_pane),
+                ("Detach Tab", &keys_config.detach_tab),
+                ("Merge Window", &keys_config.merge_window),
+                ("Navigate Up", &keys_config.navigate_up),
+                ("Navigate Down", &keys_config.navigate_down),
+                ("Navigate Left", &keys_config.navigate_left),
+                ("Navigate Right", &keys_config.navigate_right),
+                ("Swap Pane Up", &keys_config.swap_up),
+                ("Swap Pane Down", &keys_config.swap_down),
+                ("Swap Pane Left", &keys_config.swap_left),
+                ("Swap Pane Right", &keys_config.swap_right),
+                ("Resize Left", &keys_config.resize_left),
+                ("Resize Right", &keys_config.resize_right),
+                ("Resize Up", &keys_config.resize_up),
+                ("Resize Down", &keys_config.resize_down),
+                ("Help", &keys_config.toggle_help),
+            ];
+            self.cached_help_shortcuts = raw.into_iter()
+                .map(|(label, key)| (label.to_string(), format_key_combo(key)))
+                .collect();
+        }
+        // Take shortcuts out of self to avoid borrow conflict with render_text
+        let shortcuts = std::mem::take(&mut self.cached_help_shortcuts);
+
+        // Render in 2 columns
+        let col_width = viewport_w / 2.0;
+        let label_offset = scaled_cell_w * 2.0;
+        let max_label_len = shortcuts.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as f32;
+        let key_offset = label_offset + (max_label_len + 2.0) * scaled_cell_w;
+
+        let rows_per_col = (shortcuts.len() + 1) / 2;
+        for (i, (label, formatted)) in shortcuts.iter().enumerate() {
+            let col = if i < rows_per_col { 0 } else { 1 };
+            let row = if i < rows_per_col { i } else { i - rows_per_col };
+            let base_x = col as f32 * col_width;
+            let row_y = y + row as f32 * (scaled_cell_h * 1.4);
+
+            if row_y + scaled_cell_h > viewport_h - cell_h {
+                break; // Don't overflow past global status bar
+            }
+
+            // Label
+            self.render_text(vertices, label, base_x + label_offset, row_y, base_x + key_offset - scaled_cell_w, label_fg, no_bg, body_scale);
+
+            // Key combo
+            self.render_text(vertices, formatted, base_x + key_offset, row_y, base_x + col_width - scaled_cell_w, key_fg, no_bg, body_scale);
+        }
+
+        // Put shortcuts back
+        self.cached_help_shortcuts = shortcuts;
+    }
+
     pub fn cell_size(&self) -> (f32, f32) {
         (self.atlas.cell_width, self.atlas.cell_height)
     }
@@ -1074,7 +1230,19 @@ impl Renderer {
         h: f32,
         bg: [f32; 3],
     ) {
-        let bg4 = [bg[0], bg[1], bg[2], 1.0];
+        Self::push_bg_quad_alpha(vertices, x, y, w, h, bg, 1.0);
+    }
+
+    fn push_bg_quad_alpha(
+        vertices: &mut Vec<Vertex>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        bg: [f32; 3],
+        alpha: f32,
+    ) {
+        let bg4 = [bg[0], bg[1], bg[2], alpha];
         let no_tex = [0.0, 0.0];
         let white = [1.0, 1.0, 1.0, 0.0];
 
@@ -1085,4 +1253,38 @@ impl Renderer {
         vertices.push(Vertex { position: [x + w, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
         vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
     }
+}
+
+/// Format a key combo string like "cmd+shift+d" into "⌘⇧D" for display.
+fn format_key_combo(s: &str) -> String {
+    let mut result = String::new();
+    let parts: Vec<&str> = s.split('+').collect();
+    for (i, part) in parts.iter().enumerate() {
+        let trimmed = part.trim();
+        if i < parts.len() - 1 {
+            // Modifier
+            match trimmed.to_ascii_lowercase().as_str() {
+                "cmd" | "command" => result.push('\u{2318}'),
+                "ctrl" | "control" => result.push('\u{2303}'),
+                "option" | "alt" | "opt" => result.push('\u{2325}'),
+                "shift" => result.push('\u{21E7}'),
+                _ => { result.push_str(trimmed); }
+            }
+        } else {
+            // Key
+            match trimmed.to_ascii_lowercase().as_str() {
+                "up" => result.push('\u{2191}'),
+                "down" => result.push('\u{2193}'),
+                "left" => result.push('\u{2190}'),
+                "right" => result.push('\u{2192}'),
+                "backspace" | "delete" => result.push('\u{232B}'),
+                "enter" | "return" => result.push('\u{21A9}'),
+                "/" => result.push('/'),
+                "[" => result.push('['),
+                "]" => result.push(']'),
+                s => result.push_str(&s.to_ascii_uppercase()),
+            }
+        }
+    }
+    result
 }

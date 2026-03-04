@@ -72,6 +72,10 @@ pub struct KovaViewIvars {
     git_poll_counter: Cell<u32>,
     /// Git branch poll interval in ticks (fps * 2 ≈ every 2 seconds).
     git_poll_interval: Cell<u32>,
+    /// Whether the help overlay is visible.
+    show_help: Cell<bool>,
+    /// Countdown frames for "⌘? for help" hint in global status bar (fps * 3).
+    help_hint_frames: Cell<u32>,
 }
 
 struct FilterState {
@@ -225,6 +229,11 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            // Block all keys when help overlay is shown (handled in performKeyEquivalent)
+            if self.ivars().show_help.get() {
+                return;
+            }
+
             // If rename tab is active, route keys to rename
             if self.ivars().rename_tab.borrow().is_some() {
                 self.handle_rename_tab_key(event);
@@ -284,9 +293,30 @@ define_class!(
                 None => return objc2::runtime::Bool::NO,
             };
 
+            // When help overlay is shown, only allow ToggleHelp and Escape to close it
+            if self.ivars().show_help.get() {
+                if matches!(keybindings.window_map.get(&combo), Some(Action::ToggleHelp)) {
+                    self.ivars().show_help.set(false);
+                    self.mark_dirty();
+                    return objc2::runtime::Bool::YES;
+                }
+                // Escape also closes help (keyCode 0x35)
+                if event.keyCode() == 0x35 {
+                    self.ivars().show_help.set(false);
+                    self.mark_dirty();
+                    return objc2::runtime::Bool::YES;
+                }
+                // Block all other keys
+                return objc2::runtime::Bool::YES;
+            }
+
             if let Some(action) = keybindings.window_map.get(&combo) {
                 log::debug!("performKeyEquivalent: combo={:?} action={:?}", combo, action);
                 match action {
+                    Action::ToggleHelp => {
+                        self.ivars().show_help.set(true);
+                        self.mark_dirty();
+                    }
                     Action::ToggleFilter => self.toggle_filter(),
                     Action::ClearScrollback => {
                         if let Some(pane) = self.focused_pane() {
@@ -744,6 +774,8 @@ impl KovaView {
             git_poll_counter: Cell::new(0),
             git_poll_interval: Cell::new(120), // updated in setup_metal
             keybindings: OnceCell::new(),
+            show_help: Cell::new(false),
+            help_hint_frames: Cell::new(180), // updated in setup_metal
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -1994,6 +2026,7 @@ impl KovaView {
         self.ivars().config.set(config.clone()).ok();
         self.ivars().keybindings.set(Keybindings::from_config(&config.keys)).ok();
         self.ivars().git_poll_interval.set(config.terminal.fps * 2);
+        self.ivars().help_hint_frames.set(config.terminal.fps * 3);
         *self.ivars().tabs.borrow_mut() = tabs;
         self.ivars().active_tab.set(active_tab);
     }
@@ -2260,6 +2293,13 @@ impl KovaView {
             }
         };
 
+        // Decrement help hint countdown
+        let help_hint_remaining = ivars.help_hint_frames.get();
+        if help_hint_remaining > 0 {
+            ivars.help_hint_frames.set(help_hint_remaining - 1);
+        }
+        let show_help = ivars.show_help.get();
+
         // Build filter render data if active
         let filter_data = {
             let filter = ivars.filter.borrow();
@@ -2307,7 +2347,8 @@ impl KovaView {
                 hidden_right += 1;
             }
         }
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right);
+        let keys_config = ivars.config.get().map(|c| &c.keys);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, show_help, help_hint_remaining, keys_config);
         true
     }
 

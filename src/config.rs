@@ -261,6 +261,7 @@ pub struct KeysConfig {
     pub resize_right: String,
     pub resize_up: String,
     pub resize_down: String,
+    pub toggle_help: String,
     pub terminal: TerminalKeysConfig,
 }
 
@@ -311,6 +312,7 @@ impl Default for KeysConfig {
             resize_right: "cmd+ctrl+right".into(),
             resize_up: "cmd+ctrl+up".into(),
             resize_down: "cmd+ctrl+down".into(),
+            toggle_help: "cmd+shift+/".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }
