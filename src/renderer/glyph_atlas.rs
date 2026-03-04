@@ -46,7 +46,18 @@ pub struct GlyphAtlas {
 impl GlyphAtlas {
     pub fn new(device: &ProtocolObject<dyn MTLDevice>, font_size: f64, font_name: &str) -> Self {
         let cf_font_name = CFString::from_str(font_name);
-        let font = unsafe { CTFont::with_name(&cf_font_name, font_size, ptr::null()) };
+        let mut font = unsafe { CTFont::with_name(&cf_font_name, font_size, ptr::null()) };
+
+        // Verify CoreText returned the requested font (it silently substitutes if not found)
+        let actual_name = unsafe { font.display_name() }.to_string();
+        if !actual_name.to_lowercase().contains(&font_name.to_lowercase()) {
+            log::warn!(
+                "Font '{}' not found (CoreText returned '{}'), falling back to Menlo",
+                font_name, actual_name
+            );
+            let fallback_name = CFString::from_str("Menlo");
+            font = unsafe { CTFont::with_name(&fallback_name, font_size, ptr::null()) };
+        }
 
         let ascent = unsafe { font.ascent() };
         let descent = unsafe { font.descent() };
