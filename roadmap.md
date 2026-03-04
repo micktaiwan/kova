@@ -114,6 +114,8 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] **Trim trailing spaces** : tronquer les cellules vides en fin de ligne.
 - [ ] **Run-length encoding** : compresser les séquences de même couleur.
 - [ ] Metriques perf exposées (frame time, mémoire, allocations) — utile pour diagnostiquer sans avoir à lancer vmmap/heap manuellement
+- [ ] Double-clic sur un mot → sélectionne le mot entier
+- [ ] Cmd+V dans le champ de recherche (Cmd+F) — le paste ne fonctionne pas actuellement dans l'overlay de recherche
 
 ## V3 — Avancé
 
