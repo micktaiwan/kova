@@ -61,6 +61,8 @@ pub struct Renderer {
     blink_counter: u32,
     last_cursor_epoch: u32,
     bg_color: [f32; 3],
+    /// Compact version of bg_color for comparing with Cell.bg ([u8; 3]).
+    bg_color_u8: [u8; 3],
     cursor_color: [f32; 3],
     font_size: f64,
     font_name: String,
@@ -149,6 +151,7 @@ impl Renderer {
             blink_counter: 0,
             last_cursor_epoch: 0,
             bg_color: config.colors.background,
+            bg_color_u8: crate::terminal::color_to_u8(config.colors.background),
             cursor_color: config.colors.cursor,
             font_size: config.font.size,
             font_name: config.font.family.clone(),
@@ -564,8 +567,8 @@ impl Renderer {
                 let x = (ox + col_idx as f32 * cell_w).round();
 
                 // Cell background
-                if col_idx < line.len() && line[col_idx].bg != self.bg_color {
-                    Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, line[col_idx].bg);
+                if col_idx < line.len() && line[col_idx].bg != self.bg_color_u8 {
+                    Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, crate::terminal::color_to_f32(line[col_idx].bg));
                 }
 
                 // Selection highlight (rendered on top of cell bg, under glyphs)
@@ -621,7 +624,8 @@ impl Renderer {
                 let th = glyph.height as f32 / atlas_h;
 
                 let alpha = if glyph.is_color { 2.0 } else { 1.0 };
-                let fg = [cell.fg[0], cell.fg[1], cell.fg[2], alpha];
+                let fg_f = crate::terminal::color_to_f32(cell.fg);
+                let fg = [fg_f[0], fg_f[1], fg_f[2], alpha];
                 let no_bg = [0.0, 0.0, 0.0, 0.0];
 
                 vertices.push(Vertex { position: [gx, gy], tex_coords: [tx, ty], color: fg, bg_color: no_bg });

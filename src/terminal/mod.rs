@@ -17,8 +17,22 @@ pub enum CursorShape {
     Bar,
 }
 
-pub const DEFAULT_FG: [f32; 3] = [1.0, 1.0, 1.0];
-pub const DEFAULT_BG: [f32; 3] = [0.1, 0.1, 0.12];
+pub const DEFAULT_FG: [u8; 3] = [255, 255, 255];
+pub const DEFAULT_BG: [u8; 3] = [26, 26, 31];
+
+/// Convert [u8; 3] color to [f32; 3] for GPU rendering.
+/// Only called at render time — cells store compact [u8; 3] to save RAM.
+/// (Cell is 48→32 bytes, saving ~300MB+ with 10k scrollback × multiple panes)
+#[inline]
+pub fn color_to_f32(c: [u8; 3]) -> [f32; 3] {
+    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
+}
+
+/// Convert [f32; 3] color (from config/renderer) to compact [u8; 3] for cell storage.
+#[inline]
+pub fn color_to_u8(c: [f32; 3]) -> [u8; 3] {
+    [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8]
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridPos {
@@ -33,14 +47,19 @@ pub struct Selection {
     pub end: GridPos,
 }
 
+/// Terminal cell — kept compact to minimize scrollback RAM usage.
+/// Each field is chosen for size: [u8; 3] colors instead of [f32; 3] saves
+/// 18 bytes/cell (48→32 bytes), which is ~300MB+ across 10k scrollback × multiple panes.
+/// Colors are converted to [f32; 3] only at render time via color_to_f32().
+/// DO NOT change fg/bg back to [f32; 3] without measuring RAM impact.
 #[derive(Clone, Debug)]
 pub struct Cell {
     pub c: char,
     /// Multi-codepoint grapheme cluster (e.g. flags, ZWJ sequences, skin tones).
     /// None for single-codepoint characters (the common case).
     pub cluster: Option<Box<str>>,
-    pub fg: [f32; 3],
-    pub bg: [f32; 3],
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
 }
 
 impl Cell {
@@ -87,12 +106,12 @@ pub struct TerminalState {
     scroll_offset: i32,
     user_scrolled: bool,
     // Config colors used as defaults
-    pub default_fg: [f32; 3],
-    pub default_bg: [f32; 3],
+    pub default_fg: [u8; 3],
+    pub default_bg: [u8; 3],
     blank: Cell,
     // SGR state
-    current_fg: [f32; 3],
-    current_bg: [f32; 3],
+    current_fg: [u8; 3],
+    current_bg: [u8; 3],
     reversed: bool,
     bold: bool,
     dim: bool,
@@ -152,7 +171,7 @@ pub struct FilterMatch {
 }
 
 impl TerminalState {
-    pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [f32; 3], bg: [f32; 3]) -> Self {
+    pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [u8; 3], bg: [u8; 3]) -> Self {
         let blank = Cell { c: ' ', cluster: None, fg, bg };
         let grid = (0..rows as usize).map(|_| Row::new(cols as usize, &blank)).collect();
         TerminalState {
@@ -281,13 +300,13 @@ impl TerminalState {
             }
             let mut fg = self.current_fg;
             if self.dim {
-                fg = [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5];
+                fg = [fg[0] / 2, fg[1] / 2, fg[2] / 2];
             }
             if self.bold {
                 fg = [
-                    (fg[0] * 1.3).min(1.0),
-                    (fg[1] * 1.3).min(1.0),
-                    (fg[2] * 1.3).min(1.0),
+                    (fg[0] as u16 * 13 / 10).min(255) as u8,
+                    (fg[1] as u16 * 13 / 10).min(255) as u8,
+                    (fg[2] as u16 * 13 / 10).min(255) as u8,
                 ];
             }
             self.grid[row].cells[col] = Cell {
@@ -359,13 +378,13 @@ impl TerminalState {
         if row < self.grid.len() && col < self.grid[row].cells.len() {
             let mut fg = self.current_fg;
             if self.dim {
-                fg = [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5];
+                fg = [fg[0] / 2, fg[1] / 2, fg[2] / 2];
             }
             if self.bold {
                 fg = [
-                    (fg[0] * 1.3).min(1.0),
-                    (fg[1] * 1.3).min(1.0),
-                    (fg[2] * 1.3).min(1.0),
+                    (fg[0] as u16 * 13 / 10).min(255) as u8,
+                    (fg[1] as u16 * 13 / 10).min(255) as u8,
+                    (fg[2] as u16 * 13 / 10).min(255) as u8,
                 ];
             }
 
@@ -503,9 +522,9 @@ impl TerminalState {
                         i += 2;
                     } else if i + 4 < params.len() && params[i + 1] == 2 {
                         self.current_fg = [
-                            params[i + 2] as f32 / 255.0,
-                            params[i + 3] as f32 / 255.0,
-                            params[i + 4] as f32 / 255.0,
+                            params[i + 2] as u8,
+                            params[i + 3] as u8,
+                            params[i + 4] as u8,
                         ];
                         i += 4;
                     }
@@ -520,9 +539,9 @@ impl TerminalState {
                         i += 2;
                     } else if i + 4 < params.len() && params[i + 1] == 2 {
                         self.current_bg = [
-                            params[i + 2] as f32 / 255.0,
-                            params[i + 3] as f32 / 255.0,
-                            params[i + 4] as f32 / 255.0,
+                            params[i + 2] as u8,
+                            params[i + 3] as u8,
+                            params[i + 4] as u8,
                         ];
                         i += 4;
                     }
