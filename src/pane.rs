@@ -238,8 +238,8 @@ impl Pane {
             cols,
             rows,
             config.terminal.scrollback,
-            config.colors.foreground,
-            config.colors.background,
+            crate::terminal::color_to_u8(config.colors.foreground),
+            crate::terminal::color_to_u8(config.colors.background),
         )));
         let shell_exited = Arc::new(AtomicBool::new(false));
         let shell_ready = Arc::new(AtomicBool::new(false));

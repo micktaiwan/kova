@@ -483,28 +483,28 @@ impl AnsiColor {
         }
     }
 
-    pub fn to_rgb(&self) -> [f32; 3] {
+    pub fn to_rgb(&self) -> [u8; 3] {
         match self {
-            Self::Black => [0.0, 0.0, 0.0],
-            Self::Red => [0.8, 0.2, 0.2],
-            Self::Green => [0.2, 0.8, 0.2],
-            Self::Yellow => [0.8, 0.8, 0.2],
-            Self::Blue => [0.3, 0.3, 0.9],
-            Self::Magenta => [0.8, 0.2, 0.8],
-            Self::Cyan => [0.2, 0.8, 0.8],
-            Self::White => [0.75, 0.75, 0.75],
-            Self::BrightBlack => [0.4, 0.4, 0.4],
-            Self::BrightRed => [1.0, 0.3, 0.3],
-            Self::BrightGreen => [0.3, 1.0, 0.3],
-            Self::BrightYellow => [1.0, 1.0, 0.3],
-            Self::BrightBlue => [0.5, 0.5, 1.0],
-            Self::BrightMagenta => [1.0, 0.3, 1.0],
-            Self::BrightCyan => [0.3, 1.0, 1.0],
-            Self::BrightWhite => [1.0, 1.0, 1.0],
+            Self::Black => [0, 0, 0],
+            Self::Red => [204, 51, 51],
+            Self::Green => [51, 204, 51],
+            Self::Yellow => [204, 204, 51],
+            Self::Blue => [77, 77, 230],
+            Self::Magenta => [204, 51, 204],
+            Self::Cyan => [51, 204, 204],
+            Self::White => [191, 191, 191],
+            Self::BrightBlack => [102, 102, 102],
+            Self::BrightRed => [255, 77, 77],
+            Self::BrightGreen => [77, 255, 77],
+            Self::BrightYellow => [255, 255, 77],
+            Self::BrightBlue => [128, 128, 255],
+            Self::BrightMagenta => [255, 77, 255],
+            Self::BrightCyan => [77, 255, 255],
+            Self::BrightWhite => [255, 255, 255],
         }
     }
 
-    pub fn from_256(idx: u8) -> [f32; 3] {
+    pub fn from_256(idx: u8) -> [u8; 3] {
         match idx {
             0..=15 => Self::from_index(idx).to_rgb(),
             16..=231 => {
@@ -513,13 +513,13 @@ impl AnsiColor {
                 let g = (idx / 6) % 6;
                 let b = idx % 6;
                 [
-                    if r == 0 { 0.0 } else { (55 + 40 * r) as f32 / 255.0 },
-                    if g == 0 { 0.0 } else { (55 + 40 * g) as f32 / 255.0 },
-                    if b == 0 { 0.0 } else { (55 + 40 * b) as f32 / 255.0 },
+                    if r == 0 { 0 } else { 55 + 40 * r },
+                    if g == 0 { 0 } else { 55 + 40 * g },
+                    if b == 0 { 0 } else { 55 + 40 * b },
                 ]
             }
             232..=255 => {
-                let v = (8 + 10 * (idx - 232)) as f32 / 255.0;
+                let v = 8 + 10 * (idx - 232);
                 [v, v, v]
             }
         }
