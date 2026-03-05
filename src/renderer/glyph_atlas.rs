@@ -801,4 +801,14 @@ impl GlyphAtlas {
         self.texture = new_texture;
         log::info!("Atlas grew to {}x{}", self.atlas_width, self.atlas_height);
     }
+
+    /// Estimated heap bytes used by the atlas CPU buffer.
+    pub fn mem_bytes(&self) -> usize {
+        self.atlas_buf.capacity()
+    }
+
+    /// Atlas texture dimensions.
+    pub fn texture_size(&self) -> (u32, u32) {
+        (self.atlas_width, self.atlas_height)
+    }
 }

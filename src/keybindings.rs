@@ -52,6 +52,7 @@ pub enum Action {
     ReparentPane(NavDirection),
     Resize(SplitAxis, f32),
     ToggleHelp,
+    MemReport,
 }
 
 /// Terminal-level actions dispatched from handle_key_event.
@@ -219,6 +220,9 @@ impl Keybindings {
         bind(&keys.resize_up, Action::Resize(SplitAxis::Vertical, -0.05));
         bind(&keys.resize_down, Action::Resize(SplitAxis::Vertical, 0.05));
         bind(&keys.toggle_help, Action::ToggleHelp);
+
+        // Hard-coded debug binding (not user-configurable)
+        window_map.insert(parse_key_combo("cmd+shift+i"), Action::MemReport);
 
         let term = &keys.terminal;
         let mut tbind = |s: &str, action: TerminalAction| {
