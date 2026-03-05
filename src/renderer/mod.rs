@@ -45,7 +45,7 @@ pub struct PaneViewport {
     pub height: f32,
 }
 
-const MAX_VERTEX_BYTES: usize = 16 * 1024 * 1024; // 16MB
+const MAX_VERTEX_BYTES: usize = 8 * 1024 * 1024; // 8MB
 
 pub struct Renderer {
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -1158,6 +1158,15 @@ impl Renderer {
             let ptr = self.atlas_size_buf.contents().as_ptr() as *mut [f32; 2];
             *ptr = atlas_size;
         }
+    }
+
+    /// Memory report for the renderer (atlas + vertex buffers).
+    pub fn mem_report(&self) -> (usize, (u32, u32), usize, usize) {
+        let atlas_bytes = self.atlas.mem_bytes();
+        let atlas_dims = self.atlas.texture_size();
+        let glyph_count = self.atlas.glyphs.len() + self.atlas.cluster_glyphs.len();
+        let vertex_bytes = MAX_VERTEX_BYTES * 2; // double-buffered
+        (atlas_bytes, atlas_dims, glyph_count, vertex_bytes)
     }
 
     fn build_help_overlay_vertices(
