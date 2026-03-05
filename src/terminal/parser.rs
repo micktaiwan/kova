@@ -145,6 +145,23 @@ impl Perform for VteHandler {
                         term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
+                b"133" => {
+                    // Shell integration: command execution lifecycle (FinalTerm / OSC 133)
+                    let sub = params[1];
+                    match sub.first() {
+                        Some(b'C') => {
+                            // Command started — clear any previous completion flag
+                            self.term().command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Some(b'D') => {
+                            // Command finished — mark pane as completed
+                            log::debug!("OSC 133;D command completed");
+                            self.term().command_completed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.term().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
                 b"7777" => {
                     // Shell integration: preexec hook sends the command being executed
                     let command = String::from_utf8_lossy(params[1]).into_owned();

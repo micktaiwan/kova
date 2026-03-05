@@ -74,6 +74,8 @@ pub struct Tab {
     pub color: Option<usize>,
     /// Bell received on a non-focused tab — show attention indicator.
     pub has_bell: bool,
+    /// Command completed in a non-focused pane/tab — show completion indicator.
+    pub has_completion: bool,
     /// Horizontal scroll offset in pixels (0 = no scroll).
     pub scroll_offset_x: f32,
     /// Manual override of virtual width (0.0 = auto from min_split_width).
@@ -92,6 +94,7 @@ impl Tab {
             custom_title: None,
             color: None,
             has_bell: false,
+            has_completion: false,
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
         })
@@ -108,6 +111,7 @@ impl Tab {
             custom_title: None,
             color: None,
             has_bell: false,
+            has_completion: false,
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
         })
@@ -187,6 +191,30 @@ impl Tab {
     /// Clear the bell/attention flag (call when switching to this tab).
     pub fn clear_bell(&mut self) {
         self.has_bell = false;
+    }
+
+    /// Check if any non-focused pane has a completed command. Sets tab-level flag.
+    pub fn check_completion(&mut self) -> bool {
+        let focused = self.focused_pane;
+        let mut any = false;
+        self.tree.for_each_pane(&mut |pane| {
+            if pane.id != focused
+                && pane.terminal.read().command_completed.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                any = true;
+            }
+        });
+        self.has_completion = any;
+        self.has_completion
+    }
+
+    /// Clear the completion flag (call when switching to this tab).
+    pub fn clear_completion(&mut self) {
+        self.has_completion = false;
+        // Also clear all pane-level flags
+        self.tree.for_each_pane(&mut |pane| {
+            pane.terminal.read().command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 }
 
