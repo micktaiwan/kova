@@ -268,8 +268,9 @@ impl Renderer {
         let viewport_w = drawable_size.width as f32;
         let viewport_h = drawable_size.height as f32;
 
-        // Build vertices for all panes
-        let mut all_vertices = Vec::new();
+        // Build vertices for each pane with its own scissor rect for clipping
+        let mut pane_draws: Vec<(Vec<Vertex>, MTLScissorRect)> = Vec::new();
+        let mut overlay_vertices = Vec::new();
         let (cell_w, cell_h) = self.cell_size();
         let saved_hover_text = self.hovered_url_text.clone();
         let saved_hover_pos = self.hovered_url;
@@ -286,15 +287,16 @@ impl Renderer {
             if *is_focused && filter.is_some() {
                 continue;
             }
+            let mut pane_verts = Vec::new();
             if *shell_ready {
                 let t = term.read();
                 // Only blink cursor on focused pane
                 let show_blink = if *is_focused { blink_on } else { true };
                 let mut verts = self.build_vertices(&t, vp, show_blink, *is_focused, custom_title.as_deref());
-                all_vertices.append(&mut verts);
+                pane_verts.append(&mut verts);
             } else {
                 let mut verts = self.build_loading_vertices(vp);
-                all_vertices.append(&mut verts);
+                pane_verts.append(&mut verts);
             }
             // Command completion indicator: green dot on non-focused panes
             if *has_completion && !is_focused {
@@ -302,11 +304,22 @@ impl Renderer {
                 let dot_y = vp.y + cell_h * 0.5;
                 let green = [0.2, 0.8, 0.3, 1.0];
                 let no_bg = [0.0_f32, 0.0, 0.0, 0.0];
-                self.render_status_text(&mut all_vertices, "●", dot_x, dot_y, vp.x + vp.width, green, no_bg);
+                self.render_status_text(&mut pane_verts, "●", dot_x, dot_y, vp.x + vp.width, green, no_bg);
+            }
+            // Compute scissor rect clamped to drawable bounds
+            let sx = (vp.x.max(0.0)) as usize;
+            let sy = (vp.y.max(0.0)) as usize;
+            let sw = ((vp.width).min(viewport_w - sx as f32).max(0.0)) as usize;
+            let sh = ((vp.height).min(viewport_h - sy as f32).max(0.0)) as usize;
+            if !pane_verts.is_empty() && sw > 0 && sh > 0 {
+                pane_draws.push((pane_verts, MTLScissorRect { x: sx, y: sy, width: sw, height: sh }));
             }
         }
         self.hovered_url_text = saved_hover_text;
         self.hovered_url = saved_hover_pos;
+
+        // Build overlay vertices (separators, tab bar, status bar, filter, help)
+        // These are drawn with a global scissor rect (no per-pane clipping needed)
 
         // Draw split separators (1px lines)
         if !separators.is_empty() {
@@ -319,46 +332,68 @@ impl Renderer {
                     // Vertical line
                     let lx = x1 - thickness * 0.5;
                     let rx = x1 + thickness * 0.5;
-                    all_vertices.push(Vertex { position: [lx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    all_vertices.push(Vertex { position: [rx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    all_vertices.push(Vertex { position: [lx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    all_vertices.push(Vertex { position: [rx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    all_vertices.push(Vertex { position: [rx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    all_vertices.push(Vertex { position: [lx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [lx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [rx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [lx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [rx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [rx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [lx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
                 } else {
                     // Horizontal line
                     let ty = y1 - thickness * 0.5;
                     let by = y1 + thickness * 0.5;
-                    all_vertices.push(Vertex { position: [x1, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    all_vertices.push(Vertex { position: [x2, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    all_vertices.push(Vertex { position: [x1, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    all_vertices.push(Vertex { position: [x2, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    all_vertices.push(Vertex { position: [x2, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    all_vertices.push(Vertex { position: [x1, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [x1, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [x2, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [x1, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [x2, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [x2, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex { position: [x1, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
                 }
             }
         }
 
         // Draw tab bar
         if tab_titles.len() > 0 {
-            self.build_tab_bar_vertices(&mut all_vertices, viewport_w, tab_titles, tab_bar_left_inset);
+            self.build_tab_bar_vertices(&mut overlay_vertices, viewport_w, tab_titles, tab_bar_left_inset);
         }
 
         // Draw global status bar
-        self.build_global_status_bar_vertices(&mut all_vertices, viewport_w, viewport_h, hidden_left, hidden_right, help_hint_remaining, keys_config);
+        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, help_hint_remaining, keys_config);
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
             if let Some((_, vp, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _, _)| *focused) {
-                self.build_filter_overlay_vertices(&mut all_vertices, vp, filter_data);
+                self.build_filter_overlay_vertices(&mut overlay_vertices, vp, filter_data);
             }
         }
 
         // Draw help overlay (on top of everything)
         if show_help {
             if let Some(keys_config) = keys_config {
-                self.build_help_overlay_vertices(&mut all_vertices, viewport_w, viewport_h, keys_config);
+                self.build_help_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, keys_config);
             }
+        }
+
+        // Flatten all pane vertices + overlay into a single buffer, tracking draw ranges
+        let mut all_vertices: Vec<Vertex> = Vec::new();
+        let mut draw_calls: Vec<(usize, usize, MTLScissorRect)> = Vec::new(); // (start, count, scissor)
+        let global_scissor = MTLScissorRect {
+            x: 0,
+            y: 0,
+            width: viewport_w as usize,
+            height: viewport_h as usize,
+        };
+
+        for (verts, scissor) in &pane_draws {
+            let start = all_vertices.len();
+            all_vertices.extend_from_slice(verts);
+            draw_calls.push((start, verts.len(), *scissor));
+        }
+        if !overlay_vertices.is_empty() {
+            let start = all_vertices.len();
+            let count = overlay_vertices.len();
+            all_vertices.extend(overlay_vertices);
+            draw_calls.push((start, count, global_scissor));
         }
 
         // Update viewport buffer if changed
@@ -426,12 +461,6 @@ impl Renderer {
             }
 
             encoder.setRenderPipelineState(&self.pipeline);
-            encoder.setScissorRect(MTLScissorRect {
-                x: 0,
-                y: 0,
-                width: viewport_w as usize,
-                height: viewport_h as usize,
-            });
             unsafe {
                 encoder.setVertexBuffer_offset_atIndex(Some(vertex_buf), 0, 0);
                 encoder.setVertexBuffer_offset_atIndex(Some(&self.viewport_buf), 0, 1);
@@ -439,12 +468,21 @@ impl Renderer {
                 encoder.setFragmentTexture_atIndex(Some(&*self.atlas.texture), 0);
             }
 
-            unsafe {
-                encoder.drawPrimitives_vertexStart_vertexCount(
-                    MTLPrimitiveType::Triangle,
-                    0,
-                    all_vertices.len(),
-                );
+            // Draw each group with its own scissor rect
+            for &(start, count, ref scissor) in &draw_calls {
+                encoder.setScissorRect(MTLScissorRect {
+                    x: scissor.x,
+                    y: scissor.y,
+                    width: scissor.width,
+                    height: scissor.height,
+                });
+                unsafe {
+                    encoder.drawPrimitives_vertexStart_vertexCount(
+                        MTLPrimitiveType::Triangle,
+                        start,
+                        count,
+                    );
+                }
             }
         }
 
