@@ -116,6 +116,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] Metriques perf exposées (frame time, mémoire, allocations) — utile pour diagnostiquer sans avoir à lancer vmmap/heap manuellement
 - [ ] Double-clic sur un mot → sélectionne le mot entier
 - [ ] Cmd+V dans le champ de recherche (Cmd+F) — le paste ne fonctionne pas actuellement dans l'overlay de recherche
+- [x] Flèches dans le renommage de tab/pane — les flèches gauche/droite naviguent dans le texte, curseur positionnable, backspace/insertion au curseur
 
 ## V3 — Avancé
 
