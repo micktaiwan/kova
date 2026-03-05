@@ -85,10 +85,12 @@ struct FilterState {
 
 struct RenameTabState {
     input: String,
+    cursor: usize, // char index
 }
 
 struct RenamePaneState {
     input: String,
+    cursor: usize, // char index
 }
 
 define_class!(
@@ -252,6 +254,21 @@ define_class!(
                 return;
             }
 
+            // Ctrl+F → toggle filter (in addition to Cmd+F via performKeyEquivalent)
+            {
+                let modifiers = event.modifierFlags();
+                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
+                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
+                if has_ctrl && !has_cmd {
+                    if let Some(chars) = event.charactersIgnoringModifiers() {
+                        if chars.to_string() == "f" {
+                            self.toggle_filter();
+                            return;
+                        }
+                    }
+                }
+            }
+
             // Ctrl+Option+arrows → adjust virtual width
             {
                 let modifiers = event.modifierFlags();
@@ -358,19 +375,34 @@ define_class!(
                         }
                     }
                     Action::Copy => {
-                        if let Some(pane) = self.focused_pane() {
-                            let mut term = pane.terminal.write();
-                            let text = term.selected_text();
-                            if !text.is_empty() {
-                                let pasteboard = NSPasteboard::generalPasteboard();
-                                pasteboard.clearContents();
-                                let ns_str = NSString::from_str(&text);
-                                unsafe {
-                                    pasteboard.setString_forType(&ns_str, objc2_app_kit::NSPasteboardTypeString);
+                        // If filter is active, copy all filtered lines
+                        let filter = self.ivars().filter.borrow();
+                        if let Some(state) = filter.as_ref() {
+                            if !state.matches.is_empty() {
+                                let mut text = String::new();
+                                for (i, m) in state.matches.iter().enumerate() {
+                                    if i > 0 { text.push('\n'); }
+                                    text.push_str(&m.text);
                                 }
-                                term.clear_selection();
+                                drop(filter);
+                                copy_to_pasteboard(&text);
+                                // Close filter after copying
+                                *self.ivars().filter.borrow_mut() = None;
+                                self.mark_dirty();
                             } else {
-                                return objc2::runtime::Bool::NO;
+                                drop(filter);
+                            }
+                        } else {
+                            drop(filter);
+                            if let Some(pane) = self.focused_pane() {
+                                let mut term = pane.terminal.write();
+                                let text = term.selected_text();
+                                if !text.is_empty() {
+                                    copy_to_pasteboard(&text);
+                                    term.clear_selection();
+                                } else {
+                                    return objc2::runtime::Bool::NO;
+                                }
                             }
                         }
                     }
@@ -531,6 +563,8 @@ define_class!(
                 }
                 // Mark old focused pane dirty so its dim overlay updates
                 if old_focused != pane.id {
+                    // Clear completion flag on newly focused pane
+                    pane.terminal.read().command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
                     let tabs = self.ivars().tabs.borrow();
                     let idx = self.ivars().active_tab.get();
                     if let Some(tab) = tabs.get(idx) {
@@ -666,12 +700,7 @@ define_class!(
                 }
                 let text = term.selected_text();
                 if !text.is_empty() {
-                    let pasteboard = NSPasteboard::generalPasteboard();
-                    pasteboard.clearContents();
-                    let ns_str = NSString::from_str(&text);
-                    unsafe {
-                        pasteboard.setString_forType(&ns_str, objc2_app_kit::NSPasteboardTypeString);
-                    }
+                    copy_to_pasteboard(&text);
                 }
             }
         }
@@ -743,6 +772,16 @@ unsafe fn nsstring_from_input(obj: &objc2::runtime::AnyObject) -> String {
     } else {
         let ns_str: &NSString = unsafe { &*(obj as *const objc2::runtime::AnyObject as *const NSString) };
         ns_str.to_string()
+    }
+}
+
+/// Copy text to the system pasteboard.
+fn copy_to_pasteboard(text: &str) {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    let ns_str = NSString::from_str(text);
+    unsafe {
+        pasteboard.setString_forType(&ns_str, objc2_app_kit::NSPasteboardTypeString);
     }
 }
 
@@ -1172,6 +1211,7 @@ impl KovaView {
         {
             let mut tabs = self.ivars().tabs.borrow_mut();
             tabs[idx].clear_bell();
+            tabs[idx].clear_completion();
         }
         // Lazy resize: resize panes when switching to them
         self.resize_all_panes();
@@ -1585,6 +1625,8 @@ impl KovaView {
                 old.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             if let Some(new) = tab.tree.pane(neighbor_id) {
+                // Clear completion flag on the newly focused pane
+                new.terminal.read().command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
                 new.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             // Auto-scroll to reveal the newly focused pane
@@ -1773,13 +1815,16 @@ impl KovaView {
             let idx = self.ivars().active_tab.get();
             tabs.get(idx).map(|t| t.title()).unwrap_or_default()
         };
+        let cursor = current_title.chars().count();
         *self.ivars().rename_tab.borrow_mut() = Some(RenameTabState {
             input: current_title,
+            cursor,
         });
         self.mark_dirty();
     }
 
     fn handle_rename_tab_key(&self, event: &NSEvent) {
+        let key_code = event.keyCode();
         let chars = event.charactersIgnoringModifiers();
         let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
         let ch = ch_str.chars().next().unwrap_or('\0');
@@ -1790,40 +1835,60 @@ impl KovaView {
             None => return,
         };
 
-        match ch {
-            '\u{1B}' => {
-                // Escape → cancel rename
-                *rename = None;
-                drop(rename);
-                self.mark_dirty();
-                return;
+        match key_code {
+            123 => {
+                // Left arrow
+                if state.cursor > 0 { state.cursor -= 1; }
             }
-            '\r' => {
-                // Enter → apply rename (empty = reset to auto)
-                let new_title = if state.input.trim().is_empty() {
-                    None
-                } else {
-                    Some(state.input.clone())
-                };
-                *rename = None;
-                drop(rename);
-                let mut tabs = self.ivars().tabs.borrow_mut();
-                let idx = self.ivars().active_tab.get();
-                if let Some(tab) = tabs.get_mut(idx) {
-                    tab.custom_title = new_title;
+            124 => {
+                // Right arrow
+                let len = state.input.chars().count();
+                if state.cursor < len { state.cursor += 1; }
+            }
+            _ => match ch {
+                '\u{1B}' => {
+                    // Escape → cancel rename
+                    *rename = None;
+                    drop(rename);
+                    self.mark_dirty();
+                    return;
                 }
-                drop(tabs);
-                self.mark_dirty();
-                return;
+                '\r' => {
+                    // Enter → apply rename (empty = reset to auto)
+                    let new_title = if state.input.trim().is_empty() {
+                        None
+                    } else {
+                        Some(state.input.clone())
+                    };
+                    *rename = None;
+                    drop(rename);
+                    let mut tabs = self.ivars().tabs.borrow_mut();
+                    let idx = self.ivars().active_tab.get();
+                    if let Some(tab) = tabs.get_mut(idx) {
+                        tab.custom_title = new_title;
+                    }
+                    drop(tabs);
+                    self.mark_dirty();
+                    return;
+                }
+                '\u{7F}' | '\u{08}' => {
+                    // Backspace — remove char before cursor
+                    if state.cursor > 0 {
+                        let byte_idx = state.input.char_indices()
+                            .nth(state.cursor - 1).map(|(i, _)| i).unwrap();
+                        state.input.remove(byte_idx);
+                        state.cursor -= 1;
+                    }
+                }
+                c if c >= ' ' && !c.is_control() => {
+                    let byte_idx = state.input.char_indices()
+                        .nth(state.cursor).map(|(i, _)| i)
+                        .unwrap_or(state.input.len());
+                    state.input.insert(byte_idx, c);
+                    state.cursor += 1;
+                }
+                _ => return,
             }
-            '\u{7F}' | '\u{08}' => {
-                // Backspace
-                state.input.pop();
-            }
-            c if c >= ' ' && !c.is_control() => {
-                state.input.push(c);
-            }
-            _ => return,
         }
         drop(rename);
         self.mark_dirty();
@@ -1842,13 +1907,16 @@ impl KovaView {
                 }
             }).unwrap_or_default()
         };
+        let cursor = current_title.chars().count();
         *self.ivars().rename_pane.borrow_mut() = Some(RenamePaneState {
             input: current_title,
+            cursor,
         });
         self.mark_dirty();
     }
 
     fn handle_rename_pane_key(&self, event: &NSEvent) {
+        let key_code = event.keyCode();
         let chars = event.charactersIgnoringModifiers();
         let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
         let ch = ch_str.chars().next().unwrap_or('\0');
@@ -1859,42 +1927,62 @@ impl KovaView {
             None => return,
         };
 
-        match ch {
-            '\u{1B}' => {
-                // Escape → cancel rename
-                *rename = None;
-                drop(rename);
-                self.mark_dirty();
-                return;
+        match key_code {
+            123 => {
+                // Left arrow
+                if state.cursor > 0 { state.cursor -= 1; }
             }
-            '\r' => {
-                // Enter → apply rename (empty = reset to auto)
-                let new_title = if state.input.trim().is_empty() {
-                    None
-                } else {
-                    Some(state.input.clone())
-                };
-                *rename = None;
-                drop(rename);
-                let mut tabs = self.ivars().tabs.borrow_mut();
-                let idx = self.ivars().active_tab.get();
-                if let Some(tab) = tabs.get_mut(idx) {
-                    if let Some(pane) = tab.tree.pane_mut(tab.focused_pane) {
-                        pane.custom_title = new_title;
+            124 => {
+                // Right arrow
+                let len = state.input.chars().count();
+                if state.cursor < len { state.cursor += 1; }
+            }
+            _ => match ch {
+                '\u{1B}' => {
+                    // Escape → cancel rename
+                    *rename = None;
+                    drop(rename);
+                    self.mark_dirty();
+                    return;
+                }
+                '\r' => {
+                    // Enter → apply rename (empty = reset to auto)
+                    let new_title = if state.input.trim().is_empty() {
+                        None
+                    } else {
+                        Some(state.input.clone())
+                    };
+                    *rename = None;
+                    drop(rename);
+                    let mut tabs = self.ivars().tabs.borrow_mut();
+                    let idx = self.ivars().active_tab.get();
+                    if let Some(tab) = tabs.get_mut(idx) {
+                        if let Some(pane) = tab.tree.pane_mut(tab.focused_pane) {
+                            pane.custom_title = new_title;
+                        }
+                    }
+                    drop(tabs);
+                    self.mark_dirty();
+                    return;
+                }
+                '\u{7F}' | '\u{08}' => {
+                    // Backspace — remove char before cursor
+                    if state.cursor > 0 {
+                        let byte_idx = state.input.char_indices()
+                            .nth(state.cursor - 1).map(|(i, _)| i).unwrap();
+                        state.input.remove(byte_idx);
+                        state.cursor -= 1;
                     }
                 }
-                drop(tabs);
-                self.mark_dirty();
-                return;
+                c if c >= ' ' && !c.is_control() => {
+                    let byte_idx = state.input.char_indices()
+                        .nth(state.cursor).map(|(i, _)| i)
+                        .unwrap_or(state.input.len());
+                    state.input.insert(byte_idx, c);
+                    state.cursor += 1;
+                }
+                _ => return,
             }
-            '\u{7F}' | '\u{08}' => {
-                // Backspace
-                state.input.pop();
-            }
-            c if c >= ' ' && !c.is_control() => {
-                state.input.push(c);
-            }
-            _ => return,
         }
         drop(rename);
         self.mark_dirty();
@@ -2184,7 +2272,7 @@ impl KovaView {
             let tab = &tabs[active_idx];
             let focused_id = tab.focused_pane;
 
-            let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>)> = Vec::new();
+            let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>, bool)> = Vec::new();
             let cell_h = renderer.read().cell_size().1;
             let tab_bar_h = (cell_h * 2.0).round();
             let drawable_size = layer.drawableSize();
@@ -2198,6 +2286,8 @@ impl KovaView {
                 height: drawable_size.height as f32 - tab_bar_h - global_bar_h,
             };
             tab.tree.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
+                let completed = pane.id != focused_id
+                    && pane.terminal.read().command_completed.load(std::sync::atomic::Ordering::Relaxed);
                 pane_data.push((
                     pane.terminal.clone(),
                     vp,
@@ -2205,6 +2295,7 @@ impl KovaView {
                     pane.id == focused_id,
                     pane.id,
                     pane.custom_title.clone(),
+                    completed,
                 ));
             });
 
@@ -2214,7 +2305,9 @@ impl KovaView {
                 if let Some(ref rs) = *rename_pane {
                     for entry in &mut pane_data {
                         if entry.3 { // is_focused
-                            entry.5 = Some(format!("{}▏", rs.input));
+                            let before: String = rs.input.chars().take(rs.cursor).collect();
+                            let after: String = rs.input.chars().skip(rs.cursor).collect();
+                            entry.5 = Some(format!("{}▏{}", before, after));
                         }
                     }
                 }
@@ -2224,22 +2317,30 @@ impl KovaView {
             let pty_ptr = focused.map(|p| &p.pty as *const crate::terminal::pty::Pty);
             let focus_reporting = focused.map_or(false, |p| p.terminal.read().focus_reporting);
 
-            for t in tabs.iter_mut() {
+            for (i, t) in tabs.iter_mut().enumerate() {
                 t.check_bell();
+                // Skip active tab: completion already read into pane_data
+                if i != active_idx {
+                    t.check_completion();
+                }
             }
             tabs[active_idx].clear_bell();
+            // Derive active tab's completion from pane_data (avoids double atomic read)
+            tabs[active_idx].has_completion = pane_data.iter().any(|p| p.6);
 
             let rename = ivars.rename_tab.borrow();
-            let tab_titles: Vec<(String, bool, Option<usize>, bool, bool)> = tabs.iter().enumerate()
+            let tab_titles: Vec<(String, bool, Option<usize>, bool, bool, bool)> = tabs.iter().enumerate()
                 .map(|(i, t)| {
                     let is_renaming = i == active_idx && rename.is_some();
                     let title = if is_renaming {
                         let rs = rename.as_ref().unwrap();
-                        format!("{}▏", rs.input)
+                        let before: String = rs.input.chars().take(rs.cursor).collect();
+                        let after: String = rs.input.chars().skip(rs.cursor).collect();
+                        format!("{}▏{}", before, after)
                     } else {
                         t.title()
                     };
-                    (title, i == active_idx, t.color, is_renaming, t.has_bell)
+                    (title, i == active_idx, t.color, is_renaming, t.has_bell, t.has_completion)
                 })
                 .collect();
             drop(rename);
@@ -2264,7 +2365,7 @@ impl KovaView {
         }
 
         // Update NSWindow title from focused pane's OSC 0/2
-        if let Some((terminal, _, _, _, _, _)) = pane_data.iter().find(|(_, _, _, f, _, _)| *f) {
+        if let Some((terminal, _, _, _, _, _, _)) = pane_data.iter().find(|(_, _, _, f, _, _, _)| *f) {
             let term = terminal.read();
             let current = term.title.clone();
             drop(term);
@@ -2340,7 +2441,7 @@ impl KovaView {
         // Count hidden panes (fully off-screen)
         let mut hidden_left = 0usize;
         let mut hidden_right = 0usize;
-        for (_, vp, _, _, _, _) in &pane_data {
+        for (_, vp, _, _, _, _, _) in &pane_data {
             if vp.x + vp.width <= 0.0 {
                 hidden_left += 1;
             } else if vp.x >= screen_width {

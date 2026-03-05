@@ -327,6 +327,7 @@ fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>,
                     custom_title: saved_tab.custom_title.clone(),
                     color: saved_tab.color,
                     has_bell: false,
+                    has_completion: false,
                     scroll_offset_x: 0.0,
                     virtual_width_override: 0.0,
                 });

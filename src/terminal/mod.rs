@@ -138,6 +138,8 @@ pub struct TerminalState {
     pub insert_mode: bool,
     // Bell received (BEL 0x07) — used for tab attention indicator
     pub bell: AtomicBool,
+    // Command completed (OSC 133;D) — used for pane/tab completion indicator
+    pub command_completed: AtomicBool,
     // Last command executed (set via OSC 7777 from shell integration)
     pub last_command: Option<String>,
 }
@@ -194,6 +196,7 @@ impl TerminalState {
             auto_wrap: true,
             insert_mode: false,
             bell: AtomicBool::new(false),
+            command_completed: AtomicBool::new(false),
             last_command: None,
         }
     }

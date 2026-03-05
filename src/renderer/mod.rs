@@ -182,9 +182,9 @@ impl Renderer {
     pub fn render_panes(
         &mut self,
         layer: &CAMetalLayer,
-        panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>)],
+        panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>, bool)],
         separators: &[(f32, f32, f32, f32)],
-        tab_titles: &[(String, bool, Option<usize>, bool, bool)],
+        tab_titles: &[(String, bool, Option<usize>, bool, bool, bool)],
         filter: Option<&FilterRenderData>,
         tab_bar_left_inset: f32,
         hidden_left: usize,
@@ -194,7 +194,7 @@ impl Renderer {
         keys_config: Option<&KeysConfig>,
     ) {
         // Reset blink on cursor movement of focused pane
-        if let Some((term, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _)| *focused) {
+        if let Some((term, _, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _, _)| *focused) {
             let epoch = term.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed);
             if epoch != self.last_cursor_epoch {
                 self.last_cursor_epoch = epoch;
@@ -235,7 +235,7 @@ impl Renderer {
         let mut any_dirty = false;
         let mut any_not_ready = false;
         let mut any_sync_deferred = false;
-        for (term, _, ready, _, _, _) in panes {
+        for (term, _, ready, _, _, _, _) in panes {
             if !ready { any_not_ready = true; }
             let t = term.read();
             // Synchronized output: this pane wants to defer, but don't block others
@@ -270,9 +270,10 @@ impl Renderer {
 
         // Build vertices for all panes
         let mut all_vertices = Vec::new();
+        let (cell_w, cell_h) = self.cell_size();
         let saved_hover_text = self.hovered_url_text.clone();
         let saved_hover_pos = self.hovered_url;
-        for (term, vp, shell_ready, is_focused, pane_id, custom_title) in panes {
+        for (term, vp, shell_ready, is_focused, pane_id, custom_title, has_completion) in panes {
             // Scope hovered URL to the pane that owns it
             let is_hover_pane = self.hovered_url_pane_id == Some(*pane_id);
             self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
@@ -294,6 +295,14 @@ impl Renderer {
             } else {
                 let mut verts = self.build_loading_vertices(vp);
                 all_vertices.append(&mut verts);
+            }
+            // Command completion indicator: green dot on non-focused panes
+            if *has_completion && !is_focused {
+                let dot_x = vp.x + vp.width - cell_w * 2.5;
+                let dot_y = vp.y + cell_h * 0.5;
+                let green = [0.2, 0.8, 0.3, 1.0];
+                let no_bg = [0.0_f32, 0.0, 0.0, 0.0];
+                self.render_status_text(&mut all_vertices, "●", dot_x, dot_y, vp.x + vp.width, green, no_bg);
             }
         }
         self.hovered_url_text = saved_hover_text;
@@ -340,7 +349,7 @@ impl Renderer {
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
-            if let Some((_, vp, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _)| *focused) {
+            if let Some((_, vp, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _, _)| *focused) {
                 self.build_filter_overlay_vertices(&mut all_vertices, vp, filter_data);
             }
         }
@@ -793,7 +802,7 @@ impl Renderer {
         &mut self,
         vertices: &mut Vec<Vertex>,
         viewport_w: f32,
-        tab_titles: &[(String, bool, Option<usize>, bool, bool)],
+        tab_titles: &[(String, bool, Option<usize>, bool, bool, bool)],
         left_inset: f32,
     ) {
         let cell_w = self.atlas.cell_width;
@@ -817,7 +826,7 @@ impl Renderer {
         let show_version = tabs_right_edge <= viewport_w - version_padding;
         let no_bg = [0.0, 0.0, 0.0, 0.0];
 
-        for (i, (title, is_active, color_idx, is_renaming, has_bell)) in tab_titles.iter().enumerate() {
+        for (i, (title, is_active, color_idx, is_renaming, has_bell, has_completion)) in tab_titles.iter().enumerate() {
             let x = left_inset + i as f32 * tab_width;
 
             // Tab background color
@@ -877,19 +886,26 @@ impl Renderer {
             let max_x = x + tab_width - cell_w;
             self.render_status_text(vertices, &label, text_x.max(x + cell_w * 0.5), text_y, max_x, fg, no_bg);
 
-            // Bell indicator: orange dot in the top-right of the tab
-            if *has_bell && !is_active {
+            // Tab indicator dot: bell (orange) takes priority, then completion (green)
+            let indicator_color = if *has_bell && !is_active {
+                Some([1.0_f32, 0.45, 0.1])
+            } else if *has_completion && !is_active {
+                Some([0.2_f32, 0.8, 0.3])
+            } else {
+                None
+            };
+            if let Some(color) = indicator_color {
                 let dot_x = x + tab_width - cell_w * 2.0;
                 let dot_y = (bar_h - cell_h) / 2.0;
                 let dot_color = if let Some(bg) = tab_bg {
                     let lum = |c: [f32; 3]| 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
-                    if (lum([1.0, 0.45, 0.1]) - lum(bg)).abs() < 0.25 {
-                        [1.0, 1.0, 1.0, 1.0] // white when too close
+                    if (lum(color) - lum(bg)).abs() < 0.25 {
+                        [1.0, 1.0, 1.0, 1.0]
                     } else {
-                        [1.0, 0.45, 0.1, 1.0] // orange
+                        [color[0], color[1], color[2], 1.0]
                     }
                 } else {
-                    [1.0, 0.45, 0.1, 1.0] // orange
+                    [color[0], color[1], color[2], 1.0]
                 };
                 self.render_status_text(vertices, "●", dot_x, dot_y, x + tab_width, dot_color, no_bg);
             }
@@ -1165,22 +1181,14 @@ impl Renderer {
                 ("Rename Pane", &keys_config.rename_pane),
                 ("Detach Tab", &keys_config.detach_tab),
                 ("Merge Window", &keys_config.merge_window),
-                ("Navigate Up", &keys_config.navigate_up),
-                ("Navigate Down", &keys_config.navigate_down),
-                ("Navigate Left", &keys_config.navigate_left),
-                ("Navigate Right", &keys_config.navigate_right),
-                ("Swap Pane Up", &keys_config.swap_up),
-                ("Swap Pane Down", &keys_config.swap_down),
-                ("Swap Pane Left", &keys_config.swap_left),
-                ("Swap Pane Right", &keys_config.swap_right),
-                ("Resize Left", &keys_config.resize_left),
-                ("Resize Right", &keys_config.resize_right),
-                ("Resize Up", &keys_config.resize_up),
-                ("Resize Down", &keys_config.resize_down),
+                ("Navigate", &keys_config.navigate_up),
+                ("Swap Pane", &keys_config.swap_up),
+                ("Reparent Pane", &keys_config.reparent_up),
+                ("Resize Pane", &keys_config.resize_up),
                 ("Help", &keys_config.toggle_help),
             ];
             self.cached_help_shortcuts = raw.into_iter()
-                .map(|(label, key)| (label.to_string(), format_key_combo(key)))
+                .map(|(label, key)| (label.to_string(), format_key_combo_arrows(key)))
                 .collect();
         }
         // Take shortcuts out of self to avoid borrow conflict with render_text
@@ -1256,6 +1264,26 @@ impl Renderer {
 }
 
 /// Format a key combo string like "cmd+shift+d" into "⌘⇧D" for display.
+/// Like `format_key_combo` but replaces a trailing arrow direction with "Arrows".
+fn format_key_combo_arrows(s: &str) -> String {
+    let parts: Vec<&str> = s.split('+').collect();
+    if let Some(last) = parts.last() {
+        match last.trim().to_ascii_lowercase().as_str() {
+            "up" | "down" | "left" | "right" => {
+                let prefix: Vec<&str> = parts[..parts.len() - 1].to_vec();
+                let rebuilt = if prefix.is_empty() {
+                    "arrows".to_string()
+                } else {
+                    format!("{}+arrows", prefix.join("+"))
+                };
+                return format_key_combo(&rebuilt);
+            }
+            _ => {}
+        }
+    }
+    format_key_combo(s)
+}
+
 fn format_key_combo(s: &str) -> String {
     let mut result = String::new();
     let parts: Vec<&str> = s.split('+').collect();
