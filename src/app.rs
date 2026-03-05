@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::window;
 
 pub struct AppDelegateIvars {
-    windows: RefCell<Vec<Retained<NSWindow>>>,
+    pub windows: RefCell<Vec<Retained<NSWindow>>>,
     /// Windows pending dealloc — kept alive one extra timer tick so AppKit
     /// finishes its run-loop work before the Retained is dropped.
     pending_close: RefCell<Vec<Retained<NSWindow>>>,
@@ -226,7 +226,7 @@ fn collect_window_sessions(windows: &[Retained<NSWindow>]) -> Vec<crate::session
 
 /// Get a reference to our AppDelegate from the shared NSApplication.
 /// SAFETY: The app delegate is always our AppDelegate (set in main.rs).
-fn app_delegate(mtm: MainThreadMarker) -> &'static AppDelegate {
+pub fn app_delegate(mtm: MainThreadMarker) -> &'static AppDelegate {
     let app = NSApplication::sharedApplication(mtm);
     let delegate = app.delegate().expect("no app delegate");
     unsafe {

@@ -1066,6 +1066,21 @@ impl TerminalState {
         self.scrollback.len()
     }
 
+    /// Estimated heap bytes used by this terminal (grid + scrollback + alt_grid).
+    pub fn mem_bytes(&self) -> usize {
+        let cell_size = std::mem::size_of::<Cell>();
+        let row_overhead = std::mem::size_of::<Row>();
+        let row_bytes = |rows: &[Row]| -> usize {
+            rows.iter().map(|r| row_overhead + r.cells.capacity() * cell_size).sum::<usize>()
+        };
+        let grid = row_bytes(&self.grid);
+        let sb: usize = self.scrollback.iter()
+            .map(|r| row_overhead + r.cells.capacity() * cell_size)
+            .sum();
+        let alt = self.alt_grid.as_ref().map(|g| row_bytes(g)).unwrap_or(0);
+        grid + sb + alt
+    }
+
     fn row_at(&self, abs_line: usize) -> Option<Cow<'_, Row>> {
         let sb_len = self.scrollback.len();
         if abs_line < sb_len {

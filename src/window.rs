@@ -335,6 +335,7 @@ define_class!(
                         self.mark_dirty();
                     }
                     Action::ToggleFilter => self.toggle_filter(),
+                    Action::MemReport => self.log_mem_report(),
                     Action::ClearScrollback => {
                         if let Some(pane) = self.focused_pane() {
                             pane.terminal.write().clear_scrollback_and_screen();
@@ -820,6 +821,132 @@ impl KovaView {
     }
 
     /// Return the currently focused pane (keyboard input target).
+    fn log_mem_report(&self) {
+        // Process RSS via mach API
+        let rss_mb = unsafe {
+            let mut info: libc::mach_task_basic_info_data_t = std::mem::zeroed();
+            let mut count = (std::mem::size_of::<libc::mach_task_basic_info_data_t>()
+                / std::mem::size_of::<libc::natural_t>()) as u32;
+            let kr = libc::task_info(
+                libc::mach_task_self_,
+                libc::MACH_TASK_BASIC_INFO,
+                &mut info as *mut _ as *mut i32,
+                &mut count,
+            );
+            if kr == 0 { info.resident_size as f64 / (1024.0 * 1024.0) } else { -1.0 }
+        };
+
+        // Per-pane stats across ALL windows
+        let mut total_panes = 0usize;
+        let mut total_grid_bytes = 0usize;
+        let mut total_sb_lines = 0usize;
+        let mut total_sb_bytes = 0usize;
+        let mut total_alt_bytes = 0usize;
+        let mut total_renderer_bytes = 0usize;
+        let mut pane_details = Vec::new();
+        let mut renderer_details = Vec::new();
+
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let ad = crate::app::app_delegate(mtm);
+        let all_windows = ad.ivars().windows.borrow();
+
+        for (wi, win) in all_windows.iter().enumerate() {
+            if let Some(view) = crate::app::kova_view(win) {
+                let tabs = view.ivars().tabs.borrow();
+                for (ti, tab) in tabs.iter().enumerate() {
+                    tab.tree.for_each_pane(&mut |pane| {
+                        let term = pane.terminal.read();
+                        let mem = term.mem_bytes();
+                        let sb_len = term.scrollback_len();
+                        let cols = term.cols;
+                        let rows = term.rows;
+
+                        let cell_size = std::mem::size_of::<crate::terminal::Cell>();
+                        let row_oh = std::mem::size_of::<crate::terminal::Row>();
+                        let grid_b = rows as usize * (row_oh + cols as usize * cell_size);
+                        let alt_b = if term.in_alt_screen { grid_b } else { 0 };
+                        let sb_b = mem - grid_b - alt_b;
+
+                        total_panes += 1;
+                        total_grid_bytes += grid_b;
+                        total_sb_lines += sb_len;
+                        total_sb_bytes += sb_b;
+                        total_alt_bytes += alt_b;
+
+                        pane_details.push(format!(
+                            "  w{}t{} pane{}: {}x{}, sb={} lines ({:.1} KB), grid={:.1} KB",
+                            wi, ti, pane.id, cols, rows, sb_len,
+                            sb_b as f64 / 1024.0, grid_b as f64 / 1024.0,
+                        ));
+                    });
+                }
+
+                // Renderer stats for this window
+                if let Some(renderer) = view.ivars().renderer.get() {
+                    let r = renderer.read();
+                    let (atlas_buf, atlas_dims, glyph_count, vbuf) = r.mem_report();
+                    total_renderer_bytes += atlas_buf + vbuf;
+                    renderer_details.push(format!(
+                        "  w{}: atlas={}x{} ({:.1} KB, {} glyphs), vbufs={:.1} MB",
+                        wi, atlas_dims.0, atlas_dims.1,
+                        atlas_buf as f64 / 1024.0, glyph_count,
+                        vbuf as f64 / (1024.0 * 1024.0),
+                    ));
+                }
+            }
+        }
+        drop(all_windows);
+
+        let total_terminal = total_grid_bytes + total_sb_bytes + total_alt_bytes;
+
+        // Build report lines
+        let mut report = Vec::new();
+        report.push(format!("\x1b[1;36m=== MEMORY REPORT ===\x1b[0m"));
+        report.push(format!("RSS: \x1b[1m{:.1} MB\x1b[0m  |  Panes: {}", rss_mb, total_panes));
+        report.push(format!(
+            "Terminal: {:.1} MB (grid {:.1} KB, scrollback {:.1} MB [{} lines], alt {:.1} KB)",
+            total_terminal as f64 / (1024.0 * 1024.0),
+            total_grid_bytes as f64 / 1024.0,
+            total_sb_bytes as f64 / (1024.0 * 1024.0),
+            total_sb_lines,
+            total_alt_bytes as f64 / 1024.0,
+        ));
+        report.push(format!(
+            "Renderer: {:.1} MB total",
+            total_renderer_bytes as f64 / (1024.0 * 1024.0),
+        ));
+        for rd in &renderer_details {
+            report.push(rd.clone());
+        }
+        let accounted = total_terminal as f64 / (1024.0 * 1024.0) + total_renderer_bytes as f64 / (1024.0 * 1024.0);
+        report.push(format!("Unaccounted: {:.1} MB (system/Metal drawables/AppKit)", rss_mb - accounted));
+        for detail in &pane_details {
+            report.push(detail.clone());
+        }
+        report.push(format!("\x1b[1;36m=== END ===\x1b[0m"));
+
+        // Log to file
+        for line in &report {
+            // Strip ANSI for log file
+            let clean: String = line.chars().filter(|c| *c != '\x1b').collect();
+            log::info!("{}", clean);
+        }
+
+        // Inject report into focused pane's terminal via VTE parser
+        if let Some(pane) = self.focused_pane() {
+            let output = report.join("\r\n");
+            let bytes = format!("\r\n{}\r\n", output);
+            let devnull = std::fs::File::open("/dev/null").unwrap();
+            let dummy_fd = Arc::new(std::os::fd::OwnedFd::from(devnull));
+            let mut parser = vte::Parser::new();
+            let mut handler = crate::terminal::parser::VteHandler::new(
+                pane.terminal.clone(), dummy_fd,
+            );
+            parser.advance(&mut handler, bytes.as_bytes());
+            handler.release_guard();
+        }
+    }
+
     fn focused_pane(&self) -> Option<&Pane> {
         let tabs = self.ivars().tabs.borrow();
         let idx = self.ivars().active_tab.get();
