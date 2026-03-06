@@ -111,10 +111,10 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] PTY cleanup sur thread dédié — `Drop for Pty` délègue l'escalade SIGHUP → SIGTERM → SIGKILL à un thread détaché (`pty-reaper-{pid}`), zéro sleep sur le main thread. `shutdown_all()` fait la même escalade en synchrone avec timeouts réduits (25ms/étape)
 - [ ] Font fallback (block elements/box-drawing) — nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
 - [ ] **Tab bar font size** : taille de fonte des tabs configurable indépendamment (`tab_bar.font_size`), override possible par fenêtre. Voir `notes/tab-font-size.md`.
-- [ ] **Trim trailing spaces** : tronquer les cellules vides en fin de ligne.
-- [ ] **Run-length encoding** : compresser les séquences de même couleur.
+- [x] **Trim trailing blanks** : tronquer les cellules vides en fin de ligne dans le scrollback (`shrink_to_fit`), re-expand au resize. ~50-70% de réduction RAM scrollback.
+- [ ] **Run-length encoding** : compresser les séquences de même couleur. (Gain marginal après trim, complexité élevée — déprioritisé.)
 - [ ] Metriques perf exposées (frame time, mémoire, allocations) — utile pour diagnostiquer sans avoir à lancer vmmap/heap manuellement
-- [ ] Double-clic sur un mot → sélectionne le mot entier
+- [x] Double-clic sur un mot → sélectionne le mot entier
 - [ ] Minimisation de pane — réduire un pane à une barre minimale pour maximiser l'espace des autres panes, avec possibilité de le restaurer
 - [ ] Cmd+V dans le champ de recherche (Cmd+F) — le paste ne fonctionne pas actuellement dans l'overlay de recherche
 - [x] Flèches dans le renommage de tab/pane — les flèches gauche/droite naviguent dans le texte, curseur positionnable, backspace/insertion au curseur
