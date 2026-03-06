@@ -101,6 +101,24 @@ impl Row {
         }
     }
 
+    fn trim_trailing_blanks(&mut self, default_fg: [u8; 3], default_bg: [u8; 3]) {
+        let last = self.cells.iter().rposition(|c| {
+            (c.c != ' ' && c.c != '\0')
+                || c.cluster.is_some()
+                || c.fg != default_fg
+                || c.bg != default_bg
+        });
+        match last {
+            Some(idx) => {
+                self.cells.truncate(idx + 1);
+                self.cells.shrink_to_fit();
+            }
+            None => {
+                self.cells.clear();
+                self.cells.shrink_to_fit();
+            }
+        }
+    }
 }
 
 pub struct TerminalState {
@@ -448,7 +466,8 @@ impl TerminalState {
         }
     }
 
-    fn push_to_scrollback(&mut self, row: Row) {
+    fn push_to_scrollback(&mut self, mut row: Row) {
+        row.trim_trailing_blanks(self.default_fg, self.default_bg);
         self.scrollback.push_back(row);
         if self.scrollback.len() > self.scrollback_limit {
             self.scrollback.pop_front();
@@ -954,14 +973,16 @@ impl TerminalState {
         }
         // Push excess top rows into scrollback
         while self.grid.len() > nr {
-            let line = self.grid.remove(0);
+            let mut line = self.grid.remove(0);
+            line.trim_trailing_blanks(self.default_fg, self.default_bg);
             self.scrollback.push_back(line);
             self.cursor_y = self.cursor_y.saturating_sub(1);
         }
         // Pull rows back from scrollback (O(n) via collect + splice)
         let mut pulled: Vec<Row> = Vec::new();
         while self.grid.len() + pulled.len() < nr {
-            if let Some(row) = self.scrollback.pop_back() {
+            if let Some(mut row) = self.scrollback.pop_back() {
+                row.cells.resize(new_cols as usize, self.blank.clone());
                 pulled.push(row);
             } else {
                 break;
@@ -1281,11 +1302,15 @@ impl TerminalState {
         }
 
         // Build a Vec<char> from the logical line
-        let cols_per_row = cells.len();
+        let cols_per_row = self.cols as usize;
         let mut chars: Vec<char> = Vec::new();
         for r in first_row..=last_row {
             if let Some(row_cells) = display.get(r) {
                 chars.extend(row_cells.iter().map(|c| c.c));
+                // Pad trimmed scrollback rows to full width
+                for _ in row_cells.len()..cols_per_row {
+                    chars.push(' ');
+                }
             }
         }
         let len = chars.len();
