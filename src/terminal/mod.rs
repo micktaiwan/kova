@@ -41,10 +41,18 @@ pub struct GridPos {
     pub col: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionMode {
+    Normal,
+    Word,
+    Line,
+}
+
 #[derive(Clone, Debug)]
 pub struct Selection {
     pub anchor: GridPos,
     pub end: GridPos,
+    pub mode: SelectionMode,
 }
 
 /// Terminal cell — kept compact to minimize scrollback RAM usage.
@@ -1081,12 +1089,42 @@ impl TerminalState {
         grid + sb + alt
     }
 
-    fn row_at(&self, abs_line: usize) -> Option<Cow<'_, Row>> {
+    pub fn row_at(&self, abs_line: usize) -> Option<Cow<'_, Row>> {
         let sb_len = self.scrollback.len();
         if abs_line < sb_len {
             Some(Cow::Borrowed(&self.scrollback[abs_line]))
         } else {
             self.grid.get(abs_line - sb_len).map(Cow::Borrowed)
+        }
+    }
+
+    /// Returns (start_col, end_col) of the word at the given position.
+    /// A "word" is a contiguous run of non-whitespace, non-delimiter characters,
+    /// or a single delimiter/whitespace.
+    pub fn word_bounds_at(&self, pos: GridPos) -> (u16, u16) {
+        let Some(row) = self.row_at(pos.line) else { return (pos.col, pos.col) };
+        let cells = &row.cells;
+        let col = pos.col as usize;
+        if col >= cells.len() { return (pos.col, pos.col) }
+
+        let ch = cells[col].c;
+        let is_word_char = |c: char| -> bool {
+            c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == '~'
+        };
+
+        if is_word_char(ch) {
+            let mut start = col;
+            while start > 0 && is_word_char(cells[start - 1].c) {
+                start -= 1;
+            }
+            let mut end = col;
+            while end + 1 < cells.len() && is_word_char(cells[end + 1].c) {
+                end += 1;
+            }
+            (start as u16, end as u16)
+        } else {
+            // Single non-word char (space, delimiter) — select just that char
+            (pos.col, pos.col)
         }
     }
 
@@ -1200,7 +1238,28 @@ impl TerminalState {
     /// Find a URL at the given visible row and column.
     /// Returns (col_start, col_end_exclusive, url_string) if found.
     /// Works on char indices (1 cell = 1 char = 1 column).
-    pub fn url_at(&self, visible_row: usize, col: u16) -> Option<(u16, u16, String)> {
+    /// Returns whether a visible row has the soft-wrap flag set.
+    fn visible_row_wrapped(&self, visible_row: usize) -> bool {
+        if self.scroll_offset == 0 {
+            self.grid.get(visible_row).map_or(false, |r| r.wrapped)
+        } else {
+            let sb_len = self.scrollback.len() as i32;
+            let offset = self.scroll_offset.min(sb_len);
+            let sb_start = (sb_len - offset) as usize;
+            let sb_visible = self.scrollback.len() - sb_start;
+            if visible_row < sb_visible {
+                self.scrollback.get(sb_start + visible_row).map_or(false, |r| r.wrapped)
+            } else {
+                let grid_idx = visible_row - sb_visible;
+                self.grid.get(grid_idx).map_or(false, |r| r.wrapped)
+            }
+        }
+    }
+
+    /// Detect a URL at a given visible row/col position.
+    /// Returns per-row highlight segments and the full URL string.
+    /// Handles URLs that span multiple soft-wrapped rows.
+    pub fn url_at(&self, visible_row: usize, col: u16) -> Option<(Vec<(usize, u16, u16)>, String)> {
         let display = self.visible_lines();
         let cells = display.get(visible_row)?;
         let col = col as usize;
@@ -1208,9 +1267,31 @@ impl TerminalState {
             return None;
         }
 
-        // Build a Vec<char> from cells for easy scanning
-        let chars: Vec<char> = cells.iter().map(|c| c.c).collect();
+        // Find the start of the logical line (go back while previous row was wrapped)
+        let mut first_row = visible_row;
+        while first_row > 0 && self.visible_row_wrapped(first_row - 1) {
+            first_row -= 1;
+        }
+
+        // Find the end of the logical line (go forward while current row is wrapped)
+        let num_visible = display.len();
+        let mut last_row = visible_row;
+        while last_row < num_visible - 1 && self.visible_row_wrapped(last_row) {
+            last_row += 1;
+        }
+
+        // Build a Vec<char> from the logical line
+        let cols_per_row = cells.len();
+        let mut chars: Vec<char> = Vec::new();
+        for r in first_row..=last_row {
+            if let Some(row_cells) = display.get(r) {
+                chars.extend(row_cells.iter().map(|c| c.c));
+            }
+        }
         let len = chars.len();
+
+        // Adjusted col position within the logical line
+        let logical_col = (visible_row - first_row) * cols_per_row + col;
 
         let mut i = 0;
         while i < len {
@@ -1245,9 +1326,25 @@ impl TerminalState {
                 }
             }
 
-            if col >= start && col < end && end > start {
+            if logical_col >= start && logical_col < end && end > start {
                 let url: String = chars[start..end].iter().collect();
-                return Some((start as u16, end as u16, url));
+
+                // Build per-row highlight segments
+                let mut segments = Vec::new();
+                for r in first_row..=last_row {
+                    let row_start_in_logical = (r - first_row) * cols_per_row;
+                    let row_end_in_logical = row_start_in_logical + cols_per_row;
+                    // Intersect [start..end) with [row_start..row_end)
+                    let seg_start = start.max(row_start_in_logical);
+                    let seg_end = end.min(row_end_in_logical);
+                    if seg_start < seg_end {
+                        let col_start = (seg_start - row_start_in_logical) as u16;
+                        let col_end = (seg_end - row_start_in_logical) as u16;
+                        segments.push((r, col_start, col_end));
+                    }
+                }
+
+                return Some((segments, url));
             }
 
             i = if end > start { end } else { start + 1 };

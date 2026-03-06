@@ -13,7 +13,7 @@ use crate::input;
 use crate::keybindings::{Action, Keybindings, KeyCombo};
 use crate::pane::{NavDirection, Pane, PaneId, SplitDirection, SplitTree, Tab};
 use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
-use crate::terminal::{FilterMatch, GridPos, Selection};
+use crate::terminal::{FilterMatch, GridPos, Selection, SelectionMode};
 
 #[derive(Clone, Copy)]
 struct SeparatorDrag {
@@ -50,8 +50,8 @@ pub struct KovaViewIvars {
     /// Tab index targeted by right-click color menu.
     color_menu_tab: Cell<usize>,
     drag_tab: Cell<Option<DragTabState>>,
-    /// URL currently hovered (pane_id, visible_row, col_start, col_end, url) — set by mouseMoved when Cmd held
-    hovered_url: RefCell<Option<(PaneId, usize, u16, u16, String)>>,
+    /// URL currently hovered (pane_id, per-row segments [(row, col_start, col_end)], url) — set by mouseMoved when Cmd held
+    hovered_url: RefCell<Option<(PaneId, Vec<(usize, u16, u16)>, String)>>,
     /// Whether Cmd key is currently held (for URL hover detection)
     cmd_held: Cell<bool>,
     /// Auto-scroll speed during drag selection (lines/tick, positive = down, negative = up, 0 = inactive)
@@ -74,6 +74,8 @@ pub struct KovaViewIvars {
     git_poll_interval: Cell<u32>,
     /// Whether the help overlay is visible.
     show_help: Cell<bool>,
+    /// Whether the memory report overlay is visible.
+    show_mem_report: Cell<bool>,
     /// Countdown frames for "⌘? for help" hint in global status bar (fps * 3).
     help_hint_frames: Cell<u32>,
 }
@@ -231,8 +233,21 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            // Block all keys when help overlay is shown (handled in performKeyEquivalent)
-            if self.ivars().show_help.get() {
+            // Escape closes help/mem report overlays
+            if event.keyCode() == 0x35 {
+                if self.ivars().show_help.get() {
+                    self.ivars().show_help.set(false);
+                    self.mark_dirty();
+                    return;
+                }
+                if self.ivars().show_mem_report.get() {
+                    self.ivars().show_mem_report.set(false);
+                    self.mark_dirty();
+                    return;
+                }
+            }
+            // Block all keys when help/mem report overlay is shown (handled in performKeyEquivalent)
+            if self.ivars().show_help.get() || self.ivars().show_mem_report.get() {
                 return;
             }
 
@@ -310,21 +325,53 @@ define_class!(
                 None => return objc2::runtime::Bool::NO,
             };
 
-            // When help overlay is shown, only allow ToggleHelp and Escape to close it
+            // When help overlay is shown, close it first then let the action through
             if self.ivars().show_help.get() {
-                if matches!(keybindings.window_map.get(&combo), Some(Action::ToggleHelp)) {
-                    self.ivars().show_help.set(false);
-                    self.mark_dirty();
+                self.ivars().show_help.set(false);
+                self.mark_dirty();
+                if matches!(keybindings.window_map.get(&combo), Some(Action::ToggleHelp)) || event.keyCode() == 0x35 {
                     return objc2::runtime::Bool::YES;
                 }
-                // Escape also closes help (keyCode 0x35)
-                if event.keyCode() == 0x35 {
-                    self.ivars().show_help.set(false);
-                    self.mark_dirty();
+                // Fall through: close overlay AND execute the action (e.g. Cmd+Q)
+            }
+
+            // When mem report overlay is shown, close it first then let the action through
+            if self.ivars().show_mem_report.get() {
+                self.ivars().show_mem_report.set(false);
+                self.mark_dirty();
+                if matches!(keybindings.window_map.get(&combo), Some(Action::MemReport)) || event.keyCode() == 0x35 {
                     return objc2::runtime::Bool::YES;
                 }
-                // Block all other keys
-                return objc2::runtime::Bool::YES;
+                // Fall through: close overlay AND execute the action (e.g. Cmd+Q)
+            }
+
+            // When rename tab/pane is active, intercept Paste to insert into the edit field
+            if self.ivars().rename_tab.borrow().is_some() || self.ivars().rename_pane.borrow().is_some() {
+                if matches!(keybindings.window_map.get(&combo), Some(Action::Paste)) {
+                    let pasteboard = NSPasteboard::generalPasteboard();
+                    if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+                        let text = text.to_string();
+                        if !text.is_empty() {
+                            if let Some(state) = self.ivars().rename_tab.borrow_mut().as_mut() {
+                                let byte_idx = state.input.char_indices()
+                                    .nth(state.cursor).map(|(i, _)| i)
+                                    .unwrap_or(state.input.len());
+                                state.input.insert_str(byte_idx, &text);
+                                state.cursor += text.chars().count();
+                            } else if let Some(state) = self.ivars().rename_pane.borrow_mut().as_mut() {
+                                let byte_idx = state.input.char_indices()
+                                    .nth(state.cursor).map(|(i, _)| i)
+                                    .unwrap_or(state.input.len());
+                                state.input.insert_str(byte_idx, &text);
+                                state.cursor += text.chars().count();
+                            }
+                            self.mark_dirty();
+                        }
+                    }
+                    return objc2::runtime::Bool::YES;
+                }
+                // Block other key equivalents during rename
+                return objc2::runtime::Bool::NO;
             }
 
             if let Some(action) = keybindings.window_map.get(&combo) {
@@ -335,7 +382,15 @@ define_class!(
                         self.mark_dirty();
                     }
                     Action::ToggleFilter => self.toggle_filter(),
-                    Action::MemReport => self.log_mem_report(),
+                    Action::MemReport => {
+                        let showing = self.ivars().show_mem_report.get();
+                        if showing {
+                            self.ivars().show_mem_report.set(false);
+                            self.mark_dirty();
+                        } else {
+                            self.show_mem_report_overlay();
+                        }
+                    }
                     Action::ClearScrollback => {
                         if let Some(pane) = self.focused_pane() {
                             pane.terminal.write().clear_scrollback_and_screen();
@@ -542,7 +597,7 @@ define_class!(
             // Cmd+Click opens URL
             let modifiers = event.modifierFlags();
             if modifiers.contains(NSEventModifierFlags::Command) {
-                if let Some(url) = self.ivars().hovered_url.borrow().as_ref().map(|h| h.4.clone()) {
+                if let Some(url) = self.ivars().hovered_url.borrow().as_ref().map(|h| h.2.clone()) {
                     let _ = std::process::Command::new("open").arg(&url).spawn();
                     return;
                 }
@@ -575,8 +630,29 @@ define_class!(
                     }
                 }
                 if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
+                    let click_count = event.clickCount();
                     let mut term = pane.terminal.write();
-                    term.selection = Some(Selection { anchor: pos, end: pos });
+                    if click_count == 2 {
+                        // Double-click: select word
+                        let (wstart, wend) = term.word_bounds_at(pos);
+                        term.selection = Some(Selection {
+                            anchor: GridPos { line: pos.line, col: wstart },
+                            end: GridPos { line: pos.line, col: wend },
+                            mode: SelectionMode::Word,
+                        });
+                    } else if click_count >= 3 {
+                        // Triple-click: select entire line
+                        let row_len = term.row_at(pos.line)
+                            .map(|r| r.cells.len().saturating_sub(1) as u16)
+                            .unwrap_or(0);
+                        term.selection = Some(Selection {
+                            anchor: GridPos { line: pos.line, col: 0 },
+                            end: GridPos { line: pos.line, col: row_len },
+                            mode: SelectionMode::Line,
+                        });
+                    } else {
+                        term.selection = Some(Selection { anchor: pos, end: pos, mode: SelectionMode::Normal });
+                    }
                     term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -639,8 +715,41 @@ define_class!(
                         // Mouse is inside viewport — normal drag
                         self.ivars().auto_scroll_speed.set(0);
                         let mut term = pane.terminal.write();
-                        if let Some(ref mut sel) = term.selection {
-                            sel.end = pos;
+                        // Read mode and anchor before mutating selection
+                        let sel_info = term.selection.as_ref().map(|s| (s.mode, s.anchor));
+                        if let Some((mode, anchor)) = sel_info {
+                            match mode {
+                                SelectionMode::Word => {
+                                    let (wstart, wend) = term.word_bounds_at(pos);
+                                    let anchor_before = (anchor.line, anchor.col) <= (pos.line, wstart);
+                                    let sel = term.selection.as_mut().unwrap();
+                                    if anchor_before {
+                                        sel.end = GridPos { line: pos.line, col: wend };
+                                    } else {
+                                        sel.end = GridPos { line: pos.line, col: wstart };
+                                    }
+                                }
+                                SelectionMode::Line => {
+                                    let row_len = term.row_at(pos.line)
+                                        .map(|r| r.cells.len().saturating_sub(1) as u16)
+                                        .unwrap_or(0);
+                                    let anchor_row_len = term.row_at(anchor.line)
+                                        .map(|r| r.cells.len().saturating_sub(1) as u16)
+                                        .unwrap_or(0);
+                                    let sel = term.selection.as_mut().unwrap();
+                                    if pos.line >= anchor.line {
+                                        sel.anchor.col = 0;
+                                        sel.end = GridPos { line: pos.line, col: row_len };
+                                    } else {
+                                        sel.anchor.col = anchor_row_len;
+                                        sel.end = GridPos { line: pos.line, col: 0 };
+                                    }
+                                }
+                                SelectionMode::Normal => {
+                                    let sel = term.selection.as_mut().unwrap();
+                                    sel.end = pos;
+                                }
+                            }
                             term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     } else {
@@ -693,7 +802,7 @@ define_class!(
                 let mut term = pane.terminal.write();
                 // Single click (no drag) — clear selection
                 if let Some(ref sel) = term.selection {
-                    if sel.anchor == sel.end {
+                    if sel.anchor == sel.end && sel.mode == SelectionMode::Normal {
                         term.selection = None;
                         term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                         return;
@@ -815,26 +924,15 @@ impl KovaView {
             git_poll_interval: Cell::new(120), // updated in setup_metal
             keybindings: OnceCell::new(),
             show_help: Cell::new(false),
+            show_mem_report: Cell::new(false),
             help_hint_frames: Cell::new(180), // updated in setup_metal
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
-    /// Return the currently focused pane (keyboard input target).
-    fn log_mem_report(&self) {
-        // Process RSS via mach API
-        let rss_mb = unsafe {
-            let mut info: libc::mach_task_basic_info_data_t = std::mem::zeroed();
-            let mut count = (std::mem::size_of::<libc::mach_task_basic_info_data_t>()
-                / std::mem::size_of::<libc::natural_t>()) as u32;
-            let kr = libc::task_info(
-                libc::mach_task_self_,
-                libc::MACH_TASK_BASIC_INFO,
-                &mut info as *mut _ as *mut i32,
-                &mut count,
-            );
-            if kr == 0 { info.resident_size as f64 / (1024.0 * 1024.0) } else { -1.0 }
-        };
+    /// Build memory report, store in renderer for overlay, and log to file.
+    fn show_mem_report_overlay(&self) {
+        let rss_mb = crate::get_rss_mb();
 
         // Per-pane stats across ALL windows
         let mut total_panes = 0usize;
@@ -899,10 +997,9 @@ impl KovaView {
 
         let total_terminal = total_grid_bytes + total_sb_bytes + total_alt_bytes;
 
-        // Build report lines
+        // Build report lines (plain text, no ANSI — rendered by overlay)
         let mut report = Vec::new();
-        report.push(format!("\x1b[1;36m=== MEMORY REPORT ===\x1b[0m"));
-        report.push(format!("RSS: \x1b[1m{:.1} MB\x1b[0m  |  Panes: {}", rss_mb, total_panes));
+        report.push(format!("RSS: {:.1} MB  |  Panes: {}", rss_mb, total_panes));
         report.push(format!(
             "Terminal: {:.1} MB (grid {:.1} KB, scrollback {:.1} MB [{} lines], alt {:.1} KB)",
             total_terminal as f64 / (1024.0 * 1024.0),
@@ -920,31 +1017,22 @@ impl KovaView {
         }
         let accounted = total_terminal as f64 / (1024.0 * 1024.0) + total_renderer_bytes as f64 / (1024.0 * 1024.0);
         report.push(format!("Unaccounted: {:.1} MB (system/Metal drawables/AppKit)", rss_mb - accounted));
+        report.push(String::new());
         for detail in &pane_details {
             report.push(detail.clone());
         }
-        report.push(format!("\x1b[1;36m=== END ===\x1b[0m"));
 
         // Log to file
         for line in &report {
-            // Strip ANSI for log file
-            let clean: String = line.chars().filter(|c| *c != '\x1b').collect();
-            log::info!("{}", clean);
+            log::info!("{}", line);
         }
 
-        // Inject report into focused pane's terminal via VTE parser
-        if let Some(pane) = self.focused_pane() {
-            let output = report.join("\r\n");
-            let bytes = format!("\r\n{}\r\n", output);
-            let devnull = std::fs::File::open("/dev/null").unwrap();
-            let dummy_fd = Arc::new(std::os::fd::OwnedFd::from(devnull));
-            let mut parser = vte::Parser::new();
-            let mut handler = crate::terminal::parser::VteHandler::new(
-                pane.terminal.clone(), dummy_fd,
-            );
-            parser.advance(&mut handler, bytes.as_bytes());
-            handler.release_guard();
+        // Store in renderer and show overlay
+        if let Some(renderer) = self.ivars().renderer.get() {
+            renderer.write().set_mem_report(report);
         }
+        self.ivars().show_mem_report.set(true);
+        self.mark_dirty();
     }
 
     fn focused_pane(&self) -> Option<&Pane> {
@@ -1020,11 +1108,11 @@ impl KovaView {
 
         if let Some((visible_row, col)) = self.pixel_to_visible_row_col(px, py, pane, &vp) {
             let term = pane.terminal.read();
-            if let Some((start, end, url)) = term.url_at(visible_row, col) {
+            if let Some((segments, url)) = term.url_at(visible_row, col) {
                 let old = self.ivars().hovered_url.borrow().clone();
-                let changed = old.as_ref().map_or(true, |o| o.1 != visible_row || o.2 != start || o.3 != end);
+                let changed = old.as_ref().map_or(true, |o| o.1 != segments);
                 if changed {
-                    *self.ivars().hovered_url.borrow_mut() = Some((pane.id, visible_row, start, end, url));
+                    *self.ivars().hovered_url.borrow_mut() = Some((pane.id, segments, url));
                     NSCursor::pointingHandCursor().set();
                     self.mark_dirty();
                 }
@@ -1810,6 +1898,11 @@ impl KovaView {
                 if let Some(p) = tab.tree.pane(neighbor_id) {
                     p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Auto-scroll to reveal the focused pane in its new position
+                let panes_vp = self.panes_viewport_for_tab(tab);
+                if let Some(vp) = tab.tree.viewport_for_pane(focused_id, panes_vp) {
+                    tab.scroll_to_reveal(&vp, self.drawable_viewport().width);
+                }
                 drop(tabs);
                 self.resize_all_panes();
             }
@@ -2527,6 +2620,7 @@ impl KovaView {
             ivars.help_hint_frames.set(help_hint_remaining - 1);
         }
         let show_help = ivars.show_help.get();
+        let show_mem_report = ivars.show_mem_report.get();
 
         // Build filter render data if active
         let filter_data = {
@@ -2553,16 +2647,16 @@ impl KovaView {
             ivars.tab_bar_left_inset.set(inset);
             inset
         };
-        let (hover_pos, hover_text, hover_pane_id) = {
+        let (hover_segments, hover_text, hover_pane_id) = {
             let h = ivars.hovered_url.borrow();
             (
-                h.as_ref().map(|(_, row, start, end, _)| (*row, *start, *end)),
-                h.as_ref().map(|(_, _, _, _, url)| url.clone()),
-                h.as_ref().map(|(pid, _, _, _, _)| *pid),
+                h.as_ref().map(|(_, segs, _)| segs.clone()),
+                h.as_ref().map(|(_, _, url)| url.clone()),
+                h.as_ref().map(|(pid, _, _)| *pid),
             )
         };
         let mut r = renderer.write();
-        r.hovered_url = hover_pos;
+        r.hovered_url = hover_segments;
         r.hovered_url_text = hover_text;
         r.hovered_url_pane_id = hover_pane_id;
         // Count hidden panes (fully off-screen)
@@ -2576,7 +2670,7 @@ impl KovaView {
             }
         }
         let keys_config = ivars.config.get().map(|c| &c.keys);
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, show_help, help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, show_help, show_mem_report, help_hint_remaining, keys_config);
         true
     }
 
