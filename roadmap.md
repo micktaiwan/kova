@@ -115,6 +115,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [ ] **Run-length encoding** : compresser les séquences de même couleur.
 - [ ] Metriques perf exposées (frame time, mémoire, allocations) — utile pour diagnostiquer sans avoir à lancer vmmap/heap manuellement
 - [ ] Double-clic sur un mot → sélectionne le mot entier
+- [ ] Minimisation de pane — réduire un pane à une barre minimale pour maximiser l'espace des autres panes, avec possibilité de le restaurer
 - [ ] Cmd+V dans le champ de recherche (Cmd+F) — le paste ne fonctionne pas actuellement dans l'overlay de recherche
 - [x] Flèches dans le renommage de tab/pane — les flèches gauche/droite naviguent dans le texte, curseur positionnable, backspace/insertion au curseur
 
