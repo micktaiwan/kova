@@ -78,12 +78,16 @@ pub struct Renderer {
     global_bar_scroll_color: [f32; 3],
     last_minute: u32,
     cached_time_str: String,
+    last_rss_epoch: u32,
+    cached_rss_str: String,
+    /// Cached memory report lines for overlay (set by window on Cmd+Shift+I).
+    cached_mem_report: Vec<String>,
     selection_color: [f32; 3],
     tab_bar_bg: [f32; 3],
     tab_bar_fg: [f32; 3],
     tab_bar_active_bg: [f32; 3],
-    /// Hovered URL: (focused_pane_id, visible_row, col_start, col_end)
-    pub hovered_url: Option<(usize, u16, u16)>,
+    /// Hovered URL: per-row segments [(visible_row, col_start, col_end)]
+    pub hovered_url: Option<Vec<(usize, u16, u16)>>,
     /// Hovered URL text (for status bar display)
     pub hovered_url_text: Option<String>,
     /// Pane ID of the hovered URL (to show URL only in that pane's status bar)
@@ -167,6 +171,9 @@ impl Renderer {
             global_bar_scroll_color: config.global_status_bar.scroll_indicator_color,
             last_minute: u32::MAX,
             cached_time_str: String::new(),
+            last_rss_epoch: u32::MAX,
+            cached_rss_str: String::new(),
+            cached_mem_report: Vec::new(),
             selection_color: [0.45, 0.42, 0.20],
             tab_bar_bg: config.tab_bar.bg_color,
             tab_bar_fg: config.tab_bar.fg_color,
@@ -193,6 +200,7 @@ impl Renderer {
         hidden_left: usize,
         hidden_right: usize,
         show_help: bool,
+        show_mem_report: bool,
         help_hint_remaining: u32,
         keys_config: Option<&KeysConfig>,
     ) {
@@ -216,18 +224,38 @@ impl Renderer {
             (true, false)
         };
 
+        // Shared timestamp for time + RSS checks
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         // Check if minute changed for global status bar time
         let minute_changed = {
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default();
-            let current_minute = (now.as_secs() / 60) as u32;
+            let current_minute = (now_secs / 60) as u32;
             if current_minute != self.last_minute {
                 self.last_minute = current_minute;
-                let t = now.as_secs() as libc::time_t;
+                let t = now_secs as libc::time_t;
                 let mut tm: libc::tm = unsafe { std::mem::zeroed() };
                 unsafe { libc::localtime_r(&t, &mut tm) };
                 self.cached_time_str = format!("{:02}:{:02}", tm.tm_hour, tm.tm_min);
+                true
+            } else {
+                false
+            }
+        };
+
+        // Update RSS every 2 seconds
+        let rss_changed = {
+            let epoch_2s = (now_secs / 2) as u32;
+            if epoch_2s != self.last_rss_epoch {
+                self.last_rss_epoch = epoch_2s;
+                let rss_mb = crate::get_rss_mb();
+                self.cached_rss_str = if rss_mb >= 0.0 {
+                    format!("{:.1}M", rss_mb)
+                } else {
+                    String::new()
+                };
                 true
             } else {
                 false
@@ -258,7 +286,7 @@ impl Renderer {
         // If only sync-deferred panes were dirty, still need to render the others
         let all_ready = !any_not_ready;
         let has_filter = filter.is_some();
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !has_filter && !show_help && help_hint_remaining == 0 {
+        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && help_hint_remaining == 0 {
             return;
         }
 
@@ -276,12 +304,12 @@ impl Renderer {
         let mut overlay_vertices = Vec::new();
         let (cell_w, cell_h) = self.cell_size();
         let saved_hover_text = self.hovered_url_text.clone();
-        let saved_hover_pos = self.hovered_url;
+        let saved_hover_segments = self.hovered_url.clone();
         for (term, vp, shell_ready, is_focused, pane_id, custom_title, has_completion) in panes {
             // Scope hovered URL to the pane that owns it
             let is_hover_pane = self.hovered_url_pane_id == Some(*pane_id);
             self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
-            self.hovered_url = if is_hover_pane { saved_hover_pos } else { None };
+            self.hovered_url = if is_hover_pane { saved_hover_segments.clone() } else { None };
             // Skip panes entirely off-screen (hidden by horizontal scroll)
             if vp.x + vp.width <= 0.0 || vp.x >= viewport_w {
                 continue;
@@ -319,7 +347,7 @@ impl Renderer {
             }
         }
         self.hovered_url_text = saved_hover_text;
-        self.hovered_url = saved_hover_pos;
+        self.hovered_url = saved_hover_segments;
 
         // Build overlay vertices (separators, tab bar, status bar, filter, help)
         // These are drawn with a global scissor rect (no per-pane clipping needed)
@@ -375,6 +403,11 @@ impl Renderer {
             if let Some(keys_config) = keys_config {
                 self.build_help_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, keys_config);
             }
+        }
+
+        // Draw memory report overlay
+        if show_mem_report {
+            self.build_mem_report_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h);
         }
 
         // Flatten all pane vertices + overlay into a single buffer, tracking draw ranges
@@ -637,14 +670,15 @@ impl Renderer {
             }
         }
 
-        // Draw URL underline for hovered URL
-        if let Some((hover_row, col_start, col_end)) = self.hovered_url {
-            let uy = (oy + y_offset + hover_row as f32 * cell_h + cell_h - 1.0).round();
-            let ux = (ox + col_start as f32 * cell_w).round();
-            let uw = (col_end - col_start) as f32 * cell_w;
-            // Use a subtle blue underline color
+        // Draw URL underline for hovered URL (may span multiple wrapped rows)
+        if let Some(ref segments) = self.hovered_url {
             let url_color = [0.4, 0.6, 1.0];
-            Self::push_bg_quad(&mut vertices, ux, uy, uw, 1.0, url_color);
+            for &(hover_row, col_start, col_end) in segments {
+                let uy = (oy + y_offset + hover_row as f32 * cell_h + cell_h - 1.0).round();
+                let ux = (ox + col_start as f32 * cell_w).round();
+                let uw = (col_end - col_start) as f32 * cell_w;
+                Self::push_bg_quad(&mut vertices, ux, uy, uw, 1.0, url_color);
+            }
         }
 
         // Draw cursor (adjusted for scroll offset and y_offset)
@@ -831,12 +865,21 @@ impl Renderer {
             }
         }
 
-        // Right: time HH:MM (cached, updated once per minute)
+        // Right: RSS + time (e.g. "14.2M  17:42")
         if !self.cached_time_str.is_empty() {
             let time_str = self.cached_time_str.clone();
+            let rss_str = self.cached_rss_str.clone();
             let time_w = time_str.chars().count() as f32 * cell_w;
             let right_x = viewport_w - time_w - cell_w;
             self.render_status_text(vertices, &time_str, right_x, bar_y, viewport_w, time_fg, no_bg);
+
+            if !rss_str.is_empty() {
+                let rss_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.6];
+                let gap = cell_w * 2.0;
+                let rss_w = rss_str.chars().count() as f32 * cell_w;
+                let rss_x = right_x - rss_w - gap;
+                self.render_status_text(vertices, &rss_str, rss_x, bar_y, viewport_w, rss_fg, no_bg);
+            }
         }
     }
 
@@ -1273,8 +1316,68 @@ impl Renderer {
         self.cached_help_shortcuts = shortcuts;
     }
 
+    fn build_mem_report_overlay_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+
+        // Semi-transparent dark overlay
+        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let title_fg = [1.0, 0.85, 0.3, 1.0];
+        let label_fg = [0.8, 0.85, 0.9, 1.0];
+        let dim_fg = [0.55, 0.6, 0.65, 1.0];
+
+        let title_scale = 1.8_f32;
+        let body_scale = 1.2_f32;
+        let scaled_cell_h = cell_h * body_scale;
+
+        // Title
+        let title = "Memory Report";
+        let title_chars = title.chars().count() as f32;
+        let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
+        let mut y = cell_h * 3.0;
+        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        y += cell_h * title_scale * 2.0;
+
+        // Subtitle
+        let subtitle = "Press Esc to close";
+        let sub_chars = subtitle.chars().count() as f32;
+        let sub_x = (viewport_w - sub_chars * cell_w * body_scale) / 2.0;
+        self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        y += scaled_cell_h * 2.5;
+
+        // Report lines
+        let report = std::mem::take(&mut self.cached_mem_report);
+        let left_margin = cell_w * 3.0;
+        for line in &report {
+            if y + scaled_cell_h > viewport_h - cell_h {
+                break;
+            }
+            let fg = if line.starts_with("===") || line.starts_with("RSS") {
+                title_fg
+            } else if line.starts_with("  ") {
+                dim_fg
+            } else {
+                label_fg
+            };
+            self.render_text(vertices, line, left_margin, y, viewport_w - cell_w, fg, no_bg, body_scale);
+            y += scaled_cell_h * 1.3;
+        }
+        self.cached_mem_report = report;
+    }
+
     pub fn cell_size(&self) -> (f32, f32) {
         (self.atlas.cell_width, self.atlas.cell_height)
+    }
+
+    pub fn set_mem_report(&mut self, report: Vec<String>) {
+        self.cached_mem_report = report;
     }
 
     pub fn status_bar_enabled(&self) -> bool {

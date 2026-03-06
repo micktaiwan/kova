@@ -19,6 +19,22 @@ use std::path::PathBuf;
 
 static ICON_DATA: &[u8] = include_bytes!("../assets/kova.icns");
 
+/// Process RSS (Resident Set Size) in MB via mach API.
+pub(crate) fn get_rss_mb() -> f64 {
+    unsafe {
+        let mut info: libc::mach_task_basic_info_data_t = std::mem::zeroed();
+        let mut count = (std::mem::size_of::<libc::mach_task_basic_info_data_t>()
+            / std::mem::size_of::<libc::natural_t>()) as u32;
+        let kr = libc::task_info(
+            libc::mach_task_self_,
+            libc::MACH_TASK_BASIC_INFO,
+            &mut info as *mut _ as *mut i32,
+            &mut count,
+        );
+        if kr == 0 { info.resident_size as f64 / (1024.0 * 1024.0) } else { -1.0 }
+    }
+}
+
 fn setup_logging() {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let log_dir = PathBuf::from(home).join("Library/Logs/Kova");
