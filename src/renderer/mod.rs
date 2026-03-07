@@ -28,6 +28,36 @@ use vertex::Vertex;
 
 use crate::config::{Config, KeysConfig};
 use crate::pane::PaneId;
+
+/// Attention state for a non-focused pane (bell > completion > none).
+#[derive(Clone, Copy, PartialEq)]
+enum PaneAttention {
+    None,
+    Completion,
+    Bell,
+}
+
+impl PaneAttention {
+    fn from_flags(has_bell: bool, has_completion: bool) -> Self {
+        if has_bell { Self::Bell } else if has_completion { Self::Completion } else { Self::None }
+    }
+
+    fn dot_color(self) -> Option<[f32; 4]> {
+        match self {
+            Self::Bell => Some([0.9, 0.6, 0.2, 1.0]),
+            Self::Completion => Some([0.2, 0.8, 0.3, 1.0]),
+            Self::None => None,
+        }
+    }
+
+    fn bar_bg(self, default: [f32; 3]) -> [f32; 3] {
+        match self {
+            Self::Bell => [0.35, 0.22, 0.10],
+            Self::Completion => [0.15, 0.30, 0.15],
+            Self::None => default,
+        }
+    }
+}
 use crate::terminal::{CursorShape, FilterMatch, TerminalState};
 
 /// Data passed to the renderer for drawing filter overlay.
@@ -192,7 +222,7 @@ impl Renderer {
     pub fn render_panes(
         &mut self,
         layer: &CAMetalLayer,
-        panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>, bool)],
+        panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>, bool, bool)],
         separators: &[(f32, f32, f32, f32)],
         tab_titles: &[(String, bool, Option<usize>, bool, bool, bool)],
         filter: Option<&FilterRenderData>,
@@ -205,7 +235,7 @@ impl Renderer {
         keys_config: Option<&KeysConfig>,
     ) {
         // Reset blink on cursor movement of focused pane
-        if let Some((term, _, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _, _)| *focused) {
+        if let Some((term, _, _, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _, _, _)| *focused) {
             let epoch = term.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed);
             if epoch != self.last_cursor_epoch {
                 self.last_cursor_epoch = epoch;
@@ -266,7 +296,7 @@ impl Renderer {
         let mut any_dirty = false;
         let mut any_not_ready = false;
         let mut any_sync_deferred = false;
-        for (term, _, ready, _, _, _, _) in panes {
+        for (term, _, ready, _, _, _, _, _) in panes {
             if !ready { any_not_ready = true; }
             let t = term.read();
             // Synchronized output: this pane wants to defer, but don't block others
@@ -305,7 +335,7 @@ impl Renderer {
         let (cell_w, cell_h) = self.cell_size();
         let saved_hover_text = self.hovered_url_text.clone();
         let saved_hover_segments = self.hovered_url.clone();
-        for (term, vp, shell_ready, is_focused, pane_id, custom_title, has_completion) in panes {
+        for (term, vp, shell_ready, is_focused, pane_id, custom_title, has_completion, has_bell) in panes {
             // Scope hovered URL to the pane that owns it
             let is_hover_pane = self.hovered_url_pane_id == Some(*pane_id);
             self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
@@ -319,23 +349,23 @@ impl Renderer {
                 continue;
             }
             let mut pane_verts = Vec::new();
+            let pane_attention = PaneAttention::from_flags(*has_bell, *has_completion);
             if *shell_ready {
                 let t = term.read();
                 // Only blink cursor on focused pane
                 let show_blink = if *is_focused { blink_on } else { true };
-                let mut verts = self.build_vertices(&t, vp, show_blink, *is_focused, custom_title.as_deref());
+                let mut verts = self.build_vertices(&t, vp, show_blink, *is_focused, custom_title.as_deref(), pane_attention);
                 pane_verts.append(&mut verts);
             } else {
                 let mut verts = self.build_loading_vertices(vp);
                 pane_verts.append(&mut verts);
             }
-            // Command completion indicator: green dot on non-focused panes
-            if *has_completion && !is_focused {
+            // Attention indicator dot on non-focused panes
+            if let Some(color) = pane_attention.dot_color() {
                 let dot_x = vp.x + vp.width - cell_w * 2.5;
                 let dot_y = vp.y + cell_h * 0.5;
-                let green = [0.2, 0.8, 0.3, 1.0];
                 let no_bg = [0.0_f32, 0.0, 0.0, 0.0];
-                self.render_status_text(&mut pane_verts, "●", dot_x, dot_y, vp.x + vp.width, green, no_bg);
+                self.render_status_text(&mut pane_verts, "●", dot_x, dot_y, vp.x + vp.width, color, no_bg);
             }
             // Compute scissor rect clamped to drawable bounds
             let sx = (vp.x.max(0.0)) as usize;
@@ -393,7 +423,7 @@ impl Renderer {
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
-            if let Some((_, vp, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _, _)| *focused) {
+            if let Some((_, vp, _, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _, _, _)| *focused) {
                 self.build_filter_overlay_vertices(&mut overlay_vertices, vp, filter_data);
             }
         }
@@ -536,6 +566,7 @@ impl Renderer {
         blink_on: bool,
         is_focused: bool,
         custom_title: Option<&str>,
+        attention: PaneAttention,
     ) -> Vec<Vertex> {
         // Pass 1: collect unknown chars/clusters for dynamic rasterization
         let display = term.visible_lines();
@@ -726,7 +757,7 @@ impl Renderer {
 
         // Status bar
         if self.status_bar_enabled {
-            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title);
+            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention);
         }
 
         vertices
@@ -738,13 +769,14 @@ impl Renderer {
         vp: &PaneViewport,
         term: &TerminalState,
         custom_title: Option<&str>,
+        attention: PaneAttention,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
         let bar_y = vp.y + vp.height - cell_h;
 
-        // Background quad for the full status bar
-        Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, self.status_bar_bg);
+        // Background quad: orange for bell, green for completion, default otherwise
+        Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, attention.bar_bg(self.status_bar_bg));
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let cwd_fg = [self.status_bar_cwd_color[0], self.status_bar_cwd_color[1], self.status_bar_cwd_color[2], 1.0];
