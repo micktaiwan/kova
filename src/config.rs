@@ -261,7 +261,11 @@ pub struct KeysConfig {
     pub resize_right: String,
     pub resize_up: String,
     pub resize_down: String,
+    pub minimize_pane: String,
+    pub restore_minimized: String,
     pub toggle_help: String,
+    pub close_tab: String,
+    pub open_recent_project: String,
     pub terminal: TerminalKeysConfig,
 }
 
@@ -312,7 +316,11 @@ impl Default for KeysConfig {
             resize_right: "cmd+ctrl+right".into(),
             resize_up: "cmd+ctrl+up".into(),
             resize_down: "cmd+ctrl+down".into(),
+            minimize_pane: "cmd+m".into(),
+            restore_minimized: "cmd+option+m".into(),
             toggle_help: "cmd+shift+/".into(),
+            close_tab: "cmd+shift+w".into(),
+            open_recent_project: "cmd+o".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }

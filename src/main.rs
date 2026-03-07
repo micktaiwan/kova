@@ -3,6 +3,7 @@ mod config;
 mod input;
 mod keybindings;
 mod pane;
+mod recent_projects;
 mod renderer;
 mod session;
 mod terminal;

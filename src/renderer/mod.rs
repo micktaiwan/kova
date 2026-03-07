@@ -66,6 +66,36 @@ pub struct FilterRenderData {
     pub matches: Vec<FilterMatch>,
 }
 
+/// A single entry in the recent projects overlay.
+pub struct RecentProjectEntry {
+    pub path: String,
+    pub time_ago: String,
+    pub pane_count: usize,
+    pub invalid: bool,
+}
+
+/// Data passed to the renderer for drawing recent projects overlay.
+pub struct RecentProjectsRenderData<'a> {
+    pub entries: &'a [&'a RecentProjectEntry],
+    pub selected: usize,
+    pub scroll: usize,
+}
+
+/// Per-pane data passed from window to renderer.
+pub struct PaneRenderData {
+    pub terminal: Arc<RwLock<TerminalState>>,
+    pub viewport: PaneViewport,
+    pub shell_ready: bool,
+    pub is_focused: bool,
+    pub pane_id: PaneId,
+    pub custom_title: Option<String>,
+    /// Pre-computed display title (custom > OSC > CWD basename > "shell").
+    pub display_title: String,
+    pub has_completion: bool,
+    pub has_bell: bool,
+    pub minimized: bool,
+}
+
 /// Sub-region of the drawable where a pane is rendered (in pixels).
 #[derive(Clone, Copy)]
 pub struct PaneViewport {
@@ -110,6 +140,8 @@ pub struct Renderer {
     cached_time_str: String,
     last_rss_epoch: u32,
     cached_rss_str: String,
+    cached_proc_count: u32,
+    cached_proc_str: String,
     /// Cached memory report lines for overlay (set by window on Cmd+Shift+I).
     cached_mem_report: Vec<String>,
     selection_color: [f32; 3],
@@ -203,6 +235,8 @@ impl Renderer {
             cached_time_str: String::new(),
             last_rss_epoch: u32::MAX,
             cached_rss_str: String::new(),
+            cached_proc_count: 0,
+            cached_proc_str: String::from("▶0"),
             cached_mem_report: Vec::new(),
             selection_color: [0.45, 0.42, 0.20],
             tab_bar_bg: config.tab_bar.bg_color,
@@ -217,12 +251,12 @@ impl Renderer {
     }
 
 
-    /// Render multiple panes. Each entry: (terminal, viewport, shell_ready, is_focused, pane_id).
+    /// Render multiple panes. Each entry: (terminal, viewport, shell_ready, is_focused, pane_id, custom_title, has_completion, has_bell, minimized).
     /// `separators` are line segments (x1, y1, x2, y2) drawn between splits.
     pub fn render_panes(
         &mut self,
         layer: &CAMetalLayer,
-        panes: &[(Arc<RwLock<TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>, bool, bool)],
+        panes: &[PaneRenderData],
         separators: &[(f32, f32, f32, f32)],
         tab_titles: &[(String, bool, Option<usize>, bool, bool, bool)],
         filter: Option<&FilterRenderData>,
@@ -231,12 +265,13 @@ impl Renderer {
         hidden_right: usize,
         show_help: bool,
         show_mem_report: bool,
+        recent_projects: Option<&RecentProjectsRenderData<'_>>,
         help_hint_remaining: u32,
         keys_config: Option<&KeysConfig>,
     ) {
         // Reset blink on cursor movement of focused pane
-        if let Some((term, _, _, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _, _, _)| *focused) {
-            let epoch = term.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(focused_pane) = panes.iter().find(|p| p.is_focused) {
+            let epoch = focused_pane.terminal.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed);
             if epoch != self.last_cursor_epoch {
                 self.last_cursor_epoch = epoch;
                 self.blink_counter = 0;
@@ -275,7 +310,7 @@ impl Renderer {
             }
         };
 
-        // Update RSS every 2 seconds
+        // Update RSS + process count every 2 seconds
         let rss_changed = {
             let epoch_2s = (now_secs / 2) as u32;
             if epoch_2s != self.last_rss_epoch {
@@ -286,6 +321,8 @@ impl Renderer {
                 } else {
                     String::new()
                 };
+                self.cached_proc_count = crate::terminal::pty::foreground_process_count();
+                self.cached_proc_str = format!("▶{}", self.cached_proc_count);
                 true
             } else {
                 false
@@ -296,9 +333,9 @@ impl Renderer {
         let mut any_dirty = false;
         let mut any_not_ready = false;
         let mut any_sync_deferred = false;
-        for (term, _, ready, _, _, _, _, _) in panes {
-            if !ready { any_not_ready = true; }
-            let t = term.read();
+        for pane in panes {
+            if !pane.shell_ready { any_not_ready = true; }
+            let t = pane.terminal.read();
             // Synchronized output: this pane wants to defer, but don't block others
             if t.synchronized_output {
                 if let Some(since) = t.sync_output_since {
@@ -309,14 +346,15 @@ impl Renderer {
                 }
             }
             drop(t);
-            if term.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if pane.terminal.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
                 any_dirty = true;
             }
         }
         // If only sync-deferred panes were dirty, still need to render the others
         let all_ready = !any_not_ready;
         let has_filter = filter.is_some();
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && help_hint_remaining == 0 {
+        let has_recent_projects = recent_projects.is_some();
+        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && help_hint_remaining == 0 {
             return;
         }
 
@@ -335,38 +373,39 @@ impl Renderer {
         let (cell_w, cell_h) = self.cell_size();
         let saved_hover_text = self.hovered_url_text.clone();
         let saved_hover_segments = self.hovered_url.clone();
-        for (term, vp, shell_ready, is_focused, pane_id, custom_title, has_completion, has_bell) in panes {
+        for pane in panes {
+            let vp = &pane.viewport;
             // Scope hovered URL to the pane that owns it
-            let is_hover_pane = self.hovered_url_pane_id == Some(*pane_id);
+            let is_hover_pane = self.hovered_url_pane_id == Some(pane.pane_id);
             self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
             self.hovered_url = if is_hover_pane { saved_hover_segments.clone() } else { None };
             // Skip panes entirely off-screen (hidden by horizontal scroll)
             if vp.x + vp.width <= 0.0 || vp.x >= viewport_w {
                 continue;
             }
-            // Skip rendering focused pane content when filter overlay covers it
-            if *is_focused && filter.is_some() {
-                continue;
-            }
-            let mut pane_verts = Vec::new();
-            let pane_attention = PaneAttention::from_flags(*has_bell, *has_completion);
-            if *shell_ready {
-                let t = term.read();
-                // Only blink cursor on focused pane
-                let show_blink = if *is_focused { blink_on } else { true };
-                let mut verts = self.build_vertices(&t, vp, show_blink, *is_focused, custom_title.as_deref(), pane_attention);
-                pane_verts.append(&mut verts);
+            // Build pane vertices (minimized bar or full content)
+            let pane_verts = if pane.minimized {
+                self.build_minimized_bar_vertices(vp, &pane.display_title, pane.has_bell, pane.has_completion)
+            } else if pane.is_focused && filter.is_some() {
+                continue; // Skip: filter overlay covers focused pane
             } else {
-                let mut verts = self.build_loading_vertices(vp);
-                pane_verts.append(&mut verts);
-            }
-            // Attention indicator dot on non-focused panes
-            if let Some(color) = pane_attention.dot_color() {
-                let dot_x = vp.x + vp.width - cell_w * 2.5;
-                let dot_y = vp.y + cell_h * 0.5;
-                let no_bg = [0.0_f32, 0.0, 0.0, 0.0];
-                self.render_status_text(&mut pane_verts, "●", dot_x, dot_y, vp.x + vp.width, color, no_bg);
-            }
+                let pane_attention = PaneAttention::from_flags(pane.has_bell, pane.has_completion);
+                let mut verts = if pane.shell_ready {
+                    let t = pane.terminal.read();
+                    let show_blink = if pane.is_focused { blink_on } else { true };
+                    self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention)
+                } else {
+                    self.build_loading_vertices(vp)
+                };
+                // Attention indicator dot on non-focused panes
+                if let Some(color) = pane_attention.dot_color() {
+                    let dot_x = vp.x + vp.width - cell_w * 2.5;
+                    let dot_y = vp.y + cell_h * 0.5;
+                    let no_bg = [0.0_f32, 0.0, 0.0, 0.0];
+                    self.render_status_text(&mut verts, "●", dot_x, dot_y, vp.x + vp.width, color, no_bg);
+                }
+                verts
+            };
             // Compute scissor rect clamped to drawable bounds
             let sx = (vp.x.max(0.0)) as usize;
             let sy = (vp.y.max(0.0)) as usize;
@@ -423,8 +462,8 @@ impl Renderer {
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
-            if let Some((_, vp, _, _, _, _, _, _)) = panes.iter().find(|(_, _, _, focused, _, _, _, _)| *focused) {
-                self.build_filter_overlay_vertices(&mut overlay_vertices, vp, filter_data);
+            if let Some(focused_pane) = panes.iter().find(|p| p.is_focused) {
+                self.build_filter_overlay_vertices(&mut overlay_vertices, &focused_pane.viewport, filter_data);
             }
         }
 
@@ -438,6 +477,11 @@ impl Renderer {
         // Draw memory report overlay
         if show_mem_report {
             self.build_mem_report_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h);
+        }
+
+        // Draw recent projects overlay
+        if let Some(rp) = recent_projects {
+            self.build_recent_projects_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, rp);
         }
 
         // Flatten all pane vertices + overlay into a single buffer, tracking draw ranges
@@ -897,7 +941,7 @@ impl Renderer {
             }
         }
 
-        // Right: RSS + time (e.g. "14.2M  17:42")
+        // Right: proc count + RSS + time (e.g. "▶2  14.2M  17:42")
         if !self.cached_time_str.is_empty() {
             let time_str = self.cached_time_str.clone();
             let rss_str = self.cached_rss_str.clone();
@@ -905,13 +949,25 @@ impl Renderer {
             let right_x = viewport_w - time_w - cell_w;
             self.render_status_text(vertices, &time_str, right_x, bar_y, viewport_w, time_fg, no_bg);
 
+            let mut left_edge = right_x;
+            let gap = cell_w * 2.0;
+
             if !rss_str.is_empty() {
                 let rss_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.6];
-                let gap = cell_w * 2.0;
                 let rss_w = rss_str.chars().count() as f32 * cell_w;
-                let rss_x = right_x - rss_w - gap;
-                self.render_status_text(vertices, &rss_str, rss_x, bar_y, viewport_w, rss_fg, no_bg);
+                left_edge = left_edge - rss_w - gap;
+                self.render_status_text(vertices, &rss_str, left_edge, bar_y, viewport_w, rss_fg, no_bg);
             }
+
+            let proc_fg = if self.cached_proc_count > 0 {
+                [0.6, 0.85, 0.6, 1.0]
+            } else {
+                [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.4]
+            };
+            let proc_w = self.cached_proc_str.chars().count() as f32 * cell_w;
+            left_edge = left_edge - proc_w - gap;
+            let proc_str = self.cached_proc_str.clone();
+            self.render_status_text(vertices, &proc_str, left_edge, bar_y, viewport_w, proc_fg, no_bg);
         }
     }
 
@@ -1181,6 +1237,64 @@ impl Renderer {
         }
     }
 
+    /// Build vertices for a minimized pane bar (24px thin dimension).
+    /// Detects orientation from viewport aspect ratio:
+    /// - narrow & tall (HSplit minimized) → vertical bar, text rotated 90°
+    /// - wide & short (VSplit minimized) → horizontal bar, text horizontal
+    fn build_minimized_bar_vertices(
+        &mut self,
+        vp: &PaneViewport,
+        label: &str,
+        has_bell: bool,
+        has_completion: bool,
+    ) -> Vec<Vertex> {
+        let mut vertices = Vec::new();
+        let attention = PaneAttention::from_flags(has_bell, has_completion);
+        let bar_bg = attention.bar_bg(self.status_bar_bg);
+
+        // Background quad
+        Self::push_bg_quad_alpha(&mut vertices, vp.x, vp.y, vp.width, vp.height, bar_bg, 1.0);
+
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+        let fg = [0.6, 0.6, 0.65, 1.0];
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let is_vertical_bar = vp.width < vp.height;
+
+        if is_vertical_bar {
+            // Vertical bar: render each character top-to-bottom
+            let char_x = vp.x + (vp.width - cell_w) / 2.0;
+            let start_y = vp.y + cell_h * 0.5;
+            let max_chars = ((vp.height - cell_h) / cell_h).floor() as usize;
+            let dot = attention.dot_color();
+            let text_slots = if dot.is_some() { max_chars.saturating_sub(1) } else { max_chars };
+            let mut buf = [0u8; 4];
+
+            for (i, c) in label.chars().take(text_slots).enumerate() {
+                let cy = start_y + i as f32 * cell_h;
+                let s = c.encode_utf8(&mut buf);
+                self.render_status_text(&mut vertices, s, char_x, cy, char_x + cell_w, fg, no_bg);
+            }
+
+            if let Some(color) = dot {
+                let dot_y = start_y + text_slots as f32 * cell_h;
+                self.render_status_text(&mut vertices, "●", char_x, dot_y, char_x + cell_w, color, no_bg);
+            }
+        } else {
+            // Horizontal bar: render text left-to-right
+            let padding = PANE_H_PADDING;
+            let text_y = vp.y + (vp.height - cell_h) / 2.0;
+            self.render_status_text(&mut vertices, &label, vp.x + padding, text_y, vp.x + vp.width - padding, fg, no_bg);
+
+            if let Some(color) = attention.dot_color() {
+                let dot_x = vp.x + vp.width - cell_w * 2.0;
+                self.render_status_text(&mut vertices, "●", dot_x, text_y, vp.x + vp.width, color, no_bg);
+            }
+        }
+
+        vertices
+    }
+
     fn build_loading_vertices(&mut self, vp: &PaneViewport) -> Vec<Vertex> {
         let text = "starting...";
         let cell_w = self.atlas.cell_width;
@@ -1291,6 +1405,8 @@ impl Renderer {
             let raw: Vec<(&str, &str)> = vec![
                 ("New Tab", &keys_config.new_tab),
                 ("Close Pane/Tab", &keys_config.close_pane_or_tab),
+                ("Close Tab", &keys_config.close_tab),
+                ("Open Recent", &keys_config.open_recent_project),
                 ("Vertical Split", &keys_config.vsplit),
                 ("Horizontal Split", &keys_config.hsplit),
                 ("V Split (Root)", &keys_config.vsplit_root),
@@ -1311,6 +1427,8 @@ impl Renderer {
                 ("Swap Pane", &keys_config.swap_up),
                 ("Reparent Pane", &keys_config.reparent_up),
                 ("Resize Pane", &keys_config.resize_up),
+                ("Minimize Pane", &keys_config.minimize_pane),
+                ("Restore Minimized", &keys_config.restore_minimized),
                 ("Help", &keys_config.toggle_help),
             ];
             self.cached_help_shortcuts = raw.into_iter()
@@ -1402,6 +1520,108 @@ impl Renderer {
             y += scaled_cell_h * 1.3;
         }
         self.cached_mem_report = report;
+    }
+
+    fn build_recent_projects_overlay_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        viewport_w: f32,
+        viewport_h: f32,
+        data: &RecentProjectsRenderData<'_>,
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+
+        // Semi-transparent dark overlay
+        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let title_fg = [1.0, 0.85, 0.3, 1.0];
+        let label_fg = [0.85, 0.85, 0.9, 1.0];
+        let dim_fg = [0.45, 0.45, 0.5, 1.0];
+        let time_fg = [0.5, 0.5, 0.55, 1.0];
+        let selected_bg = [0.25, 0.35, 0.55];
+        let invalid_fg = [0.4, 0.4, 0.42, 1.0];
+
+        let title_scale = 1.8_f32;
+        let body_scale = 1.3_f32;
+        let scaled_cell_w = cell_w * body_scale;
+        let scaled_cell_h = cell_h * body_scale;
+        let row_height = scaled_cell_h * 1.6;
+
+        // Title centered
+        let title = "Open Recent Project";
+        let title_chars = title.chars().count() as f32;
+        let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
+        let mut y = cell_h * 3.0;
+        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        y += cell_h * title_scale * 2.0;
+
+        // Subtitle
+        let subtitle = "↑↓ Navigate  ⏎ Open  ⌘⌫ Remove  esc Cancel";
+        let sub_chars = subtitle.chars().count() as f32;
+        let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
+        self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        y += scaled_cell_h * 2.0;
+
+        let content_top = y;
+        let content_bottom = viewport_h - cell_h * 2.0;
+        let max_visible = ((content_bottom - content_top) / row_height) as usize;
+
+        // Compute scroll to keep selected visible
+        let scroll = if data.selected >= data.scroll + max_visible {
+            data.selected - max_visible + 1
+        } else {
+            data.scroll
+        };
+
+        let left_margin = scaled_cell_w * 3.0;
+        let right_margin = viewport_w - scaled_cell_w * 3.0;
+
+        if data.entries.is_empty() {
+            let msg = "No recent projects to open";
+            let msg_w = msg.chars().count() as f32 * scaled_cell_w;
+            let msg_x = (viewport_w - msg_w) / 2.0;
+            self.render_text(vertices, msg, msg_x, content_top + row_height, viewport_w, dim_fg, no_bg, body_scale);
+            return;
+        }
+
+        for (i, entry) in data.entries.iter().enumerate().skip(scroll).take(max_visible) {
+            let row_y = content_top + (i - scroll) as f32 * row_height;
+            let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
+
+            // Selected row background
+            if i == data.selected {
+                Self::push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+            }
+
+            let fg = if entry.invalid { invalid_fg } else { label_fg };
+
+            // Path
+            self.render_text(vertices, &entry.path, left_margin, text_y, right_margin - scaled_cell_w * 12.0, fg, no_bg, body_scale);
+
+            // Pane count (if > 1)
+            let info = if entry.pane_count > 1 {
+                format!("{}p  {}", entry.pane_count, entry.time_ago)
+            } else {
+                entry.time_ago.clone()
+            };
+            let info_w = info.chars().count() as f32 * scaled_cell_w;
+            let info_x = right_margin - info_w;
+            self.render_text(vertices, &info, info_x, text_y, right_margin, time_fg, no_bg, body_scale);
+        }
+
+        // Scroll indicators
+        if scroll > 0 {
+            let arrow = "▲";
+            let ax = (viewport_w - scaled_cell_w) / 2.0;
+            self.render_text(vertices, arrow, ax, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
+        }
+        if scroll + max_visible < data.entries.len() {
+            let arrow = "▼";
+            let ax = (viewport_w - scaled_cell_w) / 2.0;
+            self.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);
+        }
     }
 
     pub fn cell_size(&self) -> (f32, f32) {

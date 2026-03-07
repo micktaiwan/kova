@@ -10,6 +10,9 @@ use crate::terminal::TerminalState;
 
 pub type PaneId = u32;
 
+/// Height of a minimized pane bar (in pixels).
+pub const MINIMIZED_BAR_PX: f32 = 24.0;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SplitDirection {
     Horizontal, // side by side (left | right)
@@ -76,6 +79,8 @@ pub struct Tab {
     pub has_bell: bool,
     /// Command completed in a non-focused pane/tab — show completion indicator.
     pub has_completion: bool,
+    /// FILO stack of minimized pane IDs.
+    pub minimized_stack: Vec<PaneId>,
     /// Horizontal scroll offset in pixels (0 = no scroll).
     pub scroll_offset_x: f32,
     /// Manual override of virtual width (0.0 = auto from min_split_width).
@@ -95,6 +100,7 @@ impl Tab {
             color: None,
             has_bell: false,
             has_completion: false,
+            minimized_stack: Vec::new(),
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
         })
@@ -112,6 +118,7 @@ impl Tab {
             color: None,
             has_bell: false,
             has_completion: false,
+            minimized_stack: Vec::new(),
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
         })
@@ -154,25 +161,13 @@ impl Tab {
         }
     }
 
-    /// Title for this tab: custom title if set, then OSC title of focused pane, or CWD basename, or "shell".
+    /// Title for this tab: custom title if set, then focused pane's display title, or "shell".
     pub fn title(&self) -> String {
         if let Some(ref custom) = self.custom_title {
             return custom.clone();
         }
         if let Some(pane) = self.tree.pane(self.focused_pane) {
-            if let Some(ref custom) = pane.custom_title {
-                return custom.clone();
-            }
-            let term = pane.terminal.read();
-            if let Some(ref title) = term.title {
-                return title.clone();
-            }
-            drop(term);
-            if let Some(cwd) = pane.cwd() {
-                if let Some(base) = std::path::Path::new(&cwd).file_name() {
-                    return base.to_string_lossy().to_string();
-                }
-            }
+            return pane.display_title("shell");
         }
         "shell".to_string()
     }
@@ -208,6 +203,70 @@ impl Tab {
         self.has_completion
     }
 
+    /// Minimize the pane with given id. Refuses if it's the last non-minimized pane.
+    pub fn minimize_pane(&mut self, id: PaneId) -> bool {
+        // Count non-minimized panes
+        let mut non_minimized = 0;
+        self.tree.for_each_pane(&mut |p| {
+            if !p.minimized { non_minimized += 1; }
+        });
+        if non_minimized <= 1 {
+            return false; // can't minimize the last visible pane
+        }
+        if let Some(pane) = self.tree.pane_mut(id) {
+            if pane.minimized {
+                return false; // already minimized
+            }
+            pane.minimized = true;
+            self.minimized_stack.push(id);
+            // Move focus to a non-minimized sibling
+            if self.focused_pane == id {
+                let mut first_non_minimized = None;
+                self.tree.for_each_pane(&mut |p| {
+                    if !p.minimized && first_non_minimized.is_none() {
+                        first_non_minimized = Some(p.id);
+                    }
+                });
+                if let Some(new_focus) = first_non_minimized {
+                    self.focused_pane = new_focus;
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Restore a specific minimized pane.
+    pub fn restore_pane(&mut self, id: PaneId) {
+        if let Some(pane) = self.tree.pane_mut(id) {
+            pane.minimized = false;
+        }
+        self.minimized_stack.retain(|&pid| pid != id);
+    }
+
+    /// Restore the last minimized pane (FILO).
+    pub fn restore_last_minimized(&mut self) -> bool {
+        if let Some(id) = self.minimized_stack.pop() {
+            if let Some(pane) = self.tree.pane_mut(id) {
+                pane.minimized = false;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Rebuild minimized_stack from the tree (depth-first order). Used after session restore.
+    pub fn rebuild_minimized_stack(&mut self) {
+        self.minimized_stack.clear();
+        self.tree.for_each_pane(&mut |p| {
+            if p.minimized {
+                self.minimized_stack.push(p.id);
+            }
+        });
+    }
+
     /// Clear the completion flag (call when switching to this tab).
     pub fn clear_completion(&mut self) {
         self.has_completion = false;
@@ -230,6 +289,8 @@ pub struct Pane {
     pub pending_command: Cell<Option<String>>,
     /// Custom pane title set by user (overrides OSC title).
     pub custom_title: Option<String>,
+    /// Whether this pane is minimized (collapsed to a thin bar).
+    pub minimized: bool,
 }
 
 impl Pane {
@@ -263,6 +324,7 @@ impl Pane {
             scroll_accumulator: Cell::new(0.0),
             pending_command: Cell::new(None),
             custom_title: None,
+            minimized: false,
         })
     }
 
@@ -284,6 +346,23 @@ impl Pane {
 
     pub fn last_command(&self) -> Option<String> {
         self.terminal.read().last_command.clone()
+    }
+
+    /// Display title for this pane: custom title > OSC title > CWD basename > fallback.
+    pub fn display_title(&self, fallback: &str) -> String {
+        if let Some(ref custom) = self.custom_title {
+            return custom.clone();
+        }
+        let term = self.terminal.read();
+        if let Some(ref title) = term.title {
+            return title.clone();
+        }
+        if let Some(ref cwd) = term.cwd {
+            if let Some(base) = std::path::Path::new(cwd).file_name() {
+                return base.to_string_lossy().to_string();
+            }
+        }
+        fallback.to_string()
     }
 
     /// If the shell is ready and there's a pending command, write it to the PTY
@@ -320,7 +399,29 @@ pub enum SplitTree {
     },
 }
 
+/// Compute split sizes accounting for minimized children.
+/// When a subtree is fully minimized, it collapses to MINIMIZED_BAR_PX.
+fn split_sizes(total: f32, ratio: f32, first_minimized: bool, second_minimized: bool) -> (f32, f32) {
+    match (first_minimized, second_minimized) {
+        (true, true) => (MINIMIZED_BAR_PX, MINIMIZED_BAR_PX),
+        (true, false) => (MINIMIZED_BAR_PX, total - MINIMIZED_BAR_PX),
+        (false, true) => (total - MINIMIZED_BAR_PX, MINIMIZED_BAR_PX),
+        (false, false) => (total * ratio, total * (1.0 - ratio)),
+    }
+}
+
 impl SplitTree {
+    /// Returns true if this subtree is fully minimized (all leaves are minimized).
+    pub fn is_fully_minimized(&self) -> bool {
+        match self {
+            SplitTree::Leaf(p) => p.minimized,
+            SplitTree::HSplit { left, right, .. }
+            | SplitTree::VSplit { top: left, bottom: right, .. } => {
+                left.is_fully_minimized() && right.is_fully_minimized()
+            }
+        }
+    }
+
     /// Find a pane by id.
     pub fn pane(&self, id: PaneId) -> Option<&Pane> {
         match self {
@@ -376,6 +477,13 @@ impl SplitTree {
                 right.for_each_pane(f);
             }
         }
+    }
+
+    /// Mark all panes in the tree as dirty (needs redraw).
+    pub fn mark_all_dirty(&self) {
+        self.for_each_pane(&mut |p| {
+            p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 
     /// Collect ids of all panes whose shell has exited.
@@ -500,16 +608,16 @@ impl SplitTree {
         match self {
             SplitTree::Leaf(p) => f(p, vp),
             SplitTree::HSplit { left, right, ratio, .. } => {
-                let left_w = vp.width * ratio;
+                let (left_w, right_w) = split_sizes(vp.width, *ratio, left.is_fully_minimized(), right.is_fully_minimized());
                 let left_vp = PaneViewport { x: vp.x, y: vp.y, width: left_w, height: vp.height };
-                let right_vp = PaneViewport { x: vp.x + left_w, y: vp.y, width: vp.width - left_w, height: vp.height };
+                let right_vp = PaneViewport { x: vp.x + left_w, y: vp.y, width: right_w, height: vp.height };
                 left.for_each_pane_with_viewport(left_vp, f);
                 right.for_each_pane_with_viewport(right_vp, f);
             }
             SplitTree::VSplit { top, bottom, ratio, .. } => {
-                let top_h = vp.height * ratio;
+                let (top_h, bot_h) = split_sizes(vp.height, *ratio, top.is_fully_minimized(), bottom.is_fully_minimized());
                 let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: top_h };
-                let bot_vp = PaneViewport { x: vp.x, y: vp.y + top_h, width: vp.width, height: vp.height - top_h };
+                let bot_vp = PaneViewport { x: vp.x, y: vp.y + top_h, width: vp.width, height: bot_h };
                 top.for_each_pane_with_viewport(top_vp, f);
                 bottom.for_each_pane_with_viewport(bot_vp, f);
             }
@@ -521,18 +629,20 @@ impl SplitTree {
         match self {
             SplitTree::Leaf(_) => {}
             SplitTree::HSplit { left, right, ratio, .. } => {
-                let split_x = vp.x + vp.width * ratio;
+                let (left_w, right_w) = split_sizes(vp.width, *ratio, left.is_fully_minimized(), right.is_fully_minimized());
+                let split_x = vp.x + left_w;
                 out.push((split_x, vp.y, split_x, vp.y + vp.height));
-                let left_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width * ratio, height: vp.height };
-                let right_vp = PaneViewport { x: split_x, y: vp.y, width: vp.width * (1.0 - ratio), height: vp.height };
+                let left_vp = PaneViewport { x: vp.x, y: vp.y, width: left_w, height: vp.height };
+                let right_vp = PaneViewport { x: split_x, y: vp.y, width: right_w, height: vp.height };
                 left.collect_separators(left_vp, out);
                 right.collect_separators(right_vp, out);
             }
             SplitTree::VSplit { top, bottom, ratio, .. } => {
-                let split_y = vp.y + vp.height * ratio;
+                let (top_h, bot_h) = split_sizes(vp.height, *ratio, top.is_fully_minimized(), bottom.is_fully_minimized());
+                let split_y = vp.y + top_h;
                 out.push((vp.x, split_y, vp.x + vp.width, split_y));
-                let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: vp.height * ratio };
-                let bot_vp = PaneViewport { x: vp.x, y: split_y, width: vp.width, height: vp.height * (1.0 - ratio) };
+                let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: top_h };
+                let bot_vp = PaneViewport { x: vp.x, y: split_y, width: vp.width, height: bot_h };
                 top.collect_separators(top_vp, out);
                 bottom.collect_separators(bot_vp, out);
             }
@@ -542,10 +652,12 @@ impl SplitTree {
     /// Find the neighbor pane in the given direction from the pane with `id`.
     /// Uses viewport geometry: finds the pane whose center is closest in the given direction.
     pub fn neighbor(&self, id: PaneId, dir: NavDirection, total_vp: PaneViewport) -> Option<PaneId> {
-        // Collect all panes with their viewports
+        // Collect all non-minimized panes with their viewports
         let mut panes: Vec<(PaneId, PaneViewport)> = Vec::new();
         self.for_each_pane_with_viewport(total_vp, &mut |p, vp| {
-            panes.push((p.id, vp));
+            if !p.minimized {
+                panes.push((p.id, vp));
+            }
         });
 
         let source = panes.iter().find(|(pid, _)| *pid == id)?;
@@ -669,34 +781,45 @@ impl SplitTree {
         match self {
             SplitTree::Leaf(_) => {}
             SplitTree::HSplit { left, right, ratio, .. } => {
-                let split_x = vp.x + vp.width * ratio;
-                out.push(SeparatorInfo {
-                    pos: split_x,
-                    cross_start: vp.y,
-                    cross_end: vp.y + vp.height,
-                    is_hsplit: true,
-                    origin_ratio: *ratio,
-                    parent_dim: vp.width,
-                    node_ptr: self as *const SplitTree as usize,
-                });
-                let left_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width * ratio, height: vp.height };
-                let right_vp = PaneViewport { x: split_x, y: vp.y, width: vp.width * (1.0 - ratio), height: vp.height };
+                let first_min = left.is_fully_minimized();
+                let second_min = right.is_fully_minimized();
+                let (left_w, right_w) = split_sizes(vp.width, *ratio, first_min, second_min);
+                let split_x = vp.x + left_w;
+                // Only allow dragging if neither child is minimized
+                if !first_min && !second_min {
+                    out.push(SeparatorInfo {
+                        pos: split_x,
+                        cross_start: vp.y,
+                        cross_end: vp.y + vp.height,
+                        is_hsplit: true,
+                        origin_ratio: *ratio,
+                        parent_dim: vp.width,
+                        node_ptr: self as *const SplitTree as usize,
+                    });
+                }
+                let left_vp = PaneViewport { x: vp.x, y: vp.y, width: left_w, height: vp.height };
+                let right_vp = PaneViewport { x: split_x, y: vp.y, width: right_w, height: vp.height };
                 left.collect_separator_info(left_vp, out);
                 right.collect_separator_info(right_vp, out);
             }
             SplitTree::VSplit { top, bottom, ratio, .. } => {
-                let split_y = vp.y + vp.height * ratio;
-                out.push(SeparatorInfo {
-                    pos: split_y,
-                    cross_start: vp.x,
-                    cross_end: vp.x + vp.width,
-                    is_hsplit: false,
-                    origin_ratio: *ratio,
-                    parent_dim: vp.height,
-                    node_ptr: self as *const SplitTree as usize,
-                });
-                let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: vp.height * ratio };
-                let bot_vp = PaneViewport { x: vp.x, y: split_y, width: vp.width, height: vp.height * (1.0 - ratio) };
+                let first_min = top.is_fully_minimized();
+                let second_min = bottom.is_fully_minimized();
+                let (top_h, bot_h) = split_sizes(vp.height, *ratio, first_min, second_min);
+                let split_y = vp.y + top_h;
+                if !first_min && !second_min {
+                    out.push(SeparatorInfo {
+                        pos: split_y,
+                        cross_start: vp.x,
+                        cross_end: vp.x + vp.width,
+                        is_hsplit: false,
+                        origin_ratio: *ratio,
+                        parent_dim: vp.height,
+                        node_ptr: self as *const SplitTree as usize,
+                    });
+                }
+                let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: top_h };
+                let bot_vp = PaneViewport { x: vp.x, y: split_y, width: vp.width, height: bot_h };
                 top.collect_separator_info(top_vp, out);
                 bottom.collect_separator_info(bot_vp, out);
             }
@@ -738,16 +861,16 @@ impl SplitTree {
         match self {
             SplitTree::Leaf(p) => Some((p, vp)),
             SplitTree::HSplit { left, right, ratio, .. } => {
-                let left_w = vp.width * ratio;
+                let (left_w, right_w) = split_sizes(vp.width, *ratio, left.is_fully_minimized(), right.is_fully_minimized());
                 let left_vp = PaneViewport { x: vp.x, y: vp.y, width: left_w, height: vp.height };
-                let right_vp = PaneViewport { x: vp.x + left_w, y: vp.y, width: vp.width - left_w, height: vp.height };
+                let right_vp = PaneViewport { x: vp.x + left_w, y: vp.y, width: right_w, height: vp.height };
                 left.hit_test(x, y, left_vp)
                     .or_else(|| right.hit_test(x, y, right_vp))
             }
             SplitTree::VSplit { top, bottom, ratio, .. } => {
-                let top_h = vp.height * ratio;
+                let (top_h, bot_h) = split_sizes(vp.height, *ratio, top.is_fully_minimized(), bottom.is_fully_minimized());
                 let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: top_h };
-                let bot_vp = PaneViewport { x: vp.x, y: vp.y + top_h, width: vp.width, height: vp.height - top_h };
+                let bot_vp = PaneViewport { x: vp.x, y: vp.y + top_h, width: vp.width, height: bot_h };
                 top.hit_test(x, y, top_vp)
                     .or_else(|| bottom.hit_test(x, y, bot_vp))
             }
@@ -889,16 +1012,16 @@ impl SplitTree {
                 if p.id == id { Some(vp) } else { None }
             }
             SplitTree::HSplit { left, right, ratio, .. } => {
-                let left_w = vp.width * ratio;
+                let (left_w, right_w) = split_sizes(vp.width, *ratio, left.is_fully_minimized(), right.is_fully_minimized());
                 let left_vp = PaneViewport { x: vp.x, y: vp.y, width: left_w, height: vp.height };
-                let right_vp = PaneViewport { x: vp.x + left_w, y: vp.y, width: vp.width - left_w, height: vp.height };
+                let right_vp = PaneViewport { x: vp.x + left_w, y: vp.y, width: right_w, height: vp.height };
                 left.viewport_for_pane(id, left_vp)
                     .or_else(|| right.viewport_for_pane(id, right_vp))
             }
             SplitTree::VSplit { top, bottom, ratio, .. } => {
-                let top_h = vp.height * ratio;
+                let (top_h, bot_h) = split_sizes(vp.height, *ratio, top.is_fully_minimized(), bottom.is_fully_minimized());
                 let top_vp = PaneViewport { x: vp.x, y: vp.y, width: vp.width, height: top_h };
-                let bot_vp = PaneViewport { x: vp.x, y: vp.y + top_h, width: vp.width, height: vp.height - top_h };
+                let bot_vp = PaneViewport { x: vp.x, y: vp.y + top_h, width: vp.width, height: bot_h };
                 top.viewport_for_pane(id, top_vp)
                     .or_else(|| bottom.viewport_for_pane(id, bot_vp))
             }

@@ -10,10 +10,38 @@ use std::sync::Arc;
 use super::parser::VteHandler;
 use super::TerminalState;
 
-/// Global registry of live PTYs: (child_pid, per-instance shutdown flag).
-/// Used by `shutdown_all()` on app termination to signal every PTY reader thread.
-static PTY_REGISTRY: parking_lot::Mutex<Vec<(u32, Arc<AtomicBool>)>> =
+/// Entry in the global PTY registry.
+struct PtyEntry {
+    child_pid: u32,
+    /// Raw fd of the master PTY. Valid as long as this entry is in the registry.
+    /// SAFETY: `Pty::drop` removes the entry *before* `OwnedFd` is dropped,
+    /// so the fd is always valid while the entry exists.
+    master_fd: i32,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Clone for PtyEntry {
+    fn clone(&self) -> Self {
+        PtyEntry { child_pid: self.child_pid, master_fd: self.master_fd, shutdown: self.shutdown.clone() }
+    }
+}
+
+/// Global registry of live PTYs.
+/// Used by `shutdown_all()` on app termination to signal every PTY reader thread,
+/// and by `foreground_process_count()` to check running processes globally.
+static PTY_REGISTRY: parking_lot::Mutex<Vec<PtyEntry>> =
     parking_lot::Mutex::new(Vec::new());
+
+/// Returns the foreground process group ID if it differs from the shell's PID
+/// (i.e. a command like vim, cargo, etc. is running).
+fn foreground_pgid(master_fd: i32, child_pid: u32) -> Option<i32> {
+    let fg_pgid = unsafe { libc::tcgetpgrp(master_fd) };
+    if fg_pgid > 0 && fg_pgid != child_pid as i32 {
+        Some(fg_pgid)
+    } else {
+        None
+    }
+}
 
 pub struct Pty {
     master_fd: OwnedFd,
@@ -107,7 +135,7 @@ impl Pty {
         drop(slave_fd);
 
         let shutdown = Arc::new(AtomicBool::new(false));
-        PTY_REGISTRY.lock().push((child_pid, shutdown.clone()));
+        PTY_REGISTRY.lock().push(PtyEntry { child_pid, master_fd: master_fd.as_raw_fd(), shutdown: shutdown.clone() });
 
         let dup_fd = unsafe { libc::dup(master_fd.as_raw_fd()) };
         if dup_fd < 0 {
@@ -183,10 +211,7 @@ impl Pty {
     /// Returns the name of the foreground process if it differs from the shell
     /// (i.e. a command like vim, cargo, etc. is running).
     pub fn foreground_process_name(&self) -> Option<String> {
-        let fg_pgid = unsafe { libc::tcgetpgrp(self.master_fd.as_raw_fd()) };
-        if fg_pgid <= 0 || fg_pgid == self.child_pid as i32 {
-            return None; // shell is in foreground = idle
-        }
+        let fg_pgid = foreground_pgid(self.master_fd.as_raw_fd(), self.child_pid)?;
         let mut name_buf = [0u8; 256];
         let len = unsafe {
             libc::proc_name(fg_pgid, name_buf.as_mut_ptr() as *mut libc::c_void, 256)
@@ -245,6 +270,13 @@ fn reap_child(pid: i32, step_ms: u64) {
     log::warn!("reap_child: pid {} still alive after SIGKILL (should not happen)", pid);
 }
 
+/// Count how many PTYs have a foreground process that differs from the shell.
+/// This is the global equivalent of `Pane::foreground_process_name().is_some()`.
+pub fn foreground_process_count() -> u32 {
+    let registry = PTY_REGISTRY.lock();
+    registry.iter().filter(|e| foreground_pgid(e.master_fd, e.child_pid).is_some()).count() as u32
+}
+
 /// Signal all live PTY reader threads to stop and kill their child processes.
 /// Called once from `AppDelegate::will_terminate`.
 pub fn shutdown_all() {
@@ -252,8 +284,9 @@ pub fn shutdown_all() {
     log::info!("Shutting down {} PTY(s)", entries.len());
     let handles: Vec<_> = entries
         .into_iter()
-        .map(|(pid, shutdown)| {
-            shutdown.store(true, Ordering::Relaxed);
+        .map(|entry| {
+            entry.shutdown.store(true, Ordering::Relaxed);
+            let pid = entry.child_pid;
             std::thread::Builder::new()
                 .name(format!("pty-reaper-{}", pid))
                 .spawn(move || reap_child(pid as i32, 25))
@@ -270,7 +303,7 @@ impl Drop for Pty {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         let pid = self.child_pid;
-        PTY_REGISTRY.lock().retain(|(p, _)| *p != pid);
+        PTY_REGISTRY.lock().retain(|e| e.child_pid != pid);
         let result = std::thread::Builder::new()
             .name(format!("pty-reaper-{}", pid))
             .spawn(move || reap_child(pid as i32, 50));
