@@ -102,20 +102,21 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Horizontal scroll splits — quand les splits dépassent la largeur écran, scroll horizontal trackpad + auto-reveal du pane focusé. `min_split_width` configurable.
 - [x] Color emoji rendering via CoreText fallback fonts
 - [x] Grapheme cluster emoji (flags, ZWJ sequences, skin tones)
+- [ ] Emoji presentation fallback — les caractères avec `Emoji_Presentation` par défaut (U+2B1C, U+2B1B, U+25AA…) utilisent le glyphe de la font mono (petit carré géométrique) au lieu de la version couleur Apple Color Emoji, car `resolve_glyph` retourne le glyphe primaire sans vérifier la présentation attendue. Fix : forcer le fallback emoji pour les codepoints Unicode `Emoji_Presentation=Yes`.
 - [x] Optimisation RAM Cell — compact cell storage pour le scrollback (28→12 bytes/cell, -57% RAM). fg/bg stockés en `u32` RGBA au lieu de `[f32; 3]`.
 - [x] Multi-fenêtres — Cmd+N nouvelle fenêtre, Cmd+Q ferme fenêtre active, Cmd+Option+Q kill sans save, Cmd+Shift+T detach tab vers nouvelle fenêtre. Session restore multi-window. Dealloc différé pour éviter segfault AppKit.
 - [x] Config keybindings (raccourcis configurables via `[keys]` dans config.toml)
 - [ ] Déplacer un split par drag (anchor visuelle pendant le drag — le swap par raccourci Cmd+Shift+Arrows existe déjà)
-- [ ] Notifications visuelles avancées (activité dans un split inactif)
+- [x] Notifications visuelles avancées (activité dans un split inactif)
 - [ ] Batching du parser VT — le pty-reader tient le write lock sur `TerminalState` pendant tout `parser.advance()` d'un chunk 4 Ko. Quand un pane en background reçoit beaucoup de données (build, logs…), le write lock bloque les read locks du renderer (parking_lot donne priorité aux writers). Solution : op-buffer local (`Vec<TermOp>`) parsé sans lock, flush en un seul write lock. Voir `notes/vt-parser-batching.md`.
 - [x] PTY cleanup sur thread dédié — `Drop for Pty` délègue l'escalade SIGHUP → SIGTERM → SIGKILL à un thread détaché (`pty-reaper-{pid}`), zéro sleep sur le main thread. `shutdown_all()` fait la même escalade en synchrone avec timeouts réduits (25ms/étape)
 - [ ] Font fallback (block elements/box-drawing) — nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
 - [ ] **Tab bar font size** : taille de fonte des tabs configurable indépendamment (`tab_bar.font_size`), override possible par fenêtre. Voir `notes/tab-font-size.md`.
 - [x] **Trim trailing blanks** : tronquer les cellules vides en fin de ligne dans le scrollback (`shrink_to_fit`), re-expand au resize. ~50-70% de réduction RAM scrollback.
 - [ ] **Run-length encoding** : compresser les séquences de même couleur. (Gain marginal après trim, complexité élevée — déprioritisé.)
-- [ ] Metriques perf exposées (frame time, mémoire, allocations) — utile pour diagnostiquer sans avoir à lancer vmmap/heap manuellement
+- [x] Metriques perf exposées (mémoire, allocations) — overlay Cmd+Shift+I avec RSS, détail terminal/renderer/pane. Frame time non inclus.
 - [x] Double-clic sur un mot → sélectionne le mot entier
-- [ ] Minimisation de pane — réduire un pane à une barre minimale pour maximiser l'espace des autres panes, avec possibilité de le restaurer
+- [ ] Minimisation de pane — réduire un pane à une barre 24px affichant titre/CWD. Le pane reste dans le split tree, le sibling récupère l'espace. PTY continue en background, bell/activité visibles sur la barre. Cmd+M minimise le pane focusé, Cmd+Opt+M restaure le dernier minimisé (FILO), click sur la barre restaure ce pane spécifique.
 - [ ] Cmd+V dans le champ de recherche (Cmd+F) — le paste ne fonctionne pas actuellement dans l'overlay de recherche
 - [x] Flèches dans le renommage de tab/pane — les flèches gauche/droite naviguent dans le texte, curseur positionnable, backspace/insertion au curseur
 

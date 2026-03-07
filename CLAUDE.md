@@ -57,6 +57,10 @@ ln -sf ~/.cargo/target/release/kova /Applications/Kova.app/Contents/MacOS/kova
 
 - **Bytes vs chars** — Les cellules du terminal sont indexées par colonne (1 Cell = 1 char), mais les `String` Rust sont indexées par byte. Ne JAMAIS faire `&text[i..i+n]` sur du texte issu des cellules (contient des emoji, box-drawing, etc.). Toujours travailler avec `Vec<char>` ou itérateurs de chars quand on manipule des positions de colonnes.
 
+## Tests
+
+Ne jamais lancer l'application (open, Kova.app, etc.) — laisser l'utilisateur tester manuellement.
+
 ## Principes
 
 - Mac-only, pas de cross-platform
