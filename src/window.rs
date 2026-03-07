@@ -619,8 +619,11 @@ define_class!(
                 }
                 // Mark old focused pane dirty so its dim overlay updates
                 if old_focused != pane.id {
-                    // Clear completion flag on newly focused pane
-                    pane.terminal.read().command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+                    // Clear completion and bell flags on newly focused pane
+                    let t = pane.terminal.read();
+                    t.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+                    t.bell.store(false, std::sync::atomic::Ordering::Relaxed);
+                    drop(t);
                     let tabs = self.ivars().tabs.borrow();
                     let idx = self.ivars().active_tab.get();
                     if let Some(tab) = tabs.get(idx) {
@@ -1840,9 +1843,11 @@ impl KovaView {
                 old.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             if let Some(new) = tab.tree.pane(neighbor_id) {
-                // Clear completion flag on the newly focused pane
-                new.terminal.read().command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
-                new.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                // Clear completion and bell flags on the newly focused pane
+                let t = new.terminal.read();
+                t.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+                t.bell.store(false, std::sync::atomic::Ordering::Relaxed);
+                t.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             // Auto-scroll to reveal the newly focused pane
             if let Some(vp) = tab.tree.viewport_for_pane(neighbor_id, panes_vp) {
@@ -2492,7 +2497,7 @@ impl KovaView {
             let tab = &tabs[active_idx];
             let focused_id = tab.focused_pane;
 
-            let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>, bool)> = Vec::new();
+            let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>, bool, bool)> = Vec::new();
             let cell_h = renderer.read().cell_size().1;
             let tab_bar_h = (cell_h * 2.0).round();
             let drawable_size = layer.drawableSize();
@@ -2506,16 +2511,23 @@ impl KovaView {
                 height: drawable_size.height as f32 - tab_bar_h - global_bar_h,
             };
             tab.tree.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
-                let completed = pane.id != focused_id
-                    && pane.terminal.read().command_completed.load(std::sync::atomic::Ordering::Relaxed);
+                let is_focused = pane.id == focused_id;
+                let term = pane.terminal.read();
+                let completed = !is_focused
+                    && term.command_completed.load(std::sync::atomic::Ordering::Relaxed);
+                // Read bell without consuming — check_bell will drain it for tab-level
+                let has_bell = !is_focused
+                    && term.bell.load(std::sync::atomic::Ordering::Relaxed);
+                drop(term);
                 pane_data.push((
                     pane.terminal.clone(),
                     vp,
                     pane.is_ready(),
-                    pane.id == focused_id,
+                    is_focused,
                     pane.id,
                     pane.custom_title.clone(),
                     completed,
+                    has_bell,
                 ));
             });
 
@@ -2585,7 +2597,7 @@ impl KovaView {
         }
 
         // Update NSWindow title from focused pane's OSC 0/2
-        if let Some((terminal, _, _, _, _, _, _)) = pane_data.iter().find(|(_, _, _, f, _, _, _)| *f) {
+        if let Some((terminal, _, _, _, _, _, _, _)) = pane_data.iter().find(|(_, _, _, f, _, _, _, _)| *f) {
             let term = terminal.read();
             let current = term.title.clone();
             drop(term);
@@ -2662,7 +2674,7 @@ impl KovaView {
         // Count hidden panes (fully off-screen)
         let mut hidden_left = 0usize;
         let mut hidden_right = 0usize;
-        for (_, vp, _, _, _, _, _) in &pane_data {
+        for (_, vp, _, _, _, _, _, _) in &pane_data {
             if vp.x + vp.width <= 0.0 {
                 hidden_left += 1;
             } else if vp.x >= screen_width {
