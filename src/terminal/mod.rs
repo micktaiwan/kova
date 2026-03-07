@@ -187,6 +187,8 @@ pub struct TerminalState {
     pub command_completed: AtomicBool,
     // Last command executed (set via OSC 7777 from shell integration)
     pub last_command: Option<String>,
+    // Kitty keyboard protocol — stack of pushed flag sets
+    pub kitty_keyboard_flags: Vec<u8>,
 }
 
 /// A single line matching a filter query.
@@ -243,7 +245,12 @@ impl TerminalState {
             bell: AtomicBool::new(false),
             command_completed: AtomicBool::new(false),
             last_command: None,
+            kitty_keyboard_flags: Vec::new(),
         }
+    }
+
+    pub fn kitty_flags(&self) -> u8 {
+        self.kitty_keyboard_flags.last().copied().unwrap_or(0)
     }
 
     pub fn visible_lines(&self) -> Vec<Cow<'_, [Cell]>> {

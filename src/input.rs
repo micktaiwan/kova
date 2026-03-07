@@ -10,7 +10,47 @@ pub fn write_text(text: &str, pty: &Pty) {
     }
 }
 
-pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool, keybindings: &Keybindings) {
+/// Kitty modifier encoding: 1 + bitmask (shift=1, alt=2, ctrl=4)
+fn kitty_mods(ctrl: bool, alt: bool, shift: bool) -> u8 {
+    let mut m: u8 = 0;
+    if shift { m |= 1; }
+    if alt   { m |= 2; }
+    if ctrl  { m |= 4; }
+    m + 1
+}
+
+/// Send a key in CSI u format: ESC [ codepoint ; mods u
+fn send_csi_u(pty: &Pty, codepoint: u32, ctrl: bool, alt: bool, shift: bool) {
+    let mods = kitty_mods(ctrl, alt, shift);
+    if mods > 1 {
+        let seq = format!("\x1b[{};{}u", codepoint, mods);
+        pty.write(seq.as_bytes());
+    } else {
+        let seq = format!("\x1b[{}u", codepoint);
+        pty.write(seq.as_bytes());
+    }
+}
+
+/// Send a special key with xterm-style modifier: ESC [ 1 ; mods suffix
+fn send_modified_special(pty: &Pty, suffix: u8, ctrl: bool, alt: bool, shift: bool) {
+    let mods = kitty_mods(ctrl, alt, shift);
+    let seq = format!("\x1b[1;{}{}", mods, suffix as char);
+    pty.write(seq.as_bytes());
+}
+
+/// Send a tilde-style key with modifier: ESC [ code ; mods ~
+fn send_modified_tilde(pty: &Pty, code: u32, ctrl: bool, alt: bool, shift: bool) {
+    let mods = kitty_mods(ctrl, alt, shift);
+    if mods > 1 {
+        let seq = format!("\x1b[{};{}~", code, mods);
+        pty.write(seq.as_bytes());
+    } else {
+        let seq = format!("\x1b[{}~", code);
+        pty.write(seq.as_bytes());
+    }
+}
+
+pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool, keybindings: &Keybindings, kitty_flags: u8) {
     let combo = KeyCombo::from_event(event);
 
     // Check configurable terminal keybindings first
@@ -28,6 +68,7 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool, keybi
 
     let has_ctrl = combo.ctrl;
     let has_alt = combo.option;
+    let has_shift = combo.shift;
     let has_cmd = combo.cmd;
 
     let chars_unmod = event.charactersIgnoringModifiers();
@@ -36,6 +77,40 @@ pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool, keybi
 
     // Cmd key with no matching terminal binding — ignore (handled by performKeyEquivalent)
     if has_cmd {
+        return;
+    }
+
+    // Kitty keyboard protocol — disambiguate mode (flags & 1)
+    if kitty_flags & 1 != 0 && (has_ctrl || has_alt) {
+        // Special keys → xterm-style modifier sequences
+        match unmod_char {
+            '\u{F700}' => { send_modified_special(pty, b'A', has_ctrl, has_alt, has_shift); return; }
+            '\u{F701}' => { send_modified_special(pty, b'B', has_ctrl, has_alt, has_shift); return; }
+            '\u{F702}' => { send_modified_special(pty, b'D', has_ctrl, has_alt, has_shift); return; }
+            '\u{F703}' => { send_modified_special(pty, b'C', has_ctrl, has_alt, has_shift); return; }
+            '\u{F729}' => { send_modified_special(pty, b'H', has_ctrl, has_alt, has_shift); return; }
+            '\u{F72B}' => { send_modified_special(pty, b'F', has_ctrl, has_alt, has_shift); return; }
+            '\u{F727}' => { send_modified_tilde(pty, 2, has_ctrl, has_alt, has_shift); return; }
+            '\u{F728}' => { send_modified_tilde(pty, 3, has_ctrl, has_alt, has_shift); return; }
+            '\u{F72C}' => { send_modified_tilde(pty, 5, has_ctrl, has_alt, has_shift); return; }
+            '\u{F72D}' => { send_modified_tilde(pty, 6, has_ctrl, has_alt, has_shift); return; }
+            '\u{F704}' => { send_modified_special(pty, b'P', has_ctrl, has_alt, has_shift); return; }
+            '\u{F705}' => { send_modified_special(pty, b'Q', has_ctrl, has_alt, has_shift); return; }
+            '\u{F706}' => { send_modified_special(pty, b'R', has_ctrl, has_alt, has_shift); return; }
+            '\u{F707}' => { send_modified_special(pty, b'S', has_ctrl, has_alt, has_shift); return; }
+            _ => {}
+        }
+
+        // Regular keys → CSI u
+        let codepoint = match unmod_char {
+            '\r' => 13,
+            '\t' => 9,
+            '\u{7f}' | '\u{0008}' => 127,
+            '\u{001b}' => 27,
+            c if !c.is_control() => c as u32,
+            _ => { return; }
+        };
+        send_csi_u(pty, codepoint, has_ctrl, has_alt, has_shift);
         return;
     }
 

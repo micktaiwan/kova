@@ -288,9 +288,32 @@ impl Perform for VteHandler {
             ('s', []) => self.term().save_cursor(),
             ('u', []) => self.term().restore_cursor(),
             ('u', [b'>']) => {
-                // Kitty keyboard protocol query — respond with flags=0 (not supported)
+                // Kitty keyboard protocol — push flags
+                if params.is_empty() {
+                    // No params with > intermediate → query (some apps send CSI > u)
+                    let flags = self.term().kitty_flags();
+                    self.release_guard();
+                    let response = format!("\x1b[?{}u", flags);
+                    self.write_to_pty(response.as_bytes());
+                } else {
+                    let flags = params[0] as u8;
+                    self.term().kitty_keyboard_flags.push(flags);
+                }
+            }
+            ('u', [b'<']) => {
+                // Kitty keyboard protocol — pop
+                let n = params.first().copied().unwrap_or(1).max(1) as usize;
+                let stack = &mut self.term().kitty_keyboard_flags;
+                for _ in 0..n {
+                    stack.pop();
+                }
+            }
+            ('u', [b'?']) => {
+                // Kitty keyboard protocol — query current flags
+                let flags = self.term().kitty_flags();
                 self.release_guard();
-                self.write_to_pty(b"\x1b[?0u");
+                let response = format!("\x1b[?{}u", flags);
+                self.write_to_pty(response.as_bytes());
             }
             ('h', [b'?']) | ('l', [b'?']) => {
                 // DEC Private Mode Set/Reset

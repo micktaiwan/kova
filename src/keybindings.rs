@@ -51,8 +51,12 @@ pub enum Action {
     SwapPane(NavDirection),
     ReparentPane(NavDirection),
     Resize(SplitAxis, f32),
+    MinimizePane,
+    RestoreLastMinimized,
     ToggleHelp,
     MemReport,
+    CloseTab,
+    OpenRecentProject,
 }
 
 /// Terminal-level actions dispatched from handle_key_event.
@@ -219,7 +223,11 @@ impl Keybindings {
         bind(&keys.resize_right, Action::Resize(SplitAxis::Horizontal, 0.05));
         bind(&keys.resize_up, Action::Resize(SplitAxis::Vertical, -0.05));
         bind(&keys.resize_down, Action::Resize(SplitAxis::Vertical, 0.05));
+        bind(&keys.minimize_pane, Action::MinimizePane);
+        bind(&keys.restore_minimized, Action::RestoreLastMinimized);
         bind(&keys.toggle_help, Action::ToggleHelp);
+        bind(&keys.close_tab, Action::CloseTab);
+        bind(&keys.open_recent_project, Action::OpenRecentProject);
 
         // Hard-coded debug binding (not user-configurable)
         window_map.insert(parse_key_combo("cmd+shift+i"), Action::MemReport);

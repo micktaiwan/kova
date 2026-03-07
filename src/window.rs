@@ -76,6 +76,8 @@ pub struct KovaViewIvars {
     show_help: Cell<bool>,
     /// Whether the memory report overlay is visible.
     show_mem_report: Cell<bool>,
+    /// Recent projects overlay state.
+    recent_projects: RefCell<Option<RecentProjectsState>>,
     /// Countdown frames for "⌘? for help" hint in global status bar (fps * 3).
     help_hint_frames: Cell<u32>,
 }
@@ -93,6 +95,31 @@ struct RenameTabState {
 struct RenamePaneState {
     input: String,
     cursor: usize, // char index
+}
+
+struct RecentProjectItem {
+    entry: crate::recent_projects::RecentProject,
+    /// Pre-computed render data for the renderer.
+    render: crate::renderer::RecentProjectEntry,
+}
+
+struct RecentProjectsState {
+    items: Vec<RecentProjectItem>,
+    selected: usize,
+    /// Scroll offset (index of first visible entry).
+    scroll: usize,
+}
+
+fn build_items(entries: Vec<crate::recent_projects::RecentProject>) -> Vec<RecentProjectItem> {
+    entries.into_iter().map(|e| {
+        let render = crate::renderer::RecentProjectEntry {
+            path: crate::recent_projects::tildify(&e.path),
+            time_ago: crate::recent_projects::time_ago(e.last_opened),
+            pane_count: crate::recent_projects::pane_count(&e.tab.tree),
+            invalid: !std::path::Path::new(&e.path).is_dir(),
+        };
+        RecentProjectItem { entry: e, render }
+    }).collect()
 }
 
 define_class!(
@@ -130,10 +157,13 @@ define_class!(
             if let Some(event_ptr) = self.ivars().current_event.get() {
                 let event = unsafe { &*event_ptr };
                 if let Some(pane) = self.focused_pane() {
-                    let cursor_keys_app = pane.terminal.read().cursor_keys_application;
+                    let (cursor_keys_app, kitty_flags) = {
+                        let term = pane.terminal.read();
+                        (term.cursor_keys_application, term.kitty_flags())
+                    };
                     pane.terminal.write().reset_scroll();
                     if let Some(kb) = self.ivars().keybindings.get() {
-                        input::handle_key_event(event, &pane.pty, cursor_keys_app, kb);
+                        input::handle_key_event(event, &pane.pty, cursor_keys_app, kb, kitty_flags);
                     }
                 }
             }
@@ -233,6 +263,12 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            // Recent projects overlay handles its own keys
+            if self.ivars().recent_projects.borrow().is_some() {
+                self.handle_recent_projects_key(event);
+                return;
+            }
+
             // Escape closes help/mem report overlays
             if event.keyCode() == 0x35 {
                 if self.ivars().show_help.get() {
@@ -305,14 +341,31 @@ define_class!(
                 }
             }
 
-            if self.focused_pane().is_some() {
-                // Store the event so doCommandBySelector can access it
-                self.ivars().current_event.set(Some(event as *const NSEvent));
-                // Route through macOS input handling for dead key / IME composition
-                let event_retained: Retained<NSEvent> = event.retain();
-                let events = NSArray::from_retained_slice(&[event_retained]);
-                self.interpretKeyEvents(&events);
-                self.ivars().current_event.set(None);
+            if let Some(pane) = self.focused_pane() {
+                let (kitty_flags, cursor_keys_app) = {
+                    let term = pane.terminal.read();
+                    (term.kitty_flags(), term.cursor_keys_application)
+                };
+
+                let modifiers = event.modifierFlags();
+                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
+                let has_alt = modifiers.contains(NSEventModifierFlags::Option);
+                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
+
+                if kitty_flags > 0 && (has_ctrl || has_alt) && !has_cmd {
+                    // Kitty mode: bypass macOS text input for modified keys
+                    pane.terminal.write().reset_scroll();
+                    if let Some(kb) = self.ivars().keybindings.get() {
+                        input::handle_key_event(event, &pane.pty, cursor_keys_app, kb, kitty_flags);
+                    }
+                } else {
+                    // Normal path: macOS text input (dead keys, IME)
+                    self.ivars().current_event.set(Some(event as *const NSEvent));
+                    let event_retained: Retained<NSEvent> = event.retain();
+                    let events = NSArray::from_retained_slice(&[event_retained]);
+                    self.interpretKeyEvents(&events);
+                    self.ivars().current_event.set(None);
+                }
             }
         }
 
@@ -324,6 +377,12 @@ define_class!(
                 Some(kb) => kb,
                 None => return objc2::runtime::Bool::NO,
             };
+
+            // When recent projects overlay is shown, route keys through the overlay handler
+            if self.ivars().recent_projects.borrow().is_some() {
+                self.handle_recent_projects_key(event);
+                return objc2::runtime::Bool::YES;
+            }
 
             // When help overlay is shown, close it first then let the action through
             if self.ivars().show_help.get() {
@@ -409,6 +468,8 @@ define_class!(
                     Action::CloseWindow => self.do_close_window(),
                     Action::KillWindow => self.do_kill_window(),
                     Action::ClosePaneOrTab => self.do_close_pane_or_tab(),
+                    Action::CloseTab => self.do_close_tab(),
+                    Action::OpenRecentProject => self.do_open_recent_projects(),
                     Action::PrevTab => self.do_switch_tab_relative(-1),
                     Action::NextTab => self.do_switch_tab_relative(1),
                     Action::RenameTab => self.start_rename_tab(),
@@ -416,6 +477,8 @@ define_class!(
                     Action::DetachTab => self.do_detach_tab(),
                     Action::MergeWindow => self.do_merge_window(),
                     Action::SwitchTab(idx) => self.do_switch_tab(*idx),
+                    Action::MinimizePane => self.do_minimize_pane(),
+                    Action::RestoreLastMinimized => self.do_restore_last_minimized(),
                     Action::Navigate(dir) => self.do_navigate(*dir),
                     Action::SwapPane(dir) => self.do_swap_pane(*dir),
                     Action::ReparentPane(dir) => self.do_reparent_pane(*dir),
@@ -599,6 +662,23 @@ define_class!(
             if modifiers.contains(NSEventModifierFlags::Command) {
                 if let Some(url) = self.ivars().hovered_url.borrow().as_ref().map(|h| h.2.clone()) {
                     let _ = std::process::Command::new("open").arg(&url).spawn();
+                    return;
+                }
+            }
+
+            // Click on minimized pane → restore it
+            if let Some((pane, _vp)) = self.pane_at_event(event) {
+                if pane.minimized {
+                    let pane_id = pane.id;
+                    let mut tabs = self.ivars().tabs.borrow_mut();
+                    let idx = self.ivars().active_tab.get();
+                    if let Some(tab) = tabs.get_mut(idx) {
+                        tab.restore_pane(pane_id);
+                        tab.focused_pane = pane_id;
+                        tab.tree.mark_all_dirty();
+                    }
+                    drop(tabs);
+                    self.resize_all_panes();
                     return;
                 }
             }
@@ -928,6 +1008,7 @@ impl KovaView {
             keybindings: OnceCell::new(),
             show_help: Cell::new(false),
             show_mem_report: Cell::new(false),
+            recent_projects: RefCell::new(None),
             help_hint_frames: Cell::new(180), // updated in setup_metal
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -1680,22 +1761,9 @@ impl KovaView {
         let is_single_pane = matches!(tabs[idx].tree, SplitTree::Leaf(_));
 
         if is_single_pane {
-            // Close the tab
             log::debug!("Closing tab {}", idx);
-            tabs.remove(idx);
-            if tabs.is_empty() {
-                drop(tabs);
-                unsafe {
-                    let mtm = MainThreadMarker::new_unchecked();
-                    let app = NSApplication::sharedApplication(mtm);
-                    app.terminate(None);
-                }
-                return;
-            }
-            let new_idx = if idx >= tabs.len() { tabs.len() - 1 } else { idx };
             drop(tabs);
-            self.ivars().active_tab.set(new_idx);
-            self.resize_all_panes();
+            self.remove_tab(idx);
             return;
         }
 
@@ -1725,6 +1793,8 @@ impl KovaView {
                 let new_columns = new_tree.chain_count(true, false);
                 tabs[idx].scale_virtual_width(old_columns, new_columns);
                 tabs[idx].tree = new_tree;
+                // Clean up minimized_stack (closed pane may have been minimized)
+                tabs[idx].minimized_stack.retain(|&pid| pid != focused_id);
                 // Clamp scroll and auto-scroll to reveal focused pane
                 let full = self.drawable_viewport();
                 let min_w = self.min_split_width_px();
@@ -1737,22 +1807,209 @@ impl KovaView {
             }
             None => {
                 // Tab became empty (shouldn't happen given check above)
-                tabs.remove(idx);
-                if tabs.is_empty() {
-                    drop(tabs);
-                    unsafe {
-                        let mtm = MainThreadMarker::new_unchecked();
-                        let app = NSApplication::sharedApplication(mtm);
-                        app.terminate(None);
-                    }
-                    return;
-                }
-                let new_idx = if idx >= tabs.len() { tabs.len() - 1 } else { idx };
-                self.ivars().active_tab.set(new_idx);
+                drop(tabs);
+                self.remove_tab(idx);
+                return;
             }
         }
         drop(tabs);
         self.resize_all_panes();
+    }
+
+    /// Remove a tab by index: save to recent projects, remove from list,
+    /// update active_tab, terminate if empty, then resize.
+    /// Caller must NOT hold `tabs` borrow when calling this.
+    fn remove_tab(&self, idx: usize) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        if idx >= tabs.len() { return; }
+        crate::recent_projects::add(&tabs[idx]);
+        tabs.remove(idx);
+        if tabs.is_empty() {
+            drop(tabs);
+            unsafe {
+                let mtm = MainThreadMarker::new_unchecked();
+                let app = NSApplication::sharedApplication(mtm);
+                app.terminate(None);
+            }
+            return;
+        }
+        let new_idx = if idx >= tabs.len() { tabs.len() - 1 } else { idx };
+        drop(tabs);
+        self.ivars().active_tab.set(new_idx);
+        self.resize_all_panes();
+    }
+
+    /// Close the entire active tab (all its panes), with confirmation.
+    /// Saves to recent projects before closing.
+    fn do_close_tab(&self) {
+        // Collect running processes for confirmation BEFORE borrowing tabs
+        let procs = {
+            let tabs = self.ivars().tabs.borrow();
+            let idx = self.ivars().active_tab.get();
+            if idx >= tabs.len() {
+                return;
+            }
+            let title = tabs[idx].title();
+            let mut result = Vec::new();
+            tabs[idx].tree.for_each_pane(&mut |pane| {
+                if let Some(name) = pane.foreground_process_name() {
+                    result.push((title.clone(), name));
+                }
+            });
+            result
+        };
+
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        if !confirm_running_processes(mtm, &procs, "Close this tab?", "Close") {
+            return;
+        }
+
+        let idx = self.ivars().active_tab.get();
+        log::debug!("Closing entire tab {}", idx);
+        self.remove_tab(idx);
+    }
+
+    /// Open the recent projects overlay.
+    fn do_open_recent_projects(&self) {
+        use std::collections::HashSet;
+        // Collect CWDs of ALL panes across ALL windows to filter them out.
+        // Use NSApplication::windows() to avoid borrowing the app delegate's
+        // window list (which may be borrowed by the timer tick).
+        let open_cwds: HashSet<String> = {
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            let app = NSApplication::sharedApplication(mtm);
+            let ns_windows = app.windows();
+            let mut cwds = HashSet::new();
+            for i in 0..ns_windows.count() {
+                let win = &ns_windows.objectAtIndex(i);
+                if let Some(view) = crate::app::kova_view(win) {
+                    let tabs = view.ivars().tabs.borrow();
+                    for tab in tabs.iter() {
+                        tab.tree.for_each_pane(&mut |pane| {
+                            if let Some(cwd) = pane.cwd() {
+                                cwds.insert(cwd);
+                            }
+                        });
+                    }
+                }
+            }
+            cwds
+        };
+        let all = crate::recent_projects::load();
+        let entries: Vec<_> = all.projects.into_iter()
+            .filter(|p| !open_cwds.contains(&p.path))
+            .collect();
+
+        *self.ivars().recent_projects.borrow_mut() = Some(RecentProjectsState {
+            items: build_items(entries),
+            selected: 0,
+            scroll: 0,
+        });
+        self.mark_dirty();
+    }
+
+    /// Handle key events in the recent projects overlay.
+    fn handle_recent_projects_key(&self, event: &NSEvent) {
+        let keycode = event.keyCode();
+
+        // Escape → close
+        if keycode == 0x35 {
+            *self.ivars().recent_projects.borrow_mut() = None;
+            self.mark_dirty();
+            return;
+        }
+
+        // Enter — extract entry and close overlay, then restore outside borrow
+        if keycode == 0x24 {
+            let entry = {
+                let state = self.ivars().recent_projects.borrow();
+                state.as_ref().and_then(|s| {
+                    let item = s.items.get(s.selected)?;
+                    if !item.render.invalid { Some(item.entry.clone()) } else { None }
+                })
+            };
+            if let Some(entry) = entry {
+                *self.ivars().recent_projects.borrow_mut() = None;
+                self.restore_recent_project(&entry);
+            }
+            return;
+        }
+
+        // Cmd+Backspace — remove entry
+        if keycode == 0x33 {
+            let has_cmd = event.modifierFlags().contains(NSEventModifierFlags::Command);
+            if has_cmd {
+                let path = {
+                    let mut guard = self.ivars().recent_projects.borrow_mut();
+                    let state = match guard.as_mut() {
+                        Some(s) => s,
+                        None => return,
+                    };
+                    if state.selected >= state.items.len() {
+                        return;
+                    }
+                    let path = state.items[state.selected].entry.path.clone();
+                    state.items.remove(state.selected);
+                    if state.items.is_empty() {
+                        *guard = None;
+                    } else if state.selected >= state.items.len() {
+                        state.selected = state.items.len() - 1;
+                    }
+                    path
+                };
+                crate::recent_projects::remove(&path);
+                self.mark_dirty();
+                return;
+            }
+        }
+
+        // Arrow keys
+        {
+            let mut guard = self.ivars().recent_projects.borrow_mut();
+            let state = match guard.as_mut() {
+                Some(s) => s,
+                None => return,
+            };
+            match keycode {
+                0x7E => { // Up
+                    if state.selected > 0 {
+                        state.selected -= 1;
+                        if state.selected < state.scroll {
+                            state.scroll = state.selected;
+                        }
+                    }
+                }
+                0x7D => { // Down
+                    if state.selected + 1 < state.items.len() {
+                        state.selected += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.mark_dirty();
+    }
+
+    /// Restore a recent project as a new tab in this window.
+    fn restore_recent_project(&self, entry: &crate::recent_projects::RecentProject) {
+        let config = self.ivars().config.get().unwrap();
+        let cols = config.terminal.columns;
+        let rows = config.terminal.rows;
+
+        match crate::session::restore_saved_tab(&entry.tab, cols, rows, config) {
+            Some(tab) => {
+                let mut tabs = self.ivars().tabs.borrow_mut();
+                let new_idx = tabs.len();
+                tabs.push(tab);
+                drop(tabs);
+                self.ivars().active_tab.set(new_idx);
+                self.resize_all_panes();
+                log::info!("Restored recent project: {}", entry.path);
+            }
+            None => {
+                log::warn!("Failed to restore recent project: {}", entry.path);
+            }
+        }
     }
 
     /// Close the active window (all its tabs). The timer will detect
@@ -1764,6 +2021,11 @@ impl KovaView {
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         if !confirm_running_processes(mtm, &procs, "Close this window?", "Close") {
             return;
+        }
+        // Save all tabs to recent projects before closing (single I/O cycle)
+        {
+            let tabs = self.ivars().tabs.borrow();
+            crate::recent_projects::add_batch(&tabs);
         }
         // Signal closing — tick() will return false and the timer will close the window
         self.ivars().closing.set(true);
@@ -1825,6 +2087,33 @@ impl KovaView {
         drop(tabs);
         self.ivars().active_tab.set(first_new);
         self.resize_all_panes();
+    }
+
+    /// Minimize the focused pane.
+    fn do_minimize_pane(&self) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        if let Some(tab) = tabs.get_mut(idx) {
+            let focused_id = tab.focused_pane;
+            if tab.minimize_pane(focused_id) {
+                tab.tree.mark_all_dirty();
+                drop(tabs);
+                self.resize_all_panes();
+            }
+        }
+    }
+
+    /// Restore the last minimized pane (FILO).
+    fn do_restore_last_minimized(&self) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        if let Some(tab) = tabs.get_mut(idx) {
+            if tab.restore_last_minimized() {
+                tab.tree.mark_all_dirty();
+                drop(tabs);
+                self.resize_all_panes();
+            }
+        }
     }
 
     /// Navigate focus to an adjacent pane.
@@ -1945,6 +2234,10 @@ impl KovaView {
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get(idx) {
             tab.tree.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
+                // Skip PTY resize for minimized panes (keep old dimensions)
+                if pane.minimized {
+                    return;
+                }
                 let cols = ((vp.width - 2.0 * crate::renderer::PANE_H_PADDING) / cell_w).floor().max(1.0) as u16;
                 let usable_h = if status_bar { vp.height - cell_h } else { vp.height };
                 let rows = (usable_h / cell_h).floor().max(1.0) as u16;
@@ -2452,6 +2745,7 @@ impl KovaView {
                             let new_cols = new_tree.chain_count(true, false);
                             tab.scale_virtual_width(old_cols, new_cols);
                             tab.tree = new_tree;
+                            tab.minimized_stack.retain(|&pid| pid != *id);
                         }
                         None => {
                             tabs_to_remove.push(tab_idx);
@@ -2497,7 +2791,7 @@ impl KovaView {
             let tab = &tabs[active_idx];
             let focused_id = tab.focused_pane;
 
-            let mut pane_data: Vec<(Arc<parking_lot::RwLock<crate::terminal::TerminalState>>, PaneViewport, bool, bool, PaneId, Option<String>, bool, bool)> = Vec::new();
+            let mut pane_data: Vec<crate::renderer::PaneRenderData> = Vec::new();
             let cell_h = renderer.read().cell_size().1;
             let tab_bar_h = (cell_h * 2.0).round();
             let drawable_size = layer.drawableSize();
@@ -2519,16 +2813,18 @@ impl KovaView {
                 let has_bell = !is_focused
                     && term.bell.load(std::sync::atomic::Ordering::Relaxed);
                 drop(term);
-                pane_data.push((
-                    pane.terminal.clone(),
-                    vp,
-                    pane.is_ready(),
+                pane_data.push(crate::renderer::PaneRenderData {
+                    terminal: pane.terminal.clone(),
+                    viewport: vp,
+                    shell_ready: pane.is_ready(),
                     is_focused,
-                    pane.id,
-                    pane.custom_title.clone(),
-                    completed,
+                    pane_id: pane.id,
+                    display_title: pane.display_title("shell"),
+                    custom_title: pane.custom_title.clone(),
+                    has_completion: completed,
                     has_bell,
-                ));
+                    minimized: pane.minimized,
+                });
             });
 
             // Override custom_title for focused pane when rename_pane is active
@@ -2536,10 +2832,10 @@ impl KovaView {
                 let rename_pane = ivars.rename_pane.borrow();
                 if let Some(ref rs) = *rename_pane {
                     for entry in &mut pane_data {
-                        if entry.3 { // is_focused
+                        if entry.is_focused {
                             let before: String = rs.input.chars().take(rs.cursor).collect();
                             let after: String = rs.input.chars().skip(rs.cursor).collect();
-                            entry.5 = Some(format!("{}▏{}", before, after));
+                            entry.custom_title = Some(format!("{}▏{}", before, after));
                         }
                     }
                 }
@@ -2558,7 +2854,7 @@ impl KovaView {
             }
             tabs[active_idx].clear_bell();
             // Derive active tab's completion from pane_data (avoids double atomic read)
-            tabs[active_idx].has_completion = pane_data.iter().any(|p| p.6);
+            tabs[active_idx].has_completion = pane_data.iter().any(|p| p.has_completion);
 
             let rename = ivars.rename_tab.borrow();
             let tab_titles: Vec<(String, bool, Option<usize>, bool, bool, bool)> = tabs.iter().enumerate()
@@ -2597,8 +2893,8 @@ impl KovaView {
         }
 
         // Update NSWindow title from focused pane's OSC 0/2
-        if let Some((terminal, _, _, _, _, _, _, _)) = pane_data.iter().find(|(_, _, _, f, _, _, _, _)| *f) {
-            let term = terminal.read();
+        if let Some(focused_pane) = pane_data.iter().find(|p| p.is_focused) {
+            let term = focused_pane.terminal.read();
             let current = term.title.clone();
             drop(term);
             let mut prev = ivars.last_title.borrow_mut();
@@ -2674,15 +2970,29 @@ impl KovaView {
         // Count hidden panes (fully off-screen)
         let mut hidden_left = 0usize;
         let mut hidden_right = 0usize;
-        for (_, vp, _, _, _, _, _, _) in &pane_data {
-            if vp.x + vp.width <= 0.0 {
+        for p in &pane_data {
+            if p.viewport.x + p.viewport.width <= 0.0 {
                 hidden_left += 1;
-            } else if vp.x >= screen_width {
+            } else if p.viewport.x >= screen_width {
                 hidden_right += 1;
             }
         }
         let keys_config = ivars.config.get().map(|c| &c.keys);
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, show_help, show_mem_report, help_hint_remaining, keys_config);
+
+        // Build recent projects render data if overlay is active (uses cached data)
+        let rp_guard = ivars.recent_projects.borrow();
+        let rp_entries: Vec<&crate::renderer::RecentProjectEntry> = rp_guard.as_ref()
+            .map(|state| state.items.iter().map(|item| &item.render).collect())
+            .unwrap_or_default();
+        let rp_data = rp_guard.as_ref().map(|state| {
+            crate::renderer::RecentProjectsRenderData {
+                entries: &rp_entries,
+                selected: state.selected,
+                scroll: state.scroll,
+            }
+        });
+
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, show_help, show_mem_report, rp_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 

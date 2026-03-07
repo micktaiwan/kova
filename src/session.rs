@@ -36,6 +36,10 @@ pub struct SavedTab {
     pub focused_leaf_index: usize,
     pub custom_title: Option<String>,
     pub color: Option<usize>,
+    #[serde(default)]
+    pub virtual_width_override: Option<f32>,
+    #[serde(default)]
+    pub scroll_offset_x: Option<f32>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -47,6 +51,8 @@ pub enum SavedTree {
         last_command: Option<String>,
         #[serde(default)]
         custom_title: Option<String>,
+        #[serde(default)]
+        minimized: bool,
     },
     HSplit { left: Box<SavedTree>, right: Box<SavedTree>, ratio: f32, #[serde(default)] root: bool },
     VSplit { top: Box<SavedTree>, bottom: Box<SavedTree>, ratio: f32, #[serde(default)] root: bool },
@@ -63,6 +69,7 @@ fn snapshot_tree(tree: &SplitTree) -> SavedTree {
             cwd: pane.cwd(),
             last_command: pane.last_command(),
             custom_title: pane.custom_title.clone(),
+            minimized: pane.minimized,
         },
         SplitTree::HSplit { left, right, ratio, root } => SavedTree::HSplit {
             left: Box::new(snapshot_tree(left)),
@@ -100,16 +107,21 @@ fn leaf_index_of(tree: &SplitTree, target: PaneId) -> Option<usize> {
     walk(tree, target, &mut 0)
 }
 
+/// Snapshot a single tab into a SavedTab (public for recent_projects).
+pub fn snapshot_tab(tab: &Tab) -> SavedTab {
+    let focused_leaf_index = leaf_index_of(&tab.tree, tab.focused_pane).unwrap_or(0);
+    SavedTab {
+        tree: snapshot_tree(&tab.tree),
+        focused_leaf_index,
+        custom_title: tab.custom_title.clone(),
+        color: tab.color,
+        virtual_width_override: if tab.virtual_width_override > 0.0 { Some(tab.virtual_width_override) } else { None },
+        scroll_offset_x: if tab.scroll_offset_x != 0.0 { Some(tab.scroll_offset_x) } else { None },
+    }
+}
+
 fn snapshot_tabs(tabs: &[Tab]) -> Vec<SavedTab> {
-    tabs.iter().map(|tab| {
-        let focused_leaf_index = leaf_index_of(&tab.tree, tab.focused_pane).unwrap_or(0);
-        SavedTab {
-            tree: snapshot_tree(&tab.tree),
-            focused_leaf_index,
-            custom_title: tab.custom_title.clone(),
-            color: tab.color,
-        }
-    }).collect()
+    tabs.iter().map(snapshot_tab).collect()
 }
 
 impl WindowSession {
@@ -272,7 +284,7 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 /// Restore a saved tree, spawning new panes. Returns the tree and a list of pane ids in depth-first order.
 fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Option<(SplitTree, Vec<PaneId>)> {
     match saved {
-        SavedTree::Leaf { cwd, last_command, custom_title } => {
+        SavedTree::Leaf { cwd, last_command, custom_title, minimized } => {
             let mut pane = Pane::spawn(cols, rows, config, cwd.as_deref()).ok()?;
             let id = pane.id;
             if let Some(cmd) = last_command {
@@ -280,6 +292,7 @@ fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Opt
                 pane.terminal.write().last_command = Some(cmd.clone());
             }
             pane.custom_title = custom_title.clone();
+            pane.minimized = *minimized;
             Some((SplitTree::Leaf(pane), vec![id]))
         }
         SavedTree::HSplit { left, right, ratio, root } => {
@@ -307,34 +320,39 @@ fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Opt
     }
 }
 
+/// Restore a single saved tab. Used by recent projects and session restore.
+pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config) -> Option<Tab> {
+    let (tree, pane_ids) = restore_tree(&saved.tree, cols, rows, config)?;
+    let focused_pane = if saved.focused_leaf_index < pane_ids.len() {
+        pane_ids[saved.focused_leaf_index]
+    } else {
+        pane_ids[0]
+    };
+    let mut tab = Tab {
+        id: alloc_tab_id(),
+        tree,
+        focused_pane,
+        custom_title: saved.custom_title.clone(),
+        color: saved.color,
+        has_bell: false,
+        has_completion: false,
+        minimized_stack: Vec::new(),
+        scroll_offset_x: saved.scroll_offset_x.unwrap_or(0.0),
+        virtual_width_override: saved.virtual_width_override.unwrap_or(0.0),
+    };
+    tab.rebuild_minimized_stack();
+    Some(tab)
+}
+
 fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>, usize)> {
     let cols = config.terminal.columns;
     let rows = config.terminal.rows;
     let mut tabs = Vec::new();
 
     for saved_tab in &ws.tabs {
-        match restore_tree(&saved_tab.tree, cols, rows, config) {
-            Some((tree, pane_ids)) => {
-                let focused_pane = if saved_tab.focused_leaf_index < pane_ids.len() {
-                    pane_ids[saved_tab.focused_leaf_index]
-                } else {
-                    pane_ids[0]
-                };
-                tabs.push(Tab {
-                    id: alloc_tab_id(),
-                    tree,
-                    focused_pane,
-                    custom_title: saved_tab.custom_title.clone(),
-                    color: saved_tab.color,
-                    has_bell: false,
-                    has_completion: false,
-                    scroll_offset_x: 0.0,
-                    virtual_width_override: 0.0,
-                });
-            }
-            None => {
-                log::warn!("Failed to restore a tab, skipping");
-            }
+        match restore_saved_tab(saved_tab, cols, rows, config) {
+            Some(tab) => tabs.push(tab),
+            None => log::warn!("Failed to restore a tab, skipping"),
         }
     }
 
