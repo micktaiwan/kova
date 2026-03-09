@@ -18,6 +18,49 @@ use simplelog::{CombinedLogger, Config, TermLogger, TerminalMode, WriteLogger};
 use std::fs;
 use std::path::PathBuf;
 
+/// Install signal handlers for SIGSEGV, SIGBUS, SIGABRT to log a backtrace before dying.
+/// These signals bypass Rust's panic handler, so we need raw signal handlers.
+fn install_crash_signal_handlers() {
+    use std::io::Write;
+
+    extern "C" fn crash_handler(sig: libc::c_int) {
+        // We're in a signal handler — only async-signal-safe operations.
+        // Writing to a pre-opened fd and _exit are safe. backtrace is not
+        // strictly safe but it's our best effort for a dying process.
+        let sig_name = match sig {
+            libc::SIGSEGV => "SIGSEGV",
+            libc::SIGBUS => "SIGBUS",
+            libc::SIGABRT => "SIGABRT",
+            _ => "UNKNOWN",
+        };
+
+        // Write to the log file directly (the logger may not be signal-safe)
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let path = format!("{}/Library/Logs/Kova/kova.log", home);
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&path) {
+            let _ = writeln!(f, "\n=== CRASH SIGNAL: {} ===", sig_name);
+            let bt = std::backtrace::Backtrace::force_capture();
+            let _ = writeln!(f, "{}", bt);
+            let _ = writeln!(f, "=== END CRASH ===\n");
+        }
+
+        // Also try stderr
+        let _ = eprintln!("\nKova crashed with signal: {}", sig_name);
+
+        // Re-raise with default handler to get a proper core dump / exit code
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+
+    unsafe {
+        libc::signal(libc::SIGSEGV, crash_handler as libc::sighandler_t);
+        libc::signal(libc::SIGBUS, crash_handler as libc::sighandler_t);
+        libc::signal(libc::SIGABRT, crash_handler as libc::sighandler_t);
+    }
+}
+
 static ICON_DATA: &[u8] = include_bytes!("../assets/kova.icns");
 
 /// Process RSS (Resident Set Size) in MB via mach API.
@@ -78,6 +121,7 @@ fn main() {
         .and_then(|w| w[1].parse::<usize>().ok());
 
     setup_logging();
+    install_crash_signal_handlers();
 
     // Log panics to file before aborting
     std::panic::set_hook(Box::new(|info| {
