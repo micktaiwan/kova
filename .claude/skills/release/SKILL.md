@@ -33,11 +33,11 @@ Argument: `$ARGUMENTS` must be one of `major`, `minor`, or `patch`. If missing o
 
 8. **Update `Cargo.lock`** by running `cargo check`. This updates the lockfile as a side effect without regenerating it from scratch.
 
-9. **Build and test:**
+9. **Build and test** (warnings are errors):
    ```bash
-   cargo build --release && cargo test
+   RUSTFLAGS="-D warnings" cargo build --release && RUSTFLAGS="-D warnings" cargo test
    ```
-   Abort if either fails. Do not tag a version that doesn't compile or pass tests.
+   Abort if either fails. Do not tag a version that doesn't compile, has warnings, or fails tests.
 
 10. **Generate release commit message:** Use `git log` since the last tag to summarize changes. Format:
     ```
