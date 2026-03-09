@@ -1,5 +1,10 @@
 #!/bin/bash
 set -e
 cargo build --release
-codesign --force --sign "Apple Development: faivrem@gmail.com (23L76N6978)" --identifier com.micktaiwan.kova --entitlements Kova.entitlements ~/.cargo/target/release/kova
-echo "Build + codesign done"
+
+# Codesign (optional — requires a local Apple Development certificate)
+if codesign --force --sign "Apple Development" --identifier com.micktaiwan.kova --entitlements Kova.entitlements ~/.cargo/target/release/kova 2>/dev/null; then
+    echo "Build + codesign done"
+else
+    echo "Build done (codesign skipped — no certificate found)"
+fi
