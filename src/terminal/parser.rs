@@ -121,7 +121,7 @@ impl Perform for VteHandler {
         // Handle OSC sequences (window title, etc.)
         if params.len() >= 2 {
             match params[0] {
-                b"0" | b"2" => {
+                b"0" | b"1" | b"2" => {
                     let title = String::from_utf8_lossy(params[1]).into_owned();
                     log::trace!("OSC title: {}", title);
                     let term = self.term();
