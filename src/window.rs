@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility};
+use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSArray, NSObjectProtocol, NSString};
 use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -30,6 +30,13 @@ struct DragTabState {
     start_x: f32,
     current_x: f32,
     dragging: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ScrollAxisLock {
+    None,
+    Vertical,
+    Horizontal,
 }
 
 pub struct KovaViewIvars {
@@ -80,6 +87,8 @@ pub struct KovaViewIvars {
     recent_projects: RefCell<Option<RecentProjectsState>>,
     /// Countdown frames for "⌘? for help" hint in global status bar (fps * 3).
     help_hint_frames: Cell<u32>,
+    /// Axis lock for trackpad scroll gestures (prevents cross-axis drift).
+    scroll_axis_lock: Cell<ScrollAxisLock>,
 }
 
 struct FilterState {
@@ -589,40 +598,69 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
-            // Scroll goes to the pane under the cursor, not necessarily the focused one
-            if let Some((pane, _vp)) = self.pane_at_event(event) {
-                let dy = event.scrollingDeltaY();
-                let lines = if event.hasPreciseScrollingDeltas() {
-                    let sensitivity = self.ivars().config.get()
-                        .map(|c| c.terminal.scroll_sensitivity)
-                        .unwrap_or(TerminalConfig::default().scroll_sensitivity);
-                    let acc = pane.scroll_accumulator.get() + dy / sensitivity;
-                    let discrete = acc as i32;
-                    pane.scroll_accumulator.set(acc - discrete as f64);
-                    discrete
-                } else {
-                    dy as i32
-                };
-                if lines != 0 {
-                    let mut term = pane.terminal.write();
-                    term.scroll(lines);
-                    // Reset accumulator when hitting bounds to avoid residual drift
-                    let at_bound = term.scroll_offset() == 0
-                        || term.scroll_offset() == term.scrollback_len() as i32;
-                    if at_bound {
-                        pane.scroll_accumulator.set(0.0);
+            let ivars = self.ivars();
+            let is_trackpad = event.hasPreciseScrollingDeltas();
+
+            // Phase-based axis lock (trackpad only)
+            if is_trackpad {
+                let phase = event.phase();
+                let momentum = event.momentumPhase();
+
+                if phase == NSEventPhase::Began {
+                    let dy = event.scrollingDeltaY().abs();
+                    let dx = event.scrollingDeltaX().abs();
+                    ivars.scroll_axis_lock.set(if dy >= dx {
+                        ScrollAxisLock::Vertical
+                    } else {
+                        ScrollAxisLock::Horizontal
+                    });
+                } else if phase.intersects(NSEventPhase::Ended | NSEventPhase::Cancelled)
+                    && momentum == NSEventPhase::None
+                {
+                    ivars.scroll_axis_lock.set(ScrollAxisLock::None);
+                } else if momentum.intersects(NSEventPhase::Ended | NSEventPhase::Cancelled) {
+                    ivars.scroll_axis_lock.set(ScrollAxisLock::None);
+                }
+            }
+
+            let lock = ivars.scroll_axis_lock.get();
+
+            // Vertical scroll (pane under cursor)
+            if lock != ScrollAxisLock::Horizontal {
+                if let Some((pane, _vp)) = self.pane_at_event(event) {
+                    let dy = event.scrollingDeltaY();
+                    let lines = if is_trackpad {
+                        let sensitivity = ivars.config.get()
+                            .map(|c| c.terminal.scroll_sensitivity)
+                            .unwrap_or(TerminalConfig::default().scroll_sensitivity);
+                        let acc = pane.scroll_accumulator.get() + dy / sensitivity;
+                        let discrete = acc as i32;
+                        pane.scroll_accumulator.set(acc - discrete as f64);
+                        discrete
+                    } else {
+                        dy as i32
+                    };
+                    if lines != 0 {
+                        let mut term = pane.terminal.write();
+                        term.scroll(lines);
+                        // Reset accumulator when hitting bounds to avoid residual drift
+                        let at_bound = term.scroll_offset() == 0
+                            || term.scroll_offset() == term.scrollback_len() as i32;
+                        if at_bound {
+                            pane.scroll_accumulator.set(0.0);
+                        }
                     }
                 }
             }
 
             // Horizontal scroll for virtual viewport (trackpad only)
-            if event.hasPreciseScrollingDeltas() {
+            if lock != ScrollAxisLock::Vertical && is_trackpad {
                 let dx = event.scrollingDeltaX();
                 if dx != 0.0 {
                     let screen_w = self.drawable_viewport().width;
                     let min_w = self.min_split_width_px();
-                    let mut tabs = self.ivars().tabs.borrow_mut();
-                    let idx = self.ivars().active_tab.get();
+                    let mut tabs = ivars.tabs.borrow_mut();
+                    let idx = ivars.active_tab.get();
                     if let Some(tab) = tabs.get_mut(idx) {
                         let vw = tab.virtual_width(screen_w, min_w);
                         if vw > screen_w {
@@ -1010,6 +1048,7 @@ impl KovaView {
             show_mem_report: Cell::new(false),
             recent_projects: RefCell::new(None),
             help_hint_frames: Cell::new(180), // updated in setup_metal
+            scroll_axis_lock: Cell::new(ScrollAxisLock::None),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -1789,7 +1828,6 @@ impl KovaView {
                     .unwrap_or_else(|| new_tree.first_pane().id);
                 tabs[idx].focused_pane = new_focus;
                 let mut new_tree = new_tree;
-                new_tree.equalize();
                 let new_columns = new_tree.chain_count(true, false);
                 tabs[idx].scale_virtual_width(old_columns, new_columns);
                 tabs[idx].tree = new_tree;
@@ -2741,7 +2779,6 @@ impl KovaView {
                     ));
                     match tree.remove_pane(*id) {
                         Some(mut new_tree) => {
-                            new_tree.equalize();
                             let new_cols = new_tree.chain_count(true, false);
                             tab.scale_virtual_width(old_cols, new_cols);
                             tab.tree = new_tree;
