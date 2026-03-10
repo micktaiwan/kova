@@ -580,6 +580,42 @@ impl SplitTree {
         }
     }
 
+    /// Count the number of visual columns (minimum horizontal partitions).
+    pub fn columns(&self) -> usize {
+        match self {
+            SplitTree::Leaf(_) => 1,
+            SplitTree::HSplit { left, right, .. } => left.columns() + right.columns(),
+            SplitTree::VSplit { top, bottom, .. } => top.columns().min(bottom.columns()),
+        }
+    }
+
+    /// Find the 1-based column index of the pane with given id.
+    /// Returns None if the pane is not found.
+    pub fn column_index(&self, id: PaneId) -> Option<usize> {
+        match self {
+            SplitTree::Leaf(p) => {
+                if p.id == id { Some(1) } else { None }
+            }
+            SplitTree::HSplit { left, right, .. } => {
+                if let Some(idx) = left.column_index(id) {
+                    Some(idx)
+                } else {
+                    right.column_index(id).map(|idx| left.columns() + idx)
+                }
+            }
+            SplitTree::VSplit { top, bottom, .. } => {
+                let ct = top.columns();
+                let cb = bottom.columns();
+                let min_c = ct.min(cb);
+                if let Some(idx) = top.column_index(id) {
+                    Some(((idx - 1) * min_c / ct) + 1)
+                } else {
+                    bottom.column_index(id).map(|idx| ((idx - 1) * min_c / cb) + 1)
+                }
+            }
+        }
+    }
+
     /// Equalize ratios so that all panes along a same-direction chain get equal space.
     /// For example, HSplit(A, HSplit(B, C)) gets ratios 1/3 and 1/2, giving each pane 1/3.
     pub fn equalize(&mut self) {
@@ -735,16 +771,20 @@ impl SplitTree {
         match self {
             SplitTree::Leaf(_) => false,
             SplitTree::HSplit { left, right, ratio, .. } if axis == SplitAxis::Horizontal => {
+                // Don't adjust ratio if either child is minimized (ratio is ignored by split_sizes)
+                let blocked = left.is_fully_minimized() || right.is_fully_minimized();
                 if left.contains(id) {
                     if left.adjust_ratio_for_pane(id, delta, axis) {
                         return true;
                     }
+                    if blocked { return false; }
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
                     true
                 } else if right.contains(id) {
                     if right.adjust_ratio_for_pane(id, delta, axis) {
                         return true;
                     }
+                    if blocked { return false; }
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
                     true
                 } else {
@@ -752,16 +792,19 @@ impl SplitTree {
                 }
             }
             SplitTree::VSplit { top, bottom, ratio, .. } if axis == SplitAxis::Vertical => {
+                let blocked = top.is_fully_minimized() || bottom.is_fully_minimized();
                 if top.contains(id) {
                     if top.adjust_ratio_for_pane(id, delta, axis) {
                         return true;
                     }
+                    if blocked { return false; }
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
                     true
                 } else if bottom.contains(id) {
                     if bottom.adjust_ratio_for_pane(id, delta, axis) {
                         return true;
                     }
+                    if blocked { return false; }
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
                     true
                 } else {
