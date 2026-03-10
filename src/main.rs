@@ -70,6 +70,7 @@ pub(crate) fn get_rss_mb() -> f64 {
         let mut count = (std::mem::size_of::<libc::mach_task_basic_info_data_t>()
             / std::mem::size_of::<libc::natural_t>()) as u32;
         let kr = libc::task_info(
+            #[allow(deprecated)]
             libc::mach_task_self_,
             libc::MACH_TASK_BASIC_INFO,
             &mut info as *mut _ as *mut i32,
