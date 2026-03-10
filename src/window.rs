@@ -1827,7 +1827,6 @@ impl KovaView {
                     .filter(|id| new_tree.contains(*id))
                     .unwrap_or_else(|| new_tree.first_pane().id);
                 tabs[idx].focused_pane = new_focus;
-                let mut new_tree = new_tree;
                 let new_columns = new_tree.chain_count(true, false);
                 tabs[idx].scale_virtual_width(old_columns, new_columns);
                 tabs[idx].tree = new_tree;
@@ -2778,7 +2777,7 @@ impl KovaView {
                         Pane::spawn(1, 1, ivars.config.get().unwrap(), None).unwrap()
                     ));
                     match tree.remove_pane(*id) {
-                        Some(mut new_tree) => {
+                        Some(new_tree) => {
                             let new_cols = new_tree.chain_count(true, false);
                             tab.scale_virtual_width(old_cols, new_cols);
                             tab.tree = new_tree;
