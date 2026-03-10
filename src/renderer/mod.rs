@@ -263,6 +263,10 @@ impl Renderer {
         tab_bar_left_inset: f32,
         hidden_left: usize,
         hidden_right: usize,
+        focused_column: usize,
+        total_columns: usize,
+        active_tab: usize,
+        total_tabs: usize,
         show_help: bool,
         show_mem_report: bool,
         recent_projects: Option<&RecentProjectsRenderData<'_>>,
@@ -458,7 +462,7 @@ impl Renderer {
         }
 
         // Draw global status bar
-        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, help_hint_remaining, keys_config);
+        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, help_hint_remaining, keys_config);
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
@@ -893,6 +897,10 @@ impl Renderer {
         viewport_h: f32,
         hidden_left: usize,
         hidden_right: usize,
+        focused_column: usize,
+        total_columns: usize,
+        active_tab: usize,
+        total_tabs: usize,
         help_hint_remaining: u32,
         keys_config: Option<&KeysConfig>,
     ) {
@@ -906,19 +914,33 @@ impl Renderer {
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let time_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 1.0];
         let scroll_fg = [self.global_bar_scroll_color[0], self.global_bar_scroll_color[1], self.global_bar_scroll_color[2], 1.0];
+        let tab_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.5];
 
-        // Center: scroll indicator when panes are hidden
-        if hidden_left > 0 || hidden_right > 0 {
-            let indicator = match (hidden_left > 0, hidden_right > 0) {
-                (true, true) => format!("⟵ {} | {} ⟶", hidden_left, hidden_right),
-                (true, false) => format!("⟵ {}", hidden_left),
-                (false, true) => format!("{} ⟶", hidden_right),
-                _ => unreachable!(),
-            };
-            let char_count = indicator.chars().count() as f32;
-            let text_w = char_count * cell_w;
-            let center_x = (viewport_w - text_w) / 2.0;
-            self.render_status_text(vertices, &indicator, center_x, bar_y, viewport_w, scroll_fg, no_bg);
+        // Center: [tab/total] - col/total, combined with scroll arrows
+        // Pre-compute the full text to measure total width for centering
+        {
+            let tab_text = format!("[{}/{}]", active_tab, total_tabs);
+            let sep = " - ";
+            let col_text = format!("{}/{}", focused_column, total_columns);
+
+            // Build optional left/right scroll parts
+            let left_arrow = if hidden_left > 0 { format!("⟵ {} | ", hidden_left) } else { String::new() };
+            let right_arrow = if hidden_right > 0 { format!(" | {} ⟶", hidden_right) } else { String::new() };
+
+            // Total char width for centering
+            let total_chars = left_arrow.chars().count() + tab_text.chars().count() + sep.chars().count() + col_text.chars().count() + right_arrow.chars().count();
+            let text_w = total_chars as f32 * cell_w;
+            let mut x = (viewport_w - text_w) / 2.0;
+
+            if hidden_left > 0 {
+                x = self.render_status_text(vertices, &left_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
+            }
+            x = self.render_status_text(vertices, &tab_text, x, bar_y, viewport_w, tab_fg, no_bg);
+            x = self.render_status_text(vertices, sep, x, bar_y, viewport_w, tab_fg, no_bg);
+            x = self.render_status_text(vertices, &col_text, x, bar_y, viewport_w, scroll_fg, no_bg);
+            if hidden_right > 0 {
+                self.render_status_text(vertices, &right_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
+            }
         }
 
         // Left: help hint with fade

@@ -2783,7 +2783,7 @@ impl KovaView {
             .map(|c| c.splits.min_width)
             .unwrap_or(300.0)
             * ivars.last_scale.get().max(1.0) as f32;
-        let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width) = {
+        let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width, total_columns, focused_column, active_tab, total_tabs) = {
             let mut tabs = ivars.tabs.borrow_mut();
             if tabs.is_empty() {
                 return false;
@@ -2872,7 +2872,11 @@ impl KovaView {
                 })
                 .collect();
             drop(rename);
-            (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width)
+            let total_columns = tabs[active_idx].tree.columns();
+            let focused_column = tabs[active_idx].tree.column_index(tabs[active_idx].focused_pane).unwrap_or(1);
+            let active_tab_1based = active_idx + 1;
+            let total_tabs = tabs.len();
+            (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width, total_columns, focused_column, active_tab_1based, total_tabs)
         };
 
         // Focus reporting (DEC mode 1004) — send to focused pane only
@@ -2992,7 +2996,7 @@ impl KovaView {
             }
         });
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, show_help, show_mem_report, rp_data.as_ref(), help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, show_help, show_mem_report, rp_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 
