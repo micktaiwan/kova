@@ -41,6 +41,12 @@ pub struct GlyphAtlas {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     color_space: Retained<CGColorSpace>,
     fallback_fonts: HashMap<char, CFRetained<CTFont>>,
+    // Overlay font (larger, for overlays like Memory Report)
+    overlay_font: Retained<CTFont>,
+    overlay_descent: f64,
+    pub overlay_glyphs: HashMap<char, GlyphInfo>,
+    pub overlay_cell_width: f32,
+    pub overlay_cell_height: f32,
 }
 
 impl GlyphAtlas {
@@ -235,7 +241,36 @@ impl GlyphAtlas {
         let next_x = (last_col + 1) % chars_per_row;
         let next_y = if next_x == 0 { last_row + 1 } else { last_row };
 
-        GlyphAtlas {
+        // Create overlay font at ~1.3x the terminal font size (for overlay screens)
+        let overlay_font_size = font_size * 1.3;
+        let overlay_font = unsafe { CTFont::with_name(&cf_font_name, overlay_font_size, ptr::null()) };
+        let overlay_ascent = unsafe { overlay_font.ascent() };
+        let overlay_descent = unsafe { overlay_font.descent() };
+        let overlay_leading = unsafe { overlay_font.leading() };
+        let overlay_cell_height = (overlay_ascent + overlay_descent + overlay_leading).ceil() as f32;
+
+        // Get overlay cell width from 'M'
+        let mut overlay_uni: u16 = 'M' as u16;
+        let mut overlay_glyph_id: CGGlyph = 0;
+        unsafe {
+            overlay_font.glyphs_for_characters(
+                NonNull::new(&mut overlay_uni).unwrap(),
+                NonNull::new(&mut overlay_glyph_id).unwrap(),
+                1,
+            );
+        }
+        let mut overlay_advance = CGSize { width: 0.0, height: 0.0 };
+        unsafe {
+            overlay_font.advances_for_glyphs(
+                CTFontOrientation::Horizontal,
+                NonNull::new(&mut overlay_glyph_id).unwrap(),
+                &mut overlay_advance,
+                1,
+            );
+        }
+        let overlay_cell_width = overlay_advance.width.ceil() as f32;
+
+        let mut atlas = GlyphAtlas {
             texture,
             glyphs,
             cluster_glyphs: HashMap::new(),
@@ -252,11 +287,92 @@ impl GlyphAtlas {
             device: device.retain(),
             color_space: color_space.into(),
             fallback_fonts: HashMap::new(),
+            overlay_font: overlay_font.into(),
+            overlay_descent,
+            overlay_glyphs: HashMap::new(),
+            overlay_cell_width,
+            overlay_cell_height,
+        };
+
+        // Pre-rasterize ASCII glyphs at overlay size
+        for c in ' '..='~' {
+            atlas.rasterize_overlay_char(c);
         }
+
+        log::info!(
+            "Overlay font: cell {:.1}x{:.1}",
+            overlay_cell_width, overlay_cell_height
+        );
+
+        atlas
     }
 
     pub fn glyph(&self, c: char) -> Option<&GlyphInfo> {
         self.glyphs.get(&c)
+    }
+
+    pub fn overlay_glyph(&self, c: char) -> Option<&GlyphInfo> {
+        self.overlay_glyphs.get(&c)
+    }
+
+    /// Rasterize a character at overlay font size and insert into the atlas.
+    pub fn rasterize_overlay_char(&mut self, c: char) -> Option<GlyphInfo> {
+        if let Some(g) = self.overlay_glyphs.get(&c) {
+            return Some(*g);
+        }
+
+        let bmp_w = self.overlay_cell_width as usize;
+        let bmp_h = self.overlay_cell_height as usize;
+        let bmp_bpr = bmp_w * 4;
+
+        let mut uni_buf = [0u16; 2];
+        let encoded = c.encode_utf16(&mut uni_buf);
+        let count = encoded.len();
+        let mut glyph_buf = [0u16; 2];
+        let ok = unsafe {
+            self.overlay_font.glyphs_for_characters(
+                NonNull::new(uni_buf.as_mut_ptr()).unwrap(),
+                NonNull::new(glyph_buf.as_mut_ptr()).unwrap(),
+                count as isize,
+            )
+        };
+        let mut glyph_id = glyph_buf[0];
+        if !ok || glyph_id == 0 {
+            return None;
+        }
+
+        let mut bmp_buf = vec![0u8; bmp_bpr * bmp_h];
+        let bmp_ctx = unsafe {
+            CGBitmapContextCreate(
+                bmp_buf.as_mut_ptr() as *mut c_void,
+                bmp_w,
+                bmp_h,
+                8,
+                bmp_bpr,
+                Some(&self.color_space),
+                1u32,
+            )
+        };
+        let bmp_ctx = match bmp_ctx {
+            Some(ctx) => ctx,
+            None => return None,
+        };
+
+        CGContext::set_rgb_fill_color(Some(&bmp_ctx), 1.0, 1.0, 1.0, 1.0);
+
+        let mut pos = CGPoint { x: 0.0, y: self.overlay_descent };
+        unsafe {
+            self.overlay_font.draw_glyphs(
+                NonNull::new(&mut glyph_id).unwrap(),
+                NonNull::new(&mut pos).unwrap(),
+                1,
+                &bmp_ctx,
+            );
+        }
+
+        let info = self.insert_bitmap_raw(&bmp_buf, bmp_w, bmp_h, false)?;
+        self.overlay_glyphs.insert(c, info);
+        Some(info)
     }
 
     /// Resolve glyph ID and font for a character, using fallback if needed.
@@ -701,16 +817,17 @@ impl GlyphAtlas {
     /// Insert a rendered bitmap into the atlas, returning the GlyphInfo without storing it.
     fn insert_bitmap_raw(&mut self, bmp_buf: &[u8], bmp_w: usize, bmp_h: usize, is_color: bool) -> Option<GlyphInfo> {
         let bmp_bpr = bmp_w * 4;
+        let slot_h = (bmp_h as u32).max(self.glyph_cell_h);
 
         // Check if we need to wrap to next row
         let slot_w = bmp_w as u32;
         if self.next_x + slot_w > self.atlas_width {
             self.next_x = 0;
-            self.next_y += self.glyph_cell_h;
+            self.next_y += slot_h;
         }
 
         // Grow atlas if needed
-        if self.next_y + self.glyph_cell_h > self.atlas_height {
+        while self.next_y + slot_h > self.atlas_height {
             self.grow_atlas();
         }
 
@@ -748,7 +865,7 @@ impl GlyphAtlas {
             x: atlas_x,
             y: atlas_y,
             width: bmp_w as u32,
-            height: self.glyph_cell_h,
+            height: bmp_h as u32,
             is_color,
         };
 
