@@ -122,7 +122,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 
 ## V3 — Avancé
 
-- [ ] Support images (Sixel ou protocole Kitty)
+- [ ] Support images inline (Kitty Graphics Protocol) — affichage d'images dans le terminal (`icat`, `yazi`, etc.). Parser APC, image store, texture manager Metal, draw calls séparés. Voir [`docs/image-support.md`](docs/image-support.md)
 - [ ] Shell integration (marks, navigation prompt à prompt)
 - [ ] Complétion inline / suggestions
 
