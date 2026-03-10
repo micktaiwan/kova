@@ -1179,6 +1179,54 @@ impl Renderer {
         self.render_text(vertices, text, start_x, y, max_x, fg, no_bg, 1.0)
     }
 
+    /// Render text using the overlay font (rasterized at larger size, no bitmap stretching).
+    fn render_overlay_text(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        text: &str,
+        start_x: f32,
+        y: f32,
+        max_x: f32,
+        fg: [f32; 4],
+        no_bg: [f32; 4],
+    ) -> f32 {
+        let cell_w = self.atlas.overlay_cell_width;
+        let atlas_w = self.atlas.atlas_width as f32;
+        let atlas_h = self.atlas.atlas_height as f32;
+
+        for c in text.chars() {
+            if self.atlas.overlay_glyph(c).is_none() {
+                self.atlas.rasterize_overlay_char(c);
+            }
+        }
+
+        let mut x = start_x;
+        for c in text.chars() {
+            if x + cell_w > max_x { break; }
+            let glyph = match self.atlas.overlay_glyph(c) {
+                Some(g) => *g,
+                None => { x += cell_w; continue; }
+            };
+            if glyph.width == 0 || glyph.height == 0 { x += cell_w; continue; }
+
+            let gw = glyph.width as f32;
+            let gh = glyph.height as f32;
+            let tx = glyph.x as f32 / atlas_w;
+            let ty = glyph.y as f32 / atlas_h;
+            let tw = glyph.width as f32 / atlas_w;
+            let th = glyph.height as f32 / atlas_h;
+
+            vertices.push(Vertex { position: [x, y], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x + gw, y + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+            x += cell_w;
+        }
+        x
+    }
+
     fn build_filter_overlay_vertices(
         &mut self,
         vertices: &mut Vec<Vertex>,
@@ -1494,8 +1542,8 @@ impl Renderer {
         viewport_w: f32,
         viewport_h: f32,
     ) {
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
+        let overlay_cw = self.atlas.overlay_cell_width;
+        let overlay_ch = self.atlas.overlay_cell_height;
 
         // Semi-transparent dark overlay
         Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
@@ -1505,30 +1553,26 @@ impl Renderer {
         let label_fg = [0.8, 0.85, 0.9, 1.0];
         let dim_fg = [0.55, 0.6, 0.65, 1.0];
 
-        let title_scale = 1.8_f32;
-        let body_scale = 1.2_f32;
-        let scaled_cell_h = cell_h * body_scale;
-
-        // Title
+        // Title — rendered natively at overlay font size, no stretching
         let title = "Memory Report";
         let title_chars = title.chars().count() as f32;
-        let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
-        let mut y = cell_h * 3.0;
-        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
-        y += cell_h * title_scale * 2.0;
+        let title_x = (viewport_w - title_chars * overlay_cw) / 2.0;
+        let mut y = overlay_ch * 2.0;
+        self.render_overlay_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg);
+        y += overlay_ch * 2.0;
 
         // Subtitle
         let subtitle = "Press Esc to close";
         let sub_chars = subtitle.chars().count() as f32;
-        let sub_x = (viewport_w - sub_chars * cell_w * body_scale) / 2.0;
-        self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
-        y += scaled_cell_h * 2.5;
+        let sub_x = (viewport_w - sub_chars * overlay_cw) / 2.0;
+        self.render_overlay_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg);
+        y += overlay_ch * 2.5;
 
         // Report lines
         let report = std::mem::take(&mut self.cached_mem_report);
-        let left_margin = cell_w * 3.0;
+        let left_margin = overlay_cw * 3.0;
         for line in &report {
-            if y + scaled_cell_h > viewport_h - cell_h {
+            if y + overlay_ch > viewport_h - overlay_ch {
                 break;
             }
             let fg = if line.starts_with("===") || line.starts_with("RSS") {
@@ -1538,8 +1582,8 @@ impl Renderer {
             } else {
                 label_fg
             };
-            self.render_text(vertices, line, left_margin, y, viewport_w - cell_w, fg, no_bg, body_scale);
-            y += scaled_cell_h * 1.3;
+            self.render_overlay_text(vertices, line, left_margin, y, viewport_w - overlay_cw, fg, no_bg);
+            y += overlay_ch * 1.3;
         }
         self.cached_mem_report = report;
     }
