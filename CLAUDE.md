@@ -24,22 +24,16 @@ Voir `roadmap.md` pour le détail des versions et l'avancement.
 
 - Le target directory Cargo est **global** : `~/.cargo/target` (pas `./target`)
 - Le binaire release se trouve donc dans `~/.cargo/target/release/kova`
-- **Build release** : utiliser `./build.sh` (build + codesign avec certificat Apple Development). Ne pas faire `cargo build --release` seul.
+- **Build release** : **toujours** utiliser `./build.sh`. Ne jamais faire `cargo build --release` seul — le binaire ne serait pas copié dans le bundle `/Applications/Kova.app` et l'app ne serait pas mise à jour.
+- `build.sh` fait : cargo build → copie du binaire + Info.plist dans le bundle → codesign du bundle entier (nécessaire pour que macOS conserve les permissions TCC entre les builds).
 
 ## Installation
 
 ```bash
-./build.sh
-# Le .app bundle est un symlink, donc il suffit de rebuild :
-# /Applications/Kova.app/Contents/MacOS/kova -> ~/.cargo/target/release/kova
-```
-
-Si le bundle n'existe pas encore :
-
-```bash
-mkdir -p /Applications/Kova.app/Contents/MacOS
+mkdir -p /Applications/Kova.app/Contents/MacOS /Applications/Kova.app/Contents/Resources
 cp Info.plist /Applications/Kova.app/Contents/
-ln -sf ~/.cargo/target/release/kova /Applications/Kova.app/Contents/MacOS/kova
+cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
+./build.sh
 ```
 
 ## Release

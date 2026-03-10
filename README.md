@@ -102,20 +102,16 @@ min_width = 300.0  # minimum pane width in points before horizontal scroll activ
 Requires macOS with Metal support and Rust (edition 2024).
 
 ```bash
-cargo build --release
-```
-
-The binary lands in `~/.cargo/target/release/kova` (global target dir).
-
-### Install as .app
-
-```bash
-mkdir -p /Applications/Kova.app/Contents/MacOS
+# First time — create the .app bundle:
+mkdir -p /Applications/Kova.app/Contents/MacOS /Applications/Kova.app/Contents/Resources
 cp Info.plist /Applications/Kova.app/Contents/
-ln -sf ~/.cargo/target/release/kova /Applications/Kova.app/Contents/MacOS/kova
+cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
+
+# Build, copy binary into bundle, and codesign:
+./build.sh
 ```
 
-After the initial setup, `cargo build --release` is all you need — the symlink picks up the new binary.
+Always use `./build.sh` — it builds the binary, copies it into the `.app` bundle, and codesigns the bundle. Don't use `cargo build --release` alone as the app won't be updated.
 
 ## Non-goals
 
