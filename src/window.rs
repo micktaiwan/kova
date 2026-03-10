@@ -497,6 +497,13 @@ define_class!(
                         if let Some(tab) = tabs.get_mut(idx) {
                             let focused_id = tab.focused_pane;
                             if tab.tree.adjust_ratio_for_pane(focused_id, *delta, *axis) {
+                                let full = self.drawable_viewport();
+                                let min_w = self.min_split_width_px();
+                                tab.clamp_scroll(full.width, min_w);
+                                let panes_vp = self.panes_viewport_for_tab(tab);
+                                if let Some(vp) = tab.tree.viewport_for_pane(focused_id, panes_vp) {
+                                    tab.scroll_to_reveal(&vp, full.width);
+                                }
                                 drop(tabs);
                                 self.resize_all_panes();
                             }
@@ -1318,6 +1325,11 @@ impl KovaView {
             let new_vw = (current_vw + dir * step).max(screen_w);
             tab.virtual_width_override = if new_vw > screen_w { new_vw } else { 0.0 };
             tab.clamp_scroll(screen_w, min_w);
+            let focused_id = tab.focused_pane;
+            let panes_vp = self.panes_viewport_for_tab(tab);
+            if let Some(vp) = tab.tree.viewport_for_pane(focused_id, panes_vp) {
+                tab.scroll_to_reveal(&vp, screen_w);
+            }
             log::debug!("virtual_width override: {}px", tab.virtual_width_override);
         }
         drop(tabs);
