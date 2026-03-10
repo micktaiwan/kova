@@ -279,7 +279,11 @@ impl TerminalState {
             return; // No scrollback in alt screen
         }
         let max_offset = self.scrollback.len() as i32;
+        let old_offset = self.scroll_offset;
         self.scroll_offset = (self.scroll_offset + lines).clamp(0, max_offset);
+        if self.scroll_offset == max_offset && old_offset == max_offset {
+            log::debug!("scroll: at max offset {}/{}, scrollback_limit={}", self.scroll_offset, max_offset, self.scrollback_limit);
+        }
         self.user_scrolled = self.scroll_offset > 0;
         self.cursor_moved();
     }
@@ -639,6 +643,7 @@ impl TerminalState {
                         row.cells.iter().any(|c| !c.is_blank())
                     );
                     if let Some(last) = last_content {
+                        log::debug!("ED 2/3: pushing {} rows to scrollback (scrollback_len={})", last + 1, self.scrollback.len());
                         let rows: Vec<Row> = self.grid[..=last].to_vec();
                         for row in rows {
                             self.push_to_scrollback(row);
