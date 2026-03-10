@@ -500,10 +500,7 @@ define_class!(
                                 let full = self.drawable_viewport();
                                 let min_w = self.min_split_width_px();
                                 tab.clamp_scroll(full.width, min_w);
-                                let panes_vp = self.panes_viewport_for_tab(tab);
-                                if let Some(vp) = tab.tree.viewport_for_pane(focused_id, panes_vp) {
-                                    tab.scroll_to_reveal(&vp, full.width);
-                                }
+                                self.scroll_to_reveal_pane(tab, focused_id, full.width);
                                 drop(tabs);
                                 self.resize_all_panes();
                             }
@@ -1279,6 +1276,14 @@ impl KovaView {
         self.panes_viewport_inner(tab.scroll_offset_x, vw)
     }
 
+    /// Scroll the tab so that the given pane is visible on screen.
+    fn scroll_to_reveal_pane(&self, tab: &mut Tab, pane_id: PaneId, screen_w: f32) {
+        let panes_vp = self.panes_viewport_for_tab(tab);
+        if let Some(vp) = tab.tree.viewport_for_pane(pane_id, panes_vp) {
+            tab.scroll_to_reveal(&vp, screen_w);
+        }
+    }
+
     fn panes_viewport_inner(&self, scroll_offset_x: f32, virtual_width: f32) -> PaneViewport {
         let full = self.drawable_viewport();
         let tab_bar_h = self.tab_bar_height();
@@ -1325,11 +1330,7 @@ impl KovaView {
             let new_vw = (current_vw + dir * step).max(screen_w);
             tab.virtual_width_override = if new_vw > screen_w { new_vw } else { 0.0 };
             tab.clamp_scroll(screen_w, min_w);
-            let focused_id = tab.focused_pane;
-            let panes_vp = self.panes_viewport_for_tab(tab);
-            if let Some(vp) = tab.tree.viewport_for_pane(focused_id, panes_vp) {
-                tab.scroll_to_reveal(&vp, screen_w);
-            }
+            self.scroll_to_reveal_pane(tab, tab.focused_pane, screen_w);
             log::debug!("virtual_width override: {}px", tab.virtual_width_override);
         }
         drop(tabs);
@@ -1690,10 +1691,7 @@ impl KovaView {
             tab.tree.equalize();
             tab.focused_pane = new_id;
             // Auto-scroll to reveal the new pane
-            let panes_vp = self.panes_viewport_for_tab(tab);
-            if let Some(vp) = tab.tree.viewport_for_pane(new_id, panes_vp) {
-                tab.scroll_to_reveal(&vp, self.drawable_viewport().width);
-            }
+            self.scroll_to_reveal_pane(tab, new_id, self.drawable_viewport().width);
         }
         drop(tabs);
 
@@ -1849,10 +1847,7 @@ impl KovaView {
                 let min_w = self.min_split_width_px();
                 tabs[idx].clamp_scroll(full.width, min_w);
                 let tab = &mut tabs[idx];
-                let panes_vp = self.panes_viewport_for_tab(tab);
-                if let Some(vp) = tab.tree.viewport_for_pane(new_focus, panes_vp) {
-                    tab.scroll_to_reveal(&vp, full.width);
-                }
+                self.scroll_to_reveal_pane(tab, new_focus, full.width);
             }
             None => {
                 // Tab became empty (shouldn't happen given check above)
@@ -2188,9 +2183,7 @@ impl KovaView {
                 t.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             // Auto-scroll to reveal the newly focused pane
-            if let Some(vp) = tab.tree.viewport_for_pane(neighbor_id, panes_vp) {
-                tab.scroll_to_reveal(&vp, self.drawable_viewport().width);
-            }
+            self.scroll_to_reveal_pane(tab, neighbor_id, self.drawable_viewport().width);
         } else {
             // No neighbor in this direction → overflow to adjacent tab
             let count = tabs.len();
@@ -2214,10 +2207,7 @@ impl KovaView {
                 };
                 new_tab.focused_pane = target_id;
                 // Auto-scroll to reveal the focused pane in the new tab
-                let panes_vp = self.panes_viewport_for_tab(new_tab);
-                if let Some(vp) = new_tab.tree.viewport_for_pane(target_id, panes_vp) {
-                    new_tab.scroll_to_reveal(&vp, self.drawable_viewport().width);
-                }
+                self.scroll_to_reveal_pane(new_tab, target_id, self.drawable_viewport().width);
             }
         }
     }
@@ -2242,10 +2232,7 @@ impl KovaView {
                     p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 // Auto-scroll to reveal the focused pane in its new position
-                let panes_vp = self.panes_viewport_for_tab(tab);
-                if let Some(vp) = tab.tree.viewport_for_pane(focused_id, panes_vp) {
-                    tab.scroll_to_reveal(&vp, self.drawable_viewport().width);
-                }
+                self.scroll_to_reveal_pane(tab, focused_id, self.drawable_viewport().width);
                 drop(tabs);
                 self.resize_all_panes();
             }

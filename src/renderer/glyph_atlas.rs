@@ -241,8 +241,9 @@ impl GlyphAtlas {
         let next_x = (last_col + 1) % chars_per_row;
         let next_y = if next_x == 0 { last_row + 1 } else { last_row };
 
-        // Create overlay font at ~1.3x the terminal font size (for overlay screens)
-        let overlay_font_size = font_size * 1.3;
+        // Create overlay font at larger size (for overlay screens like Memory Report)
+        const OVERLAY_FONT_SCALE: f64 = 1.3;
+        let overlay_font_size = font_size * OVERLAY_FONT_SCALE;
         let overlay_font = unsafe { CTFont::with_name(&cf_font_name, overlay_font_size, ptr::null()) };
         let overlay_ascent = unsafe { overlay_font.ascent() };
         let overlay_descent = unsafe { overlay_font.descent() };
