@@ -116,6 +116,7 @@ define_class!(
             window_sessions.extend(collect_window_sessions(&self.ivars().windows.borrow()));
             crate::session::save(&window_sessions);
             crate::terminal::pty::shutdown_all();
+            log::logger().flush();
         }
     }
 );

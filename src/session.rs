@@ -330,7 +330,7 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
     let focused_pane = if saved.focused_leaf_index < pane_ids.len() {
         pane_ids[saved.focused_leaf_index]
     } else {
-        pane_ids[0]
+        *pane_ids.first()?
     };
     let mut tab = Tab {
         id: alloc_tab_id(),

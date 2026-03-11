@@ -46,7 +46,10 @@ fn install_crash_signal_handlers() {
 
         let fd = CRASH_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
         if fd >= 0 {
-            unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
+            unsafe {
+                libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
+                libc::fsync(fd);
+            };
         }
         // Also write to stderr (fd 2 is always valid)
         unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
@@ -85,7 +88,7 @@ pub(crate) fn get_rss_mb() -> f64 {
 }
 
 const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
-const LOG_KEEP_BYTES: usize = 512 * 1024; // keep last 512 KB after rotation
+const LOG_ARCHIVE_COUNT: usize = 3; // keep kova.log.1, .2, .3
 
 fn rotate_log_if_needed(path: &std::path::Path) {
     let meta = match fs::metadata(path) {
@@ -95,14 +98,15 @@ fn rotate_log_if_needed(path: &std::path::Path) {
     if meta.len() <= LOG_MAX_BYTES {
         return;
     }
-    if let Ok(data) = fs::read(path) {
-        let start = data.len().saturating_sub(LOG_KEEP_BYTES);
-        // Find next newline to avoid cutting a line in half
-        let start = data[start..].iter().position(|&b| b == b'\n')
-            .map(|p| start + p + 1)
-            .unwrap_or(start);
-        let _ = fs::write(path, &data[start..]);
+    // Rotate archives: .3 is deleted, .2 → .3, .1 → .2, current → .1
+    for i in (1..LOG_ARCHIVE_COUNT).rev() {
+        let from = path.with_extension(format!("log.{}", i));
+        let to = path.with_extension(format!("log.{}", i + 1));
+        let _ = fs::rename(&from, &to);
     }
+    let archive = path.with_extension("log.1");
+    let _ = fs::rename(path, &archive);
+    // Current log file will be recreated by the logger (append mode)
 }
 
 fn setup_logging() {
@@ -159,6 +163,7 @@ fn main() {
     std::panic::set_hook(Box::new(|info| {
         let bt = std::backtrace::Backtrace::force_capture();
         log::error!("PANIC: {}\n{}", info, bt);
+        log::logger().flush();
     }));
 
     let config = config::Config::load();
