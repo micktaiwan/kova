@@ -34,6 +34,9 @@ pub struct VteHandler {
     // The transmute to 'static is sound because: (1) the Arc is on the same struct,
     // (2) drop order ensures the guard is released first, (3) VteHandler is !Send
     // (due to the guard) and lives exclusively on the PTY reader thread.
+    //
+    // WARNING: DO NOT reorder these fields. Moving `terminal` before `pending_guard`
+    // would cause use-after-free (Arc dropped before guard is released).
     pending_guard: Option<RwLockWriteGuard<'static, TerminalState>>,
     terminal: Arc<RwLock<TerminalState>>,
     pty_writer: Arc<OwnedFd>,

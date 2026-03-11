@@ -1693,7 +1693,11 @@ impl KovaView {
         let mut tabs = self.ivars().tabs.borrow_mut();
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get_mut(idx) {
-            let tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(Pane::spawn(1, 1, config, None).unwrap()));
+            let dummy = match Pane::spawn(1, 1, config, None) {
+                Ok(p) => p,
+                Err(e) => { log::error!("failed to create placeholder pane: {}", e); return; }
+            };
+            let tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(dummy));
             tab.tree = tree.with_split(focused_id, new_pane, direction);
             tab.tree.equalize();
             tab.focused_pane = new_id;
@@ -1755,7 +1759,11 @@ impl KovaView {
         let mut tabs = self.ivars().tabs.borrow_mut();
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get_mut(idx) {
-            let old_tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(Pane::spawn(1, 1, config, None).unwrap()));
+            let dummy = match Pane::spawn(1, 1, config, None) {
+                Ok(p) => p,
+                Err(e) => { log::error!("failed to create placeholder pane for root split: {}", e); return; }
+            };
+            let old_tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(dummy));
             tab.tree = match direction {
                 SplitDirection::Horizontal => SplitTree::HSplit {
                     left: Box::new(old_tree),
@@ -1838,7 +1846,10 @@ impl KovaView {
 
         let config = self.ivars().config.get().unwrap();
         let old_columns = tabs[idx].tree.chain_count(true, false);
-        let dummy = Pane::spawn(1, 1, config, None).unwrap();
+        let dummy = match Pane::spawn(1, 1, config, None) {
+            Ok(p) => p,
+            Err(e) => { log::error!("failed to create placeholder pane for close: {}", e); return; }
+        };
         let tree = std::mem::replace(&mut tabs[idx].tree, SplitTree::Leaf(dummy));
         match tree.remove_pane(focused_id) {
             Some(new_tree) => {
@@ -2437,10 +2448,10 @@ impl KovaView {
                 '\u{7F}' | '\u{08}' => {
                     // Backspace — remove char before cursor
                     if state.cursor > 0 {
-                        let byte_idx = state.input.char_indices()
-                            .nth(state.cursor - 1).map(|(i, _)| i).unwrap();
-                        state.input.remove(byte_idx);
-                        state.cursor -= 1;
+                        if let Some((byte_idx, _)) = state.input.char_indices().nth(state.cursor - 1) {
+                            state.input.remove(byte_idx);
+                            state.cursor -= 1;
+                        }
                     }
                 }
                 c if c >= ' ' && !c.is_control() => {
@@ -2531,10 +2542,10 @@ impl KovaView {
                 '\u{7F}' | '\u{08}' => {
                     // Backspace — remove char before cursor
                     if state.cursor > 0 {
-                        let byte_idx = state.input.char_indices()
-                            .nth(state.cursor - 1).map(|(i, _)| i).unwrap();
-                        state.input.remove(byte_idx);
-                        state.cursor -= 1;
+                        if let Some((byte_idx, _)) = state.input.char_indices().nth(state.cursor - 1) {
+                            state.input.remove(byte_idx);
+                            state.cursor -= 1;
+                        }
                     }
                 }
                 c if c >= ' ' && !c.is_control() => {
@@ -2781,9 +2792,15 @@ impl KovaView {
                 log::debug!("Reaping exited panes in tab {}: {:?}", tab_idx, exited);
                 for id in &exited {
                     let old_cols = tab.tree.chain_count(true, false);
-                    let tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(
-                        Pane::spawn(1, 1, ivars.config.get().unwrap(), None).unwrap()
-                    ));
+                    let config = match ivars.config.get() {
+                        Some(c) => c,
+                        None => break,
+                    };
+                    let dummy = match Pane::spawn(1, 1, config, None) {
+                        Ok(p) => p,
+                        Err(e) => { log::error!("failed to create placeholder pane for reap: {}", e); break; }
+                    };
+                    let tree = std::mem::replace(&mut tab.tree, SplitTree::Leaf(dummy));
                     match tree.remove_pane(*id) {
                         Some(new_tree) => {
                             let new_cols = new_tree.chain_count(true, false);
