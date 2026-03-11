@@ -37,6 +37,7 @@ pub enum Action {
     CloseWindow,
     KillWindow,
     Copy,
+    CopyRaw,
     Paste,
     ToggleFilter,
     ClearScrollback,
@@ -186,6 +187,7 @@ impl Keybindings {
         bind(&keys.close_window, Action::CloseWindow);
         bind(&keys.kill_window, Action::KillWindow);
         bind(&keys.copy, Action::Copy);
+        bind(&keys.copy_raw, Action::CopyRaw);
         bind(&keys.paste, Action::Paste);
         bind(&keys.toggle_filter, Action::ToggleFilter);
         bind(&keys.clear_scrollback, Action::ClearScrollback);

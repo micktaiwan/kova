@@ -3,7 +3,7 @@ pub mod pty;
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use unicode_width::UnicodeWidthChar;
@@ -189,6 +189,8 @@ pub struct TerminalState {
     pub last_command: Option<String>,
     // Kitty keyboard protocol — stack of pushed flag sets
     pub kitty_keyboard_flags: Vec<u8>,
+    // Printable character counter (displayed in status bars)
+    pub printable_chars: AtomicU64,
 }
 
 /// A single line matching a filter query.
@@ -246,6 +248,7 @@ impl TerminalState {
             command_completed: AtomicBool::new(false),
             last_command: None,
             kitty_keyboard_flags: Vec::new(),
+            printable_chars: AtomicU64::new(0),
         }
     }
 
@@ -1213,6 +1216,50 @@ impl TerminalState {
                 result.push('\n');
             }
         }
+        result
+    }
+
+    /// Like selected_text() but joins consecutive non-empty lines with a space.
+    /// Empty lines (paragraph breaks) are preserved as newlines.
+    pub fn selected_text_joined(&self) -> String {
+        let raw = self.selected_text();
+        if raw.is_empty() { return raw; }
+        let mut result = String::new();
+        let mut prev_blank = false;
+        for (i, line) in raw.split('\n').enumerate() {
+            if i == 0 {
+                result.push_str(line);
+                prev_blank = line.trim().is_empty();
+                continue;
+            }
+            if line.trim().is_empty() {
+                // Empty line = paragraph break (collapse consecutive blanks)
+                if !prev_blank {
+                    result.push('\n');
+                    result.push('\n');
+                }
+                prev_blank = true;
+            } else if prev_blank {
+                result.push_str(line);
+                prev_blank = false;
+            } else {
+                // Consecutive non-empty lines → join with space
+                result.push(' ');
+                result.push_str(line.trim_start());
+                prev_blank = false;
+            }
+        }
+        // Collapse runs of multiple spaces into a single space
+        let mut prev_space = false;
+        result.retain(|c| {
+            if c == ' ' {
+                if prev_space { return false; }
+                prev_space = true;
+            } else {
+                prev_space = false;
+            }
+            true
+        });
         result
     }
 
