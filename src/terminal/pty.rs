@@ -4,7 +4,7 @@ use rustix_openpty::openpty;
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::parser::VteHandler;
@@ -25,6 +25,10 @@ impl Clone for PtyEntry {
         PtyEntry { child_pid: self.child_pid, master_fd: self.master_fd, shutdown: self.shutdown.clone() }
     }
 }
+
+/// Global cumulative I/O counters (persist across pane lifetimes).
+pub static GLOBAL_INPUT_CHARS: AtomicU64 = AtomicU64::new(0);
+pub static GLOBAL_PRINTABLE_CHARS: AtomicU64 = AtomicU64::new(0);
 
 /// Global registry of live PTYs.
 /// Used by `shutdown_all()` on app termination to signal every PTY reader thread,
@@ -47,6 +51,8 @@ pub struct Pty {
     master_fd: OwnedFd,
     child_pid: u32,
     shutdown: Arc<AtomicBool>,
+    pub input_chars: Arc<AtomicU64>,
+    reader_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Pty {
@@ -150,8 +156,10 @@ impl Pty {
         }
         let writer_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(writer_dup) });
 
+        let input_chars = Arc::new(AtomicU64::new(0));
+
         let reader_shutdown = shutdown.clone();
-        std::thread::Builder::new()
+        let reader_handle = std::thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {
                 let mut file = unsafe { std::fs::File::from_raw_fd(reader_fd.into_raw_fd()) };
@@ -187,11 +195,17 @@ impl Pty {
             master_fd,
             child_pid,
             shutdown,
+            input_chars,
+            reader_thread: Some(reader_handle),
         })
     }
 
     pub fn write(&self, data: &[u8]) {
         let _ = rustix::io::write(&self.master_fd, data);
+        // Count UTF-8 characters (non-continuation bytes)
+        let n = data.iter().filter(|b| (*b & 0xC0) != 0x80).count() as u64;
+        self.input_chars.fetch_add(n, Ordering::Relaxed);
+        GLOBAL_INPUT_CHARS.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -302,6 +316,12 @@ pub fn shutdown_all() {
 impl Drop for Pty {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        // Send SIGHUP to the child so it exits, which causes EOF on the reader fd.
+        // Without this, the reader thread could block indefinitely on read().
+        unsafe { libc::kill(self.child_pid as i32, libc::SIGHUP) };
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
         let pid = self.child_pid;
         PTY_REGISTRY.lock().retain(|e| e.child_pid != pid);
         let result = std::thread::Builder::new()

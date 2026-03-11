@@ -15,6 +15,19 @@ pub const TAB_COLORS: [[f32; 3]; 6] = [
     [0.60, 0.35, 0.75], // Violet
 ];
 
+/// Format a count as human-readable string (e.g. "1.2K", "3.4M").
+fn format_count(n: u64) -> String {
+    if n < 1_000 {
+        format!("{}", n)
+    } else if n < 1_000_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else if n < 1_000_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else {
+        format!("{:.1}G", n as f64 / 1_000_000_000.0)
+    }
+}
+
 use glyph_atlas::GlyphAtlas;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -94,6 +107,7 @@ pub struct PaneRenderData {
     pub has_completion: bool,
     pub has_bell: bool,
     pub minimized: bool,
+    pub input_chars: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Sub-region of the drawable where a pane is rendered (in pixels).
@@ -142,6 +156,7 @@ pub struct Renderer {
     cached_rss_str: String,
     cached_proc_count: u32,
     cached_proc_str: String,
+    cached_io_str: String,
     /// Cached memory report lines for overlay (set by window on Cmd+Shift+I).
     cached_mem_report: Vec<String>,
     selection_color: [f32; 3],
@@ -237,6 +252,7 @@ impl Renderer {
             cached_rss_str: String::new(),
             cached_proc_count: 0,
             cached_proc_str: String::from("▶0"),
+            cached_io_str: String::new(),
             cached_mem_report: Vec::new(),
             selection_color: [0.45, 0.42, 0.20],
             tab_bar_bg: config.tab_bar.bg_color,
@@ -397,7 +413,8 @@ impl Renderer {
                 let mut verts = if pane.shell_ready {
                     let t = pane.terminal.read();
                     let show_blink = if pane.is_focused { blink_on } else { true };
-                    self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention)
+                    let pin = pane.input_chars.load(std::sync::atomic::Ordering::Relaxed);
+                    self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin)
                 } else {
                     self.build_loading_vertices(vp)
                 };
@@ -459,6 +476,13 @@ impl Renderer {
         // Draw tab bar
         if tab_titles.len() > 0 {
             self.build_tab_bar_vertices(&mut overlay_vertices, viewport_w, tab_titles, tab_bar_left_inset);
+        }
+
+        // Update I/O char counters (global totals, persist across pane closures)
+        if rss_changed {
+            let total_in = crate::terminal::pty::GLOBAL_INPUT_CHARS.load(std::sync::atomic::Ordering::Relaxed);
+            let total_out = crate::terminal::pty::GLOBAL_PRINTABLE_CHARS.load(std::sync::atomic::Ordering::Relaxed);
+            self.cached_io_str = format!("↑{} ↓{}", format_count(total_in), format_count(total_out));
         }
 
         // Draw global status bar
@@ -548,8 +572,14 @@ impl Renderer {
             desc
         };
 
-        let cmd_buf = self.command_queue.commandBuffer().unwrap();
-        let encoder = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc).unwrap();
+        let cmd_buf = match self.command_queue.commandBuffer() {
+            Some(buf) => buf,
+            None => { log::error!("Metal: failed to create command buffer, skipping frame"); return; }
+        };
+        let encoder = match cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) {
+            Some(enc) => enc,
+            None => { log::error!("Metal: failed to create render encoder, skipping frame"); return; }
+        };
 
         if !all_vertices.is_empty() {
             let vertex_bytes = unsafe {
@@ -615,6 +645,7 @@ impl Renderer {
         is_focused: bool,
         custom_title: Option<&str>,
         attention: PaneAttention,
+        pane_input_chars: u64,
     ) -> Vec<Vertex> {
         // Pass 1: collect unknown chars/clusters for dynamic rasterization
         let display = term.visible_lines();
@@ -805,7 +836,7 @@ impl Renderer {
 
         // Status bar
         if self.status_bar_enabled {
-            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention);
+            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention, pane_input_chars);
         }
 
         vertices
@@ -818,6 +849,7 @@ impl Renderer {
         term: &TerminalState,
         custom_title: Option<&str>,
         attention: PaneAttention,
+        pane_input_chars: u64,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
@@ -879,14 +911,29 @@ impl Renderer {
         } else {
             term.title.as_ref().map(|t| (t.clone(), title_fg))
         };
-        if let Some((text, fg)) = right_text {
+        let right_content_start = if let Some((ref text, fg)) = right_text {
             let char_count = text.chars().count();
             let text_w = char_count as f32 * cell_w;
             let title_x = right_after_scroll - text_w;
             // Only render if it doesn't overlap with left content
             if title_x >= left_end + cell_w * 2.0 {
-                self.render_status_text(vertices, &text, title_x, bar_y, right_after_scroll, fg, no_bg);
+                self.render_status_text(vertices, text, title_x, bar_y, right_after_scroll, fg, no_bg);
+                title_x
+            } else {
+                right_after_scroll
             }
+        } else {
+            right_after_scroll
+        };
+
+        // Per-pane I/O counters — only if enough space between left and right content
+        let pane_out = term.printable_chars.load(std::sync::atomic::Ordering::Relaxed);
+        let io_str = format!("↑{} ↓{}", format_count(pane_input_chars), format_count(pane_out));
+        let io_w = io_str.chars().count() as f32 * cell_w;
+        let io_x = right_content_start - io_w - cell_w * 2.0;
+        if io_x >= left_end + cell_w * 2.0 {
+            let io_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 0.4];
+            self.render_status_text(vertices, &io_str, io_x, bar_y, right_content_start, io_fg, no_bg);
         }
     }
 
@@ -979,6 +1026,14 @@ impl Renderer {
                 let rss_w = rss_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - rss_w - gap;
                 self.render_status_text(vertices, &rss_str, left_edge, bar_y, viewport_w, rss_fg, no_bg);
+            }
+
+            if !self.cached_io_str.is_empty() {
+                let io_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.5];
+                let io_w = self.cached_io_str.chars().count() as f32 * cell_w;
+                left_edge = left_edge - io_w - gap;
+                let io_str = self.cached_io_str.clone();
+                self.render_status_text(vertices, &io_str, left_edge, bar_y, viewport_w, io_fg, no_bg);
             }
 
             let proc_fg = if self.cached_proc_count > 0 {
@@ -1484,6 +1539,7 @@ impl Renderer {
                 ("New Window", &keys_config.new_window),
                 ("Close Window", &keys_config.close_window),
                 ("Copy", &keys_config.copy),
+                ("Copy Raw", &keys_config.copy_raw),
                 ("Paste", &keys_config.paste),
                 ("Find", &keys_config.toggle_filter),
                 ("Clear Scrollback", &keys_config.clear_scrollback),
