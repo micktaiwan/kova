@@ -3,6 +3,30 @@ pub mod pipeline;
 pub mod vertex;
 
 pub const PANE_H_PADDING: f32 = 10.0;
+const TOOLTIP_ANIM_FRAMES: u8 = 10; // ~166ms at 60fps
+
+/// A hoverable zone in a status bar, with associated tooltip text.
+struct TooltipZone {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    text: &'static str,
+}
+
+impl TooltipZone {
+    fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+    }
+}
+
+/// Active tooltip state for rendering.
+#[derive(Clone, PartialEq)]
+pub struct ActiveTooltip {
+    pub text: &'static str,
+    pub anchor_x: f32,
+    pub anchor_y: f32,
+}
 
 /// Predefined tab color palette (macOS Finder-style tags).
 /// Each entry is [R, G, B] in 0.0–1.0.
@@ -173,6 +197,14 @@ pub struct Renderer {
     cached_help_hint: String,
     /// Cached formatted shortcuts for help overlay (label, formatted key combo).
     cached_help_shortcuts: Vec<(String, String)>,
+    /// Hoverable zones in status bars (rebuilt each frame).
+    tooltip_zones: Vec<TooltipZone>,
+    /// Active tooltip to render. Set by window on mouse hover.
+    pub active_tooltip: Option<ActiveTooltip>,
+    /// Tooltip being animated (kept for fade-out after active_tooltip becomes None).
+    tooltip_visible: Option<ActiveTooltip>,
+    /// Animation progress: 0 = hidden, TOOLTIP_ANIM_FRAMES = fully visible.
+    tooltip_anim: u8,
 }
 
 impl Renderer {
@@ -263,6 +295,10 @@ impl Renderer {
             hovered_url_pane_id: None,
             cached_help_hint: String::new(),
             cached_help_shortcuts: Vec::new(),
+            tooltip_zones: Vec::new(),
+            active_tooltip: None,
+            tooltip_visible: None,
+            tooltip_anim: 0,
         }
     }
 
@@ -374,7 +410,8 @@ impl Renderer {
         let all_ready = !any_not_ready;
         let has_filter = filter.is_some();
         let has_recent_projects = recent_projects.is_some();
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && help_hint_remaining == 0 {
+        let tooltip_animating = self.tooltip_anim > 0 && self.tooltip_anim < TOOLTIP_ANIM_FRAMES;
+        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && help_hint_remaining == 0 && !tooltip_animating {
             return;
         }
 
@@ -390,6 +427,7 @@ impl Renderer {
         // Build vertices for each pane with its own scissor rect for clipping
         let mut pane_draws: Vec<(Vec<Vertex>, MTLScissorRect)> = Vec::new();
         let mut overlay_vertices = Vec::new();
+        self.tooltip_zones.clear();
         let (cell_w, cell_h) = self.cell_size();
         let saved_hover_text = self.hovered_url_text.clone();
         let saved_hover_segments = self.hovered_url.clone();
@@ -511,6 +549,18 @@ impl Renderer {
         if let Some(rp) = recent_projects {
             self.build_recent_projects_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, rp);
         }
+
+        // Tooltip animation: update visible state and animation counter
+        if self.active_tooltip.is_some() {
+            self.tooltip_visible = self.active_tooltip.clone();
+            self.tooltip_anim = self.tooltip_anim.saturating_add(1).min(TOOLTIP_ANIM_FRAMES);
+        } else {
+            self.tooltip_anim = self.tooltip_anim.saturating_sub(1);
+            if self.tooltip_anim == 0 {
+                self.tooltip_visible = None;
+            }
+        }
+        self.build_tooltip_vertices(&mut overlay_vertices, viewport_w);
 
         // Flatten all pane vertices + overlay into a single buffer, tracking draw ranges
         let mut all_vertices: Vec<Vertex> = Vec::new();
@@ -898,6 +948,7 @@ impl Renderer {
             let scroll_w = scroll_str.chars().count() as f32 * cell_w;
             let right_x = right_edge - scroll_w;
             self.render_status_text(vertices, &scroll_str, right_x, bar_y, right_edge + cell_w, scroll_fg, no_bg);
+            self.push_tooltip_zone(right_x, bar_y, scroll_w, cell_h, "Scroll offset (lines above visible area)");
             right_x - cell_w * 2.0 // gap before title
         } else {
             right_edge
@@ -934,6 +985,7 @@ impl Renderer {
         if io_x >= left_end + cell_w * 2.0 {
             let io_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 0.4];
             self.render_status_text(vertices, &io_str, io_x, bar_y, right_content_start, io_fg, no_bg);
+            self.push_tooltip_zone(io_x, bar_y, io_w, cell_h, "Pane I/O — ↑ chars sent  ↓ chars received");
         }
     }
 
@@ -977,7 +1029,8 @@ impl Renderer {
             // Total char width for centering
             let total_chars = left_arrow.chars().count() + tab_text.chars().count() + sep.chars().count() + col_text.chars().count() + right_arrow.chars().count();
             let text_w = total_chars as f32 * cell_w;
-            let mut x = (viewport_w - text_w) / 2.0;
+            let center_start = (viewport_w - text_w) / 2.0;
+            let mut x = center_start;
 
             if hidden_left > 0 {
                 x = self.render_status_text(vertices, &left_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
@@ -986,8 +1039,9 @@ impl Renderer {
             x = self.render_status_text(vertices, sep, x, bar_y, viewport_w, tab_fg, no_bg);
             x = self.render_status_text(vertices, &col_text, x, bar_y, viewport_w, scroll_fg, no_bg);
             if hidden_right > 0 {
-                self.render_status_text(vertices, &right_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
+                x = self.render_status_text(vertices, &right_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
             }
+            self.push_tooltip_zone(center_start, bar_y, x - center_start, cell_h, "Tab / total — focused column / total columns");
         }
 
         // Left: help hint with fade
@@ -1026,6 +1080,7 @@ impl Renderer {
                 let rss_w = rss_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - rss_w - gap;
                 self.render_status_text(vertices, &rss_str, left_edge, bar_y, viewport_w, rss_fg, no_bg);
+                self.push_tooltip_zone(left_edge, bar_y, rss_w, cell_h, "Memory usage (RSS)");
             }
 
             if !self.cached_io_str.is_empty() {
@@ -1034,6 +1089,7 @@ impl Renderer {
                 left_edge = left_edge - io_w - gap;
                 let io_str = self.cached_io_str.clone();
                 self.render_status_text(vertices, &io_str, left_edge, bar_y, viewport_w, io_fg, no_bg);
+                self.push_tooltip_zone(left_edge, bar_y, io_w, cell_h, "Total I/O — ↑ chars sent  ↓ chars received");
             }
 
             let proc_fg = if self.cached_proc_count > 0 {
@@ -1045,6 +1101,7 @@ impl Renderer {
             left_edge = left_edge - proc_w - gap;
             let proc_str = self.cached_proc_str.clone();
             self.render_status_text(vertices, &proc_str, left_edge, bar_y, viewport_w, proc_fg, no_bg);
+            self.push_tooltip_zone(left_edge, bar_y, proc_w, cell_h, "Running child processes");
         }
     }
 
@@ -1756,6 +1813,54 @@ impl Renderer {
 
     pub fn status_bar_enabled(&self) -> bool {
         self.status_bar_enabled
+    }
+
+    /// Hit-test mouse position against tooltip zones. Returns an ActiveTooltip if hovering.
+    pub fn hit_test_tooltip(&self, px: f32, py: f32) -> Option<ActiveTooltip> {
+        self.tooltip_zones.iter().find(|z| z.contains(px, py)).map(|z| ActiveTooltip {
+            text: z.text,
+            anchor_x: z.x + z.width / 2.0,
+            anchor_y: z.y,
+        })
+    }
+
+    fn push_tooltip_zone(&mut self, x: f32, y: f32, width: f32, height: f32, text: &'static str) {
+        self.tooltip_zones.push(TooltipZone { x, y, width, height, text });
+    }
+
+    fn build_tooltip_vertices(&mut self, vertices: &mut Vec<Vertex>, viewport_w: f32) {
+        let tt = match &self.tooltip_visible {
+            Some(t) => t,
+            None => return,
+        };
+        // Smoothstep ease-in/ease-out: t²(3 - 2t)
+        let t = self.tooltip_anim as f32 / TOOLTIP_ANIM_FRAMES as f32;
+        let alpha = t * t * (3.0 - 2.0 * t);
+
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+        let padding_x = cell_w;
+        let padding_y = cell_h * 0.25;
+        let text_w = tt.text.chars().count() as f32 * cell_w;
+        let box_w = text_w + padding_x * 2.0;
+        let box_h = cell_h + padding_y * 2.0;
+
+        // Center tooltip horizontally on anchor, clamp to viewport
+        let box_x = (tt.anchor_x - box_w / 2.0).clamp(0.0, (viewport_w - box_w).max(0.0));
+
+        // Position above the anchor, with slight slide-up during animation
+        let slide = (1.0 - alpha) * cell_h * 0.3;
+        let box_y = tt.anchor_y - box_h - 2.0 + slide;
+
+        let bg = [0.15, 0.15, 0.18];
+        Self::push_bg_quad_alpha(vertices, box_x, box_y, box_w, box_h, bg, 0.95 * alpha);
+
+        let text_str = tt.text;
+        let text_x = box_x + padding_x;
+        let text_y = box_y + padding_y;
+        let fg = [0.85, 0.85, 0.85, alpha];
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        self.render_status_text(vertices, text_str, text_x, text_y, text_x + text_w + cell_w, fg, no_bg);
     }
 
     fn push_bg_quad(

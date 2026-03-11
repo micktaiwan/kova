@@ -976,6 +976,7 @@ define_class!(
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
             self.update_hovered_url(event);
+            self.update_tooltip(event);
         }
 
         #[unsafe(method(updateTrackingAreas))]
@@ -1258,6 +1259,21 @@ impl KovaView {
         if had_hover {
             *self.ivars().hovered_url.borrow_mut() = None;
             NSCursor::arrowCursor().set();
+            self.mark_dirty();
+        }
+    }
+
+    fn update_tooltip(&self, event: &NSEvent) {
+        let renderer = match self.ivars().renderer.get() {
+            Some(r) => r,
+            None => return,
+        };
+        let (px, py) = self.event_to_pixel(event);
+        let new_tooltip = renderer.read().hit_test_tooltip(px, py);
+        let mut r = renderer.write();
+        if r.active_tooltip != new_tooltip {
+            r.active_tooltip = new_tooltip;
+            drop(r);
             self.mark_dirty();
         }
     }
