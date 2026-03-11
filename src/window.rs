@@ -506,7 +506,8 @@ define_class!(
                             }
                         }
                     }
-                    Action::Copy => {
+                    Action::Copy | Action::CopyRaw => {
+                        let raw = matches!(action, Action::CopyRaw);
                         // If filter is active, copy all filtered lines
                         let filter = self.ivars().filter.borrow();
                         if let Some(state) = filter.as_ref() {
@@ -527,11 +528,14 @@ define_class!(
                         } else {
                             drop(filter);
                             if let Some(pane) = self.focused_pane() {
-                                let mut term = pane.terminal.write();
-                                let text = term.selected_text();
+                                let text = if raw {
+                                    pane.terminal.read().selected_text()
+                                } else {
+                                    pane.terminal.read().selected_text_joined()
+                                };
                                 if !text.is_empty() {
                                     copy_to_pasteboard(&text);
-                                    term.clear_selection();
+                                    pane.terminal.write().clear_selection();
                                 } else {
                                     return objc2::runtime::Bool::NO;
                                 }
@@ -847,11 +851,12 @@ define_class!(
                                 SelectionMode::Word => {
                                     let (wstart, wend) = term.word_bounds_at(pos);
                                     let anchor_before = (anchor.line, anchor.col) <= (pos.line, wstart);
-                                    let sel = term.selection.as_mut().unwrap();
-                                    if anchor_before {
-                                        sel.end = GridPos { line: pos.line, col: wend };
-                                    } else {
-                                        sel.end = GridPos { line: pos.line, col: wstart };
+                                    if let Some(sel) = term.selection.as_mut() {
+                                        if anchor_before {
+                                            sel.end = GridPos { line: pos.line, col: wend };
+                                        } else {
+                                            sel.end = GridPos { line: pos.line, col: wstart };
+                                        }
                                     }
                                 }
                                 SelectionMode::Line => {
@@ -861,18 +866,20 @@ define_class!(
                                     let anchor_row_len = term.row_at(anchor.line)
                                         .map(|r| r.cells.len().saturating_sub(1) as u16)
                                         .unwrap_or(0);
-                                    let sel = term.selection.as_mut().unwrap();
-                                    if pos.line >= anchor.line {
-                                        sel.anchor.col = 0;
-                                        sel.end = GridPos { line: pos.line, col: row_len };
-                                    } else {
-                                        sel.anchor.col = anchor_row_len;
-                                        sel.end = GridPos { line: pos.line, col: 0 };
+                                    if let Some(sel) = term.selection.as_mut() {
+                                        if pos.line >= anchor.line {
+                                            sel.anchor.col = 0;
+                                            sel.end = GridPos { line: pos.line, col: row_len };
+                                        } else {
+                                            sel.anchor.col = anchor_row_len;
+                                            sel.end = GridPos { line: pos.line, col: 0 };
+                                        }
                                     }
                                 }
                                 SelectionMode::Normal => {
-                                    let sel = term.selection.as_mut().unwrap();
-                                    sel.end = pos;
+                                    if let Some(sel) = term.selection.as_mut() {
+                                        sel.end = pos;
+                                    }
                                 }
                             }
                             term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1755,12 +1762,14 @@ impl KovaView {
                     right: Box::new(SplitTree::Leaf(new_pane)),
                     ratio: 0.5,
                     root: true,
+                    custom_ratio: false,
                 },
                 SplitDirection::Vertical => SplitTree::VSplit {
                     top: Box::new(old_tree),
                     bottom: Box::new(SplitTree::Leaf(new_pane)),
                     ratio: 0.5,
                     root: true,
+                    custom_ratio: false,
                 },
             };
             tab.tree.equalize();
@@ -2859,6 +2868,7 @@ impl KovaView {
                     has_completion: completed,
                     has_bell,
                     minimized: pane.minimized,
+                    input_chars: pane.pty.input_chars.clone(),
                 });
             });
 
