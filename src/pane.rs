@@ -388,6 +388,8 @@ pub enum SplitTree {
         ratio: f32,
         /// Whether this split was created at root level (Cmd+E).
         root: bool,
+        /// Whether the ratio was manually adjusted by the user (Ctrl+Cmd+Arrow).
+        custom_ratio: bool,
     },
     VSplit {
         top: Box<SplitTree>,
@@ -396,6 +398,8 @@ pub enum SplitTree {
         ratio: f32,
         /// Whether this split was created at root level (Cmd+Shift+E).
         root: bool,
+        /// Whether the ratio was manually adjusted by the user (Ctrl+Cmd+Arrow).
+        custom_ratio: bool,
     },
 }
 
@@ -504,28 +508,52 @@ impl SplitTree {
             SplitTree::Leaf(p) => {
                 if p.id == id { None } else { Some(SplitTree::Leaf(p)) }
             }
-            SplitTree::HSplit { left, right, ratio, root } => {
+            SplitTree::HSplit { left, right, ratio, root, custom_ratio } => {
                 if left.contains(id) {
                     match left.remove_pane(id) {
-                        Some(new_left) => Some(SplitTree::HSplit { left: Box::new(new_left), right, ratio, root }),
-                        None => Some(*right), // left was a leaf that got removed, promote right
+                        Some(new_left) => {
+                            let new_ratio = if custom_ratio { ratio } else {
+                                let lc = new_left.chain_count(true, false) as f32;
+                                lc / (lc + right.chain_count(true, false) as f32)
+                            };
+                            Some(SplitTree::HSplit { left: Box::new(new_left), right, ratio: new_ratio, root, custom_ratio })
+                        }
+                        None => Some(*right),
                     }
                 } else {
                     match right.remove_pane(id) {
-                        Some(new_right) => Some(SplitTree::HSplit { left, right: Box::new(new_right), ratio, root }),
+                        Some(new_right) => {
+                            let new_ratio = if custom_ratio { ratio } else {
+                                let lc = left.chain_count(true, false) as f32;
+                                lc / (lc + new_right.chain_count(true, false) as f32)
+                            };
+                            Some(SplitTree::HSplit { left, right: Box::new(new_right), ratio: new_ratio, root, custom_ratio })
+                        }
                         None => Some(*left),
                     }
                 }
             }
-            SplitTree::VSplit { top, bottom, ratio, root } => {
+            SplitTree::VSplit { top, bottom, ratio, root, custom_ratio } => {
                 if top.contains(id) {
                     match top.remove_pane(id) {
-                        Some(new_top) => Some(SplitTree::VSplit { top: Box::new(new_top), bottom, ratio, root }),
+                        Some(new_top) => {
+                            let new_ratio = if custom_ratio { ratio } else {
+                                let tc = new_top.chain_count(false, false) as f32;
+                                tc / (tc + bottom.chain_count(false, false) as f32)
+                            };
+                            Some(SplitTree::VSplit { top: Box::new(new_top), bottom, ratio: new_ratio, root, custom_ratio })
+                        }
                         None => Some(*bottom),
                     }
                 } else {
                     match bottom.remove_pane(id) {
-                        Some(new_bottom) => Some(SplitTree::VSplit { top, bottom: Box::new(new_bottom), ratio, root }),
+                        Some(new_bottom) => {
+                            let new_ratio = if custom_ratio { ratio } else {
+                                let tc = top.chain_count(false, false) as f32;
+                                tc / (tc + new_bottom.chain_count(false, false) as f32)
+                            };
+                            Some(SplitTree::VSplit { top, bottom: Box::new(new_bottom), ratio: new_ratio, root, custom_ratio })
+                        }
                         None => Some(*top),
                     }
                 }
@@ -542,23 +570,23 @@ impl SplitTree {
                 let old = Box::new(SplitTree::Leaf(p));
                 let new = Box::new(SplitTree::Leaf(new_pane));
                 match direction {
-                    SplitDirection::Horizontal => SplitTree::HSplit { left: old, right: new, ratio: 0.5, root: false },
-                    SplitDirection::Vertical => SplitTree::VSplit { top: old, bottom: new, ratio: 0.5, root: false },
+                    SplitDirection::Horizontal => SplitTree::HSplit { left: old, right: new, ratio: 0.5, root: false, custom_ratio: false },
+                    SplitDirection::Vertical => SplitTree::VSplit { top: old, bottom: new, ratio: 0.5, root: false, custom_ratio: false },
                 }
             }
             SplitTree::Leaf(_) => self,
-            SplitTree::HSplit { left, right, ratio, root } => {
+            SplitTree::HSplit { left, right, ratio, root, custom_ratio } => {
                 if left.contains(id) {
-                    SplitTree::HSplit { left: Box::new(left.with_split(id, new_pane, direction)), right, ratio, root }
+                    SplitTree::HSplit { left: Box::new(left.with_split(id, new_pane, direction)), right, ratio, root, custom_ratio }
                 } else {
-                    SplitTree::HSplit { left, right: Box::new(right.with_split(id, new_pane, direction)), ratio, root }
+                    SplitTree::HSplit { left, right: Box::new(right.with_split(id, new_pane, direction)), ratio, root, custom_ratio }
                 }
             }
-            SplitTree::VSplit { top, bottom, ratio, root } => {
+            SplitTree::VSplit { top, bottom, ratio, root, custom_ratio } => {
                 if top.contains(id) {
-                    SplitTree::VSplit { top: Box::new(top.with_split(id, new_pane, direction)), bottom, ratio, root }
+                    SplitTree::VSplit { top: Box::new(top.with_split(id, new_pane, direction)), bottom, ratio, root, custom_ratio }
                 } else {
-                    SplitTree::VSplit { top, bottom: Box::new(bottom.with_split(id, new_pane, direction)), ratio, root }
+                    SplitTree::VSplit { top, bottom: Box::new(bottom.with_split(id, new_pane, direction)), ratio, root, custom_ratio }
                 }
             }
         }
@@ -621,19 +649,21 @@ impl SplitTree {
     pub fn equalize(&mut self) {
         match self {
             SplitTree::Leaf(_) => {}
-            SplitTree::HSplit { left, right, ratio, .. } => {
+            SplitTree::HSplit { left, right, ratio, custom_ratio, .. } => {
                 left.equalize();
                 right.equalize();
                 let left_count = left.chain_count(true, false);
                 let total = left_count + right.chain_count(true, false);
                 *ratio = left_count as f32 / total as f32;
+                *custom_ratio = false;
             }
-            SplitTree::VSplit { top, bottom, ratio, .. } => {
+            SplitTree::VSplit { top, bottom, ratio, custom_ratio, .. } => {
                 top.equalize();
                 bottom.equalize();
                 let top_count = top.chain_count(false, false);
                 let total = top_count + bottom.chain_count(false, false);
                 *ratio = top_count as f32 / total as f32;
+                *custom_ratio = false;
             }
         }
     }
@@ -770,7 +800,7 @@ impl SplitTree {
     pub fn adjust_ratio_for_pane(&mut self, id: PaneId, delta: f32, axis: SplitAxis) -> bool {
         match self {
             SplitTree::Leaf(_) => false,
-            SplitTree::HSplit { left, right, ratio, .. } if axis == SplitAxis::Horizontal => {
+            SplitTree::HSplit { left, right, ratio, custom_ratio, .. } if axis == SplitAxis::Horizontal => {
                 // Don't adjust ratio if either child is minimized (ratio is ignored by split_sizes)
                 let blocked = left.is_fully_minimized() || right.is_fully_minimized();
                 if left.contains(id) {
@@ -779,6 +809,7 @@ impl SplitTree {
                     }
                     if blocked { return false; }
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    *custom_ratio = true;
                     true
                 } else if right.contains(id) {
                     if right.adjust_ratio_for_pane(id, delta, axis) {
@@ -786,12 +817,13 @@ impl SplitTree {
                     }
                     if blocked { return false; }
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    *custom_ratio = true;
                     true
                 } else {
                     false
                 }
             }
-            SplitTree::VSplit { top, bottom, ratio, .. } if axis == SplitAxis::Vertical => {
+            SplitTree::VSplit { top, bottom, ratio, custom_ratio, .. } if axis == SplitAxis::Vertical => {
                 let blocked = top.is_fully_minimized() || bottom.is_fully_minimized();
                 if top.contains(id) {
                     if top.adjust_ratio_for_pane(id, delta, axis) {
@@ -799,6 +831,7 @@ impl SplitTree {
                     }
                     if blocked { return false; }
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    *custom_ratio = true;
                     true
                 } else if bottom.contains(id) {
                     if bottom.adjust_ratio_for_pane(id, delta, axis) {
@@ -806,6 +839,7 @@ impl SplitTree {
                     }
                     if blocked { return false; }
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    *custom_ratio = true;
                     true
                 } else {
                     false
@@ -874,18 +908,20 @@ impl SplitTree {
         let self_ptr = self as *const SplitTree as usize;
         match self {
             SplitTree::Leaf(_) => false,
-            SplitTree::HSplit { left, right, ratio, .. } => {
+            SplitTree::HSplit { left, right, ratio, custom_ratio, .. } => {
                 if self_ptr == ptr {
                     *ratio = new_ratio.clamp(0.1, 0.9);
+                    *custom_ratio = true;
                     true
                 } else {
                     left.set_ratio_by_ptr(ptr, new_ratio)
                         || right.set_ratio_by_ptr(ptr, new_ratio)
                 }
             }
-            SplitTree::VSplit { top, bottom, ratio, .. } => {
+            SplitTree::VSplit { top, bottom, ratio, custom_ratio, .. } => {
                 if self_ptr == ptr {
                     *ratio = new_ratio.clamp(0.1, 0.9);
+                    *custom_ratio = true;
                     true
                 } else {
                     top.set_ratio_by_ptr(ptr, new_ratio)
@@ -1024,11 +1060,11 @@ impl SplitTree {
         // The old value is consumed (not dropped) and a new value is written immediately.
         let old = unsafe { std::ptr::read(self) };
         let new = match old {
-            SplitTree::HSplit { left, right, ratio, root } => {
-                SplitTree::VSplit { top: left, bottom: right, ratio, root }
+            SplitTree::HSplit { left, right, ratio, root, custom_ratio } => {
+                SplitTree::VSplit { top: left, bottom: right, ratio, root, custom_ratio }
             }
-            SplitTree::VSplit { top, bottom, ratio, root } => {
-                SplitTree::HSplit { left: top, right: bottom, ratio, root }
+            SplitTree::VSplit { top, bottom, ratio, root, custom_ratio } => {
+                SplitTree::HSplit { left: top, right: bottom, ratio, root, custom_ratio }
             }
             leaf => leaf,
         };

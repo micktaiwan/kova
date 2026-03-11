@@ -18,34 +18,38 @@ use simplelog::{CombinedLogger, Config, TermLogger, TerminalMode, WriteLogger};
 use std::fs;
 use std::path::PathBuf;
 
-/// Install signal handlers for SIGSEGV, SIGBUS, SIGABRT to log a backtrace before dying.
+/// Pre-opened fd for the crash log file, set once at startup.
+/// Used by the signal handler which cannot safely open files.
+static CRASH_LOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Install signal handlers for SIGSEGV, SIGBUS, SIGABRT to log before dying.
 /// These signals bypass Rust's panic handler, so we need raw signal handlers.
 fn install_crash_signal_handlers() {
-    use std::io::Write;
+    // Pre-open the log file for the signal handler (async-signal-safe requirement)
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let path = format!("{}/Library/Logs/Kova/kova.log\0", home);
+    let fd = unsafe {
+        libc::open(path.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT, 0o644)
+    };
+    if fd >= 0 {
+        CRASH_LOG_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
+    }
 
     extern "C" fn crash_handler(sig: libc::c_int) {
-        // We're in a signal handler — only async-signal-safe operations.
-        // Writing to a pre-opened fd and _exit are safe. backtrace is not
-        // strictly safe but it's our best effort for a dying process.
-        let sig_name = match sig {
-            libc::SIGSEGV => "SIGSEGV",
-            libc::SIGBUS => "SIGBUS",
-            libc::SIGABRT => "SIGABRT",
-            _ => "UNKNOWN",
+        // Only async-signal-safe operations: write() to pre-opened fd, raise, signal.
+        let msg: &[u8] = match sig {
+            libc::SIGSEGV => b"\n=== CRASH SIGNAL: SIGSEGV ===\n",
+            libc::SIGBUS  => b"\n=== CRASH SIGNAL: SIGBUS ===\n",
+            libc::SIGABRT => b"\n=== CRASH SIGNAL: SIGABRT ===\n",
+            _             => b"\n=== CRASH SIGNAL: UNKNOWN ===\n",
         };
 
-        // Write to the log file directly (the logger may not be signal-safe)
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let path = format!("{}/Library/Logs/Kova/kova.log", home);
-        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&path) {
-            let _ = writeln!(f, "\n=== CRASH SIGNAL: {} ===", sig_name);
-            let bt = std::backtrace::Backtrace::force_capture();
-            let _ = writeln!(f, "{}", bt);
-            let _ = writeln!(f, "=== END CRASH ===\n");
+        let fd = CRASH_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
+        if fd >= 0 {
+            unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
         }
-
-        // Also try stderr
-        let _ = eprintln!("\nKova crashed with signal: {}", sig_name);
+        // Also write to stderr (fd 2 is always valid)
+        unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
 
         // Re-raise with default handler to get a proper core dump / exit code
         unsafe {
@@ -80,12 +84,38 @@ pub(crate) fn get_rss_mb() -> f64 {
     }
 }
 
+const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
+const LOG_KEEP_BYTES: usize = 512 * 1024; // keep last 512 KB after rotation
+
+fn rotate_log_if_needed(path: &std::path::Path) {
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if meta.len() <= LOG_MAX_BYTES {
+        return;
+    }
+    if let Ok(data) = fs::read(path) {
+        let start = data.len().saturating_sub(LOG_KEEP_BYTES);
+        // Find next newline to avoid cutting a line in half
+        let start = data[start..].iter().position(|&b| b == b'\n')
+            .map(|p| start + p + 1)
+            .unwrap_or(start);
+        let _ = fs::write(path, &data[start..]);
+    }
+}
+
 fn setup_logging() {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let log_dir = PathBuf::from(home).join("Library/Logs/Kova");
     fs::create_dir_all(&log_dir).expect("cannot create log dir");
-    let log_file =
-        fs::File::create(log_dir.join("kova.log")).expect("cannot create log file");
+    let log_path = log_dir.join("kova.log");
+    rotate_log_if_needed(&log_path);
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("cannot open log file");
 
     let level = std::env::var("RUST_LOG")
         .ok()
@@ -122,11 +152,13 @@ fn main() {
         .and_then(|w| w[1].parse::<usize>().ok());
 
     setup_logging();
+    log::info!("========== Kova starting ==========");
     install_crash_signal_handlers();
 
-    // Log panics to file before aborting
+    // Log panics to file with backtrace before aborting
     std::panic::set_hook(Box::new(|info| {
-        log::error!("PANIC: {}", info);
+        let bt = std::backtrace::Backtrace::force_capture();
+        log::error!("PANIC: {}\n{}", info, bt);
     }));
 
     let config = config::Config::load();

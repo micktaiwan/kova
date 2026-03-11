@@ -26,12 +26,17 @@ pub fn resolve_git_branch(path: &str) -> Option<String> {
 }
 
 pub struct VteHandler {
+    // IMPORTANT: `pending_guard` MUST be declared before `terminal` so that Rust's
+    // drop order (declaration order) drops the guard before the Arc. This guarantees
+    // the RwLock is still alive when the guard is released.
+    //
+    // SAFETY: self.terminal (Arc) keeps the RwLock alive as long as self lives.
+    // The transmute to 'static is sound because: (1) the Arc is on the same struct,
+    // (2) drop order ensures the guard is released first, (3) VteHandler is !Send
+    // (due to the guard) and lives exclusively on the PTY reader thread.
+    pending_guard: Option<RwLockWriteGuard<'static, TerminalState>>,
     terminal: Arc<RwLock<TerminalState>>,
     pty_writer: Arc<OwnedFd>,
-    // SAFETY: The Arc<RwLock<TerminalState>> is held in `terminal` on the same struct,
-    // guaranteeing the RwLock outlives this guard. We transmute the lifetime to 'static
-    // to allow storing it alongside the Arc.
-    pending_guard: Option<RwLockWriteGuard<'static, TerminalState>>,
     /// Buffer for consecutive print() calls. Flushed as grapheme clusters
     /// before any non-print event.
     print_buf: String,
@@ -69,10 +74,13 @@ impl VteHandler {
         use unicode_segmentation::UnicodeSegmentation;
         // Take ownership to avoid borrow issues
         let buf = std::mem::take(&mut self.print_buf);
+        let char_count = buf.chars().count() as u64;
         let term = self.term();
         for cluster in buf.graphemes(true) {
             term.put_cluster(cluster);
         }
+        term.printable_chars.fetch_add(char_count, std::sync::atomic::Ordering::Relaxed);
+        super::pty::GLOBAL_PRINTABLE_CHARS.fetch_add(char_count, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn write_to_pty(&self, data: &[u8]) {
