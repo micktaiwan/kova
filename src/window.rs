@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::config::{Config, TerminalConfig};
 use crate::input;
 use crate::keybindings::{Action, Keybindings, KeyCombo};
-use crate::pane::{NavDirection, Pane, PaneId, SplitDirection, SplitTree, Tab};
+use crate::pane::{alloc_tab_id, NavDirection, Pane, PaneId, SplitDirection, SplitTree, Tab};
 use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
 use crate::terminal::{FilterMatch, GridPos, Selection, SelectionMode};
 
@@ -484,6 +484,7 @@ define_class!(
                     Action::RenameTab => self.start_rename_tab(),
                     Action::RenamePane => self.start_rename_pane(),
                     Action::DetachTab => self.do_detach_tab(),
+                    Action::BreakPane => self.do_break_pane(),
                     Action::MergeWindow => self.do_merge_window(),
                     Action::SwitchTab(idx) => self.do_switch_tab(*idx),
                     Action::MinimizePane => self.do_minimize_pane(),
@@ -650,6 +651,9 @@ define_class!(
                     };
                     if lines != 0 {
                         let mut term = pane.terminal.write();
+                        let active_tab_idx = ivars.active_tab.get();
+                        log::debug!("SCROLL-EVENT tab={} pane={} term_id={} lines={} offset_before={}",
+                            active_tab_idx, pane.id, term.terminal_id, lines, term.scroll_offset());
                         term.scroll(lines);
                         // Reset accumulator when hitting bounds to avoid residual drift
                         let at_bound = term.scroll_offset() == 0
@@ -722,6 +726,10 @@ define_class!(
                         tab.restore_pane(pane_id);
                         tab.focused_pane = pane_id;
                         tab.tree.mark_all_dirty();
+                        let full = self.drawable_viewport();
+                        let min_w = self.min_split_width_px();
+                        tab.clamp_scroll(full.width, min_w);
+                        self.scroll_to_reveal_pane(tab, pane_id, full.width);
                     }
                     drop(tabs);
                     self.resize_all_panes();
@@ -2145,6 +2153,97 @@ impl KovaView {
         crate::app::detach_tab_to_new_window(mtm, tab, source_frame);
     }
 
+    /// Break the focused pane out of its split into a new tab.
+    /// No-op if the pane is already alone (single leaf tab).
+    fn do_break_pane(&self) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        if idx >= tabs.len() {
+            return;
+        }
+
+        // No-op if already a single pane
+        if matches!(tabs[idx].tree, SplitTree::Leaf(_)) {
+            log::debug!("do_break_pane: pane is already alone, ignoring");
+            return;
+        }
+
+        let focused_id = tabs[idx].focused_pane;
+        log::debug!("do_break_pane: extracting pane {} from tab {}", focused_id, idx);
+
+        // Find a neighbor to focus in the remaining tree
+        let panes_vp = self.panes_viewport_for_tab(&tabs[idx]);
+        let next_focus = tabs[idx].tree.neighbor(focused_id, NavDirection::Right, panes_vp)
+            .or_else(|| tabs[idx].tree.neighbor(focused_id, NavDirection::Left, panes_vp))
+            .or_else(|| tabs[idx].tree.neighbor(focused_id, NavDirection::Down, panes_vp))
+            .or_else(|| tabs[idx].tree.neighbor(focused_id, NavDirection::Up, panes_vp));
+
+        // Use placeholder swap pattern to take ownership of the tree
+        let config = match self.ivars().config.get() {
+            Some(c) => c,
+            None => return,
+        };
+        let old_columns = tabs[idx].tree.chain_count(true, false);
+        let dummy = match Pane::spawn(1, 1, config, None) {
+            Ok(p) => p,
+            Err(e) => { log::error!("failed to create placeholder pane for break: {}", e); return; }
+        };
+        let tree = std::mem::replace(&mut tabs[idx].tree, SplitTree::Leaf(dummy));
+
+        // Extract the pane — returns (extracted_leaf, remaining_tree)
+        match tree.extract_pane(focused_id) {
+            Some((extracted, remainder)) => {
+                // Update the source tab with the remainder
+                let new_focus = next_focus
+                    .filter(|id| remainder.contains(*id))
+                    .unwrap_or_else(|| remainder.first_pane().id);
+                tabs[idx].focused_pane = new_focus;
+                let new_columns = remainder.chain_count(true, false);
+                tabs[idx].scale_virtual_width(old_columns, new_columns);
+                tabs[idx].tree = remainder;
+                tabs[idx].minimized_stack.retain(|&pid| pid != focused_id);
+
+                let full = self.drawable_viewport();
+                let min_w = self.min_split_width_px();
+                tabs[idx].clamp_scroll(full.width, min_w);
+                let tab = &mut tabs[idx];
+                self.scroll_to_reveal_pane(tab, new_focus, full.width);
+
+                // Create a new tab from the extracted pane
+                let new_tab = Tab {
+                    id: alloc_tab_id(),
+                    tree: extracted,
+                    focused_pane: focused_id,
+                    custom_title: None,
+                    color: None,
+                    has_bell: false,
+                    has_completion: false,
+                    minimized_stack: Vec::new(),
+                    scroll_offset_x: 0.0,
+                    virtual_width_override: 0.0,
+                };
+
+                // Resize the source tab's remaining panes while it's still active
+                drop(tabs);
+                self.resize_all_panes();
+
+                // Insert the new tab right after the current one and switch to it
+                let mut tabs = self.ivars().tabs.borrow_mut();
+                let new_idx = idx + 1;
+                tabs.insert(new_idx, new_tab);
+                self.ivars().active_tab.set(new_idx);
+                drop(tabs);
+                self.resize_all_panes();
+            }
+            None => {
+                // Tree was consumed — tab is stuck with dummy. Remove it.
+                log::error!("do_break_pane: extract_pane returned None unexpectedly");
+                drop(tabs);
+                self.remove_tab(idx);
+            }
+        }
+    }
+
     /// Merge all tabs from this window into another window.
     /// No-op if this is the only window.
     fn do_merge_window(&self) {
@@ -2177,6 +2276,11 @@ impl KovaView {
             let focused_id = tab.focused_pane;
             if tab.minimize_pane(focused_id) {
                 tab.tree.mark_all_dirty();
+                let full = self.drawable_viewport();
+                let min_w = self.min_split_width_px();
+                tab.clamp_scroll(full.width, min_w);
+                let new_focus = tab.focused_pane;
+                self.scroll_to_reveal_pane(tab, new_focus, full.width);
                 drop(tabs);
                 self.resize_all_panes();
             }
@@ -2190,6 +2294,11 @@ impl KovaView {
         if let Some(tab) = tabs.get_mut(idx) {
             if tab.restore_last_minimized() {
                 tab.tree.mark_all_dirty();
+                let full = self.drawable_viewport();
+                let min_w = self.min_split_width_px();
+                tab.clamp_scroll(full.width, min_w);
+                let focused = tab.focused_pane;
+                self.scroll_to_reveal_pane(tab, focused, full.width);
                 drop(tabs);
                 self.resize_all_panes();
             }
@@ -2889,6 +2998,12 @@ impl KovaView {
                 // Read bell without consuming — check_bell will drain it for tab-level
                 let has_bell = !is_focused
                     && term.bell.load(std::sync::atomic::Ordering::Relaxed);
+                // Log pane→terminal mapping when scrolled (cross-terminal bug investigation)
+                if term.scroll_offset() > 0 {
+                    log::info!("RENDER-SCROLLED tab={} pane={} term_id={} scroll_offset={} sb_len={} cwd={:?}",
+                        active_idx, pane.id, term.terminal_id, term.scroll_offset(), term.scrollback_len(),
+                        term.cwd);
+                }
                 drop(term);
                 pane_data.push(crate::renderer::PaneRenderData {
                     terminal: pane.terminal.clone(),
