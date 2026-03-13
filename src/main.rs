@@ -19,13 +19,31 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Pre-opened fd for the crash log file, set once at startup.
-/// Used by the signal handler which cannot safely open files.
+/// Used by the signal/panic handler to write without allocation.
 static CRASH_LOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// Write a message directly to the crash log fd + stderr, no allocation.
+/// Async-signal-safe in practice (atomic load + libc::write only).
+fn crash_write(msg: &[u8]) {
+    let fd = CRASH_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe {
+            libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
+    }
+    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+}
+
+fn crash_flush() {
+    let fd = CRASH_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe { libc::fsync(fd); }
+    }
+}
+
 /// Install signal handlers for SIGSEGV, SIGBUS, SIGABRT to log before dying.
-/// These signals bypass Rust's panic handler, so we need raw signal handlers.
 fn install_crash_signal_handlers() {
-    // Pre-open the log file for the signal handler (async-signal-safe requirement)
+    // Pre-open the log file (async-signal-safe requirement)
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let path = format!("{}/Library/Logs/Kova/kova.log\0", home);
     let fd = unsafe {
@@ -36,25 +54,15 @@ fn install_crash_signal_handlers() {
     }
 
     extern "C" fn crash_handler(sig: libc::c_int) {
-        // Only async-signal-safe operations: write() to pre-opened fd, raise, signal.
         let msg: &[u8] = match sig {
-            libc::SIGSEGV => b"\n=== CRASH SIGNAL: SIGSEGV ===\n",
-            libc::SIGBUS  => b"\n=== CRASH SIGNAL: SIGBUS ===\n",
-            libc::SIGABRT => b"\n=== CRASH SIGNAL: SIGABRT ===\n",
-            _             => b"\n=== CRASH SIGNAL: UNKNOWN ===\n",
+            libc::SIGSEGV => b"\n=== CRASH: SIGSEGV (segfault) ===\n",
+            libc::SIGBUS  => b"\n=== CRASH: SIGBUS ===\n",
+            libc::SIGABRT => b"\n=== CRASH: SIGABRT (panic/abort) ===\n",
+            _             => b"\n=== CRASH: UNKNOWN SIGNAL ===\n",
         };
+        crash_write(msg);
+        crash_flush();
 
-        let fd = CRASH_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
-        if fd >= 0 {
-            unsafe {
-                libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
-                libc::fsync(fd);
-            };
-        }
-        // Also write to stderr (fd 2 is always valid)
-        unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
-
-        // Re-raise with default handler to get a proper core dump / exit code
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
@@ -159,11 +167,32 @@ fn main() {
     log::info!("========== Kova starting ==========");
     install_crash_signal_handlers();
 
-    // Log panics to file with backtrace before aborting
+    // Log panics: write directly to crash fd (guaranteed), then try logger (best effort)
     std::panic::set_hook(Box::new(|info| {
-        let bt = std::backtrace::Backtrace::force_capture();
-        log::error!("PANIC: {}\n{}", info, bt);
-        log::logger().flush();
+        // Step 1: write to fd immediately — no allocation, can't fail
+        crash_write(b"\n=== RUST PANIC ===\n");
+
+        // Step 2: format the panic info (allocates, but should work in most cases)
+        // If this itself panics, step 1 already wrote something useful.
+        if let Ok(msg) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            format!("{}\n", info)
+        })) {
+            crash_write(msg.as_bytes());
+        }
+
+        // Step 3: try backtrace (can fail if allocator is broken — that's OK)
+        if let Ok(bt) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::backtrace::Backtrace::force_capture()
+        })) {
+            if let Ok(bt_str) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                format!("{}\n", bt)
+            })) {
+                crash_write(bt_str.as_bytes());
+            }
+        }
+
+        crash_write(b"=== END PANIC ===\n");
+        crash_flush();
     }));
 
     let config = config::Config::load();

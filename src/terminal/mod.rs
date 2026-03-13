@@ -121,7 +121,10 @@ impl Row {
     }
 }
 
+static TERMINAL_ID_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 pub struct TerminalState {
+    pub terminal_id: u32,
     pub cols: u16,
     pub rows: u16,
     grid: Vec<Row>,
@@ -204,7 +207,10 @@ impl TerminalState {
     pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [u8; 3], bg: [u8; 3]) -> Self {
         let blank = Cell { c: ' ', cluster: None, fg, bg };
         let grid = (0..rows as usize).map(|_| Row::new(cols as usize, &blank)).collect();
+        let terminal_id = TERMINAL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        log::info!("TerminalState::new id={} cols={} rows={}", terminal_id, cols, rows);
         TerminalState {
+            terminal_id,
             cols,
             rows,
             grid,
@@ -286,6 +292,16 @@ impl TerminalState {
         self.scroll_offset = (self.scroll_offset + lines).clamp(0, max_offset);
         if self.scroll_offset == max_offset && old_offset == max_offset {
             log::debug!("scroll: at max offset {}/{}, scrollback_limit={}", self.scroll_offset, max_offset, self.scrollback_limit);
+        }
+        // Log scroll state for cross-terminal debugging
+        if self.scroll_offset > 0 && old_offset == 0 {
+            // Just started scrolling — log terminal identity + first scrollback line
+            let first_sb_text: String = self.scrollback.front()
+                .map(|r| r.cells.iter().take(60).map(|c| c.c).collect())
+                .unwrap_or_default();
+            log::info!("SCROLL-START term_id={} sb_len={} offset={} cwd={:?} first_sb=\"{}\"",
+                self.terminal_id, self.scrollback.len(), self.scroll_offset,
+                self.cwd, first_sb_text);
         }
         self.user_scrolled = self.scroll_offset > 0;
         self.cursor_moved();
@@ -1193,11 +1209,18 @@ impl TerminalState {
         for line_idx in start.line..=end.line {
             let Some(row) = self.row_at(line_idx) else { continue };
             let cells = &row.cells;
+            if cells.is_empty() {
+                // Blank scrollback row (trimmed) — treat as empty line
+                if line_idx < end.line && !row.wrapped {
+                    result.push('\n');
+                }
+                continue;
+            }
             let col_start = if line_idx == start.line { start.col as usize } else { 0 };
             let col_end = if line_idx == end.line {
-                (end.col as usize).min(cells.len().saturating_sub(1))
+                (end.col as usize).min(cells.len() - 1)
             } else {
-                cells.len().saturating_sub(1)
+                cells.len() - 1
             };
             if col_start <= col_end {
                 let text: String = cells[col_start..=col_end].iter().map(|c| {

@@ -1605,6 +1605,7 @@ impl Renderer {
                 ("Rename Tab", &keys_config.rename_tab),
                 ("Rename Pane", &keys_config.rename_pane),
                 ("Detach Tab", &keys_config.detach_tab),
+                ("Break Pane", &keys_config.break_pane),
                 ("Merge Window", &keys_config.merge_window),
                 ("Navigate", &keys_config.navigate_up),
                 ("Swap Pane", &keys_config.swap_up),

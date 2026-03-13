@@ -561,6 +561,116 @@ impl SplitTree {
         }
     }
 
+    /// Extract a pane by id, returning (extracted_pane, remaining_tree).
+    /// Returns `None` if pane not found or if the tree is a single leaf (nothing to extract from).
+    pub fn extract_pane(self, id: PaneId) -> Option<(SplitTree, SplitTree)> {
+        match self {
+            SplitTree::Leaf(_) => {
+                // Single leaf — can't extract, caller should check first
+                None
+            }
+            SplitTree::HSplit { left, right, ratio, root, custom_ratio } => {
+                if let SplitTree::Leaf(ref p) = *left {
+                    if p.id == id {
+                        return Some((*left, *right));
+                    }
+                }
+                if let SplitTree::Leaf(ref p) = *right {
+                    if p.id == id {
+                        return Some((*right, *left));
+                    }
+                }
+                // Recurse into subtrees
+                if left.contains(id) {
+                    match left.extract_pane(id) {
+                        Some((extracted, remaining_left)) => {
+                            let new_ratio = if custom_ratio { ratio } else {
+                                let lc = remaining_left.chain_count(true, false) as f32;
+                                lc / (lc + right.chain_count(true, false) as f32)
+                            };
+                            let remainder = SplitTree::HSplit {
+                                left: Box::new(remaining_left),
+                                right,
+                                ratio: new_ratio,
+                                root,
+                                custom_ratio,
+                            };
+                            Some((extracted, remainder))
+                        }
+                        None => None,
+                    }
+                } else {
+                    match right.extract_pane(id) {
+                        Some((extracted, remaining_right)) => {
+                            let new_ratio = if custom_ratio { ratio } else {
+                                let lc = left.chain_count(true, false) as f32;
+                                lc / (lc + remaining_right.chain_count(true, false) as f32)
+                            };
+                            let remainder = SplitTree::HSplit {
+                                left,
+                                right: Box::new(remaining_right),
+                                ratio: new_ratio,
+                                root,
+                                custom_ratio,
+                            };
+                            Some((extracted, remainder))
+                        }
+                        None => None,
+                    }
+                }
+            }
+            SplitTree::VSplit { top, bottom, ratio, root, custom_ratio } => {
+                if let SplitTree::Leaf(ref p) = *top {
+                    if p.id == id {
+                        return Some((*top, *bottom));
+                    }
+                }
+                if let SplitTree::Leaf(ref p) = *bottom {
+                    if p.id == id {
+                        return Some((*bottom, *top));
+                    }
+                }
+                if top.contains(id) {
+                    match top.extract_pane(id) {
+                        Some((extracted, remaining_top)) => {
+                            let new_ratio = if custom_ratio { ratio } else {
+                                let tc = remaining_top.chain_count(false, false) as f32;
+                                tc / (tc + bottom.chain_count(false, false) as f32)
+                            };
+                            let remainder = SplitTree::VSplit {
+                                top: Box::new(remaining_top),
+                                bottom,
+                                ratio: new_ratio,
+                                root,
+                                custom_ratio,
+                            };
+                            Some((extracted, remainder))
+                        }
+                        None => None,
+                    }
+                } else {
+                    match bottom.extract_pane(id) {
+                        Some((extracted, remaining_bottom)) => {
+                            let new_ratio = if custom_ratio { ratio } else {
+                                let tc = top.chain_count(false, false) as f32;
+                                tc / (tc + remaining_bottom.chain_count(false, false) as f32)
+                            };
+                            let remainder = SplitTree::VSplit {
+                                top,
+                                bottom: Box::new(remaining_bottom),
+                                ratio: new_ratio,
+                                root,
+                                custom_ratio,
+                            };
+                            Some((extracted, remainder))
+                        }
+                        None => None,
+                    }
+                }
+            }
+        }
+    }
+
     /// Split the pane with given id. The old pane stays in the first position
     /// (left/top) and the new pane goes in the second (right/bottom).
     /// Consumes self and returns the new tree. Use via `tree = tree.with_split(...)`.
@@ -652,18 +762,20 @@ impl SplitTree {
             SplitTree::HSplit { left, right, ratio, custom_ratio, .. } => {
                 left.equalize();
                 right.equalize();
-                let left_count = left.chain_count(true, false);
-                let total = left_count + right.chain_count(true, false);
-                *ratio = left_count as f32 / total as f32;
-                *custom_ratio = false;
+                if !*custom_ratio {
+                    let left_count = left.chain_count(true, false);
+                    let total = left_count + right.chain_count(true, false);
+                    *ratio = left_count as f32 / total as f32;
+                }
             }
             SplitTree::VSplit { top, bottom, ratio, custom_ratio, .. } => {
                 top.equalize();
                 bottom.equalize();
-                let top_count = top.chain_count(false, false);
-                let total = top_count + bottom.chain_count(false, false);
-                *ratio = top_count as f32 / total as f32;
-                *custom_ratio = false;
+                if !*custom_ratio {
+                    let top_count = top.chain_count(false, false);
+                    let total = top_count + bottom.chain_count(false, false);
+                    *ratio = top_count as f32 / total as f32;
+                }
             }
         }
     }
@@ -816,7 +928,9 @@ impl SplitTree {
                         return true;
                     }
                     if blocked { return false; }
-                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    // Pane is in the right child: flip delta so resize_right
+                    // grows this pane (shrinks the left sibling) and vice versa.
+                    *ratio = (*ratio - delta).clamp(0.1, 0.9);
                     *custom_ratio = true;
                     true
                 } else {
@@ -838,7 +952,9 @@ impl SplitTree {
                         return true;
                     }
                     if blocked { return false; }
-                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    // Pane is in bottom child: flip delta so resize_down
+                    // grows this pane and vice versa.
+                    *ratio = (*ratio - delta).clamp(0.1, 0.9);
                     *custom_ratio = true;
                     true
                 } else {

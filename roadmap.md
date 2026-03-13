@@ -104,7 +104,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Grapheme cluster emoji (flags, ZWJ sequences, skin tones)
 - [ ] Emoji presentation fallback — les caractères avec `Emoji_Presentation` par défaut (U+2B1C, U+2B1B, U+25AA…) utilisent le glyphe de la font mono (petit carré géométrique) au lieu de la version couleur Apple Color Emoji, car `resolve_glyph` retourne le glyphe primaire sans vérifier la présentation attendue. Fix : forcer le fallback emoji pour les codepoints Unicode `Emoji_Presentation=Yes`.
 - [x] Optimisation RAM Cell — compact cell storage pour le scrollback (28→12 bytes/cell, -57% RAM). fg/bg stockés en `u32` RGBA au lieu de `[f32; 3]`.
-- [x] Multi-fenêtres — Cmd+N nouvelle fenêtre, Cmd+Q ferme fenêtre active, Cmd+Option+Q kill sans save, Cmd+Shift+T detach tab vers nouvelle fenêtre. Session restore multi-window. Dealloc différé pour éviter segfault AppKit.
+- [x] Multi-fenêtres — Cmd+N nouvelle fenêtre, Cmd+Q ferme fenêtre active, Cmd+Option+Q kill sans save, Cmd+Shift+T detach tab vers nouvelle fenêtre, Cmd+Ctrl+T break pane vers nouvel onglet. Session restore multi-window. Dealloc différé pour éviter segfault AppKit.
 - [x] Config keybindings (raccourcis configurables via `[keys]` dans config.toml)
 - [ ] Déplacer un split par drag (anchor visuelle pendant le drag — le swap par raccourci Cmd+Shift+Arrows existe déjà)
 - [x] Notifications visuelles avancées (activité dans un split inactif)
