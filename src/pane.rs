@@ -1024,6 +1024,58 @@ impl SplitTree {
         }
     }
 
+    /// Post-validation: adjust ratios so no leaf exceeds `max_w` pixels.
+    /// `total` is the total width available to this subtree.
+    /// If a leaf would exceed max_w, its parent's ratio is adjusted to cap it.
+    /// Siblings absorb the freed space.
+    pub fn clamp_pane_widths(&mut self, total: f32, max_w: f32) {
+        match self {
+            SplitTree::Leaf(_) => {}
+            SplitTree::HSplit { left, right, ratio, custom_ratio, .. } => {
+                let mut left_w = *ratio * total;
+                // Cap left subtree
+                let left_max = left.max_leaf_width_px(left_w);
+                if left_max > max_w && left_max > 0.0 {
+                    left_w *= max_w / left_max;
+                    *ratio = (left_w / total).clamp(0.1, 0.9);
+                    *custom_ratio = true;
+                    left_w = *ratio * total;
+                }
+                // Cap right subtree
+                let mut right_w = (1.0 - *ratio) * total;
+                let right_max = right.max_leaf_width_px(right_w);
+                if right_max > max_w && right_max > 0.0 {
+                    right_w *= max_w / right_max;
+                    *ratio = (1.0 - right_w / total).clamp(0.1, 0.9);
+                    *custom_ratio = true;
+                    left_w = *ratio * total;
+                    right_w = (1.0 - *ratio) * total;
+                }
+                left.clamp_pane_widths(left_w, max_w);
+                right.clamp_pane_widths(right_w, max_w);
+            }
+            SplitTree::VSplit { top, bottom, .. } => {
+                top.clamp_pane_widths(total, max_w);
+                bottom.clamp_pane_widths(total, max_w);
+            }
+        }
+    }
+
+    /// Returns the maximum leaf width in pixels for this subtree given `total` width.
+    fn max_leaf_width_px(&self, total: f32) -> f32 {
+        match self {
+            SplitTree::Leaf(_) => total,
+            SplitTree::HSplit { left, right, ratio, .. } => {
+                left.max_leaf_width_px(*ratio * total)
+                    .max(right.max_leaf_width_px((1.0 - *ratio) * total))
+            }
+            SplitTree::VSplit { top, bottom, .. } => {
+                top.max_leaf_width_px(total).max(bottom.max_leaf_width_px(total))
+            }
+        }
+    }
+
+
     /// Adjust ratios so that only `target_id` absorbs the size change when
     /// virtual width changes from `old_total` to `new_total`.
     /// All other panes keep their absolute pixel size.
