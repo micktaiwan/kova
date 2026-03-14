@@ -235,6 +235,8 @@ pub struct RestoredWindow {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     pub frame: Option<(f64, f64, f64, f64)>,
+    /// Tabs not yet spawned (deferred for progressive loading).
+    pub deferred_tabs: Vec<(usize, SavedTab)>,
 }
 
 /// Print available session backups to stdout.
@@ -324,7 +326,9 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 fn restore_column(saved: &SavedColumn, cols: u16, rows: u16, config: &Config) -> Option<(ColumnTree, Vec<PaneId>)> {
     match saved {
         SavedColumn::Leaf { cwd, last_command, custom_title, minimized } => {
+            let t = std::time::Instant::now();
             let mut pane = Pane::spawn(cols, rows, config, cwd.as_deref()).ok()?;
+            log::info!("[STARTUP] Pane::spawn id={} cwd={:?} in {:?}", pane.id, cwd, t.elapsed());
             let id = pane.id;
             if let Some(cmd) = last_command {
                 pane.pending_command.set(Some(cmd.clone()));
@@ -426,6 +430,23 @@ fn saved_tree_to_saved_column(tree: &SavedTree) -> SavedColumn {
     }
 }
 
+fn count_panes_in_saved_column(col: &SavedColumn) -> usize {
+    match col {
+        SavedColumn::Leaf { .. } => 1,
+        SavedColumn::VSplit { top, bottom, .. } => {
+            count_panes_in_saved_column(top) + count_panes_in_saved_column(bottom)
+        }
+    }
+}
+
+pub fn count_panes_in_saved_tab(tab: &SavedTab) -> usize {
+    if let Some(ref cols) = tab.columns {
+        cols.iter().map(count_panes_in_saved_column).sum()
+    } else {
+        1 // legacy format, approximate
+    }
+}
+
 /// Restore a single saved tab. Used by recent projects and session restore.
 pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config) -> Option<Tab> {
     let (columns, column_weights, pane_ids) = if let Some(ref saved_cols) = saved.columns {
@@ -469,29 +490,59 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
     Some(tab)
 }
 
-fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>, usize)> {
+fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>, usize, Vec<(usize, SavedTab)>)> {
     let cols = config.terminal.columns;
     let rows = config.terminal.rows;
-    let mut tabs = Vec::new();
+    let total = ws.tabs.len();
+    let active_idx = ws.active_tab.min(total.saturating_sub(1));
 
-    for saved_tab in &ws.tabs {
-        match restore_saved_tab(saved_tab, cols, rows, config) {
-            Some(tab) => tabs.push(tab),
-            None => log::warn!("Failed to restore a tab, skipping"),
+    // Restore the active tab first (priority)
+    let t = std::time::Instant::now();
+    let pane_count = count_panes_in_saved_tab(&ws.tabs[active_idx]);
+    let active_tab = match restore_saved_tab(&ws.tabs[active_idx], cols, rows, config) {
+        Some(tab) => {
+            log::info!("[STARTUP] active tab {}/{} restored ({} panes) in {:?}", active_idx + 1, total, pane_count, t.elapsed());
+            tab
+        }
+        None => {
+            log::warn!("Failed to restore active tab, falling back to sequential restore");
+            // Fallback: try all tabs sequentially
+            let mut tabs = Vec::new();
+            for saved_tab in &ws.tabs {
+                if let Some(tab) = restore_saved_tab(saved_tab, cols, rows, config) {
+                    tabs.push(tab);
+                }
+            }
+            if tabs.is_empty() { return None; }
+            return Some((tabs, 0, Vec::new()));
+        }
+    };
+
+    // Build tab list: placeholders at deferred positions, real tab at active position
+    let mut tabs = Vec::with_capacity(total);
+    let mut deferred = Vec::new();
+    let mut active_tab = Some(active_tab);
+    for (i, saved_tab) in ws.tabs.iter().enumerate() {
+        if i == active_idx {
+            tabs.push(active_tab.take().unwrap());
+        } else {
+            // Create a placeholder tab (single empty pane) so tab indices are stable
+            match crate::pane::Tab::new(config) {
+                Ok(mut placeholder) => {
+                    // Copy visual metadata so the tab bar looks right
+                    placeholder.custom_title = saved_tab.custom_title.clone();
+                    placeholder.color = saved_tab.color;
+                    tabs.push(placeholder);
+                    deferred.push((i, saved_tab.clone()));
+                }
+                Err(e) => log::warn!("Failed to create placeholder tab {}: {}", i, e),
+            }
         }
     }
 
-    if tabs.is_empty() {
-        return None;
-    }
-
-    let active_tab = if ws.active_tab < tabs.len() {
-        ws.active_tab
-    } else {
-        tabs.len() - 1
-    };
-
-    Some((tabs, active_tab))
+    if tabs.is_empty() { return None; }
+    log::info!("[STARTUP] {} tab(s) deferred for progressive restore", deferred.len());
+    Some((tabs, active_idx, deferred))
 }
 
 /// Restore a multi-window session. Returns a list of windows to create.
@@ -499,11 +550,12 @@ pub fn restore_session(session: Session, config: &Config) -> Option<Vec<Restored
     let mut windows = Vec::new();
 
     for ws in &session.windows {
-        if let Some((tabs, active_tab)) = restore_window_tabs(ws, config) {
+        if let Some((tabs, active_tab, deferred_tabs)) = restore_window_tabs(ws, config) {
             windows.push(RestoredWindow {
                 tabs,
                 active_tab,
                 frame: ws.frame,
+                deferred_tabs,
             });
         }
     }

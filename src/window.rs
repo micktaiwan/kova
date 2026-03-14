@@ -91,8 +91,12 @@ pub struct KovaViewIvars {
     help_hint_frames: Cell<u32>,
     /// Axis lock for trackpad scroll gestures (prevents cross-axis drift).
     scroll_axis_lock: Cell<ScrollAxisLock>,
+    /// "Send Tab to Window" overlay state.
+    send_to_window: RefCell<Option<SendToWindowState>>,
     /// Resize feedback: (mode_name, screen_w, virtual_w, remaining_frames).
     resize_feedback: Cell<Option<ResizeFeedback>>,
+    /// Deferred tabs to restore progressively (tab_index, saved_tab_data).
+    deferred_tabs: RefCell<Vec<(usize, crate::session::SavedTab)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -132,6 +136,17 @@ struct RecentProjectsState {
     selected: usize,
     /// Scroll offset (index of first visible entry).
     scroll: usize,
+}
+
+struct SendToWindowEntry {
+    label: String,
+    /// Index in app delegate's window list, or None for "New Window".
+    window_index: Option<usize>,
+}
+
+struct SendToWindowState {
+    entries: Vec<SendToWindowEntry>,
+    selected: usize,
 }
 
 fn build_items(entries: Vec<crate::recent_projects::RecentProject>) -> Vec<RecentProjectItem> {
@@ -287,6 +302,12 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            // Send-to-window overlay handles its own keys
+            if self.ivars().send_to_window.borrow().is_some() {
+                self.handle_send_to_window_key(event);
+                return;
+            }
+
             // Recent projects overlay handles its own keys
             if self.ivars().recent_projects.borrow().is_some() {
                 self.handle_recent_projects_key(event);
@@ -509,7 +530,7 @@ define_class!(
                     Action::RenamePane => self.start_rename_pane(),
                     Action::DetachTab => self.do_detach_tab(),
                     Action::BreakPane => self.do_break_pane(),
-                    Action::MergeWindow => self.do_merge_window(),
+                    Action::MergeWindow => self.do_detach_tab(),
                     Action::SwitchTab(idx) => self.do_switch_tab(*idx),
                     Action::MinimizePane => self.do_minimize_pane(),
                     Action::RestoreLastMinimized => self.do_restore_last_minimized(),
@@ -1142,9 +1163,11 @@ impl KovaView {
             show_help: Cell::new(false),
             show_mem_report: Cell::new(false),
             recent_projects: RefCell::new(None),
+            send_to_window: RefCell::new(None),
             help_hint_frames: Cell::new(180), // updated in setup_metal
             scroll_axis_lock: Cell::new(ScrollAxisLock::None),
             resize_feedback: Cell::new(None),
+            deferred_tabs: RefCell::new(Vec::new()),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -2206,6 +2229,54 @@ impl KovaView {
         }
     }
 
+    /// Handle key events in the "Send Tab to Window" overlay.
+    fn handle_send_to_window_key(&self, event: &NSEvent) {
+        let keycode = event.keyCode();
+
+        // Escape → close
+        if keycode == 0x35 {
+            *self.ivars().send_to_window.borrow_mut() = None;
+            self.mark_dirty();
+            return;
+        }
+
+        // Enter → confirm selection
+        if keycode == 0x24 {
+            let target = {
+                let state = self.ivars().send_to_window.borrow();
+                state.as_ref().map(|s| s.entries[s.selected].window_index)
+            };
+            if let Some(window_index) = target {
+                *self.ivars().send_to_window.borrow_mut() = None;
+                self.send_active_tab_to(window_index);
+            }
+            return;
+        }
+
+        // Arrow keys
+        {
+            let mut guard = self.ivars().send_to_window.borrow_mut();
+            let state = match guard.as_mut() {
+                Some(s) => s,
+                None => return,
+            };
+            match keycode {
+                0x7E => { // Up
+                    if state.selected > 0 {
+                        state.selected -= 1;
+                    }
+                }
+                0x7D => { // Down
+                    if state.selected + 1 < state.entries.len() {
+                        state.selected += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.mark_dirty();
+    }
+
     /// Close the active window (all its tabs). The timer will detect
     /// the empty tab list and remove the window. App terminates when
     /// the last window is closed (via `applicationShouldTerminateAfterLastWindowClosed`).
@@ -2236,16 +2307,57 @@ impl KovaView {
         self.ivars().skip_session_save.get()
     }
 
-    /// Detach the active tab to a new window.
-    /// No-op if only one tab remains.
+    /// Send the active tab to another window.
+    /// - 1 tab + no other window → no-op (would leave nothing)
+    /// - 1 tab + other windows → overlay (no "New Window" option)
+    /// - 2+ tabs + no other window → detach to new window directly
+    /// - 2+ tabs + other windows → overlay with "New Window" option
     fn do_detach_tab(&self) {
-        let mut tabs = self.ivars().tabs.borrow_mut();
-        if tabs.len() <= 1 {
-            log::debug!("do_detach_tab: only {} tab(s), ignoring", tabs.len());
+        let tab_count = self.ivars().tabs.borrow().len();
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let source = self.window().unwrap();
+        let others = crate::app::list_other_windows(mtm, &source);
+        let is_last_tab = tab_count <= 1;
+
+        if is_last_tab && others.is_empty() {
+            log::debug!("do_detach_tab: single tab, single window, ignoring");
             return;
         }
+
+        if others.is_empty() {
+            // Multiple tabs, no other window — detach directly
+            self.detach_active_tab_to_new_window();
+        } else if others.len() == 1 && is_last_tab {
+            // Last tab, single other window — send directly
+            self.send_active_tab_to(Some(others[0].index));
+        } else {
+            // Show overlay
+            let mut entries: Vec<SendToWindowEntry> = others.into_iter()
+                .map(|info| SendToWindowEntry {
+                    label: info.label,
+                    window_index: Some(info.index),
+                })
+                .collect();
+            // Only offer "New Window" if this isn't the last tab
+            if !is_last_tab {
+                entries.push(SendToWindowEntry {
+                    label: "New Window".to_string(),
+                    window_index: None,
+                });
+            }
+            *self.ivars().send_to_window.borrow_mut() = Some(SendToWindowState {
+                entries,
+                selected: 0,
+            });
+            self.mark_dirty();
+        }
+    }
+
+    /// Detach the active tab to a new window (no overlay).
+    fn detach_active_tab_to_new_window(&self) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
         let idx = self.ivars().active_tab.get();
-        if idx >= tabs.len() {
+        if idx >= tabs.len() || tabs.len() <= 1 {
             return;
         }
         let tab = tabs.remove(idx);
@@ -2257,6 +2369,39 @@ impl KovaView {
         let source_frame = self.window().map(|w| w.frame());
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         crate::app::detach_tab_to_new_window(mtm, tab, source_frame);
+    }
+
+    /// Send the active tab to a specific window (by index) or a new window.
+    fn send_active_tab_to(&self, window_index: Option<usize>) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        if idx >= tabs.len() {
+            return;
+        }
+        let is_last = tabs.len() == 1;
+        let tab = tabs.remove(idx);
+        if !is_last {
+            let new_idx = if idx >= tabs.len() { tabs.len() - 1 } else { idx };
+            self.ivars().active_tab.set(new_idx);
+        }
+        drop(tabs);
+
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        match window_index {
+            Some(wi) => crate::app::send_tab_to_window(mtm, tab, wi),
+            None => {
+                let source_frame = self.window().map(|w| w.frame());
+                crate::app::detach_tab_to_new_window(mtm, tab, source_frame);
+            }
+        }
+
+        if is_last {
+            // Close this window — it's now empty
+            self.ivars().skip_session_save.set(true);
+            self.ivars().closing.set(true);
+        } else {
+            self.resize_all_panes();
+        }
     }
 
     /// Break the focused pane out of its split into a new tab.
@@ -2337,18 +2482,10 @@ impl KovaView {
         }
     }
 
-    /// Merge all tabs from this window into another window.
-    /// No-op if this is the only window.
-    fn do_merge_window(&self) {
-        let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        let source = self.window().unwrap();
-        // Check+merge in one call; tabs are only drained if a target exists
-        if !crate::app::merge_tabs_from(mtm, &self.ivars().tabs, &source) {
-            log::debug!("do_merge_window: no other window, ignoring");
-            return;
-        }
-        self.ivars().skip_session_save.set(true);
-        self.ivars().closing.set(true);
+    /// Get tab titles for this window (used by "Send Tab to Window" overlay).
+    pub fn tab_titles(&self) -> Vec<String> {
+        let tabs = self.ivars().tabs.borrow();
+        tabs.iter().map(|t| t.title()).collect()
     }
 
     /// Append external tabs (used by merge window).
@@ -2939,6 +3076,31 @@ impl KovaView {
             }
         }
 
+        // --- Progressive restore of deferred tabs (one per tick) ---
+        {
+            let mut deferred = ivars.deferred_tabs.borrow_mut();
+            if let Some((tab_idx, saved_tab)) = deferred.pop() {
+                let config = ivars.config.get().unwrap();
+                let cols = config.terminal.columns;
+                let rows = config.terminal.rows;
+                let t = std::time::Instant::now();
+                let pane_count = crate::session::count_panes_in_saved_tab(&saved_tab);
+                match crate::session::restore_saved_tab(&saved_tab, cols, rows, config) {
+                    Some(tab) => {
+                        log::info!("[STARTUP] deferred tab {} restored ({} panes) in {:?}", tab_idx, pane_count, t.elapsed());
+                        let mut tabs = ivars.tabs.borrow_mut();
+                        if tab_idx < tabs.len() {
+                            // Kill the placeholder pane before replacing
+                            tabs[tab_idx] = tab;
+                        }
+                        drop(tabs);
+                        self.resize_all_panes();
+                    }
+                    None => log::warn!("Failed to restore deferred tab {}", tab_idx),
+                }
+            }
+        }
+
         // --- Auto-scroll during drag selection ---
         {
             let speed = ivars.auto_scroll_speed.get();
@@ -3282,6 +3444,18 @@ impl KovaView {
             }
         });
 
+        // Build send-to-window render data if overlay is active
+        let stw_guard = ivars.send_to_window.borrow();
+        let stw_labels: Vec<String> = stw_guard.as_ref()
+            .map(|state| state.entries.iter().map(|e| e.label.clone()).collect())
+            .unwrap_or_default();
+        let stw_data = stw_guard.as_ref().map(|state| {
+            crate::renderer::SendToWindowRenderData {
+                entries: &stw_labels,
+                selected: state.selected,
+            }
+        });
+
         // Update resize feedback (decrement frames, build text)
         if let Some(mut fb) = ivars.resize_feedback.get() {
             if fb.remaining_frames > 0 {
@@ -3301,7 +3475,33 @@ impl KovaView {
             r.resize_feedback_text = None;
         }
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, show_help, show_mem_report, rp_data.as_ref(), help_hint_remaining, keys_config);
+        // Update loading progress: count shell_ready across ALL tabs
+        {
+            let tabs = ivars.tabs.borrow();
+            let deferred_remaining = ivars.deferred_tabs.borrow().len() as u32;
+            let mut ready: u32 = 0;
+            let mut total: u32 = 0;
+            for tab in tabs.iter() {
+                tab.for_each_pane(&mut |pane| {
+                    total += 1;
+                    if pane.is_ready() {
+                        ready += 1;
+                    }
+                });
+            }
+            // Add deferred tabs' pane count to total
+            let deferred_panes: u32 = ivars.deferred_tabs.borrow().iter()
+                .map(|(_, saved)| crate::session::count_panes_in_saved_tab(saved) as u32)
+                .sum();
+            total += deferred_panes;
+            if ready < total || deferred_remaining > 0 {
+                r.loading_progress = Some((ready, total));
+            } else {
+                r.loading_progress = None;
+            }
+        }
+
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 
@@ -3330,7 +3530,7 @@ pub fn confirm_running_processes(mtm: MainThreadMarker, procs: &[(String, String
 }
 
 /// Create a new Kova window with the given tabs.
-pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, active_tab: usize) -> Retained<NSWindow> {
+pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, active_tab: usize, deferred_tabs: Vec<(usize, crate::session::SavedTab)>) -> Retained<NSWindow> {
     let content_rect = CGRect {
         origin: CGPoint { x: config.window.x, y: config.window.y },
         size: CGSize {
@@ -3371,6 +3571,9 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, act
 
     let view = KovaView::new(mtm, content_rect);
     view.setup_metal(mtm, config, tabs, active_tab);
+    if !deferred_tabs.is_empty() {
+        *view.ivars().deferred_tabs.borrow_mut() = deferred_tabs;
+    }
     window.setContentView(Some(&view));
     window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*view)));
     window.makeFirstResponder(Some(&view));
