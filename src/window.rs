@@ -89,7 +89,20 @@ pub struct KovaViewIvars {
     help_hint_frames: Cell<u32>,
     /// Axis lock for trackpad scroll gestures (prevents cross-axis drift).
     scroll_axis_lock: Cell<ScrollAxisLock>,
+    /// Resize feedback: (mode_name, screen_w, virtual_w, remaining_frames).
+    resize_feedback: Cell<Option<ResizeFeedback>>,
 }
+
+#[derive(Clone, Copy)]
+struct ResizeFeedback {
+    mode: ResizeMode,
+    screen_w: u32,
+    virtual_w: u32,
+    remaining_frames: u32,
+}
+
+#[derive(Clone, Copy)]
+enum ResizeMode { Ratio, Virtual, Edge }
 
 struct FilterState {
     query: String,
@@ -493,15 +506,53 @@ define_class!(
                     Action::SwapPane(dir) => self.do_swap_pane(*dir),
                     Action::ReparentPane(dir) => self.do_reparent_pane(*dir),
                     Action::Resize(axis, delta) => {
+                        // Mode 1: ratio resize — move nearest separator, virtual width unchanged
                         let mut tabs = self.ivars().tabs.borrow_mut();
                         let idx = self.ivars().active_tab.get();
                         if let Some(tab) = tabs.get_mut(idx) {
                             let focused_id = tab.focused_pane;
-                            if tab.tree.adjust_ratio_for_pane(focused_id, *delta, *axis) {
+                            if tab.tree.adjust_ratio_directional(focused_id, *delta, *axis)
+                                || tab.tree.adjust_ratio_nearest(focused_id, *delta, *axis) {
                                 let full = self.drawable_viewport();
                                 let min_w = self.min_split_width_px();
+                                self.cap_virtual_width(tab, full.width, min_w);
                                 tab.clamp_scroll(full.width, min_w);
                                 self.scroll_to_reveal_pane(tab, focused_id, full.width);
+                                self.set_resize_feedback("Ratio", tab, full.width, min_w);
+                                drop(tabs);
+                                self.resize_all_panes();
+                            }
+                        }
+                    }
+                    Action::EdgeGrow(delta) => {
+                        // Mode 3: edge grow — only focused pane changes size, virtual width adjusts
+                        let mut tabs = self.ivars().tabs.borrow_mut();
+                        let idx = self.ivars().active_tab.get();
+                        if let Some(tab) = tabs.get_mut(idx) {
+                            let focused_id = tab.focused_pane;
+                            let full = self.drawable_viewport();
+                            let min_w = self.min_split_width_px();
+                            let screen_w = full.width;
+                            let old_vw = tab.virtual_width(screen_w, min_w);
+                            let step = (0.05 * screen_w).max(20.0);
+                            let new_vw = if *delta > 0.0 {
+                                old_vw + step
+                            } else {
+                                (old_vw - step).max(screen_w)
+                            };
+                            // Cap: focused pane absorbs all the delta, so its new width =
+                            // old_pane_width + (new_vw - old_vw). Must not exceed screen_w.
+                            let pane_vp = tab.tree.viewport_for_pane(focused_id, self.panes_viewport_for_tab(tab));
+                            let old_pane_w = pane_vp.map(|vp| vp.width).unwrap_or(screen_w);
+                            let max_vw = old_vw + (screen_w - old_pane_w);
+                            let capped_vw = new_vw.min(max_vw);
+                            if (capped_vw - old_vw).abs() > 0.5 {
+                                tab.tree.scale_ratios_for_edge_grow(focused_id, old_vw, capped_vw);
+                                tab.virtual_width_override = if capped_vw > screen_w { capped_vw } else { 0.0 };
+                                self.cap_virtual_width(tab, screen_w, min_w);
+                                tab.clamp_scroll(screen_w, min_w);
+                                self.scroll_to_reveal_pane(tab, focused_id, screen_w);
+                                self.set_resize_feedback("Right Edge", tab, screen_w, min_w);
                                 drop(tabs);
                                 self.resize_all_panes();
                             }
@@ -1069,6 +1120,7 @@ impl KovaView {
             recent_projects: RefCell::new(None),
             help_hint_frames: Cell::new(180), // updated in setup_metal
             scroll_axis_lock: Cell::new(ScrollAxisLock::None),
+            resize_feedback: Cell::new(None),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -1349,7 +1401,7 @@ impl KovaView {
         min_w * self.backing_scale()
     }
 
-    /// Adjust the virtual width override of the active tab.
+    /// Mode 2: adjust the virtual width override of the active tab (all panes scale proportionally).
     fn adjust_virtual_width(&self, dir: f32) {
         let step = 200.0 * self.backing_scale();
         let screen_w = self.drawable_viewport().width;
@@ -1358,14 +1410,46 @@ impl KovaView {
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get_mut(idx) {
             let current_vw = tab.virtual_width(screen_w, min_w);
-            let new_vw = (current_vw + dir * step).max(screen_w);
+            let max_frac = tab.tree.max_leaf_width_fraction();
+            let max_vw = if max_frac > 0.0 { screen_w / max_frac } else { screen_w };
+            let new_vw = (current_vw + dir * step).clamp(screen_w, max_vw);
             tab.virtual_width_override = if new_vw > screen_w { new_vw } else { 0.0 };
             tab.clamp_scroll(screen_w, min_w);
             self.scroll_to_reveal_pane(tab, tab.focused_pane, screen_w);
-            log::debug!("virtual_width override: {}px", tab.virtual_width_override);
+            self.set_resize_feedback("Virtual", tab, screen_w, min_w);
         }
         drop(tabs);
         self.resize_all_panes();
+    }
+
+    /// Enforce: no pane may exceed screen width. Shrinks virtual_width_override if needed.
+    /// Must be called after any resize operation (mode 1, 2, or 3).
+    fn cap_virtual_width(&self, tab: &mut Tab, screen_w: f32, min_w: f32) {
+        let vw = tab.virtual_width(screen_w, min_w);
+        if vw <= screen_w { return; }
+        let max_frac = tab.tree.max_leaf_width_fraction();
+        if max_frac <= 0.0 { return; }
+        let max_vw = screen_w / max_frac;
+        if vw > max_vw {
+            tab.virtual_width_override = if max_vw > screen_w { max_vw } else { 0.0 };
+            tab.clamp_scroll(screen_w, min_w);
+        }
+    }
+
+    /// Store resize feedback info to display in the global status bar for ~2 seconds.
+    fn set_resize_feedback(&self, mode: &str, tab: &Tab, screen_w: f32, min_w: f32) {
+        let fps = self.ivars().config.get().map(|c| c.terminal.fps).unwrap_or(60) as u32;
+        let resize_mode = match mode {
+            "Virtual" => ResizeMode::Virtual,
+            "Right Edge" => ResizeMode::Edge,
+            _ => ResizeMode::Ratio,
+        };
+        self.ivars().resize_feedback.set(Some(ResizeFeedback {
+            mode: resize_mode,
+            screen_w: screen_w as u32,
+            virtual_w: tab.virtual_width(screen_w, min_w) as u32,
+            remaining_frames: fps * 2,
+        }));
     }
 
     fn get_tab_bar_left_inset(&self) -> f32 {
@@ -3188,6 +3272,25 @@ impl KovaView {
                 scroll: state.scroll,
             }
         });
+
+        // Update resize feedback (decrement frames, build text)
+        if let Some(mut fb) = ivars.resize_feedback.get() {
+            if fb.remaining_frames > 0 {
+                fb.remaining_frames -= 1;
+                ivars.resize_feedback.set(Some(fb));
+                let mode_str = match fb.mode {
+                    ResizeMode::Ratio => "Ratio",
+                    ResizeMode::Virtual => "Virtual",
+                    ResizeMode::Edge => "Right Edge",
+                };
+                r.resize_feedback_text = Some(format!("{} — screen {}px — virtual {}px", mode_str, fb.screen_w, fb.virtual_w));
+            } else {
+                ivars.resize_feedback.set(None);
+                r.resize_feedback_text = None;
+            }
+        } else {
+            r.resize_feedback_text = None;
+        }
 
         r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, show_help, show_mem_report, rp_data.as_ref(), help_hint_remaining, keys_config);
         true
