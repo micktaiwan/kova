@@ -191,6 +191,8 @@ pub struct Renderer {
     pub hovered_url: Option<Vec<(usize, u16, u16)>>,
     /// Hovered URL text (for status bar display)
     pub hovered_url_text: Option<String>,
+    /// Resize mode feedback text, displayed on the left of the global status bar.
+    pub resize_feedback_text: Option<String>,
     /// Pane ID of the hovered URL (to show URL only in that pane's status bar)
     pub hovered_url_pane_id: Option<PaneId>,
     /// Cached help hint text for status bar (avoid per-frame allocation).
@@ -292,6 +294,7 @@ impl Renderer {
             tab_bar_active_bg: config.tab_bar.active_bg,
             hovered_url: None,
             hovered_url_text: None,
+            resize_feedback_text: None,
             hovered_url_pane_id: None,
             cached_help_hint: String::new(),
             cached_help_shortcuts: Vec::new(),
@@ -1044,8 +1047,13 @@ impl Renderer {
             self.push_tooltip_zone(center_start, bar_y, x - center_start, cell_h, "Tab / total — focused column / total columns");
         }
 
-        // Left: help hint with fade
-        if help_hint_remaining > 0 {
+        // Left: resize feedback (takes priority over help hint)
+        if let Some(text) = self.resize_feedback_text.clone() {
+            let info_fg = [0.6, 0.85, 0.6, 1.0];
+            self.render_status_text(vertices, &text, cell_w, bar_y, viewport_w, info_fg, no_bg);
+        }
+        // Left: help hint with fade (only if no resize feedback)
+        else if help_hint_remaining > 0 {
             if self.cached_help_hint.is_empty() {
                 if let Some(kc) = keys_config {
                     self.cached_help_hint = format_key_combo(&kc.toggle_help);
@@ -1611,6 +1619,7 @@ impl Renderer {
                 ("Swap Pane", &keys_config.swap_up),
                 ("Reparent Pane", &keys_config.reparent_up),
                 ("Resize Pane", &keys_config.resize_up),
+                ("Edge Grow", &keys_config.edge_grow_right),
                 ("Minimize Pane", &keys_config.minimize_pane),
                 ("Restore Minimized", &keys_config.restore_minimized),
                 ("Help", &keys_config.toggle_help),

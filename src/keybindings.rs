@@ -53,6 +53,7 @@ pub enum Action {
     SwapPane(NavDirection),
     ReparentPane(NavDirection),
     Resize(SplitAxis, f32),
+    EdgeGrow(f32),
     MinimizePane,
     RestoreLastMinimized,
     ToggleHelp,
@@ -227,6 +228,8 @@ impl Keybindings {
         bind(&keys.resize_right, Action::Resize(SplitAxis::Horizontal, 0.05));
         bind(&keys.resize_up, Action::Resize(SplitAxis::Vertical, -0.05));
         bind(&keys.resize_down, Action::Resize(SplitAxis::Vertical, 0.05));
+        bind(&keys.edge_grow_right, Action::EdgeGrow(1.0));
+        bind(&keys.edge_grow_left, Action::EdgeGrow(-1.0));
         bind(&keys.minimize_pane, Action::MinimizePane);
         bind(&keys.restore_minimized, Action::RestoreLastMinimized);
         bind(&keys.toggle_help, Action::ToggleHelp);

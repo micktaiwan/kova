@@ -905,32 +905,24 @@ impl SplitTree {
         self.pane(id).is_some()
     }
 
-    /// Move the nearest separator in the arrow direction.
-    /// `delta > 0` (Right/Down): separator moves right/down (ratio increases).
-    /// `delta < 0` (Left/Up): separator moves left/up (ratio decreases).
-    /// Finds the nearest ancestor of the matching axis and applies delta to its ratio.
-    pub fn adjust_ratio_for_pane(&mut self, id: PaneId, delta: f32, axis: SplitAxis) -> bool {
+    /// Fallback for adjust_ratio_directional: move the nearest separator in the
+    /// arrow direction (no flip). Used when no separator exists in the arrow direction
+    /// — the pane shrinks because the separator moves away from it.
+    pub fn adjust_ratio_nearest(&mut self, id: PaneId, delta: f32, axis: SplitAxis) -> bool {
         match self {
             SplitTree::Leaf(_) => false,
             SplitTree::HSplit { left, right, ratio, custom_ratio, .. } if axis == SplitAxis::Horizontal => {
-                // Don't adjust ratio if either child is minimized (ratio is ignored by split_sizes)
                 let blocked = left.is_fully_minimized() || right.is_fully_minimized();
                 if left.contains(id) {
-                    if left.adjust_ratio_for_pane(id, delta, axis) {
-                        return true;
-                    }
+                    if left.adjust_ratio_nearest(id, delta, axis) { return true; }
                     if blocked { return false; }
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
                     *custom_ratio = true;
                     true
                 } else if right.contains(id) {
-                    if right.adjust_ratio_for_pane(id, delta, axis) {
-                        return true;
-                    }
+                    if right.adjust_ratio_nearest(id, delta, axis) { return true; }
                     if blocked { return false; }
-                    // Pane is in the right child: flip delta so resize_right
-                    // grows this pane (shrinks the left sibling) and vice versa.
-                    *ratio = (*ratio - delta).clamp(0.1, 0.9);
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
                     *custom_ratio = true;
                     true
                 } else {
@@ -940,21 +932,67 @@ impl SplitTree {
             SplitTree::VSplit { top, bottom, ratio, custom_ratio, .. } if axis == SplitAxis::Vertical => {
                 let blocked = top.is_fully_minimized() || bottom.is_fully_minimized();
                 if top.contains(id) {
-                    if top.adjust_ratio_for_pane(id, delta, axis) {
-                        return true;
-                    }
+                    if top.adjust_ratio_nearest(id, delta, axis) { return true; }
                     if blocked { return false; }
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
                     *custom_ratio = true;
                     true
                 } else if bottom.contains(id) {
-                    if bottom.adjust_ratio_for_pane(id, delta, axis) {
-                        return true;
-                    }
+                    if bottom.adjust_ratio_nearest(id, delta, axis) { return true; }
                     if blocked { return false; }
-                    // Pane is in bottom child: flip delta so resize_down
-                    // grows this pane and vice versa.
-                    *ratio = (*ratio - delta).clamp(0.1, 0.9);
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    *custom_ratio = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            SplitTree::HSplit { left, right, .. } | SplitTree::VSplit { top: left, bottom: right, .. } => {
+                left.adjust_ratio_nearest(id, delta, axis)
+                    || right.adjust_ratio_nearest(id, delta, axis)
+            }
+        }
+    }
+
+    /// Move the separator that is in the direction of the arrow.
+    /// delta > 0 (Right/Down): find a split where pane is in the first child (separator is to pane's right/bottom).
+    /// delta < 0 (Left/Up): find a split where pane is in the second child (separator is to pane's left/top).
+    /// No delta flip — `ratio += delta` always moves the separator in the arrow direction.
+    /// Returns false if no matching separator found (caller should fall back to adjust_ratio_for_pane).
+    pub fn adjust_ratio_directional(&mut self, id: PaneId, delta: f32, axis: SplitAxis) -> bool {
+        match self {
+            SplitTree::Leaf(_) => false,
+            SplitTree::HSplit { left, right, ratio, custom_ratio, .. } if axis == SplitAxis::Horizontal => {
+                let blocked = left.is_fully_minimized() || right.is_fully_minimized();
+                // Recurse first (deeper splits take priority)
+                if left.adjust_ratio_directional(id, delta, axis) { return true; }
+                if right.adjust_ratio_directional(id, delta, axis) { return true; }
+                if blocked { return false; }
+                // delta > 0: separator should be to pane's right → pane in left child
+                // delta < 0: separator should be to pane's left → pane in right child
+                if delta > 0.0 && left.contains(id) {
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    *custom_ratio = true;
+                    true
+                } else if delta < 0.0 && right.contains(id) {
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    *custom_ratio = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            SplitTree::VSplit { top, bottom, ratio, custom_ratio, .. } if axis == SplitAxis::Vertical => {
+                let blocked = top.is_fully_minimized() || bottom.is_fully_minimized();
+                if top.adjust_ratio_directional(id, delta, axis) { return true; }
+                if bottom.adjust_ratio_directional(id, delta, axis) { return true; }
+                if blocked { return false; }
+                if delta > 0.0 && top.contains(id) {
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    *custom_ratio = true;
+                    true
+                } else if delta < 0.0 && bottom.contains(id) {
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
                     *custom_ratio = true;
                     true
                 } else {
@@ -963,8 +1001,64 @@ impl SplitTree {
             }
             // Wrong axis — recurse through children
             SplitTree::HSplit { left, right, .. } | SplitTree::VSplit { top: left, bottom: right, .. } => {
-                left.adjust_ratio_for_pane(id, delta, axis)
-                    || right.adjust_ratio_for_pane(id, delta, axis)
+                left.adjust_ratio_directional(id, delta, axis)
+                    || right.adjust_ratio_directional(id, delta, axis)
+            }
+        }
+    }
+
+    /// Returns the maximum leaf width as a fraction of total width (0.0–1.0).
+    /// Used to cap virtual width so no pane exceeds screen width.
+    pub fn max_leaf_width_fraction(&self) -> f32 {
+        match self {
+            SplitTree::Leaf(_) => 1.0,
+            SplitTree::HSplit { left, right, ratio, .. } => {
+                let left_frac = left.max_leaf_width_fraction() * ratio;
+                let right_frac = right.max_leaf_width_fraction() * (1.0 - ratio);
+                left_frac.max(right_frac)
+            }
+            SplitTree::VSplit { top, bottom, .. } => {
+                // VSplit doesn't split width — both children get the full width
+                top.max_leaf_width_fraction().max(bottom.max_leaf_width_fraction())
+            }
+        }
+    }
+
+    /// Adjust ratios so that only `target_id` absorbs the size change when
+    /// virtual width changes from `old_total` to `new_total`.
+    /// All other panes keep their absolute pixel size.
+    ///
+    /// At each HSplit ancestor of the target pane:
+    ///   sibling_px = sibling_share * old_total  →  must equal sibling_share' * new_total
+    ///   → new_ratio preserves the sibling's absolute pixel size
+    pub fn scale_ratios_for_edge_grow(&mut self, target_id: PaneId, old_total: f32, new_total: f32) {
+        if new_total <= 0.0 || old_total <= 0.0 { return; }
+        match self {
+            SplitTree::Leaf(_) => {}
+            SplitTree::HSplit { left, right, ratio, custom_ratio, .. } => {
+                if left.contains(target_id) {
+                    // Right sibling keeps its pixel size
+                    let right_px = (1.0 - *ratio) * old_total;
+                    let new_ratio = (1.0 - right_px / new_total).clamp(0.1, 0.9);
+                    let old_left = *ratio * old_total;
+                    let new_left = new_ratio * new_total;
+                    *ratio = new_ratio;
+                    *custom_ratio = true;
+                    left.scale_ratios_for_edge_grow(target_id, old_left, new_left);
+                } else if right.contains(target_id) {
+                    // Left sibling keeps its pixel size
+                    let left_px = *ratio * old_total;
+                    let new_ratio = (left_px / new_total).clamp(0.1, 0.9);
+                    let old_right = (1.0 - *ratio) * old_total;
+                    let new_right = (1.0 - new_ratio) * new_total;
+                    *ratio = new_ratio;
+                    *custom_ratio = true;
+                    right.scale_ratios_for_edge_grow(target_id, old_right, new_right);
+                }
+            }
+            SplitTree::VSplit { top, bottom, .. } => {
+                top.scale_ratios_for_edge_grow(target_id, old_total, new_total);
+                bottom.scale_ratios_for_edge_grow(target_id, old_total, new_total);
             }
         }
     }
