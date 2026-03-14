@@ -946,12 +946,12 @@ impl TerminalState {
 
             // Reflow scrollback
             let sb: Vec<Row> = self.scrollback.drain(..).collect();
-            let reflowed_sb = Self::reflow_rows(sb, new_cols as usize, &self.blank);
+            let reflowed_sb = Self::reflow_rows(sb, old_cols as usize, new_cols as usize, &self.blank);
             self.scrollback = reflowed_sb.into();
 
             // Reflow grid
             let grid = std::mem::take(&mut self.grid);
-            let reflowed_grid = Self::reflow_rows(grid, new_cols as usize, &self.blank);
+            let reflowed_grid = Self::reflow_rows(grid, old_cols as usize, new_cols as usize, &self.blank);
 
             // Find cursor in reflowed grid: skip logical_line_idx logical lines,
             // then walk offset_in_logical cells into that logical line.
@@ -1057,12 +1057,22 @@ impl TerminalState {
 
     // --- Reflow helpers ---
 
-    /// Concatenate consecutive wrapped rows into logical lines
-    fn rows_to_logical_lines(rows: Vec<Row>) -> Vec<Vec<Cell>> {
+    /// Concatenate consecutive wrapped rows into logical lines.
+    /// `old_cols` is used to pad trimmed wrapped rows back to full width
+    /// so that column positions stay aligned across concatenated rows.
+    fn rows_to_logical_lines(rows: Vec<Row>, old_cols: usize, blank: &Cell) -> Vec<Vec<Cell>> {
         let mut lines: Vec<Vec<Cell>> = Vec::new();
         let mut current: Vec<Cell> = Vec::new();
         for row in rows {
-            current.extend(row.cells);
+            if row.wrapped && row.cells.len() < old_cols {
+                // Row was trimmed (shrink_to_fit) — pad back to old_cols
+                // so the next row's content starts at the right column offset.
+                let mut cells = row.cells;
+                cells.resize(old_cols, blank.clone());
+                current.extend(cells);
+            } else {
+                current.extend(row.cells);
+            }
             if !row.wrapped {
                 lines.push(current);
                 current = Vec::new();
@@ -1099,9 +1109,10 @@ impl TerminalState {
         rows
     }
 
-    /// Reflow a set of rows to new column width
-    fn reflow_rows(rows: Vec<Row>, new_cols: usize, blank: &Cell) -> Vec<Row> {
-        let logical = Self::rows_to_logical_lines(rows);
+    /// Reflow a set of rows to new column width.
+    /// `old_cols` is the previous column width, used to re-pad trimmed wrapped rows.
+    fn reflow_rows(rows: Vec<Row>, old_cols: usize, new_cols: usize, blank: &Cell) -> Vec<Row> {
+        let logical = Self::rows_to_logical_lines(rows, old_cols, blank);
         let mut result = Vec::new();
         for line in logical {
             result.extend(Self::wrap_logical_line(line, new_cols, blank));
