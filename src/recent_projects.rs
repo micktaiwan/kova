@@ -104,7 +104,7 @@ pub fn remove(path: &str) {
 /// or the most common CWD among all panes.
 fn primary_cwd(tab: &crate::pane::Tab) -> String {
     // Try focused pane first
-    if let Some(pane) = tab.tree.pane(tab.focused_pane) {
+    if let Some(pane) = tab.pane(tab.focused_pane) {
         if let Some(cwd) = pane.cwd() {
             return cwd;
         }
@@ -112,7 +112,7 @@ fn primary_cwd(tab: &crate::pane::Tab) -> String {
 
     // Fallback: most common CWD
     let mut counts: HashMap<String, usize> = HashMap::new();
-    tab.tree.for_each_pane(&mut |p| {
+    tab.for_each_pane(&mut |p| {
         if let Some(cwd) = p.cwd() {
             *counts.entry(cwd).or_insert(0) += 1;
         }
@@ -155,13 +155,32 @@ pub fn time_ago(epoch_secs: u64) -> String {
     }
 }
 
-/// Count the number of panes (leaves) in a saved tab tree.
-pub fn pane_count(tree: &crate::session::SavedTree) -> usize {
+/// Count the number of panes (leaves) in a saved tab.
+pub fn pane_count_tab(tab: &crate::session::SavedTab) -> usize {
+    if let Some(ref cols) = tab.columns {
+        cols.iter().map(pane_count_column).sum()
+    } else if let Some(ref tree) = tab.tree {
+        pane_count_tree(tree)
+    } else {
+        0
+    }
+}
+
+fn pane_count_column(col: &crate::session::SavedColumn) -> usize {
+    match col {
+        crate::session::SavedColumn::Leaf { .. } => 1,
+        crate::session::SavedColumn::VSplit { top, bottom, .. } => {
+            pane_count_column(top) + pane_count_column(bottom)
+        }
+    }
+}
+
+fn pane_count_tree(tree: &crate::session::SavedTree) -> usize {
     match tree {
         crate::session::SavedTree::Leaf { .. } => 1,
         crate::session::SavedTree::HSplit { left, right, .. }
         | crate::session::SavedTree::VSplit { top: left, bottom: right, .. } => {
-            pane_count(left) + pane_count(right)
+            pane_count_tree(left) + pane_count_tree(right)
         }
     }
 }

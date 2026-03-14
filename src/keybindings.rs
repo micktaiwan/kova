@@ -60,6 +60,7 @@ pub enum Action {
     MemReport,
     CloseTab,
     OpenRecentProject,
+    Equalize,
 }
 
 /// Terminal-level actions dispatched from handle_key_event.
@@ -127,42 +128,50 @@ fn parse_key_combo(s: &str) -> KeyCombo {
         key: Key::Char('\0'),
     };
 
-    let num_parts = s.split('+').count();
-    for (i, part) in s.split('+').enumerate() {
+    // Split modifiers from key. The key is everything after the last '+' that
+    // is not a known modifier. Handle trailing '+' as the literal '+' key
+    // (e.g. "cmd+shift++" → modifiers=[cmd,shift], key='+').
+    let parts: Vec<&str> = s.split('+').collect();
+    // If the string ends with '+', the last element is "" — the key is '+'
+    let (modifier_parts, key_str) = if parts.last() == Some(&"") && parts.len() >= 2 {
+        (&parts[..parts.len() - 1], "+")
+    } else {
+        (&parts[..parts.len() - 1], parts[parts.len() - 1])
+    };
+
+    for part in modifier_parts {
         let trimmed = part.trim();
-        if i < num_parts - 1 {
-            // Modifier
-            if trimmed.eq_ignore_ascii_case("cmd") || trimmed.eq_ignore_ascii_case("command") {
-                combo.cmd = true;
-            } else if trimmed.eq_ignore_ascii_case("ctrl") || trimmed.eq_ignore_ascii_case("control") {
-                combo.ctrl = true;
-            } else if trimmed.eq_ignore_ascii_case("option") || trimmed.eq_ignore_ascii_case("alt") || trimmed.eq_ignore_ascii_case("opt") {
-                combo.option = true;
-            } else if trimmed.eq_ignore_ascii_case("shift") {
-                combo.shift = true;
-            } else {
-                log::warn!("Unknown modifier in keybinding: {}", trimmed);
-            }
+        if trimmed.eq_ignore_ascii_case("cmd") || trimmed.eq_ignore_ascii_case("command") {
+            combo.cmd = true;
+        } else if trimmed.eq_ignore_ascii_case("ctrl") || trimmed.eq_ignore_ascii_case("control") {
+            combo.ctrl = true;
+        } else if trimmed.eq_ignore_ascii_case("option") || trimmed.eq_ignore_ascii_case("alt") || trimmed.eq_ignore_ascii_case("opt") {
+            combo.option = true;
+        } else if trimmed.eq_ignore_ascii_case("shift") {
+            combo.shift = true;
         } else {
-            // Key (last token)
-            let lower = trimmed.to_ascii_lowercase();
-            combo.key = match lower.as_str() {
-                "up" => Key::Up,
-                "down" => Key::Down,
-                "left" => Key::Left,
-                "right" => Key::Right,
-                "backspace" | "delete" => Key::Backspace,
-                "enter" | "return" => Key::Enter,
-                "[" => Key::Char('['),
-                "]" => Key::Char(']'),
-                s if s.len() == 1 => Key::Char(s.chars().next().unwrap()),
-                _ => {
-                    log::warn!("Unknown key in keybinding: {}", trimmed);
-                    Key::Char('\0')
-                }
-            };
+            log::warn!("Unknown modifier in keybinding: {}", trimmed);
         }
     }
+
+    let key_trimmed = key_str.trim();
+    let lower = key_trimmed.to_ascii_lowercase();
+    combo.key = match lower.as_str() {
+        "up" => Key::Up,
+        "down" => Key::Down,
+        "left" => Key::Left,
+        "right" => Key::Right,
+        "backspace" | "delete" => Key::Backspace,
+        "enter" | "return" => Key::Enter,
+        "[" => Key::Char('['),
+        "]" => Key::Char(']'),
+        "+" => Key::Char('+'),
+        s if s.len() == 1 => Key::Char(s.chars().next().unwrap()),
+        _ => {
+            log::warn!("Unknown key in keybinding: {}", key_trimmed);
+            Key::Char('\0')
+        }
+    };
 
     combo
 }
@@ -235,6 +244,7 @@ impl Keybindings {
         bind(&keys.toggle_help, Action::ToggleHelp);
         bind(&keys.close_tab, Action::CloseTab);
         bind(&keys.open_recent_project, Action::OpenRecentProject);
+        bind(&keys.equalize, Action::Equalize);
 
         // Hard-coded debug binding (not user-configurable)
         window_map.insert(parse_key_combo("cmd+shift+i"), Action::MemReport);

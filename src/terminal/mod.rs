@@ -499,10 +499,15 @@ impl TerminalState {
     fn push_to_scrollback(&mut self, mut row: Row) {
         row.trim_trailing_blanks(self.default_fg, self.default_bg);
         self.scrollback.push_back(row);
+        if self.scroll_offset > 0 {
+            self.scroll_offset += 1;
+        }
         if self.scrollback.len() > self.scrollback_limit {
             self.scrollback.pop_front();
-        } else if self.scroll_offset > 0 {
-            self.scroll_offset += 1;
+            let max = self.scrollback.len() as i32;
+            if self.scroll_offset > max {
+                self.scroll_offset = max;
+            }
         }
     }
 
