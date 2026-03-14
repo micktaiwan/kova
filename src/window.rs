@@ -533,6 +533,10 @@ define_class!(
                             let full = self.drawable_viewport();
                             let min_w = self.min_split_width_px();
                             let screen_w = full.width;
+                            // Don't grow if focused pane is already at screen width
+                            let pane_vp = tab.tree.viewport_for_pane(focused_id, self.panes_viewport_for_tab(tab));
+                            let pane_w = pane_vp.map(|vp| vp.width).unwrap_or(0.0);
+                            let blocked = *delta > 0.0 && pane_w >= screen_w - 1.0;
                             let old_vw = tab.virtual_width(screen_w, min_w);
                             let step = (0.05 * screen_w).max(20.0);
                             let new_vw = if *delta > 0.0 {
@@ -540,16 +544,10 @@ define_class!(
                             } else {
                                 (old_vw - step).max(screen_w)
                             };
-                            // Cap: focused pane absorbs all the delta, so its new width =
-                            // old_pane_width + (new_vw - old_vw). Must not exceed screen_w.
-                            let pane_vp = tab.tree.viewport_for_pane(focused_id, self.panes_viewport_for_tab(tab));
-                            let old_pane_w = pane_vp.map(|vp| vp.width).unwrap_or(screen_w);
-                            let max_vw = old_vw + (screen_w - old_pane_w);
-                            let capped_vw = new_vw.min(max_vw);
-                            if (capped_vw - old_vw).abs() > 0.5 {
-                                tab.tree.scale_ratios_for_edge_grow(focused_id, old_vw, capped_vw);
-                                tab.virtual_width_override = if capped_vw > screen_w { capped_vw } else { 0.0 };
-                                self.cap_virtual_width(tab, screen_w, min_w);
+                            if !blocked && (new_vw - old_vw).abs() > 0.5 {
+                                tab.tree.scale_ratios_for_edge_grow(focused_id, old_vw, new_vw);
+                                tab.virtual_width_override = if new_vw > screen_w { new_vw } else { 0.0 };
+                                self.enforce_max_pane_width(tab, screen_w, min_w);
                                 tab.clamp_scroll(screen_w, min_w);
                                 self.scroll_to_reveal_pane(tab, focused_id, screen_w);
                                 self.set_resize_feedback("Right Edge", tab, screen_w, min_w);
@@ -1410,10 +1408,9 @@ impl KovaView {
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get_mut(idx) {
             let current_vw = tab.virtual_width(screen_w, min_w);
-            let max_frac = tab.tree.max_leaf_width_fraction();
-            let max_vw = if max_frac > 0.0 { screen_w / max_frac } else { screen_w };
-            let new_vw = (current_vw + dir * step).clamp(screen_w, max_vw);
+            let new_vw = (current_vw + dir * step).max(screen_w);
             tab.virtual_width_override = if new_vw > screen_w { new_vw } else { 0.0 };
+            self.enforce_max_pane_width(tab, screen_w, min_w);
             tab.clamp_scroll(screen_w, min_w);
             self.scroll_to_reveal_pane(tab, tab.focused_pane, screen_w);
             self.set_resize_feedback("Virtual", tab, screen_w, min_w);
@@ -1422,8 +1419,8 @@ impl KovaView {
         self.resize_all_panes();
     }
 
-    /// Enforce: no pane may exceed screen width. Shrinks virtual_width_override if needed.
-    /// Must be called after any resize operation (mode 1, 2, or 3).
+    /// Mode 1 post-validation: reduce virtual_width so no pane exceeds screen_width.
+    /// Does NOT touch ratios (the user just set them).
     fn cap_virtual_width(&self, tab: &mut Tab, screen_w: f32, min_w: f32) {
         let vw = tab.virtual_width(screen_w, min_w);
         if vw <= screen_w { return; }

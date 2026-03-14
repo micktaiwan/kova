@@ -133,7 +133,12 @@ All ratio modifications clamp to `[0.1, 0.9]`. This guarantees each child gets a
 
 ### Max pane width
 
-**Invariant**: no pane's pixel width may ever exceed the real screen width. Enforced after every resize operation (all 3 modes, plus mouse drag). If a ratio change or virtual width expansion would cause any pane to exceed `screen_width`, `virtual_width_override` is automatically reduced so that `max_leaf_width_fraction * virtual_width <= screen_width`.
+**Invariant**: no pane's pixel width may ever exceed the real screen width. Enforced after every resize operation via post-validation (action happens first, then correction).
+
+Two enforcement strategies depending on the mode:
+
+- **Mode 1** (ratio resize): the user's ratios are preserved. If a pane exceeds screen width, `virtual_width_override` is reduced instead (`cap_virtual_width`).
+- **Modes 2 & 3** (virtual width changes): ratios are adjusted first to cap oversized panes at screen width — siblings absorb the freed space (`clamp_pane_widths`). If ratios alone can't fix it, `virtual_width_override` is reduced as last resort (`enforce_max_pane_width`).
 
 ## Equalization
 
