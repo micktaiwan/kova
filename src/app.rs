@@ -44,15 +44,20 @@ define_class!(
             log::debug!("Config loaded: {}x{} cols/rows, {} scrollback", config.terminal.columns, config.terminal.rows, config.terminal.scrollback);
 
             // Restore session (all windows) or create a single fresh window
+            let t0 = std::time::Instant::now();
             let restored = crate::session::load(self.ivars().session_backup)
-                .and_then(|s| crate::session::restore_session(s, config));
+                .and_then(|s| {
+                    log::info!("[STARTUP] session load+parse: {:?}", t0.elapsed());
+                    crate::session::restore_session(s, config)
+                });
+            log::info!("[STARTUP] total session restore (all spawns): {:?}", t0.elapsed());
 
             match restored {
                 Some(windows) => {
                     log::info!("Restoring {} window(s) from session", windows.len());
                     let mut win_vec = self.ivars().windows.borrow_mut();
                     for (i, rw) in windows.into_iter().enumerate() {
-                        let win = window::create_window(mtm, config, rw.tabs, rw.active_tab);
+                        let win = window::create_window(mtm, config, rw.tabs, rw.active_tab, rw.deferred_tabs);
                         // Restore saved window position if available
                         if let Some((x, y, w, h)) = rw.frame {
                             let frame = objc2_core_foundation::CGRect {
@@ -67,7 +72,7 @@ define_class!(
                 }
                 None => {
                     let tab = crate::pane::Tab::new(config).expect("failed to create initial tab");
-                    let win = window::create_window(mtm, config, vec![tab], 0);
+                    let win = window::create_window(mtm, config, vec![tab], 0, Vec::new());
                     win.makeKeyAndOrderFront(None);
                     self.ivars().windows.borrow_mut().push(win);
                 }
@@ -242,7 +247,7 @@ pub fn create_new_window(mtm: MainThreadMarker) {
     let ad = app_delegate(mtm);
     let config = ad.ivars().config.get().unwrap();
     let tab = crate::pane::Tab::new(config).expect("failed to create tab");
-    let win = window::create_window(mtm, config, vec![tab], 0);
+    let win = window::create_window(mtm, config, vec![tab], 0, Vec::new());
     win.makeKeyAndOrderFront(None);
     ad.ivars().windows.borrow_mut().push(win);
 }
@@ -255,7 +260,7 @@ pub fn detach_tab_to_new_window(
 ) {
     let ad = app_delegate(mtm);
     let config = ad.ivars().config.get().unwrap();
-    let win = window::create_window(mtm, config, vec![tab], 0);
+    let win = window::create_window(mtm, config, vec![tab], 0, Vec::new());
 
     // Offset new window from source (+20x, -20y cascade)
     if let Some(sf) = source_frame {
@@ -277,24 +282,47 @@ pub fn detach_tab_to_new_window(
     ad.ivars().windows.borrow_mut().push(win);
 }
 
-/// Drain all tabs from `source_tabs` and append them to the first other window.
-/// Returns `false` (no-op) if there is no other window; tabs are untouched in that case.
-pub fn merge_tabs_from(
-    mtm: MainThreadMarker,
-    source_tabs: &std::cell::RefCell<Vec<crate::pane::Tab>>,
-    source: &NSWindow,
-) -> bool {
+/// Info about a window for the "Send Tab to Window" overlay.
+pub struct WindowInfo {
+    pub label: String,
+    /// Index in the app delegate's windows list.
+    pub index: usize,
+}
+
+/// List other windows (excluding `source`) with their tab summaries.
+pub fn list_other_windows(mtm: MainThreadMarker, source: &NSWindow) -> Vec<WindowInfo> {
     let ad = app_delegate(mtm);
     let windows = ad.ivars().windows.borrow();
-    let Some(target) = windows.iter().find(|w| !w.isEqual(Some(source))) else {
-        return false;
-    };
-    let tabs: Vec<crate::pane::Tab> = source_tabs.borrow_mut().drain(..).collect();
-    if let Some(view) = kova_view(target) {
-        view.append_tabs(tabs);
+    let mut result = Vec::new();
+    for (i, win) in windows.iter().enumerate() {
+        if win.isEqual(Some(source)) {
+            continue;
+        }
+        let label = if let Some(view) = kova_view(win) {
+            let names = view.tab_titles();
+            if names.len() == 1 {
+                names[0].clone()
+            } else {
+                format!("{} tabs: {}", names.len(), names.join(", "))
+            }
+        } else {
+            format!("Window {}", i + 1)
+        };
+        result.push(WindowInfo { label, index: i });
     }
-    target.makeKeyAndOrderFront(None);
-    true
+    result
+}
+
+/// Send a tab to an existing window (by index in the app delegate's window list).
+pub fn send_tab_to_window(mtm: MainThreadMarker, tab: crate::pane::Tab, window_index: usize) {
+    let ad = app_delegate(mtm);
+    let windows = ad.ivars().windows.borrow();
+    if let Some(target) = windows.get(window_index) {
+        if let Some(view) = kova_view(target) {
+            view.append_tabs(vec![tab]);
+        }
+        target.makeKeyAndOrderFront(None);
+    }
 }
 
 /// Cast the window's contentView to our KovaView.

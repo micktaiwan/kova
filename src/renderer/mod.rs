@@ -118,6 +118,12 @@ pub struct RecentProjectsRenderData<'a> {
     pub scroll: usize,
 }
 
+/// Data passed to the renderer for drawing "Send Tab to Window" overlay.
+pub struct SendToWindowRenderData<'a> {
+    pub entries: &'a [String],
+    pub selected: usize,
+}
+
 /// Per-pane data passed from window to renderer.
 pub struct PaneRenderData {
     pub terminal: Arc<RwLock<TerminalState>>,
@@ -193,6 +199,8 @@ pub struct Renderer {
     pub hovered_url_text: Option<String>,
     /// Resize mode feedback text, displayed on the left of the global status bar.
     pub resize_feedback_text: Option<String>,
+    /// Loading progress: (ready_panes, total_panes). None when all loaded.
+    pub loading_progress: Option<(u32, u32)>,
     /// Pane ID of the hovered URL (to show URL only in that pane's status bar)
     pub hovered_url_pane_id: Option<PaneId>,
     /// Cached help hint text for status bar (avoid per-frame allocation).
@@ -295,6 +303,7 @@ impl Renderer {
             hovered_url: None,
             hovered_url_text: None,
             resize_feedback_text: None,
+            loading_progress: None,
             hovered_url_pane_id: None,
             cached_help_hint: String::new(),
             cached_help_shortcuts: Vec::new(),
@@ -326,6 +335,7 @@ impl Renderer {
         show_help: bool,
         show_mem_report: bool,
         recent_projects: Option<&RecentProjectsRenderData<'_>>,
+        send_to_window: Option<&SendToWindowRenderData<'_>>,
         help_hint_remaining: u32,
         keys_config: Option<&KeysConfig>,
     ) {
@@ -415,7 +425,8 @@ impl Renderer {
         let has_filter = filter.is_some();
         let has_recent_projects = recent_projects.is_some();
         let tooltip_animating = self.tooltip_anim > 0 && self.tooltip_anim < TOOLTIP_ANIM_FRAMES;
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && help_hint_remaining == 0 && !tooltip_animating {
+        let has_loading = self.loading_progress.is_some();
+        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && help_hint_remaining == 0 && !tooltip_animating && !has_loading {
             return;
         }
 
@@ -552,6 +563,11 @@ impl Renderer {
         // Draw recent projects overlay
         if let Some(rp) = recent_projects {
             self.build_recent_projects_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, rp);
+        }
+
+        // Draw send-to-window overlay
+        if let Some(stw) = send_to_window {
+            self.build_send_to_window_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, stw);
         }
 
         // Tooltip animation: update visible state and animation counter
@@ -1051,8 +1067,14 @@ impl Renderer {
             self.push_tooltip_zone(center_start, bar_y, x - center_start, cell_h, "Tab / total — focused column / total columns");
         }
 
+        // Left: loading progress (highest priority)
+        if let Some((ready, total)) = self.loading_progress {
+            let text = format!("Loading {}/{}...", ready, total);
+            let loading_fg = [0.6, 0.85, 0.6, 1.0];
+            self.render_status_text(vertices, &text, cell_w, bar_y, viewport_w, loading_fg, no_bg);
+        }
         // Left: resize feedback (takes priority over help hint)
-        if let Some(text) = self.resize_feedback_text.clone() {
+        else if let Some(text) = self.resize_feedback_text.clone() {
             let info_fg = [0.6, 0.85, 0.6, 1.0];
             self.render_status_text(vertices, &text, cell_w, bar_y, viewport_w, info_fg, no_bg);
         }
@@ -1713,6 +1735,68 @@ impl Renderer {
             y += overlay_ch * 1.3;
         }
         self.cached_mem_report = report;
+    }
+
+    fn build_send_to_window_overlay_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        viewport_w: f32,
+        viewport_h: f32,
+        data: &SendToWindowRenderData<'_>,
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+
+        // Semi-transparent dark overlay
+        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let title_fg = [1.0, 0.85, 0.3, 1.0];
+        let label_fg = [0.85, 0.85, 0.9, 1.0];
+        let dim_fg = [0.45, 0.45, 0.5, 1.0];
+        let selected_bg = [0.25, 0.35, 0.55];
+        let new_window_fg = [0.5, 0.8, 0.5, 1.0];
+
+        let title_scale = 1.8_f32;
+        let body_scale = 1.3_f32;
+        let scaled_cell_w = cell_w * body_scale;
+        let scaled_cell_h = cell_h * body_scale;
+        let row_height = scaled_cell_h * 1.6;
+
+        // Title centered
+        let title = "Send Tab to Window";
+        let title_chars = title.chars().count() as f32;
+        let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
+        let mut y = cell_h * 3.0;
+        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        y += cell_h * title_scale * 2.0;
+
+        // Subtitle
+        let subtitle = "\u{2191}\u{2193} Navigate  \u{23ce} Send  esc Cancel";
+        let sub_chars = subtitle.chars().count() as f32;
+        let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
+        self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        y += scaled_cell_h * 2.0;
+
+        let left_margin = scaled_cell_w * 3.0;
+        let right_margin = viewport_w - scaled_cell_w * 3.0;
+
+        for (i, label) in data.entries.iter().enumerate() {
+            let row_y = y + i as f32 * row_height;
+            let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
+
+            // Selected row background
+            if i == data.selected {
+                Self::push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+            }
+
+            // "New Window" gets a distinct color
+            let is_new_window = i == data.entries.len() - 1;
+            let fg = if is_new_window { new_window_fg } else { label_fg };
+            let prefix = if is_new_window { "+ " } else { "" };
+            let text = format!("{}{}", prefix, label);
+            self.render_text(vertices, &text, left_margin, text_y, right_margin, fg, no_bg, body_scale);
+        }
     }
 
     fn build_recent_projects_overlay_vertices(
