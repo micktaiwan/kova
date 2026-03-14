@@ -1433,6 +1433,25 @@ impl KovaView {
         }
     }
 
+    /// Modes 2 & 3 post-validation: adjust ratios of oversized panes first,
+    /// then reduce virtual_width as last resort.
+    fn enforce_max_pane_width(&self, tab: &mut Tab, screen_w: f32, min_w: f32) {
+        let vw = tab.virtual_width(screen_w, min_w);
+        if vw <= screen_w { return; }
+        // Step 1: adjust ratios to cap oversized panes
+        tab.tree.clamp_pane_widths(vw, screen_w);
+        // Step 2: if still oversized (total too large), reduce virtual_width
+        let max_frac = tab.tree.max_leaf_width_fraction();
+        if max_frac > 0.0 {
+            let max_vw = screen_w / max_frac;
+            let current_vw = tab.virtual_width(screen_w, min_w);
+            if current_vw > max_vw {
+                tab.virtual_width_override = if max_vw > screen_w { max_vw } else { 0.0 };
+            }
+        }
+        tab.clamp_scroll(screen_w, min_w);
+    }
+
     /// Store resize feedback info to display in the global status bar for ~2 seconds.
     fn set_resize_feedback(&self, mode: &str, tab: &Tab, screen_w: f32, min_w: f32) {
         let fps = self.ivars().config.get().map(|c| c.terminal.fps).unwrap_or(60) as u32;
@@ -3050,7 +3069,7 @@ impl KovaView {
             .map(|c| c.splits.min_width)
             .unwrap_or(300.0)
             * ivars.last_scale.get().max(1.0) as f32;
-        let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width, total_columns, focused_column, active_tab, total_tabs) = {
+        let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width, total_columns, focused_column, active_tab, total_tabs, active_tab_name) = {
             let mut tabs = ivars.tabs.borrow_mut();
             if tabs.is_empty() {
                 return false;
@@ -3150,7 +3169,8 @@ impl KovaView {
             let focused_column = tabs[active_idx].tree.column_index(tabs[active_idx].focused_pane).unwrap_or(1);
             let active_tab_1based = active_idx + 1;
             let total_tabs = tabs.len();
-            (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width, total_columns, focused_column, active_tab_1based, total_tabs)
+            let active_tab_name = tabs[active_idx].title();
+            (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width, total_columns, focused_column, active_tab_1based, total_tabs, active_tab_name)
         };
 
         // Focus reporting (DEC mode 1004) — send to focused pane only
@@ -3289,7 +3309,7 @@ impl KovaView {
             r.resize_feedback_text = None;
         }
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, show_help, show_mem_report, rp_data.as_ref(), help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, show_help, show_mem_report, rp_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 

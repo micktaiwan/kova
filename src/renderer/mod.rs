@@ -322,6 +322,7 @@ impl Renderer {
         total_columns: usize,
         active_tab: usize,
         total_tabs: usize,
+        active_tab_name: &str,
         show_help: bool,
         show_mem_report: bool,
         recent_projects: Option<&RecentProjectsRenderData<'_>>,
@@ -527,7 +528,7 @@ impl Renderer {
         }
 
         // Draw global status bar
-        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, help_hint_remaining, keys_config);
+        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, help_hint_remaining, keys_config);
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
@@ -1003,6 +1004,7 @@ impl Renderer {
         total_columns: usize,
         active_tab: usize,
         total_tabs: usize,
+        active_tab_name: &str,
         help_hint_remaining: u32,
         keys_config: Option<&KeysConfig>,
     ) {
@@ -1021,6 +1023,7 @@ impl Renderer {
         // Center: [tab/total] - col/total, combined with scroll arrows
         // Pre-compute the full text to measure total width for centering
         {
+            let tab_name_text = format!("{} ", active_tab_name);
             let tab_text = format!("[{}/{}]", active_tab, total_tabs);
             let sep = " - ";
             let col_text = format!("{}/{}", focused_column, total_columns);
@@ -1030,7 +1033,7 @@ impl Renderer {
             let right_arrow = if hidden_right > 0 { format!(" | {} ⟶", hidden_right) } else { String::new() };
 
             // Total char width for centering
-            let total_chars = left_arrow.chars().count() + tab_text.chars().count() + sep.chars().count() + col_text.chars().count() + right_arrow.chars().count();
+            let total_chars = left_arrow.chars().count() + tab_name_text.chars().count() + tab_text.chars().count() + sep.chars().count() + col_text.chars().count() + right_arrow.chars().count();
             let text_w = total_chars as f32 * cell_w;
             let center_start = (viewport_w - text_w) / 2.0;
             let mut x = center_start;
@@ -1038,6 +1041,7 @@ impl Renderer {
             if hidden_left > 0 {
                 x = self.render_status_text(vertices, &left_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
             }
+            x = self.render_status_text(vertices, &tab_name_text, x, bar_y, viewport_w, tab_fg, no_bg);
             x = self.render_status_text(vertices, &tab_text, x, bar_y, viewport_w, tab_fg, no_bg);
             x = self.render_status_text(vertices, sep, x, bar_y, viewport_w, tab_fg, no_bg);
             x = self.render_status_text(vertices, &col_text, x, bar_y, viewport_w, scroll_fg, no_bg);
