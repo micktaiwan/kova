@@ -171,6 +171,8 @@ pub struct TerminalState {
     pub git_branch: Option<String>,
     // Window title (set via OSC 0/2)
     pub title: Option<String>,
+    // Sticky title (set via OSC 1) — propagated to pane.custom_title
+    pub osc1_title: Option<String>,
     // Text selection
     pub selection: Option<Selection>,
     // Synchronized output (DEC mode 2026)
@@ -243,6 +245,7 @@ impl TerminalState {
             cwd: None,
             git_branch: None,
             title: None,
+            osc1_title: None,
             selection: None,
             synchronized_output: false,
             sync_output_since: None,

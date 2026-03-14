@@ -132,11 +132,18 @@ impl Perform for VteHandler {
         // Handle OSC sequences (window title, etc.)
         if params.len() >= 2 {
             match params[0] {
-                b"0" | b"1" | b"2" => {
+                b"0" | b"2" => {
                     let title = String::from_utf8_lossy(params[1]).into_owned();
                     log::trace!("OSC title: {}", title);
                     let term = self.term();
                     term.title = Some(title);
+                    term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                b"1" => {
+                    let title = String::from_utf8_lossy(params[1]).into_owned();
+                    log::trace!("OSC 1 sticky title: {}", title);
+                    let term = self.term();
+                    term.osc1_title = Some(title);
                     term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 b"7" => {
