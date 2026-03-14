@@ -2,11 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::config::Config;
-use crate::pane::{alloc_tab_id, Pane, PaneId, SplitTree, Tab};
+use crate::pane::{alloc_tab_id, ColumnTree, Pane, PaneId, Tab};
 
-const SESSION_VERSION: u32 = 2;
+const SESSION_VERSION: u32 = 3;
 
-/// Multi-window session format (v2).
+/// Multi-window session format (v3 — flat columns).
 #[derive(Serialize, Deserialize)]
 pub struct Session {
     pub version: u32,
@@ -30,9 +30,20 @@ struct SessionV1 {
     pub tabs: Vec<SavedTab>,
 }
 
+// ---------------------------------------------------------------
+// New column-based save format
+// ---------------------------------------------------------------
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SavedTab {
-    pub tree: SavedTree,
+    /// New format: columns + weights (v3).
+    #[serde(default)]
+    pub columns: Option<Vec<SavedColumn>>,
+    #[serde(default)]
+    pub column_weights: Option<Vec<f32>>,
+    /// Legacy format: single tree (v2).
+    #[serde(default)]
+    pub tree: Option<SavedTree>,
     pub focused_leaf_index: usize,
     pub custom_title: Option<String>,
     pub color: Option<usize>,
@@ -42,6 +53,28 @@ pub struct SavedTab {
     pub scroll_offset_x: Option<f32>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SavedColumn {
+    Leaf {
+        cwd: Option<String>,
+        #[serde(default)]
+        last_command: Option<String>,
+        #[serde(default)]
+        custom_title: Option<String>,
+        #[serde(default)]
+        minimized: bool,
+    },
+    VSplit {
+        top: Box<SavedColumn>,
+        bottom: Box<SavedColumn>,
+        ratio: f32,
+        #[serde(default)]
+        custom_ratio: bool,
+    },
+}
+
+/// Legacy tree format — kept for backward compat reading.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SavedTree {
@@ -63,57 +96,63 @@ fn session_path() -> PathBuf {
     PathBuf::from(home).join(".config/kova/session.json")
 }
 
-fn snapshot_tree(tree: &SplitTree) -> SavedTree {
-    match tree {
-        SplitTree::Leaf(pane) => SavedTree::Leaf {
+// ---------------------------------------------------------------
+// Snapshot (save)
+// ---------------------------------------------------------------
+
+fn snapshot_column(col: &ColumnTree) -> SavedColumn {
+    match col {
+        ColumnTree::Leaf(pane) => SavedColumn::Leaf {
             cwd: pane.cwd(),
             last_command: pane.last_command(),
             custom_title: pane.custom_title.clone(),
             minimized: pane.minimized,
         },
-        SplitTree::HSplit { left, right, ratio, root, custom_ratio } => SavedTree::HSplit {
-            left: Box::new(snapshot_tree(left)),
-            right: Box::new(snapshot_tree(right)),
+        ColumnTree::VSplit { top, bottom, ratio, custom_ratio } => SavedColumn::VSplit {
+            top: Box::new(snapshot_column(top)),
+            bottom: Box::new(snapshot_column(bottom)),
             ratio: *ratio,
-            root: *root,
-            custom_ratio: *custom_ratio,
-        },
-        SplitTree::VSplit { top, bottom, ratio, root, custom_ratio } => SavedTree::VSplit {
-            top: Box::new(snapshot_tree(top)),
-            bottom: Box::new(snapshot_tree(bottom)),
-            ratio: *ratio,
-            root: *root,
             custom_ratio: *custom_ratio,
         },
     }
 }
 
-/// Find the depth-first leaf index of a pane by id. Returns None if not found.
-fn leaf_index_of(tree: &SplitTree, target: PaneId) -> Option<usize> {
-    fn walk(tree: &SplitTree, target: PaneId, idx: &mut usize) -> Option<usize> {
-        match tree {
-            SplitTree::Leaf(p) => {
-                if p.id == target {
-                    Some(*idx)
-                } else {
-                    *idx += 1;
-                    None
-                }
+/// Find the depth-first leaf index of a pane by id across all columns.
+fn leaf_index_of_tab(tab: &Tab) -> usize {
+    let mut idx = 0;
+    let target = tab.focused_pane;
+    let mut found = None;
+    for col in &tab.columns {
+        leaf_index_walk(col, target, &mut idx, &mut found);
+        if found.is_some() { break; }
+    }
+    found.unwrap_or(0)
+}
+
+fn leaf_index_walk(col: &ColumnTree, target: PaneId, idx: &mut usize, found: &mut Option<usize>) {
+    match col {
+        ColumnTree::Leaf(p) => {
+            if p.id == target {
+                *found = Some(*idx);
             }
-            SplitTree::HSplit { left, right, .. }
-            | SplitTree::VSplit { top: left, bottom: right, .. } => {
-                walk(left, target, idx).or_else(|| walk(right, target, idx))
+            *idx += 1;
+        }
+        ColumnTree::VSplit { top, bottom, .. } => {
+            leaf_index_walk(top, target, idx, found);
+            if found.is_none() {
+                leaf_index_walk(bottom, target, idx, found);
             }
         }
     }
-    walk(tree, target, &mut 0)
 }
 
 /// Snapshot a single tab into a SavedTab (public for recent_projects).
 pub fn snapshot_tab(tab: &Tab) -> SavedTab {
-    let focused_leaf_index = leaf_index_of(&tab.tree, tab.focused_pane).unwrap_or(0);
+    let focused_leaf_index = leaf_index_of_tab(tab);
     SavedTab {
-        tree: snapshot_tree(&tab.tree),
+        columns: Some(tab.columns.iter().map(snapshot_column).collect()),
+        column_weights: Some(tab.column_weights.clone()),
+        tree: None,
         focused_leaf_index,
         custom_title: tab.custom_title.clone(),
         color: tab.color,
@@ -167,9 +206,7 @@ pub fn save(windows: &[WindowSession]) {
     }
 }
 
-/// Rotate session.json → session.1.json → session.2.json → ... → session.N.json
-/// Only rotates if the current file differs from the latest backup (avoids
-/// filling history with identical periodic saves).
+/// Rotate session.json -> session.1.json -> session.2.json -> ...
 fn rotate_session_backups(path: &std::path::Path, new_content: &[u8]) {
     if !path.exists() {
         return;
@@ -180,14 +217,12 @@ fn rotate_session_backups(path: &std::path::Path, new_content: &[u8]) {
         else { parent.join(format!("session.{}.json", n)) }
     };
 
-    // Skip rotation if new content is identical to most recent backup
     if let Ok(latest) = std::fs::read(&backup(1)) {
         if new_content == latest {
             return;
         }
     }
 
-    // Drop oldest, shift everything down
     let _ = std::fs::remove_file(backup(SESSION_HISTORY_COUNT));
     for i in (1..SESSION_HISTORY_COUNT).rev() {
         let _ = std::fs::rename(backup(i), backup(i + 1));
@@ -246,12 +281,11 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
     };
     let data = std::fs::read_to_string(&path).ok()?;
 
-    // Try v2 first, then fall back to v1
+    // Try v3 first, then v2, then v1
     let session: Session = if let Ok(s) = serde_json::from_str::<Session>(&data) {
-        if s.version == SESSION_VERSION {
+        if s.version == SESSION_VERSION || s.version == 2 {
             s
         } else if s.version == 1 {
-            // Shouldn't happen (v1 doesn't have `windows` field), but handle gracefully
             log::warn!("Session v1 with windows field, ignoring");
             return None;
         } else {
@@ -260,7 +294,7 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
         }
     } else if let Ok(v1) = serde_json::from_str::<SessionV1>(&data) {
         if v1.version == 1 {
-            log::info!("Migrating v1 session to v2");
+            log::info!("Migrating v1 session to v3");
             Session {
                 version: SESSION_VERSION,
                 windows: vec![WindowSession {
@@ -278,13 +312,44 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
         return None;
     };
 
-    // Remove session file after loading so a crash during restore doesn't loop
     let _ = std::fs::remove_file(&path);
     Some(session)
 }
 
-/// Restore a saved tree, spawning new panes. Returns the tree and a list of pane ids in depth-first order.
-fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Option<(SplitTree, Vec<PaneId>)> {
+// ---------------------------------------------------------------
+// Restore
+// ---------------------------------------------------------------
+
+/// Restore a saved column tree.
+fn restore_column(saved: &SavedColumn, cols: u16, rows: u16, config: &Config) -> Option<(ColumnTree, Vec<PaneId>)> {
+    match saved {
+        SavedColumn::Leaf { cwd, last_command, custom_title, minimized } => {
+            let mut pane = Pane::spawn(cols, rows, config, cwd.as_deref()).ok()?;
+            let id = pane.id;
+            if let Some(cmd) = last_command {
+                pane.pending_command.set(Some(cmd.clone()));
+                pane.terminal.write().last_command = Some(cmd.clone());
+            }
+            pane.custom_title = custom_title.clone();
+            pane.minimized = *minimized;
+            Some((ColumnTree::Leaf(pane), vec![id]))
+        }
+        SavedColumn::VSplit { top, bottom, ratio, custom_ratio } => {
+            let (top_tree, mut top_ids) = restore_column(top, cols, rows, config)?;
+            let (bot_tree, bot_ids) = restore_column(bottom, cols, rows, config)?;
+            top_ids.extend(bot_ids);
+            Some((ColumnTree::VSplit {
+                top: Box::new(top_tree),
+                bottom: Box::new(bot_tree),
+                ratio: *ratio,
+                custom_ratio: *custom_ratio,
+            }, top_ids))
+        }
+    }
+}
+
+/// Restore from legacy SavedTree format, flattening HSplits into columns.
+fn restore_legacy_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Option<(Vec<ColumnTree>, Vec<f32>, Vec<PaneId>)> {
     match saved {
         SavedTree::Leaf { cwd, last_command, custom_title, minimized } => {
             let mut pane = Pane::spawn(cols, rows, config, cwd.as_deref()).ok()?;
@@ -295,38 +360,93 @@ fn restore_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Opt
             }
             pane.custom_title = custom_title.clone();
             pane.minimized = *minimized;
-            Some((SplitTree::Leaf(pane), vec![id]))
+            Some((vec![ColumnTree::Leaf(pane)], vec![1.0], vec![id]))
         }
-        SavedTree::HSplit { left, right, ratio, root, custom_ratio } => {
-            let (left_tree, mut left_ids) = restore_tree(left, cols, rows, config)?;
-            let (right_tree, right_ids) = restore_tree(right, cols, rows, config)?;
+        SavedTree::HSplit { left, right, ratio, .. } => {
+            let (mut left_cols, mut left_weights, mut left_ids) = restore_legacy_tree(left, cols, rows, config)?;
+            let (right_cols, right_weights, right_ids) = restore_legacy_tree(right, cols, rows, config)?;
+            // Scale weights: left side gets ratio, right side gets 1-ratio
+            let left_sum: f32 = left_weights.iter().sum();
+            let right_sum: f32 = right_weights.iter().sum();
+            if left_sum > 0.0 {
+                for w in &mut left_weights {
+                    *w = *w / left_sum * ratio;
+                }
+            }
+            let right_ratio = 1.0 - ratio;
+            let scaled_right: Vec<f32> = if right_sum > 0.0 {
+                right_weights.iter().map(|w| w / right_sum * right_ratio).collect()
+            } else {
+                right_weights
+            };
+            left_cols.extend(right_cols);
+            left_weights.extend(scaled_right);
             left_ids.extend(right_ids);
-            Some((SplitTree::HSplit {
-                left: Box::new(left_tree),
-                right: Box::new(right_tree),
-                ratio: *ratio,
-                root: *root,
-                custom_ratio: *custom_ratio,
-            }, left_ids))
+            Some((left_cols, left_weights, left_ids))
         }
-        SavedTree::VSplit { top, bottom, ratio, root, custom_ratio } => {
-            let (top_tree, mut top_ids) = restore_tree(top, cols, rows, config)?;
-            let (bottom_tree, bottom_ids) = restore_tree(bottom, cols, rows, config)?;
-            top_ids.extend(bottom_ids);
-            Some((SplitTree::VSplit {
-                top: Box::new(top_tree),
-                bottom: Box::new(bottom_tree),
+        SavedTree::VSplit { top, bottom, ratio, custom_ratio, .. } => {
+            // VSplit within a column — restore as a single column with VSplit
+            let saved_col = SavedColumn::VSplit {
+                top: Box::new(saved_tree_to_saved_column(top)),
+                bottom: Box::new(saved_tree_to_saved_column(bottom)),
                 ratio: *ratio,
-                root: *root,
                 custom_ratio: *custom_ratio,
-            }, top_ids))
+            };
+            let (col, ids) = restore_column(&saved_col, cols, rows, config)?;
+            Some((vec![col], vec![1.0], ids))
+        }
+    }
+}
+
+/// Convert a legacy SavedTree to SavedColumn (for VSplit branches).
+fn saved_tree_to_saved_column(tree: &SavedTree) -> SavedColumn {
+    match tree {
+        SavedTree::Leaf { cwd, last_command, custom_title, minimized } => {
+            SavedColumn::Leaf {
+                cwd: cwd.clone(),
+                last_command: last_command.clone(),
+                custom_title: custom_title.clone(),
+                minimized: *minimized,
+            }
+        }
+        SavedTree::HSplit { left, .. } => {
+            // HSplit inside a VSplit: flatten by taking the left side as top
+            // This is a lossy conversion but should be rare
+            log::warn!("HSplit nested inside VSplit during legacy migration — flattening");
+            saved_tree_to_saved_column(left)
+        }
+        SavedTree::VSplit { top, bottom, ratio, custom_ratio, .. } => {
+            SavedColumn::VSplit {
+                top: Box::new(saved_tree_to_saved_column(top)),
+                bottom: Box::new(saved_tree_to_saved_column(bottom)),
+                ratio: *ratio,
+                custom_ratio: *custom_ratio,
+            }
         }
     }
 }
 
 /// Restore a single saved tab. Used by recent projects and session restore.
 pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config) -> Option<Tab> {
-    let (tree, pane_ids) = restore_tree(&saved.tree, cols, rows, config)?;
+    let (columns, column_weights, pane_ids) = if let Some(ref saved_cols) = saved.columns {
+        // New format (v3)
+        let weights = saved.column_weights.clone().unwrap_or_else(|| vec![1.0; saved_cols.len()]);
+        let mut all_ids = Vec::new();
+        let mut cols_vec = Vec::new();
+        for sc in saved_cols {
+            let (col, ids) = restore_column(sc, cols, rows, config)?;
+            cols_vec.push(col);
+            all_ids.extend(ids);
+        }
+        (cols_vec, weights, all_ids)
+    } else if let Some(ref tree) = saved.tree {
+        // Legacy format (v2) — flatten HSplits
+        restore_legacy_tree(tree, cols, rows, config)?
+    } else {
+        log::warn!("SavedTab has neither columns nor tree");
+        return None;
+    };
+
     let focused_pane = if saved.focused_leaf_index < pane_ids.len() {
         pane_ids[saved.focused_leaf_index]
     } else {
@@ -334,7 +454,8 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
     };
     let mut tab = Tab {
         id: alloc_tab_id(),
-        tree,
+        columns,
+        column_weights,
         focused_pane,
         custom_title: saved.custom_title.clone(),
         color: saved.color,
