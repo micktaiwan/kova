@@ -3053,7 +3053,7 @@ impl KovaView {
             if tabs.is_empty() {
                 return false;
             }
-            let tab = &tabs[active_idx];
+            let tab = &mut tabs[active_idx];
             let focused_id = tab.focused_pane;
 
             let mut pane_data: Vec<crate::renderer::PaneRenderData> = Vec::new();
@@ -3098,6 +3098,19 @@ impl KovaView {
                     input_chars: pane.pty.input_chars.clone(),
                 });
             });
+
+            // Propagate OSC 1 sticky titles to pane custom_title
+            for entry in &mut pane_data {
+                let has_osc1 = entry.terminal.read().osc1_title.is_some();
+                if has_osc1 {
+                    let sticky = entry.terminal.write().osc1_title.take().unwrap();
+                    let title = if sticky.is_empty() { None } else { Some(sticky) };
+                    if let Some(pane) = tab.pane_mut(entry.pane_id) {
+                        pane.custom_title = title.clone();
+                    }
+                    entry.custom_title = title;
+                }
+            }
 
             // Override custom_title for focused pane when rename_pane is active
             {
