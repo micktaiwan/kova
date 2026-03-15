@@ -502,15 +502,12 @@ impl TerminalState {
     fn push_to_scrollback(&mut self, mut row: Row) {
         row.trim_trailing_blanks(self.default_fg, self.default_bg);
         self.scrollback.push_back(row);
-        if self.scroll_offset > 0 {
-            self.scroll_offset += 1;
-        }
         if self.scrollback.len() > self.scrollback_limit {
+            // Buffer full: 1 in, 1 out — net zero, viewport stays put.
             self.scrollback.pop_front();
-            let max = self.scrollback.len() as i32;
-            if self.scroll_offset > max {
-                self.scroll_offset = max;
-            }
+        } else if self.scroll_offset > 0 {
+            // Buffer still growing: shift viewport to keep the same content visible.
+            self.scroll_offset += 1;
         }
     }
 
