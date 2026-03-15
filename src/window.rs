@@ -530,7 +530,7 @@ define_class!(
                     Action::RenamePane => self.start_rename_pane(),
                     Action::DetachTab => self.do_detach_tab(),
                     Action::BreakPane => self.do_break_pane(),
-                    Action::MergeWindow => self.do_detach_tab(),
+
                     Action::SwitchTab(idx) => self.do_switch_tab(*idx),
                     Action::MinimizePane => self.do_minimize_pane(),
                     Action::RestoreLastMinimized => self.do_restore_last_minimized(),
@@ -2488,7 +2488,7 @@ impl KovaView {
         tabs.iter().map(|t| t.title()).collect()
     }
 
-    /// Append external tabs (used by merge window).
+    /// Append external tabs (used by send-tab-to-window).
     pub fn append_tabs(&self, new_tabs: Vec<crate::pane::Tab>) {
         let mut tabs = self.ivars().tabs.borrow_mut();
         let first_new = tabs.len();

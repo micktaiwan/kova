@@ -47,7 +47,7 @@ pub enum Action {
     RenamePane,
     DetachTab,
     BreakPane,
-    MergeWindow,
+
     SwitchTab(usize),
     Navigate(NavDirection),
     SwapPane(NavDirection),
@@ -208,7 +208,7 @@ impl Keybindings {
         bind(&keys.rename_pane, Action::RenamePane);
         bind(&keys.detach_tab, Action::DetachTab);
         bind(&keys.break_pane, Action::BreakPane);
-        bind(&keys.merge_window, Action::MergeWindow);
+
 
         for (i, s) in [
             &keys.switch_tab_1, &keys.switch_tab_2, &keys.switch_tab_3,

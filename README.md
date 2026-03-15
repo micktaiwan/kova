@@ -95,7 +95,7 @@ min_width = 300.0  # minimum pane width in points before horizontal scroll activ
 | Cmd+Option+R | Rename pane |
 | Cmd+Shift+T | Detach tab to new window |
 | Cmd+Ctrl+T | Break pane out to new tab |
-| Cmd+Shift+M | Merge window into another |
+
 | Cmd+M | Minimize pane |
 | Cmd+Option+M | Restore last minimized pane |
 | Cmd+F | Search scrollback |
