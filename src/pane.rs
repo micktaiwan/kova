@@ -801,7 +801,13 @@ impl Tab {
         false
     }
 
-    /// Fallback: adjust nearest column weight (non-directional).
+    /// Fallback: push the nearest separator in the arrow direction.
+    ///
+    /// Semantics: "move the separator", NOT "grow the focused pane".
+    /// Example: focused is rightmost column, user presses →.
+    /// Directional fails (no right neighbor). Nearest finds the left separator
+    /// and pushes it rightward — the left neighbor grows, focused shrinks.
+    /// The separator moves in the direction of the arrow, which is the expected UX.
     fn adjust_column_weight_nearest(&mut self, id: PaneId, delta: f32) -> bool {
         let col_idx = match self.column_index_of(id) {
             Some(i) => i,
@@ -810,9 +816,9 @@ impl Tab {
         if self.columns.len() < 2 { return false; }
 
         let step = delta.abs() * 0.5;
-        // Try both neighbors, pick whichever exists
         if delta > 0.0 {
-            // Right arrow, but no right neighbor — try left
+            // → arrow, no right neighbor: push left separator rightward
+            // (left neighbor grows, focused shrinks)
             if col_idx > 0 {
                 let transfer = (self.column_weights[col_idx - 1] * step).min(self.column_weights[col_idx - 1] * 0.8);
                 if transfer > 0.001 {
@@ -822,7 +828,8 @@ impl Tab {
                 }
             }
         } else {
-            // Left arrow, but no left neighbor — try right
+            // ← arrow, no left neighbor: push right separator leftward
+            // (right neighbor grows, focused shrinks)
             if col_idx + 1 < self.columns.len() {
                 let transfer = (self.column_weights[col_idx + 1] * step).min(self.column_weights[col_idx + 1] * 0.8);
                 if transfer > 0.001 {
