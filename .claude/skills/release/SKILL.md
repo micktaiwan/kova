@@ -47,7 +47,7 @@ Argument: `$ARGUMENTS` must be one of `major`, `minor`, or `patch`. If missing o
     ```
     Keep it concise (1-5 bullet points).
 
-11. **Commit all modified files** (not just version files — include everything changed by previous steps).
+11. **Commit all modified files** — specifically `Cargo.toml`, `Cargo.lock`, and `Info.plist` (plus anything else changed by previous steps). Use `git add` with explicit file names, then verify with `git status` that `Cargo.lock` is staged before committing.
 
 12. **Tag** as `vX.Y.Z`.
 
