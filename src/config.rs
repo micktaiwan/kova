@@ -237,6 +237,7 @@ pub struct KeysConfig {
     pub rename_pane: String,
     pub detach_tab: String,
     pub break_pane: String,
+    pub merge_tab: String,
 
     pub switch_tab_1: String,
     pub switch_tab_2: String,
@@ -297,6 +298,7 @@ impl Default for KeysConfig {
             rename_pane: "cmd+option+r".into(),
             detach_tab: "cmd+shift+t".into(),
             break_pane: "cmd+ctrl+t".into(),
+            merge_tab: "cmd+ctrl+m".into(),
 
             switch_tab_1: "cmd+1".into(),
             switch_tab_2: "cmd+2".into(),

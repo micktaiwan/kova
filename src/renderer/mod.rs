@@ -118,10 +118,14 @@ pub struct RecentProjectsRenderData<'a> {
     pub scroll: usize,
 }
 
-/// Data passed to the renderer for drawing "Send Tab to Window" overlay.
+/// Data passed to the renderer for drawing a list-selection overlay
+/// (used by "Send Tab to Window" and "Merge Tab").
 pub struct SendToWindowRenderData<'a> {
+    pub title: &'a str,
     pub entries: &'a [String],
     pub selected: usize,
+    /// Whether the last entry is a special "New Window" option (gets a distinct color).
+    pub has_new_entry: bool,
 }
 
 /// Per-pane data passed from window to renderer.
@@ -1640,6 +1644,7 @@ impl Renderer {
                 ("Rename Pane", &keys_config.rename_pane),
                 ("Detach Tab", &keys_config.detach_tab),
                 ("Break Pane", &keys_config.break_pane),
+                ("Merge Tab", &keys_config.merge_tab),
 
                 ("Navigate", &keys_config.navigate_up),
                 ("Swap Pane", &keys_config.swap_up),
@@ -1648,6 +1653,8 @@ impl Renderer {
                 ("Edge Grow", &keys_config.edge_grow_right),
                 ("Minimize Pane", &keys_config.minimize_pane),
                 ("Restore Minimized", &keys_config.restore_minimized),
+                ("Equalize", &keys_config.equalize),
+                ("Kill Window", &keys_config.kill_window),
                 ("Help", &keys_config.toggle_help),
             ];
             self.cached_help_shortcuts = raw.into_iter()
@@ -1701,6 +1708,7 @@ impl Renderer {
         let title_fg = [1.0, 0.85, 0.3, 1.0];
         let label_fg = [0.8, 0.85, 0.9, 1.0];
         let dim_fg = [0.55, 0.6, 0.65, 1.0];
+        let estimated_fg = [0.9, 0.4, 0.35, 1.0];
 
         // Title — rendered natively at overlay font size, no stretching
         let title = "Memory Report";
@@ -1724,14 +1732,16 @@ impl Renderer {
             if y + overlay_ch > viewport_h - overlay_ch {
                 break;
             }
-            let fg = if line.starts_with("===") || line.starts_with("RSS") {
-                title_fg
+            let (text, fg) = if let Some(stripped) = line.strip_prefix('~') {
+                (stripped, estimated_fg)
+            } else if line.starts_with("===") || line.starts_with("RSS") {
+                (line.as_str(), title_fg)
             } else if line.starts_with("  ") {
-                dim_fg
+                (line.as_str(), dim_fg)
             } else {
-                label_fg
+                (line.as_str(), label_fg)
             };
-            self.render_overlay_text(vertices, line, left_margin, y, viewport_w - overlay_cw, fg, no_bg);
+            self.render_overlay_text(vertices, text, left_margin, y, viewport_w - overlay_cw, fg, no_bg);
             y += overlay_ch * 1.3;
         }
         self.cached_mem_report = report;
@@ -1764,7 +1774,7 @@ impl Renderer {
         let row_height = scaled_cell_h * 1.6;
 
         // Title centered
-        let title = "Send Tab to Window";
+        let title = data.title;
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
         let mut y = cell_h * 3.0;
@@ -1790,8 +1800,8 @@ impl Renderer {
                 Self::push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
             }
 
-            // "New Window" gets a distinct color
-            let is_new_window = i == data.entries.len() - 1;
+            // "New Window" gets a distinct color (only if flagged)
+            let is_new_window = data.has_new_entry && i == data.entries.len() - 1;
             let fg = if is_new_window { new_window_fg } else { label_fg };
             let prefix = if is_new_window { "+ " } else { "" };
             let text = format!("{}{}", prefix, label);

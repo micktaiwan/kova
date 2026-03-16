@@ -92,6 +92,8 @@ pub struct KovaViewIvars {
     scroll_axis_lock: Cell<ScrollAxisLock>,
     /// "Send Tab to Window" overlay state.
     send_to_window: RefCell<Option<SendToWindowState>>,
+    /// "Merge Tab" overlay state.
+    merge_tab: RefCell<Option<MergeTabState>>,
     /// Resize feedback: (mode_name, screen_w, virtual_w, remaining_frames).
     resize_feedback: Cell<Option<ResizeFeedback>>,
     /// Deferred tabs to restore progressively (tab_index, saved_tab_data).
@@ -141,6 +143,17 @@ struct SendToWindowEntry {
     label: String,
     /// Index in app delegate's window list, or None for "New Window".
     window_index: Option<usize>,
+}
+
+struct MergeTabEntry {
+    label: String,
+    /// Tab index in the current window's tab list.
+    tab_index: usize,
+}
+
+struct MergeTabState {
+    entries: Vec<MergeTabEntry>,
+    selected: usize,
 }
 
 struct SendToWindowState {
@@ -304,6 +317,12 @@ define_class!(
             // Send-to-window overlay handles its own keys
             if self.ivars().send_to_window.borrow().is_some() {
                 self.handle_send_to_window_key(event);
+                return;
+            }
+
+            // Merge-tab overlay handles its own keys
+            if self.ivars().merge_tab.borrow().is_some() {
+                self.handle_merge_tab_key(event);
                 return;
             }
 
@@ -529,6 +548,7 @@ define_class!(
                     Action::RenamePane => self.start_rename_pane(),
                     Action::DetachTab => self.do_detach_tab(),
                     Action::BreakPane => self.do_break_pane(),
+                    Action::MergeTab => self.do_merge_tab(),
 
                     Action::SwitchTab(idx) => self.do_switch_tab(*idx),
                     Action::MinimizePane => self.do_minimize_pane(),
@@ -1168,6 +1188,7 @@ impl KovaView {
             show_mem_report: Cell::new(false),
             recent_projects: RefCell::new(None),
             send_to_window: RefCell::new(None),
+            merge_tab: RefCell::new(None),
             help_hint_frames: Cell::new(180), // updated in setup_metal
             scroll_axis_lock: Cell::new(ScrollAxisLock::None),
             resize_feedback: Cell::new(None),
@@ -1247,7 +1268,7 @@ impl KovaView {
         let mut report = Vec::new();
         report.push(format!("RSS: {:.1} MB  |  Panes: {}", rss_mb, total_panes));
         report.push(format!(
-            "Terminal: {:.1} MB (grid {:.1} KB, scrollback {:.1} MB [{} lines], alt {:.1} KB)",
+            "~Terminal: {:.1} MB (grid {:.1} KB, scrollback {:.1} MB [{} lines], alt {:.1} KB)",
             total_terminal as f64 / (1024.0 * 1024.0),
             total_grid_bytes as f64 / 1024.0,
             total_sb_bytes as f64 / (1024.0 * 1024.0),
@@ -1255,14 +1276,15 @@ impl KovaView {
             total_alt_bytes as f64 / 1024.0,
         ));
         report.push(format!(
-            "Renderer: {:.1} MB total",
+            "~Renderer: {:.1} MB total",
             total_renderer_bytes as f64 / (1024.0 * 1024.0),
         ));
         for rd in &renderer_details {
-            report.push(rd.clone());
+            report.push(format!("~{}", rd));
         }
         let accounted = total_terminal as f64 / (1024.0 * 1024.0) + total_renderer_bytes as f64 / (1024.0 * 1024.0);
-        report.push(format!("Unaccounted: {:.1} MB (system/Metal drawables/AppKit)", rss_mb - accounted));
+        report.push(format!("~Unaccounted: {:.1} MB (system/Metal drawables/AppKit)", rss_mb - accounted));
+        report.push(String::from("~(~ = estimated, may differ from RSS)"));
         report.push(String::new());
         for detail in &pane_details {
             report.push(detail.clone());
@@ -2528,6 +2550,129 @@ impl KovaView {
         }
     }
 
+    /// Merge the current tab into another tab (show overlay to pick target).
+    /// No-op if there's only one tab.
+    fn do_merge_tab(&self) {
+        let tabs = self.ivars().tabs.borrow();
+        if tabs.len() <= 1 {
+            log::debug!("do_merge_tab: only one tab, ignoring");
+            return;
+        }
+        let active = self.ivars().active_tab.get();
+        let entries: Vec<MergeTabEntry> = tabs.iter().enumerate()
+            .filter(|(i, _)| *i != active)
+            .map(|(i, t)| MergeTabEntry {
+                label: t.title(),
+                tab_index: i,
+            })
+            .collect();
+        drop(tabs);
+
+        if entries.len() == 1 {
+            // Only one possible target — merge directly
+            let target = entries[0].tab_index;
+            self.merge_active_tab_into(target);
+        } else {
+            *self.ivars().merge_tab.borrow_mut() = Some(MergeTabState {
+                entries,
+                selected: 0,
+            });
+            self.mark_dirty();
+        }
+    }
+
+    /// Handle key events in the "Merge Tab" overlay.
+    fn handle_merge_tab_key(&self, event: &NSEvent) {
+        let keycode = event.keyCode();
+
+        // Escape → close
+        if keycode == 0x35 {
+            *self.ivars().merge_tab.borrow_mut() = None;
+            self.mark_dirty();
+            return;
+        }
+
+        // Enter → confirm selection
+        if keycode == 0x24 {
+            let target = {
+                let state = self.ivars().merge_tab.borrow();
+                state.as_ref().map(|s| s.entries[s.selected].tab_index)
+            };
+            if let Some(target_idx) = target {
+                *self.ivars().merge_tab.borrow_mut() = None;
+                self.merge_active_tab_into(target_idx);
+            }
+            return;
+        }
+
+        // Arrow keys
+        {
+            let mut guard = self.ivars().merge_tab.borrow_mut();
+            let state = match guard.as_mut() {
+                Some(s) => s,
+                None => return,
+            };
+            match keycode {
+                0x7E => { // Up
+                    if state.selected > 0 {
+                        state.selected -= 1;
+                    }
+                }
+                0x7D => { // Down
+                    if state.selected + 1 < state.entries.len() {
+                        state.selected += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.mark_dirty();
+    }
+
+    /// Merge the active tab's columns into the target tab (appended to the right).
+    /// The active tab is removed. Focus moves to the leftmost pane of the merged columns.
+    fn merge_active_tab_into(&self, target_idx: usize) {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let active = self.ivars().active_tab.get();
+        if active >= tabs.len() || target_idx >= tabs.len() || active == target_idx {
+            return;
+        }
+
+        // Remove the source tab first
+        let source = tabs.remove(active);
+
+        // Adjust target index after removal
+        let target = if target_idx > active { target_idx - 1 } else { target_idx };
+
+        // The leftmost pane in the source becomes the new focus
+        let new_focus = source.columns.first()
+            .and_then(|col| col.panes.first())
+            .map(|p| p.id)
+            .unwrap_or(source.focused_pane);
+
+        // Append source columns to target tab
+        let avg_weight: f32 = tabs[target].column_weights.iter().sum::<f32>()
+            / tabs[target].columns.len() as f32;
+        for (col, weight) in source.columns.into_iter().zip(source.column_weights.into_iter()) {
+            tabs[target].columns.push(col);
+            // Use source weights scaled to target's average
+            tabs[target].column_weights.push(avg_weight * weight);
+            tabs[target].custom_weights.push(false);
+        }
+
+        // Merge minimized stacks
+        tabs[target].minimized_stack.extend(source.minimized_stack);
+
+        // Focus the leftmost pane from the merged columns
+        tabs[target].focused_pane = new_focus;
+
+        // Switch to the target tab
+        self.ivars().active_tab.set(target);
+
+        drop(tabs);
+        self.resize_all_panes();
+    }
+
     /// Get tab titles for this window (used by "Send Tab to Window" overlay).
     pub fn tab_titles(&self) -> Vec<String> {
         let tabs = self.ivars().tabs.borrow();
@@ -3696,17 +3841,33 @@ impl KovaView {
             }
         });
 
-        // Build send-to-window render data if overlay is active
+        // Build list-overlay render data (send-to-window or merge-tab)
         let stw_guard = ivars.send_to_window.borrow();
-        let stw_labels: Vec<String> = stw_guard.as_ref()
-            .map(|state| state.entries.iter().map(|e| e.label.clone()).collect())
-            .unwrap_or_default();
-        let stw_data = stw_guard.as_ref().map(|state| {
-            crate::renderer::SendToWindowRenderData {
-                entries: &stw_labels,
+        let mt_guard = ivars.merge_tab.borrow();
+        let overlay_labels: Vec<String> = if stw_guard.is_some() {
+            stw_guard.as_ref().unwrap().entries.iter().map(|e| e.label.clone()).collect()
+        } else if mt_guard.is_some() {
+            mt_guard.as_ref().unwrap().entries.iter().map(|e| e.label.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let stw_data = if let Some(state) = stw_guard.as_ref() {
+            Some(crate::renderer::SendToWindowRenderData {
+                title: "Send Tab to Window",
+                entries: &overlay_labels,
                 selected: state.selected,
-            }
-        });
+                has_new_entry: state.entries.last().map_or(false, |e| e.window_index.is_none()),
+            })
+        } else if let Some(state) = mt_guard.as_ref() {
+            Some(crate::renderer::SendToWindowRenderData {
+                title: "Merge Tab Into",
+                entries: &overlay_labels,
+                selected: state.selected,
+                has_new_entry: false,
+            })
+        } else {
+            None
+        };
 
         // Update resize feedback (decrement frames, build text)
         if let Some(mut fb) = ivars.resize_feedback.get() {
