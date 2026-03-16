@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::config::Config;
-use crate::pane::{alloc_tab_id, ColumnTree, Pane, PaneId, Tab};
+use crate::pane::{alloc_tab_id, Column, Pane, PaneId, Tab};
 
-const SESSION_VERSION: u32 = 3;
+const SESSION_VERSION: u32 = 4;
 
 /// Multi-window session format (v3 — flat columns).
 #[derive(Serialize, Deserialize)]
@@ -36,11 +36,16 @@ struct SessionV1 {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SavedTab {
-    /// New format: columns + weights (v3).
+    /// New format (v4): flat columns with pane lists.
+    #[serde(default)]
+    pub flat_columns: Option<Vec<SavedFlatColumn>>,
+    /// Legacy format: columns + weights (v3).
     #[serde(default)]
     pub columns: Option<Vec<SavedColumn>>,
     #[serde(default)]
     pub column_weights: Option<Vec<f32>>,
+    #[serde(default)]
+    pub custom_weights: Option<Vec<bool>>,
     /// Legacy format: single tree (v2).
     #[serde(default)]
     pub tree: Option<SavedTree>,
@@ -53,6 +58,28 @@ pub struct SavedTab {
     pub scroll_offset_x: Option<f32>,
 }
 
+/// Flat column format (v4): a column is a list of panes with row weights.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SavedFlatColumn {
+    pub panes: Vec<SavedPane>,
+    pub row_weights: Vec<f32>,
+    #[serde(default)]
+    pub custom_row_weights: Option<Vec<bool>>,
+}
+
+/// A single pane in the flat format.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SavedPane {
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub last_command: Option<String>,
+    #[serde(default)]
+    pub custom_title: Option<String>,
+    #[serde(default)]
+    pub minimized: bool,
+}
+
+/// Legacy column format (v3) — kept for backward compat reading.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SavedColumn {
@@ -100,58 +127,46 @@ fn session_path() -> PathBuf {
 // Snapshot (save)
 // ---------------------------------------------------------------
 
-fn snapshot_column(col: &ColumnTree) -> SavedColumn {
-    match col {
-        ColumnTree::Leaf(pane) => SavedColumn::Leaf {
-            cwd: pane.cwd(),
-            last_command: pane.last_command(),
-            custom_title: pane.custom_title.clone(),
-            minimized: pane.minimized,
-        },
-        ColumnTree::VSplit { top, bottom, ratio, custom_ratio } => SavedColumn::VSplit {
-            top: Box::new(snapshot_column(top)),
-            bottom: Box::new(snapshot_column(bottom)),
-            ratio: *ratio,
-            custom_ratio: *custom_ratio,
+fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
+    SavedFlatColumn {
+        panes: col.panes.iter().map(|p| SavedPane {
+            cwd: p.cwd(),
+            last_command: p.last_command(),
+            custom_title: p.custom_title.clone(),
+            minimized: p.minimized,
+        }).collect(),
+        row_weights: col.row_weights.clone(),
+        custom_row_weights: if col.custom_row_weights.iter().any(|&cw| cw) {
+            Some(col.custom_row_weights.clone())
+        } else {
+            None
         },
     }
 }
 
-/// Find the depth-first leaf index of a pane by id across all columns.
+/// Find the flat leaf index of a pane by id across all columns.
 fn leaf_index_of_tab(tab: &Tab) -> usize {
     let mut idx = 0;
     let target = tab.focused_pane;
-    let mut found = None;
     for col in &tab.columns {
-        leaf_index_walk(col, target, &mut idx, &mut found);
-        if found.is_some() { break; }
-    }
-    found.unwrap_or(0)
-}
-
-fn leaf_index_walk(col: &ColumnTree, target: PaneId, idx: &mut usize, found: &mut Option<usize>) {
-    match col {
-        ColumnTree::Leaf(p) => {
-            if p.id == target {
-                *found = Some(*idx);
+        for pane in &col.panes {
+            if pane.id == target {
+                return idx;
             }
-            *idx += 1;
-        }
-        ColumnTree::VSplit { top, bottom, .. } => {
-            leaf_index_walk(top, target, idx, found);
-            if found.is_none() {
-                leaf_index_walk(bottom, target, idx, found);
-            }
+            idx += 1;
         }
     }
+    0
 }
 
 /// Snapshot a single tab into a SavedTab (public for recent_projects).
 pub fn snapshot_tab(tab: &Tab) -> SavedTab {
     let focused_leaf_index = leaf_index_of_tab(tab);
     SavedTab {
-        columns: Some(tab.columns.iter().map(snapshot_column).collect()),
+        flat_columns: Some(tab.columns.iter().map(snapshot_flat_column).collect()),
+        columns: None,
         column_weights: Some(tab.column_weights.clone()),
+        custom_weights: if tab.custom_weights.iter().any(|&cw| cw) { Some(tab.custom_weights.clone()) } else { None },
         tree: None,
         focused_leaf_index,
         custom_title: tab.custom_title.clone(),
@@ -283,9 +298,9 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
     };
     let data = std::fs::read_to_string(&path).ok()?;
 
-    // Try v3 first, then v2, then v1
+    // Try v4/v3 first, then v2, then v1
     let session: Session = if let Ok(s) = serde_json::from_str::<Session>(&data) {
-        if s.version == SESSION_VERSION || s.version == 2 {
+        if s.version == SESSION_VERSION || s.version == 3 || s.version == 2 {
             s
         } else if s.version == 1 {
             log::warn!("Session v1 with windows field, ignoring");
@@ -322,8 +337,55 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 // Restore
 // ---------------------------------------------------------------
 
-/// Restore a saved column tree.
-fn restore_column(saved: &SavedColumn, cols: u16, rows: u16, config: &Config) -> Option<(ColumnTree, Vec<PaneId>)> {
+/// Restore a flat column (v4 format).
+fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &Config) -> Option<(Column, Vec<PaneId>)> {
+    let mut panes = Vec::new();
+    let mut ids = Vec::new();
+    for sp in &saved.panes {
+        let t = std::time::Instant::now();
+        let mut pane = Pane::spawn(cols, rows, config, sp.cwd.as_deref()).ok()?;
+        log::info!("[STARTUP] Pane::spawn id={} cwd={:?} in {:?}", pane.id, sp.cwd, t.elapsed());
+        let id = pane.id;
+        if let Some(ref cmd) = sp.last_command {
+            pane.pending_command.set(Some(cmd.clone()));
+            pane.terminal.write().last_command = Some(cmd.clone());
+        }
+        pane.custom_title = sp.custom_title.clone();
+        pane.minimized = sp.minimized;
+        panes.push(pane);
+        ids.push(id);
+    }
+    if panes.is_empty() { return None; }
+    let row_weights = saved.row_weights.clone();
+    let custom_row_weights = saved.custom_row_weights.clone().unwrap_or_else(|| vec![false; panes.len()]);
+    Some((Column { panes, row_weights, custom_row_weights }, ids))
+}
+
+/// Restore a saved column tree (v3 legacy format) into a flat Column.
+fn restore_column(saved: &SavedColumn, cols: u16, rows: u16, config: &Config) -> Option<(Column, Vec<PaneId>)> {
+    // Flatten the tree into a flat column by collecting all leaves depth-first,
+    // converting ratios to weights.
+    let mut panes = Vec::new();
+    let mut weights = Vec::new();
+    let mut ids = Vec::new();
+    flatten_saved_column(saved, 1.0, cols, rows, config, &mut panes, &mut weights, &mut ids)?;
+    if panes.is_empty() { return None; }
+    let custom_row_weights = vec![false; panes.len()];
+    Some((Column { panes, row_weights: weights, custom_row_weights }, ids))
+}
+
+/// Recursively flatten a SavedColumn tree into panes + weights.
+/// `weight_share` is this node's share of the parent's height.
+fn flatten_saved_column(
+    saved: &SavedColumn,
+    weight_share: f32,
+    cols: u16,
+    rows: u16,
+    config: &Config,
+    panes: &mut Vec<Pane>,
+    weights: &mut Vec<f32>,
+    ids: &mut Vec<PaneId>,
+) -> Option<()> {
     match saved {
         SavedColumn::Leaf { cwd, last_command, custom_title, minimized } => {
             let t = std::time::Instant::now();
@@ -336,24 +398,21 @@ fn restore_column(saved: &SavedColumn, cols: u16, rows: u16, config: &Config) ->
             }
             pane.custom_title = custom_title.clone();
             pane.minimized = *minimized;
-            Some((ColumnTree::Leaf(pane), vec![id]))
+            panes.push(pane);
+            weights.push(weight_share);
+            ids.push(id);
+            Some(())
         }
-        SavedColumn::VSplit { top, bottom, ratio, custom_ratio } => {
-            let (top_tree, mut top_ids) = restore_column(top, cols, rows, config)?;
-            let (bot_tree, bot_ids) = restore_column(bottom, cols, rows, config)?;
-            top_ids.extend(bot_ids);
-            Some((ColumnTree::VSplit {
-                top: Box::new(top_tree),
-                bottom: Box::new(bot_tree),
-                ratio: *ratio,
-                custom_ratio: *custom_ratio,
-            }, top_ids))
+        SavedColumn::VSplit { top, bottom, ratio, .. } => {
+            flatten_saved_column(top, weight_share * ratio, cols, rows, config, panes, weights, ids)?;
+            flatten_saved_column(bottom, weight_share * (1.0 - ratio), cols, rows, config, panes, weights, ids)?;
+            Some(())
         }
     }
 }
 
 /// Restore from legacy SavedTree format, flattening HSplits into columns.
-fn restore_legacy_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Option<(Vec<ColumnTree>, Vec<f32>, Vec<PaneId>)> {
+fn restore_legacy_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Option<(Vec<Column>, Vec<f32>, Vec<PaneId>)> {
     match saved {
         SavedTree::Leaf { cwd, last_command, custom_title, minimized } => {
             let mut pane = Pane::spawn(cols, rows, config, cwd.as_deref()).ok()?;
@@ -364,7 +423,7 @@ fn restore_legacy_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config)
             }
             pane.custom_title = custom_title.clone();
             pane.minimized = *minimized;
-            Some((vec![ColumnTree::Leaf(pane)], vec![1.0], vec![id]))
+            Some((vec![Column::new(pane)], vec![1.0], vec![id]))
         }
         SavedTree::HSplit { left, right, ratio, .. } => {
             let (mut left_cols, mut left_weights, mut left_ids) = restore_legacy_tree(left, cols, rows, config)?;
@@ -389,7 +448,7 @@ fn restore_legacy_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config)
             Some((left_cols, left_weights, left_ids))
         }
         SavedTree::VSplit { top, bottom, ratio, custom_ratio, .. } => {
-            // VSplit within a column — restore as a single column with VSplit
+            // VSplit within a column — restore as a single flat column
             let saved_col = SavedColumn::VSplit {
                 top: Box::new(saved_tree_to_saved_column(top)),
                 bottom: Box::new(saved_tree_to_saved_column(bottom)),
@@ -440,7 +499,9 @@ fn count_panes_in_saved_column(col: &SavedColumn) -> usize {
 }
 
 pub fn count_panes_in_saved_tab(tab: &SavedTab) -> usize {
-    if let Some(ref cols) = tab.columns {
+    if let Some(ref flat_cols) = tab.flat_columns {
+        flat_cols.iter().map(|c| c.panes.len()).sum()
+    } else if let Some(ref cols) = tab.columns {
         cols.iter().map(count_panes_in_saved_column).sum()
     } else {
         1 // legacy format, approximate
@@ -449,9 +510,22 @@ pub fn count_panes_in_saved_tab(tab: &SavedTab) -> usize {
 
 /// Restore a single saved tab. Used by recent projects and session restore.
 pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config) -> Option<Tab> {
-    let (columns, column_weights, pane_ids) = if let Some(ref saved_cols) = saved.columns {
-        // New format (v3)
+    let (columns, column_weights, custom_weights, pane_ids) = if let Some(ref flat_cols) = saved.flat_columns {
+        // New flat format (v4)
+        let weights = saved.column_weights.clone().unwrap_or_else(|| vec![1.0; flat_cols.len()]);
+        let cweights = saved.custom_weights.clone().unwrap_or_else(|| vec![false; flat_cols.len()]);
+        let mut all_ids = Vec::new();
+        let mut cols_vec = Vec::new();
+        for fc in flat_cols {
+            let (col, ids) = restore_flat_column(fc, cols, rows, config)?;
+            cols_vec.push(col);
+            all_ids.extend(ids);
+        }
+        (cols_vec, weights, cweights, all_ids)
+    } else if let Some(ref saved_cols) = saved.columns {
+        // Legacy format (v3) — flatten SavedColumn trees into flat Columns
         let weights = saved.column_weights.clone().unwrap_or_else(|| vec![1.0; saved_cols.len()]);
+        let cweights = saved.custom_weights.clone().unwrap_or_else(|| vec![false; saved_cols.len()]);
         let mut all_ids = Vec::new();
         let mut cols_vec = Vec::new();
         for sc in saved_cols {
@@ -459,12 +533,14 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
             cols_vec.push(col);
             all_ids.extend(ids);
         }
-        (cols_vec, weights, all_ids)
+        (cols_vec, weights, cweights, all_ids)
     } else if let Some(ref tree) = saved.tree {
         // Legacy format (v2) — flatten HSplits
-        restore_legacy_tree(tree, cols, rows, config)?
+        let (cols_vec, weights, ids) = restore_legacy_tree(tree, cols, rows, config)?;
+        let cweights = vec![false; cols_vec.len()];
+        (cols_vec, weights, cweights, ids)
     } else {
-        log::warn!("SavedTab has neither columns nor tree");
+        log::warn!("SavedTab has neither flat_columns, columns, nor tree");
         return None;
     };
 
@@ -477,6 +553,7 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         id: alloc_tab_id(),
         columns,
         column_weights,
+        custom_weights,
         focused_pane,
         custom_title: saved.custom_title.clone(),
         color: saved.color,
@@ -485,6 +562,7 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         minimized_stack: Vec::new(),
         scroll_offset_x: saved.scroll_offset_x.unwrap_or(0.0),
         virtual_width_override: saved.virtual_width_override.unwrap_or(0.0),
+        cell_h: std::cell::Cell::new(0.0),
     };
     tab.rebuild_minimized_stack();
     Some(tab)
