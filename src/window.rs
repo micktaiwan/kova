@@ -17,7 +17,6 @@ use crate::terminal::{FilterMatch, GridPos, Selection, SelectionMode};
 
 #[derive(Clone, Copy)]
 struct SeparatorDrag {
-    is_column_sep: bool,
     origin_pixel: f32,
     parent_dim: f32,
     column_sep_index: Option<usize>,
@@ -1616,7 +1615,6 @@ impl KovaView {
             if sep.is_column_sep {
                 if (px - sep.pos).abs() < tolerance && py >= sep.cross_start && py <= sep.cross_end {
                     return Some(SeparatorDrag {
-                        is_column_sep: true,
                         origin_pixel: px,
                         parent_dim: sep.parent_dim,
                         column_sep_index: sep.column_sep_index,
@@ -1627,7 +1625,6 @@ impl KovaView {
             } else {
                 if (py - sep.pos).abs() < tolerance && px >= sep.cross_start && px <= sep.cross_end {
                     return Some(SeparatorDrag {
-                        is_column_sep: false,
                         origin_pixel: py,
                         parent_dim: sep.parent_dim,
                         column_sep_index: sep.column_sep_index,

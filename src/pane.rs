@@ -1172,10 +1172,6 @@ impl Column {
         self.panes.iter().any(|p| p.id == id)
     }
 
-    pub fn leaf_count(&self) -> usize {
-        self.panes.len()
-    }
-
     /// Find the index of a pane by id.
     pub fn pane_index_of(&self, id: PaneId) -> Option<usize> {
         self.panes.iter().position(|p| p.id == id)
