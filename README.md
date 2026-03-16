@@ -90,11 +90,14 @@ min_width = 300.0  # minimum pane width in points before horizontal scroll activ
 | Cmd+1..9 | Jump to tab |
 | Cmd+Option+Arrows | Navigate between splits (cross-tab) |
 | Cmd+Shift+Arrows | Swap pane with neighbor |
+| Cmd+Ctrl+Shift+Arrows | Reparent pane (move to adjacent column) |
 | Cmd+Ctrl+Arrows | Resize split |
+| Cmd+Ctrl+Option+Left/Right | Edge grow (resize focused pane, adjust virtual width) |
 | Cmd+Shift+R | Rename tab |
 | Cmd+Option+R | Rename pane |
 | Cmd+Shift+T | Detach tab to new window |
 | Cmd+Ctrl+T | Break pane out to new tab |
+| Cmd+Ctrl+M | Merge tab into another tab (as split) |
 | Cmd+N | New window |
 | Cmd+M | Minimize pane |
 | Cmd+Option+M | Restore last minimized pane |
@@ -106,6 +109,10 @@ min_width = 300.0  # minimum pane width in points before horizontal scroll activ
 | Cmd+K | Clear scrollback and screen |
 | Cmd+C | Copy selection |
 | Cmd+V | Paste |
+| Cmd+Q | Close window |
+| Cmd+Option+Q | Kill window (no session save) |
+| Cmd+Shift+/ | Toggle help overlay |
+| Cmd+Shift+I | Memory/perf report |
 
 ## Build
 
