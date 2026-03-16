@@ -1,4 +1,4 @@
-use parking_lot::{RwLock, RwLockWriteGuard};
+use parking_lot::RwLock;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use vte::{Params, Perform};
@@ -25,69 +25,295 @@ pub fn resolve_git_branch(path: &str) -> Option<String> {
     }
 }
 
+/// Buffered terminal operation. Accumulated during VTE parsing (no lock held),
+/// then replayed in a single write lock acquisition.
+enum TermOp {
+    /// Text to display (grapheme clusters from print buffer)
+    Print(String),
+    // Control characters
+    Backspace,
+    Tab,
+    Newline,
+    CarriageReturn,
+    Bell,
+    // Cursor movement
+    CursorUp(u16),
+    CursorDown(u16),
+    CursorForward(u16),
+    CursorBackward(u16),
+    SetCursorPos(u16, u16),
+    /// Cursor Horizontal Absolute — needs cursor_y at replay time
+    SetCursorCol(u16),
+    /// Vertical Position Absolute — needs cursor_x at replay time
+    SetCursorRow(u16),
+    /// Cursor Next Line: down N + CR
+    CursorNextLine(u16),
+    /// Cursor Previous Line: up N + CR
+    CursorPrevLine(u16),
+    SaveCursor,
+    RestoreCursor,
+    // Erasing
+    EraseInDisplay(u16),
+    EraseInLine(u16),
+    EraseChars(u16),
+    // Lines
+    InsertLines(u16),
+    DeleteLines(u16),
+    DeleteChars(u16),
+    InsertChars(u16),
+    // Scroll
+    ScrollUp(u16),
+    ScrollDown(u16),
+    /// top, bottom (None = use term.rows as default)
+    SetScrollRegion(u16, Option<u16>),
+    // Modes
+    /// DEC private mode: (mode_number, on/off)
+    SetDecMode(u16, bool),
+    /// SM/RM non-private mode: (mode_number, on/off)
+    SetMode(u16, bool),
+    // SGR
+    SetSgr(Vec<u16>),
+    // Cursor shape (DECSCUSR param)
+    SetCursorShape(u16),
+    // Screen
+    ReverseIndex,
+    FullReset,
+    // Metadata
+    SetTitle(String),
+    SetOsc1Title(String),
+    /// path, pre-resolved git_branch
+    SetCwd(String, Option<String>),
+    SetLastCommand(String),
+    /// OSC 133;C — command started
+    CommandStarted,
+    /// OSC 133;D — command completed
+    SetCommandCompleted,
+    // Kitty keyboard protocol
+    KittyKeyboardPush(u8),
+    KittyKeyboardPop(u16),
+    // Responses — read state during replay, write to PTY after lock release
+    CursorPositionReport,
+    DeviceAttributes,
+    ReportPrivateMode(u16),
+    KittyKeyboardQuery,
+}
+
 pub struct VteHandler {
-    // IMPORTANT: `pending_guard` MUST be declared before `terminal` so that Rust's
-    // drop order (declaration order) drops the guard before the Arc. This guarantees
-    // the RwLock is still alive when the guard is released.
-    //
-    // SAFETY: self.terminal (Arc) keeps the RwLock alive as long as self lives.
-    // The transmute to 'static is sound because: (1) the Arc is on the same struct,
-    // (2) drop order ensures the guard is released first, (3) VteHandler is !Send
-    // (due to the guard) and lives exclusively on the PTY reader thread.
-    //
-    // WARNING: DO NOT reorder these fields. Moving `terminal` before `pending_guard`
-    // would cause use-after-free (Arc dropped before guard is released).
-    pending_guard: Option<RwLockWriteGuard<'static, TerminalState>>,
     terminal: Arc<RwLock<TerminalState>>,
     pty_writer: Arc<OwnedFd>,
-    /// Buffer for consecutive print() calls. Flushed as grapheme clusters
+    /// Buffer for consecutive print() calls. Flushed as a Print op
     /// before any non-print event.
     print_buf: String,
+    /// Buffered operations — accumulated during parsing, replayed in apply_ops().
+    ops: Vec<TermOp>,
 }
 
 impl VteHandler {
     pub fn new(terminal: Arc<RwLock<TerminalState>>, pty_writer: Arc<OwnedFd>) -> Self {
-        VteHandler { terminal, pty_writer, pending_guard: None, print_buf: String::new() }
-    }
-
-    /// Lazily acquires the write lock on first call, reuses it on subsequent calls.
-    fn term(&mut self) -> &mut TerminalState {
-        if self.pending_guard.is_none() {
-            let guard = self.terminal.write();
-            // SAFETY: self.terminal (Arc) keeps the RwLock alive as long as self lives,
-            // and pending_guard is always dropped before or with self.
-            let guard: RwLockWriteGuard<'static, TerminalState> = unsafe { std::mem::transmute(guard) };
-            self.pending_guard = Some(guard);
+        VteHandler {
+            terminal,
+            pty_writer,
+            print_buf: String::new(),
+            ops: Vec::with_capacity(256),
         }
-        self.pending_guard.as_mut().unwrap()
     }
 
-    /// Releases the write lock (if held). Called after parser.advance() and
-    /// before PTY writes that should not hold the lock.
-    pub fn release_guard(&mut self) {
-        self.flush_print_buf();
-        self.pending_guard = None;
-    }
-
-    /// Flush the print buffer: split into grapheme clusters and write each.
+    /// Flush the print buffer into a Print op.
     fn flush_print_buf(&mut self) {
-        if self.print_buf.is_empty() {
-            return;
+        if !self.print_buf.is_empty() {
+            let buf = std::mem::take(&mut self.print_buf);
+            self.ops.push(TermOp::Print(buf));
         }
-        use unicode_segmentation::UnicodeSegmentation;
-        // Take ownership to avoid borrow issues
-        let buf = std::mem::take(&mut self.print_buf);
-        let char_count = buf.chars().count() as u64;
-        let term = self.term();
-        for cluster in buf.graphemes(true) {
-            term.put_cluster(cluster);
-        }
-        term.printable_chars.fetch_add(char_count, std::sync::atomic::Ordering::Relaxed);
-        super::pty::GLOBAL_PRINTABLE_CHARS.fetch_add(char_count, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn write_to_pty(&self, data: &[u8]) {
         let _ = rustix::io::write(&*self.pty_writer, data);
+    }
+
+    /// Take the write lock once, replay all buffered ops, release the lock,
+    /// then write any PTY responses.
+    pub fn apply_ops(&mut self) {
+        self.flush_print_buf();
+        if self.ops.is_empty() {
+            return;
+        }
+
+        // Collect PTY responses to write after releasing the lock
+        let mut pty_responses: Vec<Vec<u8>> = Vec::new();
+
+        {
+            let mut term = self.terminal.write();
+            for op in self.ops.drain(..) {
+                match op {
+                    TermOp::Print(buf) => {
+                        use unicode_segmentation::UnicodeSegmentation;
+                        let char_count = buf.chars().count() as u64;
+                        for cluster in buf.graphemes(true) {
+                            term.put_cluster(cluster);
+                        }
+                        term.printable_chars.fetch_add(char_count, std::sync::atomic::Ordering::Relaxed);
+                        super::pty::GLOBAL_PRINTABLE_CHARS.fetch_add(char_count, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    TermOp::Backspace => term.backspace(),
+                    TermOp::Tab => term.tab(),
+                    TermOp::Newline => term.newline(),
+                    TermOp::CarriageReturn => term.carriage_return(),
+                    TermOp::Bell => {
+                        term.bell.store(true, std::sync::atomic::Ordering::Relaxed);
+                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    TermOp::CursorUp(n) => term.cursor_up(n),
+                    TermOp::CursorDown(n) => term.cursor_down(n),
+                    TermOp::CursorForward(n) => term.cursor_forward(n),
+                    TermOp::CursorBackward(n) => term.cursor_backward(n),
+                    TermOp::SetCursorPos(row, col) => term.set_cursor_pos(row, col),
+                    TermOp::SetCursorCol(col) => {
+                        let row = term.cursor_y;
+                        term.set_cursor_pos(row, col);
+                    }
+                    TermOp::SetCursorRow(row) => {
+                        let col = term.cursor_x;
+                        term.set_cursor_pos(row, col);
+                    }
+                    TermOp::CursorNextLine(n) => {
+                        term.cursor_down(n);
+                        term.carriage_return();
+                    }
+                    TermOp::CursorPrevLine(n) => {
+                        term.cursor_up(n);
+                        term.carriage_return();
+                    }
+                    TermOp::SaveCursor => term.save_cursor(),
+                    TermOp::RestoreCursor => term.restore_cursor(),
+                    TermOp::EraseInDisplay(mode) => term.erase_in_display(mode),
+                    TermOp::EraseInLine(mode) => term.erase_in_line(mode),
+                    TermOp::EraseChars(n) => term.erase_chars(n),
+                    TermOp::InsertLines(n) => term.insert_lines(n),
+                    TermOp::DeleteLines(n) => term.delete_lines(n),
+                    TermOp::DeleteChars(n) => term.delete_chars(n),
+                    TermOp::InsertChars(n) => term.insert_chars(n),
+                    TermOp::ScrollUp(n) => term.scroll_up_region(n),
+                    TermOp::ScrollDown(n) => term.scroll_down_region(n),
+                    TermOp::SetScrollRegion(top, bottom) => {
+                        let bottom = bottom.unwrap_or(term.rows.saturating_sub(1));
+                        term.set_scroll_region(top, bottom);
+                    }
+                    TermOp::SetDecMode(mode, on) => {
+                        match mode {
+                            1 => term.cursor_keys_application = on,
+                            7 => term.auto_wrap = on,
+                            12 => {} // Cursor blink — ignored
+                            25 => {
+                                term.cursor_visible = on;
+                                term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            1049 => {
+                                if on { term.enter_alt_screen(); } else { term.leave_alt_screen(); }
+                            }
+                            1004 => term.focus_reporting = on,
+                            2004 => term.bracketed_paste = on,
+                            2026 => {
+                                if on {
+                                    term.synchronized_output = true;
+                                    term.sync_output_since = Some(std::time::Instant::now());
+                                } else {
+                                    term.synchronized_output = false;
+                                    term.sync_output_since = None;
+                                    term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            _ => log::debug!("unhandled DEC mode: {}", mode),
+                        }
+                    }
+                    TermOp::SetMode(mode, on) => {
+                        match mode {
+                            4 => term.insert_mode = on,
+                            _ => log::debug!("unhandled SM/RM mode: {}", mode),
+                        }
+                    }
+                    TermOp::SetSgr(params) => term.set_sgr(&params),
+                    TermOp::SetCursorShape(ps) => {
+                        term.cursor_shape = match ps {
+                            0 | 1 | 2 => CursorShape::Block,
+                            3 | 4 => CursorShape::Underline,
+                            5 | 6 => CursorShape::Bar,
+                            _ => CursorShape::Block,
+                        };
+                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    TermOp::ReverseIndex => term.reverse_index(),
+                    TermOp::FullReset => {
+                        let cols = term.cols;
+                        let rows = term.rows;
+                        let scrollback_limit = term.scrollback_limit;
+                        let fg = term.default_fg;
+                        let bg = term.default_bg;
+                        *term = TerminalState::new(cols, rows, scrollback_limit, fg, bg);
+                    }
+                    TermOp::SetTitle(title) => {
+                        term.title = Some(title);
+                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    TermOp::SetOsc1Title(title) => {
+                        term.osc1_title = Some(title);
+                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    TermOp::SetCwd(path, git_branch) => {
+                        term.cwd = Some(path);
+                        term.git_branch = git_branch;
+                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    TermOp::SetLastCommand(cmd) => {
+                        term.last_command = Some(cmd);
+                    }
+                    TermOp::CommandStarted => {
+                        term.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    TermOp::SetCommandCompleted => {
+                        term.command_completed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    TermOp::KittyKeyboardPush(flags) => {
+                        term.kitty_keyboard_flags.push(flags);
+                    }
+                    TermOp::KittyKeyboardPop(n) => {
+                        for _ in 0..n {
+                            term.kitty_keyboard_flags.pop();
+                        }
+                    }
+                    // --- Responses: read current state, buffer PTY write ---
+                    TermOp::CursorPositionReport => {
+                        let row = term.cursor_y + 1;
+                        let col = term.cursor_x + 1;
+                        pty_responses.push(format!("\x1b[{};{}R", row, col).into_bytes());
+                    }
+                    TermOp::DeviceAttributes => {
+                        pty_responses.push(b"\x1b[?62;22c".to_vec());
+                    }
+                    TermOp::ReportPrivateMode(mode) => {
+                        let value = match mode {
+                            1 => if term.cursor_keys_application { 1 } else { 2 },
+                            7 => if term.auto_wrap { 1 } else { 2 },
+                            25 => if term.cursor_visible { 1 } else { 2 },
+                            1004 => if term.focus_reporting { 1 } else { 2 },
+                            1049 => if term.in_alt_screen { 1 } else { 2 },
+                            2004 => if term.bracketed_paste { 1 } else { 2 },
+                            2026 => if term.synchronized_output { 1 } else { 2 },
+                            _ => 0,
+                        };
+                        pty_responses.push(format!("\x1b[?{};{}$y", mode, value).into_bytes());
+                    }
+                    TermOp::KittyKeyboardQuery => {
+                        let flags = term.kitty_flags();
+                        pty_responses.push(format!("\x1b[?{}u", flags).into_bytes());
+                    }
+                }
+            }
+        }
+        // Write lock released — now send PTY responses without holding any lock
+        for response in &pty_responses {
+            self.write_to_pty(response);
+        }
     }
 }
 
@@ -99,16 +325,13 @@ impl Perform for VteHandler {
     fn execute(&mut self, byte: u8) {
         self.flush_print_buf();
         match byte {
-            0x08 => self.term().backspace(),        // BS
-            0x09 => self.term().tab(),              // HT
-            0x0A | 0x0B | 0x0C => {                 // LF, VT, FF
-                self.term().newline();
-            }
-            0x0D => self.term().carriage_return(),  // CR
-            0x07 => {                               // BEL
+            0x08 => self.ops.push(TermOp::Backspace),        // BS
+            0x09 => self.ops.push(TermOp::Tab),              // HT
+            0x0A | 0x0B | 0x0C => self.ops.push(TermOp::Newline), // LF, VT, FF
+            0x0D => self.ops.push(TermOp::CarriageReturn),   // CR
+            0x07 => {                                         // BEL
                 log::trace!("BEL received");
-                self.term().bell.store(true, std::sync::atomic::Ordering::Relaxed);
-                self.term().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.ops.push(TermOp::Bell);
             }
             _ => log::debug!("unhandled execute: byte=0x{:02X}", byte),
         }
@@ -129,65 +352,48 @@ impl Perform for VteHandler {
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         self.flush_print_buf();
-        // Handle OSC sequences (window title, etc.)
         if params.len() >= 2 {
             match params[0] {
                 b"0" | b"2" => {
                     let title = String::from_utf8_lossy(params[1]).into_owned();
                     log::trace!("OSC title: {}", title);
-                    let term = self.term();
-                    term.title = Some(title);
-                    term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.ops.push(TermOp::SetTitle(title));
                 }
                 b"1" => {
                     let title = String::from_utf8_lossy(params[1]).into_owned();
                     log::trace!("OSC 1 sticky title: {}", title);
-                    let term = self.term();
-                    term.osc1_title = Some(title);
-                    term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.ops.push(TermOp::SetOsc1Title(title));
                 }
                 b"7" => {
                     // Current working directory: file://hostname/path
                     let uri = String::from_utf8_lossy(params[1]);
                     let path = if let Some(rest) = uri.strip_prefix("file://") {
-                        // Skip hostname (everything up to the next '/')
                         rest.find('/').map(|i| rest[i..].to_string())
                     } else {
                         None
                     };
                     if let Some(path) = path {
-                        // Release lock before filesystem I/O
-                        self.release_guard();
+                        // Filesystem I/O done during parsing — no lock held
                         let git_branch = resolve_git_branch(&path);
-                        let term = self.term();
-                        term.cwd = Some(path);
-                        term.git_branch = git_branch;
-                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.ops.push(TermOp::SetCwd(path, git_branch));
                     }
                 }
                 b"133" => {
-                    // Shell integration: command execution lifecycle (FinalTerm / OSC 133)
                     let sub = params[1];
                     match sub.first() {
-                        Some(b'C') => {
-                            // Command started — clear any previous completion flag
-                            self.term().command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
-                        }
+                        Some(b'C') => self.ops.push(TermOp::CommandStarted),
                         Some(b'D') => {
-                            // Command finished — mark pane as completed
                             log::debug!("OSC 133;D command completed");
-                            self.term().command_completed.store(true, std::sync::atomic::Ordering::Relaxed);
-                            self.term().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.ops.push(TermOp::SetCommandCompleted);
                         }
                         _ => {}
                     }
                 }
                 b"7777" => {
-                    // Shell integration: preexec hook sends the command being executed
                     let command = String::from_utf8_lossy(params[1]).into_owned();
                     if !command.is_empty() {
                         log::debug!("OSC 7777 last_command: {}", command);
-                        self.term().last_command = Some(command);
+                        self.ops.push(TermOp::SetLastCommand(command));
                     }
                 }
                 _ => {
@@ -204,244 +410,135 @@ impl Perform for VteHandler {
 
         match (action, intermediates) {
             ('A', []) => {
-                // Cursor Up
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.term().cursor_up(n);
+                self.ops.push(TermOp::CursorUp(n));
             }
             ('B', []) => {
-                // Cursor Down
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.term().cursor_down(n);
+                self.ops.push(TermOp::CursorDown(n));
             }
             ('C', []) => {
-                // Cursor Forward
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.term().cursor_forward(n);
+                self.ops.push(TermOp::CursorForward(n));
             }
             ('D', []) => {
-                // Cursor Backward
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.term().cursor_backward(n);
+                self.ops.push(TermOp::CursorBackward(n));
             }
             ('E', []) => {
-                // Cursor Next Line
                 let n = params.first().copied().unwrap_or(1).max(1);
-                let term = self.term();
-                term.cursor_down(n);
-                term.carriage_return();
+                self.ops.push(TermOp::CursorNextLine(n));
             }
             ('F', []) => {
-                // Cursor Previous Line
                 let n = params.first().copied().unwrap_or(1).max(1);
-                let term = self.term();
-                term.cursor_up(n);
-                term.carriage_return();
+                self.ops.push(TermOp::CursorPrevLine(n));
             }
             ('G', []) => {
-                // Cursor Horizontal Absolute
                 let col = params.first().copied().unwrap_or(1).max(1) - 1;
-                let term = self.term();
-                let row = term.cursor_y;
-                term.set_cursor_pos(row, col);
+                self.ops.push(TermOp::SetCursorCol(col));
             }
             ('H' | 'f', []) => {
-                // Cursor Position
                 let row = params.first().copied().unwrap_or(1).max(1) - 1;
                 let col = params.get(1).copied().unwrap_or(1).max(1) - 1;
-                self.term().set_cursor_pos(row, col);
+                self.ops.push(TermOp::SetCursorPos(row, col));
             }
             ('J', []) => {
                 let mode = params.first().copied().unwrap_or(0);
-                self.term().erase_in_display(mode);
+                self.ops.push(TermOp::EraseInDisplay(mode));
             }
             ('K', []) => {
                 let mode = params.first().copied().unwrap_or(0);
-                self.term().erase_in_line(mode);
+                self.ops.push(TermOp::EraseInLine(mode));
             }
             ('L', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.term().insert_lines(n);
+                self.ops.push(TermOp::InsertLines(n));
             }
             ('M', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.term().delete_lines(n);
+                self.ops.push(TermOp::DeleteLines(n));
             }
             ('P', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.term().delete_chars(n);
+                self.ops.push(TermOp::DeleteChars(n));
             }
             ('S', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.term().scroll_up_region(n);
+                self.ops.push(TermOp::ScrollUp(n));
             }
             ('T', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.term().scroll_down_region(n);
+                self.ops.push(TermOp::ScrollDown(n));
             }
             ('X', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.term().erase_chars(n);
+                self.ops.push(TermOp::EraseChars(n));
             }
             ('d', []) => {
-                // Vertical Position Absolute
                 let row = params.first().copied().unwrap_or(1).max(1) - 1;
-                let term = self.term();
-                let col = term.cursor_x;
-                term.set_cursor_pos(row, col);
+                self.ops.push(TermOp::SetCursorRow(row));
             }
             ('m', []) => {
                 if params.is_empty() {
-                    self.term().set_sgr(&[0]);
+                    self.ops.push(TermOp::SetSgr(vec![0]));
                 } else {
-                    self.term().set_sgr(&params);
+                    self.ops.push(TermOp::SetSgr(params));
                 }
             }
             ('r', []) => {
-                // Set scroll region
                 let top = params.first().copied().unwrap_or(1).max(1) - 1;
-                let term = self.term();
-                let bottom = params.get(1).copied().unwrap_or(term.rows).max(1) - 1;
-                term.set_scroll_region(top, bottom);
+                let bottom = params.get(1).map(|&b| b.max(1) - 1);
+                self.ops.push(TermOp::SetScrollRegion(top, bottom));
             }
-            ('s', []) => self.term().save_cursor(),
-            ('u', []) => self.term().restore_cursor(),
+            ('s', []) => self.ops.push(TermOp::SaveCursor),
+            ('u', []) => self.ops.push(TermOp::RestoreCursor),
             ('u', [b'>']) => {
-                // Kitty keyboard protocol — push flags
+                // Kitty keyboard protocol — push flags (or query if no params)
                 if params.is_empty() {
-                    // No params with > intermediate → query (some apps send CSI > u)
-                    let flags = self.term().kitty_flags();
-                    self.release_guard();
-                    let response = format!("\x1b[?{}u", flags);
-                    self.write_to_pty(response.as_bytes());
+                    self.ops.push(TermOp::KittyKeyboardQuery);
                 } else {
-                    let flags = params[0] as u8;
-                    self.term().kitty_keyboard_flags.push(flags);
+                    self.ops.push(TermOp::KittyKeyboardPush(params[0] as u8));
                 }
             }
             ('u', [b'<']) => {
-                // Kitty keyboard protocol — pop
-                let n = params.first().copied().unwrap_or(1).max(1) as usize;
-                let stack = &mut self.term().kitty_keyboard_flags;
-                for _ in 0..n {
-                    stack.pop();
-                }
+                let n = params.first().copied().unwrap_or(1).max(1);
+                self.ops.push(TermOp::KittyKeyboardPop(n));
             }
             ('u', [b'?']) => {
-                // Kitty keyboard protocol — query current flags
-                let flags = self.term().kitty_flags();
-                self.release_guard();
-                let response = format!("\x1b[?{}u", flags);
-                self.write_to_pty(response.as_bytes());
+                self.ops.push(TermOp::KittyKeyboardQuery);
             }
             ('h', [b'?']) | ('l', [b'?']) => {
-                // DEC Private Mode Set/Reset
-                let term = self.term();
+                let on = action == 'h';
                 for &p in &params {
-                    match p {
-                        1 => {
-                            term.cursor_keys_application = action == 'h';
-                        }
-                        7 => {
-                            term.auto_wrap = action == 'h';
-                        }
-                        12 => {} // Cursor blink
-                        25 => {
-                            term.cursor_visible = action == 'h';
-                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        1049 => {
-                            // Alternate screen buffer
-                            if action == 'h' {
-                                term.enter_alt_screen();
-                            } else {
-                                term.leave_alt_screen();
-                            }
-                        }
-                        1004 => {
-                            term.focus_reporting = action == 'h';
-                        }
-                        2004 => {
-                            term.bracketed_paste = action == 'h';
-                        }
-                        2026 => {
-                            if action == 'h' {
-                                term.synchronized_output = true;
-                                term.sync_output_since = Some(std::time::Instant::now());
-                            } else {
-                                term.synchronized_output = false;
-                                term.sync_output_since = None;
-                                term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                        _ => log::debug!("unhandled DEC mode: {}", p),
-                    }
+                    self.ops.push(TermOp::SetDecMode(p, on));
                 }
             }
             ('h', []) | ('l', []) => {
-                // SM/RM — Set/Reset Mode (non-private)
-                let term = self.term();
+                let on = action == 'h';
                 for &p in &params {
-                    match p {
-                        4 => {
-                            term.insert_mode = action == 'h';
-                        }
-                        _ => log::debug!("unhandled SM/RM mode: {}", p),
-                    }
+                    self.ops.push(TermOp::SetMode(p, on));
                 }
             }
             ('@', []) => {
-                // ICH — Insert Characters
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.term().insert_chars(n);
+                self.ops.push(TermOp::InsertChars(n));
             }
             ('n', []) => {
-                // Device Status Report
                 if params.first() == Some(&6) {
-                    // CPR - Cursor Position Report (1-based)
-                    let term = self.term();
-                    let row = term.cursor_y + 1;
-                    let col = term.cursor_x + 1;
-                    self.release_guard();
-                    let response = format!("\x1b[{};{}R", row, col);
-                    self.write_to_pty(response.as_bytes());
+                    self.ops.push(TermOp::CursorPositionReport);
                 }
             }
             ('c', []) | ('c', [b'?']) => {
-                // DA1 — identify as VT220-compatible
-                self.release_guard();
-                self.write_to_pty(b"\x1b[?62;22c");
+                self.ops.push(TermOp::DeviceAttributes);
             }
             ('p', [b'?', b'$']) => {
-                // DECRPM — Report Private Mode
                 if let Some(&mode) = params.first() {
-                    let term = self.term();
-                    // 1 = set, 2 = reset, 0 = not recognized
-                    let value = match mode {
-                        1 => if term.cursor_keys_application { 1 } else { 2 },
-                        7 => if term.auto_wrap { 1 } else { 2 },
-                        25 => if term.cursor_visible { 1 } else { 2 },
-                        1004 => if term.focus_reporting { 1 } else { 2 },
-                        1049 => if term.in_alt_screen { 1 } else { 2 },
-                        2004 => if term.bracketed_paste { 1 } else { 2 },
-                        2026 => if term.synchronized_output { 1 } else { 2 },
-                        _ => 0,
-                    };
-                    self.release_guard();
-                    let response = format!("\x1b[?{};{}$y", mode, value);
-                    self.write_to_pty(response.as_bytes());
+                    self.ops.push(TermOp::ReportPrivateMode(mode));
                 }
             }
             ('q', [b' ']) => {
-                // DECSCUSR — Set Cursor Style
                 let ps = params.first().copied().unwrap_or(0);
-                let term = self.term();
-                term.cursor_shape = match ps {
-                    0 | 1 | 2 => CursorShape::Block,
-                    3 | 4 => CursorShape::Underline,
-                    5 | 6 => CursorShape::Bar,
-                    _ => CursorShape::Block,
-                };
-                term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.ops.push(TermOp::SetCursorShape(ps));
             }
             _ => {
                 log::debug!(
@@ -457,22 +554,10 @@ impl Perform for VteHandler {
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         self.flush_print_buf();
         match (byte, intermediates) {
-            (b'M', []) => {
-                // Reverse Index
-                self.term().reverse_index();
-            }
-            (b'7', []) => self.term().save_cursor(),
-            (b'8', []) => self.term().restore_cursor(),
-            (b'c', []) => {
-                // Full reset
-                let term = self.term();
-                let cols = term.cols;
-                let rows = term.rows;
-                let scrollback_limit = term.scrollback_limit;
-                let fg = term.default_fg;
-                let bg = term.default_bg;
-                *term = TerminalState::new(cols, rows, scrollback_limit, fg, bg);
-            }
+            (b'M', []) => self.ops.push(TermOp::ReverseIndex),
+            (b'7', []) => self.ops.push(TermOp::SaveCursor),
+            (b'8', []) => self.ops.push(TermOp::RestoreCursor),
+            (b'c', []) => self.ops.push(TermOp::FullReset),
             _ => {
                 log::debug!(
                     "unhandled ESC: byte=0x{:02X}, intermediates={:?}",

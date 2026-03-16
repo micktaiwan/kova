@@ -13,7 +13,7 @@ Rust + Metal, zéro compromis cross-platform.
 - [x] Rendu texte Metal (monospace, un seul font, pas de ligatures)
 - [x] Atlas de glyphes basique via CoreText
 - [x] Atlas dynamique (rasterisation à la demande des caractères non-ASCII)
-- [x] PTY : spawn d'un shell (zsh) via `posix_spawnp` (safe multi-thread)
+- [x] PTY : spawn d'un shell (zsh) via `Command` + `pre_exec` (safe multi-thread, controlling terminal via `setsid`+`TIOCSCTTY`)
 - [x] Input clavier → PTY
 - [x] Output PTY → écran (parsing VT via `vte`)
 - [x] Scrollback basique
@@ -23,7 +23,7 @@ Rust + Metal, zéro compromis cross-platform.
 - [x] Scroll trackpad (accumulateur fractionnaire)
 - [x] Alternate screen buffer (CSI ?1049 h/l)
 - [x] Resize fenêtre (recalcul cols/rows + SIGWINCH)
-  - Passé de `posix_spawn`+`SETSID` à `fork`+`setsid`+`TIOCSCTTY` : nécessaire pour que le slave PTY soit le controlling terminal et que SIGWINCH atteigne les sous-processes (fork OK car single-threaded à ce stade)
+  - Le slave PTY est le controlling terminal (`setsid`+`TIOCSCTTY` dans `pre_exec`), donc SIGWINCH atteint les sous-processes automatiquement
 - [x] Cmd+V (coller depuis le presse-papier)
 - [x] Rendu à la demande (dirty flag) — ne redessiner que quand l'état change
 
@@ -81,7 +81,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Save/restore session layout — sauvegarde arbre de tabs/splits et CWD au quit, restauration au lancement
 - [x] File logging — écriture des logs dans un fichier pour debug
 - [x] Tab bar redesign — couleurs de tabs, refonte visuelle
-- [x] Navigation cross-tab (Cmd+Shift+Arrows entre splits de différents tabs)
+- [x] Navigation cross-tab (Cmd+Option+Arrows entre splits de différents tabs)
 - [x] Lazy write lock dans le parser VTE — acquisition du write lock uniquement quand nécessaire, réduit la contention
 - [x] Synchronized output (mode 2026) — bufferiser le rendu entre h/l pour éviter le tearing
 - [x] CPR (Cursor Position Report, CSI 6 n) — réponse position curseur
@@ -102,26 +102,33 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 - [x] Horizontal scroll splits — quand les splits dépassent la largeur écran, scroll horizontal trackpad + auto-reveal du pane focusé. `min_split_width` configurable.
 - [x] Color emoji rendering via CoreText fallback fonts
 - [x] Grapheme cluster emoji (flags, ZWJ sequences, skin tones)
-- [ ] Emoji presentation fallback — les caractères avec `Emoji_Presentation` par défaut (U+2B1C, U+2B1B, U+25AA…) utilisent le glyphe de la font mono (petit carré géométrique) au lieu de la version couleur Apple Color Emoji, car `resolve_glyph` retourne le glyphe primaire sans vérifier la présentation attendue. Fix : forcer le fallback emoji pour les codepoints Unicode `Emoji_Presentation=Yes`.
-- [x] Optimisation RAM Cell — compact cell storage pour le scrollback (28→12 bytes/cell, -57% RAM). fg/bg stockés en `u32` RGBA au lieu de `[f32; 3]`.
+- [x] Optimisation RAM Cell — compact cell storage pour le scrollback (48→32 bytes/cell, -33% RAM). fg/bg stockés en `[u8; 3]` au lieu de `[f32; 3]`, conversion GPU à la volée.
 - [x] Multi-fenêtres — Cmd+N nouvelle fenêtre, Cmd+Q ferme fenêtre active, Cmd+Option+Q kill sans save, Cmd+Shift+T detach tab vers nouvelle fenêtre, Cmd+Ctrl+T break pane vers nouvel onglet. Session restore multi-window. Dealloc différé pour éviter segfault AppKit.
 - [x] Config keybindings (raccourcis configurables via `[keys]` dans config.toml)
-- [ ] Déplacer un split par drag (anchor visuelle pendant le drag — le swap par raccourci Cmd+Shift+Arrows existe déjà)
 - [x] Notifications visuelles avancées (activité dans un split inactif)
-- [ ] Batching du parser VT — le pty-reader tient le write lock sur `TerminalState` pendant tout `parser.advance()` d'un chunk 4 Ko. Quand un pane en background reçoit beaucoup de données (build, logs…), le write lock bloque les read locks du renderer (parking_lot donne priorité aux writers). Solution : op-buffer local (`Vec<TermOp>`) parsé sans lock, flush en un seul write lock. Voir `notes/vt-parser-batching.md`.
 - [x] PTY cleanup sur thread dédié — `Drop for Pty` délègue l'escalade SIGHUP → SIGTERM → SIGKILL à un thread détaché (`pty-reaper-{pid}`), zéro sleep sur le main thread. `shutdown_all()` fait la même escalade en synchrone avec timeouts réduits (25ms/étape)
-- [ ] Font fallback (block elements/box-drawing) — nécessitent un rendu custom (voir `notes/font-fallback-investigation.md`)
-- [ ] **Tab bar font size** : taille de fonte des tabs configurable indépendamment (`tab_bar.font_size`), override possible par fenêtre. Voir `notes/tab-font-size.md`.
 - [x] **Trim trailing blanks** : tronquer les cellules vides en fin de ligne dans le scrollback (`shrink_to_fit`), re-expand au resize. ~50-70% de réduction RAM scrollback.
-- [ ] **Run-length encoding** : compresser les séquences de même couleur. (Gain marginal après trim, complexité élevée — déprioritisé.)
 - [x] Metriques perf exposées (mémoire, allocations) — overlay Cmd+Shift+I avec RSS, détail terminal/renderer/pane. Frame time non inclus.
 - [x] Double-clic sur un mot → sélectionne le mot entier
-- [ ] Minimisation de pane — réduire un pane à une barre 24px affichant titre/CWD. Le pane reste dans le split tree, le sibling récupère l'espace. PTY continue en background, bell/activité visibles sur la barre. Cmd+M minimise le pane focusé, Cmd+Opt+M restaure le dernier minimisé (FILO), click sur la barre restaure ce pane spécifique.
-- [ ] Cmd+V dans le champ de recherche (Cmd+F) — le paste ne fonctionne pas actuellement dans l'overlay de recherche
+- [x] Minimisation de pane — réduire un pane à une barre 24px affichant titre/CWD. Le pane reste dans le split tree, le sibling récupère l'espace. PTY continue en background, bell/activité visibles sur la barre. Cmd+M minimise le pane focusé, Cmd+Opt+M restaure le dernier minimisé (FILO), click sur la barre restaure ce pane spécifique.
 - [x] Flèches dans le renommage de tab/pane — les flèches gauche/droite naviguent dans le texte, curseur positionnable, backspace/insertion au curseur
+
+### Prochaines priorités V2
+
+- [x] **Batching du parser VT** _(priorité 1 — perf)_ — le pty-reader tient le write lock sur `TerminalState` pendant tout `parser.advance()` d'un chunk 4 Ko. Quand un pane en background reçoit beaucoup de données (build, logs…), le write lock bloque les read locks du renderer (`parking_lot` donne priorité aux writers → lag visible au switch de tab). Solution : `Vec<TermOp>` local parsé sans lock, flush en un seul write lock. Réduction estimée 5-10× du temps sous lock. Voir `notes/vt-parser-batching.md`.
+- [x] **Font fallback (block elements/box-drawing)** _(priorité 2 — visuel)_ — les caractères U+2500-U+257F (box-drawing) et U+2580-U+259F (block elements) doivent être dessinés directement dans le bitmap au lieu de passer par CoreText. Les glyphs de police ne remplissent pas la cellule bord à bord → ligne noire dans le banner Claude Code, bordures cassées dans toutes les TUI (lazygit, btop). Tous les terminaux modernes (Alacritty, Kitty, WezTerm, Ghostty) font ce rendu custom. Voir `notes/font-fallback-investigation.md`.
+- [ ] **Colonnes pinnées (`custom_weight`)** — flag par colonne indiquant un redimensionnement manuel. Les colonnes pinnées conservent leur poids lors des redistributions. Voir `docs/split-specs.md` section "Colonnes pinnées".
+- [ ] **Redistribution multi-colonnes au resize** — quand un séparateur est déplacé (souris ou clavier), redistribuer l'espace entre toutes les colonnes non-pinnées du côté opposé, au lieu de ne toucher que les deux colonnes adjacentes. Voir `docs/split-specs.md` section "Redistribution des colonnes".
+- [ ] **Curseur souris sur séparateurs** — changer le curseur au survol d'un séparateur (↔ pour colonnes, ↕ pour VSplits, ±3px de tolérance). Voir `docs/split-specs.md` section "Mouse drag".
+- [ ] **Emoji presentation fallback** — les caractères avec `Emoji_Presentation` par défaut (U+2B1C, U+2B1B, U+25AA…) utilisent le glyphe de la font mono au lieu de la version couleur Apple Color Emoji. Fix : forcer le fallback emoji pour les codepoints Unicode `Emoji_Presentation=Yes`.
+- [ ] **Cmd+V dans le champ de recherche** (Cmd+F) — le paste ne fonctionne pas actuellement dans l'overlay de recherche.
+- [ ] **Tab bar font size** : taille de fonte des tabs configurable indépendamment (`tab_bar.font_size`), override possible par fenêtre. Voir `notes/tab-font-size.md`.
+- [ ] **Déplacer un split par drag** (anchor visuelle pendant le drag — le swap par raccourci Cmd+Shift+Arrows existe déjà).
+- [ ] **Run-length encoding** : compresser les séquences de même couleur. (Gain marginal après trim, complexité élevée — déprioritisé.)
 
 ## V3 — Avancé
 
+- [x] **IPC / pilotage externe** _(priorité 3 — stratégique)_ — socket Unix (`/tmp/kova-{pid}.sock`) acceptant des commandes JSON : `split --cmd "..."`, `list-panes`, `close-pane`, `send-keys`. Permet à Claude Code Teams de spawner des agents dans des panes séparés (aujourd'hui seul tmux le peut). Transforme Kova de "terminal avec splits" en "plateforme de développement scriptable". Voir `track.md` section IPC.
 - [ ] Support images inline (Kitty Graphics Protocol) — affichage d'images dans le terminal (`icat`, `yazi`, etc.). Parser APC, image store, texture manager Metal, draw calls séparés. Voir [`docs/image-support.md`](docs/image-support.md)
 - [ ] Shell integration (marks, navigation prompt à prompt)
 - [ ] Complétion inline / suggestions

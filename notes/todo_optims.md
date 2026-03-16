@@ -7,7 +7,7 @@ Baseline mesurée : ~116 MB RSS pour un seul pane (2026-02-24).
 | Poste | Estimation | Fichier | Notes |
 |-------|-----------|---------|-------|
 | Vertex buffers Metal (×2) | **32 MB** | `renderer/mod.rs:47` | `MAX_VERTEX_BYTES = 16 MB` × 2 double-buffered |
-| Scrollback (×N panes) | **~22 MB/pane** | `terminal/mod.rs:69` | 10 000 lignes × 80 cols × 28 B/cell |
+| Scrollback (×N panes) | **~25 MB/pane** | `terminal/mod.rs:69` | 10 000 lignes × 80 cols × 32 B/cell (avant trim) |
 | Atlas buf CPU + texture GPU | **1–10 MB** | `renderer/glyph_atlas.rs:31` | Double stockage CPU+GPU, croît sans rétrécir |
 | Fallback fonts cache | **1–5 MB** | `renderer/glyph_atlas.rs:40` | Un `CTFont` par char unique, jamais purgé |
 | Runtime Rust + libs | **5–10 MB** | — | Baseline incompressible |
@@ -20,11 +20,10 @@ Baseline mesurée : ~116 MB RSS pour un seul pane (2026-02-24).
 - Un terminal 200×50 produit ~2.4 MB de vertices max
 - **Action** : réduire à 4 MB (×2 = 8 MB au lieu de 32 MB)
 
-### 2. Compacter la struct Cell — gain ~75% sur le scrollback
-- Actuellement : `char` (4B) + `fg: [f32; 3]` (12B) + `bg: [f32; 3]` (12B) = **28 bytes**
-- Avec palette : `char` (4B) + `fg_idx: u8` + `bg_idx: u8` = **6 bytes**
-- Stocker les couleurs comme indices dans une palette globale (256 couleurs ANSI + quelques customs)
-- **Gain** : scrollback 10k lignes × 80 cols passe de 22 MB à ~5 MB par pane
+### 2. ~~Compacter la struct Cell~~ ✅ DONE
+- Fait : `fg`/`bg` passés de `[f32; 3]` (12B) à `[u8; 3]` (3B). Cell est maintenant **32 bytes** (48→32, -33%).
+- Le champ `cluster: Option<Box<str>>` (16B) a été ajouté pour le support grapheme cluster (emoji flags, ZWJ).
+- Prochaine étape éventuelle : palette-based indexing (`fg_idx: u8`) pour descendre à ~12 bytes, mais complexité élevée pour un gain marginal maintenant que trim trailing blanks est en place.
 
 ### 3. Dropper le atlas_buf CPU après upload — gain variable
 - `atlas_buf: Vec<u8>` est gardé en permanence pour les updates partielles

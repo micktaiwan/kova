@@ -21,7 +21,7 @@
 | Cmd+Shift+E | Horizontal split at root (full-width row) |
 | Cmd+Option+Arrows | Navigate between panes (cross-tab if at edge) |
 | Cmd+Shift+Arrows | Swap focused pane with neighbor |
-| Cmd+Ctrl+Shift+Arrows | Rotate split orientation (2-pane splits only) |
+| Cmd+Ctrl+Shift+Arrows | Reparent pane (move to adjacent column/vsplit) |
 | Cmd+Ctrl+Arrows | Resize splits |
 
 ## Windows
@@ -30,7 +30,7 @@
 |----------|--------|
 | Cmd+N | New window |
 | Cmd+Shift+T | Detach tab to new window |
-| Cmd+Shift+M | Merge all tabs into another window |
+| Cmd+Shift+M | Send tab to another window (overlay) |
 
 ## Editing
 
@@ -46,12 +46,26 @@
 | Shift+Enter | Newline without executing |
 | Shift+Tab | Backtab (CSI Z) |
 
+## Panes
+
+| Shortcut | Action |
+|----------|--------|
+| Cmd+Option+R | Rename pane |
+| Cmd+M | Minimize pane |
+| Cmd+Option+M | Restore last minimized pane |
+| Cmd+Ctrl+T | Break pane out to new tab |
+
 ## Terminal
 
 | Shortcut | Action |
 |----------|--------|
 | Cmd+F | Toggle search filter |
 | Cmd+K | Clear scrollback and screen |
+| Cmd+O | Open recent project |
+| Cmd+Shift+= | Equalize all splits |
+| Cmd+Shift+C | Copy selection (raw, no trailing spaces) |
+| Cmd+Shift+I | Memory/perf report |
+| Cmd+Shift+W | Close tab |
 | Cmd+Q | Quit |
 | Ctrl+A..Z | Send control character |
 

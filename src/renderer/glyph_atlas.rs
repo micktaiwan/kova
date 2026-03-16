@@ -443,7 +443,7 @@ impl GlyphAtlas {
     fn draw_builtin_glyph(c: char, buf: &mut [u8], w: usize, h: usize) -> bool {
         let bpr = w * 4;
 
-        // Helper: fill a rectangular region with white (alpha=255 in channel 0)
+        // Helper: fill a rectangular region with white (RGBA=255)
         let fill_rect = |buf: &mut [u8], x0: usize, y0: usize, x1: usize, y1: usize| {
             for y in y0..y1.min(h) {
                 for x in x0..x1.min(w) {
@@ -458,6 +458,36 @@ impl GlyphAtlas {
 
         let hw = w / 2; // half width
         let hh = h / 2; // half height
+
+        // Scale-aware line thicknesses
+        let light = 1.max(h / 16);  // thin line (~1px at 14pt, 2px at 28pt)
+        let heavy = 2.max(h / 8);   // thick line (~3px at 14pt, 4px at 28pt)
+
+        // Precompute centered offsets for light lines
+        let lx0 = hw.saturating_sub(light / 2);
+        let lx1 = lx0 + light;
+        let ly0 = hh.saturating_sub(light / 2);
+        let ly1 = ly0 + light;
+
+        // Precompute centered offsets for heavy lines
+        let hx0 = hw.saturating_sub(heavy / 2);
+        let hx1 = hx0 + heavy;
+        let hy0 = hh.saturating_sub(heavy / 2);
+        let hy1 = hy0 + heavy;
+
+        // Double-line: two thin lines with a gap between them
+        let dbl_gap = 2.max(h / 10);
+        let dbl_span = light * 2 + dbl_gap;
+        // Horizontal double (two lines stacked vertically)
+        let dy0 = hh.saturating_sub(dbl_span / 2);
+        let dy0e = dy0 + light;
+        let dy1 = dy0 + light + dbl_gap;
+        let dy1e = dy1 + light;
+        // Vertical double (two lines side by side)
+        let dx0 = hw.saturating_sub(dbl_span / 2);
+        let dx0e = dx0 + light;
+        let dx1 = dx0 + light + dbl_gap;
+        let dx1e = dx1 + light;
 
         match c {
             // === Block Elements (U+2580-U+259F) ===
@@ -490,6 +520,8 @@ impl GlyphAtlas {
                 for y in 0..h { for x in 0..w { if (x + y) % 4 != 0 { let o = y*bpr+x*4; buf[o]=255; buf[o+1]=255; buf[o+2]=255; buf[o+3]=255; } } }
                 true
             }
+            '\u{2594}' => { fill_rect(buf, 0, 0, w, h/8); true }        // ▔ upper 1/8
+            '\u{2595}' => { let l = w - w/8; fill_rect(buf, l, 0, w, h); true } // ▕ right 1/8
             // Quadrants
             '\u{2596}' => { fill_rect(buf, 0, hh, hw, h); true }        // ▖ lower left
             '\u{2597}' => { fill_rect(buf, hw, hh, w, h); true }        // ▗ lower right
@@ -526,107 +558,189 @@ impl GlyphAtlas {
                 true
             }
 
-            // === Box-Drawing (U+2500-U+257F) ===
-            '\u{2500}' | '\u{2501}' => { // ─ ━ horizontal line
-                let thick = if c == '\u{2501}' { 3 } else { 1 };
-                let y0 = hh.saturating_sub(thick / 2);
-                fill_rect(buf, 0, y0, w, y0 + thick);
+            // === Box-Drawing Light (U+2500-U+253C) ===
+            '\u{2500}' => { // ─ light horizontal
+                fill_rect(buf, 0, ly0, w, ly1);
                 true
             }
-            '\u{2502}' | '\u{2503}' => { // │ ┃ vertical line
-                let thick = if c == '\u{2503}' { 3 } else { 1 };
-                let x0 = hw.saturating_sub(thick / 2);
-                fill_rect(buf, x0, 0, x0 + thick, h);
+            '\u{2502}' => { // │ light vertical
+                fill_rect(buf, lx0, 0, lx1, h);
                 true
             }
-            '\u{250C}' => { // ┌
-                fill_rect(buf, hw, hh, hw + 1, h);
-                fill_rect(buf, hw, hh, w, hh + 1);
+            '\u{250C}' => { // ┌ light down and right
+                fill_rect(buf, lx0, ly0, lx1, h);
+                fill_rect(buf, lx0, ly0, w, ly1);
                 true
             }
-            '\u{2510}' => { // ┐
-                fill_rect(buf, hw, hh, hw + 1, h);
-                fill_rect(buf, 0, hh, hw + 1, hh + 1);
+            '\u{2510}' => { // ┐ light down and left
+                fill_rect(buf, lx0, ly0, lx1, h);
+                fill_rect(buf, 0, ly0, lx1, ly1);
                 true
             }
-            '\u{2514}' => { // └
-                fill_rect(buf, hw, 0, hw + 1, hh + 1);
-                fill_rect(buf, hw, hh, w, hh + 1);
+            '\u{2514}' => { // └ light up and right
+                fill_rect(buf, lx0, 0, lx1, ly1);
+                fill_rect(buf, lx0, ly0, w, ly1);
                 true
             }
-            '\u{2518}' => { // ┘
-                fill_rect(buf, hw, 0, hw + 1, hh + 1);
-                fill_rect(buf, 0, hh, hw + 1, hh + 1);
+            '\u{2518}' => { // ┘ light up and left
+                fill_rect(buf, lx0, 0, lx1, ly1);
+                fill_rect(buf, 0, ly0, lx1, ly1);
                 true
             }
-            '\u{251C}' => { // ├
-                fill_rect(buf, hw, 0, hw + 1, h);
-                fill_rect(buf, hw, hh, w, hh + 1);
+            '\u{251C}' => { // ├ light vertical and right
+                fill_rect(buf, lx0, 0, lx1, h);
+                fill_rect(buf, lx0, ly0, w, ly1);
                 true
             }
-            '\u{2524}' => { // ┤
-                fill_rect(buf, hw, 0, hw + 1, h);
-                fill_rect(buf, 0, hh, hw + 1, hh + 1);
+            '\u{2524}' => { // ┤ light vertical and left
+                fill_rect(buf, lx0, 0, lx1, h);
+                fill_rect(buf, 0, ly0, lx1, ly1);
                 true
             }
-            '\u{252C}' => { // ┬
-                fill_rect(buf, 0, hh, w, hh + 1);
-                fill_rect(buf, hw, hh, hw + 1, h);
+            '\u{252C}' => { // ┬ light down and horizontal
+                fill_rect(buf, 0, ly0, w, ly1);
+                fill_rect(buf, lx0, ly0, lx1, h);
                 true
             }
-            '\u{2534}' => { // ┴
-                fill_rect(buf, 0, hh, w, hh + 1);
-                fill_rect(buf, hw, 0, hw + 1, hh + 1);
+            '\u{2534}' => { // ┴ light up and horizontal
+                fill_rect(buf, 0, ly0, w, ly1);
+                fill_rect(buf, lx0, 0, lx1, ly1);
                 true
             }
-            '\u{253C}' => { // ┼
-                fill_rect(buf, 0, hh, w, hh + 1);
-                fill_rect(buf, hw, 0, hw + 1, h);
+            '\u{253C}' => { // ┼ light vertical and horizontal
+                fill_rect(buf, 0, ly0, w, ly1);
+                fill_rect(buf, lx0, 0, lx1, h);
                 true
             }
-            // Rounded corners (same as sharp corners visually at terminal scale)
-            '\u{256D}' => { // ╭
-                fill_rect(buf, hw, hh, hw + 1, h);
-                fill_rect(buf, hw, hh, w, hh + 1);
+
+            // === Box-Drawing Heavy ===
+            '\u{2501}' => { // ━ heavy horizontal
+                fill_rect(buf, 0, hy0, w, hy1);
                 true
             }
-            '\u{256E}' => { // ╮
-                fill_rect(buf, hw, hh, hw + 1, h);
-                fill_rect(buf, 0, hh, hw + 1, hh + 1);
+            '\u{2503}' => { // ┃ heavy vertical
+                fill_rect(buf, hx0, 0, hx1, h);
                 true
             }
-            '\u{256F}' => { // ╯
-                fill_rect(buf, hw, 0, hw + 1, hh + 1);
-                fill_rect(buf, 0, hh, hw + 1, hh + 1);
+            '\u{250F}' => { // ┏ heavy down and right
+                fill_rect(buf, hx0, hy0, hx1, h);
+                fill_rect(buf, hx0, hy0, w, hy1);
                 true
             }
-            '\u{2570}' => { // ╰
-                fill_rect(buf, hw, 0, hw + 1, hh + 1);
-                fill_rect(buf, hw, hh, w, hh + 1);
+            '\u{2513}' => { // ┓ heavy down and left
+                fill_rect(buf, hx0, hy0, hx1, h);
+                fill_rect(buf, 0, hy0, hx1, hy1);
                 true
             }
-            // Double lines
+            '\u{2517}' => { // ┗ heavy up and right
+                fill_rect(buf, hx0, 0, hx1, hy1);
+                fill_rect(buf, hx0, hy0, w, hy1);
+                true
+            }
+            '\u{251B}' => { // ┛ heavy up and left
+                fill_rect(buf, hx0, 0, hx1, hy1);
+                fill_rect(buf, 0, hy0, hx1, hy1);
+                true
+            }
+            '\u{2523}' => { // ┣ heavy vertical and right
+                fill_rect(buf, hx0, 0, hx1, h);
+                fill_rect(buf, hx0, hy0, w, hy1);
+                true
+            }
+            '\u{252B}' => { // ┫ heavy vertical and left
+                fill_rect(buf, hx0, 0, hx1, h);
+                fill_rect(buf, 0, hy0, hx1, hy1);
+                true
+            }
+            '\u{2533}' => { // ┳ heavy down and horizontal
+                fill_rect(buf, 0, hy0, w, hy1);
+                fill_rect(buf, hx0, hy0, hx1, h);
+                true
+            }
+            '\u{253B}' => { // ┻ heavy up and horizontal
+                fill_rect(buf, 0, hy0, w, hy1);
+                fill_rect(buf, hx0, 0, hx1, hy1);
+                true
+            }
+            '\u{254B}' => { // ╋ heavy vertical and horizontal
+                fill_rect(buf, 0, hy0, w, hy1);
+                fill_rect(buf, hx0, 0, hx1, h);
+                true
+            }
+
+            // === Rounded corners (light, approximate with straight lines) ===
+            '\u{256D}' => { // ╭ arc down and right
+                fill_rect(buf, lx0, ly0, lx1, h);
+                fill_rect(buf, lx0, ly0, w, ly1);
+                true
+            }
+            '\u{256E}' => { // ╮ arc down and left
+                fill_rect(buf, lx0, ly0, lx1, h);
+                fill_rect(buf, 0, ly0, lx1, ly1);
+                true
+            }
+            '\u{256F}' => { // ╯ arc up and left
+                fill_rect(buf, lx0, 0, lx1, ly1);
+                fill_rect(buf, 0, ly0, lx1, ly1);
+                true
+            }
+            '\u{2570}' => { // ╰ arc up and right
+                fill_rect(buf, lx0, 0, lx1, ly1);
+                fill_rect(buf, lx0, ly0, w, ly1);
+                true
+            }
+
+            // === Double lines ===
             '\u{2550}' => { // ═ double horizontal
-                let y0 = hh.saturating_sub(1);
-                fill_rect(buf, 0, y0, w, y0 + 1);
-                fill_rect(buf, 0, y0 + 2, w, y0 + 3);
+                fill_rect(buf, 0, dy0, w, dy0e);
+                fill_rect(buf, 0, dy1, w, dy1e);
                 true
             }
             '\u{2551}' => { // ║ double vertical
-                let x0 = hw.saturating_sub(1);
-                fill_rect(buf, x0, 0, x0 + 1, h);
-                fill_rect(buf, x0 + 2, 0, x0 + 3, h);
+                fill_rect(buf, dx0, 0, dx0e, h);
+                fill_rect(buf, dx1, 0, dx1e, h);
                 true
             }
-            '\u{2552}'..='\u{256C}' => {
-                // For remaining double-line box-drawing, fall through to font rendering
-                // (less commonly used, can be added later)
-                false
+            '\u{2554}' => { // ╔ double down and right
+                fill_rect(buf, dx0, dy0, dx0e, h);    // outer vertical down
+                fill_rect(buf, dx0, dy0, w, dy0e);    // outer horizontal right
+                fill_rect(buf, dx1, dy1, dx1e, h);    // inner vertical down
+                fill_rect(buf, dx1, dy1, w, dy1e);    // inner horizontal right
+                fill_rect(buf, dx1, dy0, w, dy0e);    // extend outer horiz past inner vert
+                fill_rect(buf, dx0, dy1, dx0e, dy1e); // extend inner horiz to outer vert
+                true
             }
-            // Dashes
+            '\u{2557}' => { // ╗ double down and left
+                fill_rect(buf, dx1, dy0, dx1e, h);    // outer vertical down
+                fill_rect(buf, 0, dy0, dx1e, dy0e);   // outer horizontal left
+                fill_rect(buf, dx0, dy1, dx0e, h);    // inner vertical down
+                fill_rect(buf, 0, dy1, dx0e, dy1e);   // inner horizontal left
+                fill_rect(buf, 0, dy0, dx0e, dy0e);   // extend outer horiz past inner vert
+                fill_rect(buf, dx1, dy1, dx1e, dy1e); // extend inner horiz to outer vert
+                true
+            }
+            '\u{255A}' => { // ╚ double up and right
+                fill_rect(buf, dx0, 0, dx0e, dy1e);   // outer vertical up
+                fill_rect(buf, dx0, dy1, w, dy1e);     // outer horizontal right
+                fill_rect(buf, dx1, 0, dx1e, dy0e);   // inner vertical up
+                fill_rect(buf, dx1, dy0, w, dy0e);     // inner horizontal right
+                fill_rect(buf, dx1, dy1, w, dy1e);     // extend outer horiz past inner vert
+                fill_rect(buf, dx0, dy0, dx0e, dy0e); // extend inner horiz to outer vert
+                true
+            }
+            '\u{255D}' => { // ╝ double up and left
+                fill_rect(buf, dx1, 0, dx1e, dy1e);   // outer vertical up
+                fill_rect(buf, 0, dy1, dx1e, dy1e);    // outer horizontal left
+                fill_rect(buf, dx0, 0, dx0e, dy0e);   // inner vertical up
+                fill_rect(buf, 0, dy0, dx0e, dy0e);    // inner horizontal left
+                fill_rect(buf, 0, dy1, dx0e, dy1e);    // extend outer horiz past inner vert
+                fill_rect(buf, dx1, dy0, dx1e, dy0e); // extend inner horiz to outer vert
+                true
+            }
+
+            // Dashes — fall through to font for now
             '\u{2504}' | '\u{2505}' | '\u{2508}' | '\u{2509}' | // ┄ ┅ ┈ ┉
             '\u{254C}' | '\u{254D}' | '\u{254E}' | '\u{254F}' => { // ╌ ╍ ╎ ╏
-                // Dashed lines - fall through to font for now
                 false
             }
 

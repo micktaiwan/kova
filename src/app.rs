@@ -22,6 +22,8 @@ pub struct AppDelegateIvars {
     tick_count: Cell<u64>,
     /// Optional session backup number to restore (--session N).
     session_backup: Option<usize>,
+    /// IPC command receiver — polled in the timer tick on the main thread.
+    ipc_rx: RefCell<Option<std::sync::mpsc::Receiver<crate::ipc::IpcRequest>>>,
 }
 
 define_class!(
@@ -81,6 +83,10 @@ define_class!(
             let app = NSApplication::sharedApplication(mtm);
             app.activate();
 
+            // Start IPC server (Unix socket for external process control)
+            let ipc_rx = crate::ipc::start();
+            *self.ivars().ipc_rx.borrow_mut() = Some(ipc_rx);
+
             // Start global render timer — single timer for all windows
             self.start_global_timer(config.terminal.fps);
         }
@@ -121,6 +127,7 @@ define_class!(
             window_sessions.extend(collect_window_sessions(&self.ivars().windows.borrow()));
             crate::session::save(&window_sessions);
             crate::terminal::pty::shutdown_all();
+            crate::ipc::cleanup();
             log::logger().flush();
         }
     }
@@ -135,6 +142,7 @@ impl AppDelegate {
             closed_sessions: RefCell::new(Vec::new()),
             config: OnceCell::new(),
             session_backup,
+            ipc_rx: RefCell::new(None),
         });
         let retained: Retained<Self> = unsafe { msg_send![super(this), init] };
         retained.ivars().config.set(config).ok();
@@ -165,6 +173,17 @@ impl AppDelegate {
                                 if !view.tick() {
                                     dead_indices.push(i);
                                 }
+                            }
+                        }
+                    }
+
+                    // Process IPC commands from external processes
+                    {
+                        let rx_borrow = ivars.ipc_rx.borrow();
+                        if let Some(ref rx) = *rx_borrow {
+                            while let Ok((cmd, responder)) = rx.try_recv() {
+                                let response = handle_ipc_command(cmd, &ivars.windows, &ivars.config);
+                                let _ = responder.send(response);
                             }
                         }
                     }
@@ -332,6 +351,171 @@ pub fn kova_view(window: &NSWindow) -> Option<&crate::window::KovaView> {
         let ptr: *const objc2_app_kit::NSView = &*cv;
         unsafe { &*(ptr as *const crate::window::KovaView) }
     })
+}
+
+/// Handle a single IPC command on the main thread.
+/// All window/pane operations happen here (AppKit requirement).
+fn handle_ipc_command(
+    cmd: crate::ipc::IpcCommand,
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    config_cell: &OnceCell<Config>,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcCommand;
+
+    match cmd {
+        IpcCommand::Split { direction, cmd: command, cwd } => {
+            handle_ipc_split(windows, config_cell, &direction, command, cwd)
+        }
+        IpcCommand::ListPanes => {
+            handle_ipc_list_panes(windows)
+        }
+        IpcCommand::ClosePaneById(pane_id) => {
+            handle_ipc_close_pane(windows, pane_id)
+        }
+        IpcCommand::SendKeys { pane_id, text } => {
+            handle_ipc_send_keys(windows, pane_id, &text)
+        }
+        IpcCommand::FocusPane(pane_id) => {
+            handle_ipc_focus_pane(windows, pane_id)
+        }
+    }
+}
+
+/// IPC: split the focused pane in the key window.
+fn handle_ipc_split(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    config_cell: &OnceCell<Config>,
+    direction: &str,
+    command: Option<String>,
+    cwd: Option<String>,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let config = match config_cell.get() {
+        Some(c) => c,
+        None => return IpcResponse::Error { message: "config not loaded".to_string() },
+    };
+
+    let wins = windows.borrow();
+    // Find the key window (first one, or the one that isKeyWindow)
+    let win = wins.iter()
+        .find(|w| w.isKeyWindow())
+        .or_else(|| wins.first());
+    let win = match win {
+        Some(w) => w,
+        None => return IpcResponse::Error { message: "no window".to_string() },
+    };
+    let view = match kova_view(win) {
+        Some(v) => v,
+        None => return IpcResponse::Error { message: "no view".to_string() },
+    };
+
+    let split_dir = match direction {
+        "vertical" => crate::pane::SplitDirection::Vertical,
+        _ => crate::pane::SplitDirection::Horizontal,
+    };
+
+    // Determine CWD: explicit param > focused pane's CWD
+    let effective_cwd = cwd.or_else(|| view.ipc_focused_cwd());
+
+    let new_pane_id = view.ipc_split(config, split_dir, effective_cwd.as_deref(), command);
+    match new_pane_id {
+        Some(id) => IpcResponse::Ok {
+            data: Some(serde_json::json!({"pane_id": id})),
+        },
+        None => IpcResponse::Error { message: "split failed".to_string() },
+    }
+}
+
+/// IPC: list all panes across all windows.
+fn handle_ipc_list_panes(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    let mut panes = Vec::new();
+    for (win_idx, win) in wins.iter().enumerate() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        let is_key = win.isKeyWindow();
+        view.ipc_collect_panes(win_idx, is_key, &mut panes);
+    }
+
+    IpcResponse::Ok {
+        data: Some(serde_json::Value::Array(panes)),
+    }
+}
+
+/// IPC: close a pane by ID.
+fn handle_ipc_close_pane(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        match view.ipc_close_pane(pane_id) {
+            Some(true) => return IpcResponse::Ok { data: None },
+            Some(false) => return IpcResponse::Error { message: format!("pane {} is the last pane — cannot close", pane_id) },
+            None => continue,
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: send keystrokes to a pane's PTY.
+fn handle_ipc_send_keys(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    text: &str,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        if view.ipc_send_keys(pane_id, text) {
+            return IpcResponse::Ok { data: None };
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: focus a pane by ID (switch tab/window if needed).
+fn handle_ipc_focus_pane(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        if view.ipc_focus_pane(pane_id) {
+            win.makeKeyAndOrderFront(None);
+            let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+            app.activate();
+            return IpcResponse::Ok { data: None };
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
 }
 
 fn setup_menu(mtm: MainThreadMarker) {

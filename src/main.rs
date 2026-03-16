@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod input;
+mod ipc;
 mod keybindings;
 mod pane;
 mod recent_projects;

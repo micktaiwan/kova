@@ -63,6 +63,7 @@ impl Pty {
         shell_exited: Arc<AtomicBool>,
         shell_ready: Arc<AtomicBool>,
         working_dir: Option<&str>,
+        pane_id: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_pair = openpty(None, None)?;
 
@@ -106,6 +107,8 @@ impl Pty {
                 .env("TERM", "xterm-256color")
                 .env("TERM_PROGRAM", "Kova")
                 .env("KOVA_SHELL_INTEGRATION", "1")
+                .env("KOVA_SOCKET", crate::ipc::socket_path())
+                .env("KOVA_PANE_ID", pane_id.to_string())
                 .current_dir(&start_dir)
                 .pre_exec(move || {
                     // New session — required before TIOCSCTTY
@@ -179,7 +182,7 @@ impl Pty {
                                 shell_ready.store(true, Ordering::Relaxed);
                             }
                             parser.advance(&mut handler, &buf[..n]);
-                            handler.release_guard();
+                            handler.apply_ops();
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(e) => { log::warn!("PTY read error: {}", e); eof = true; break; }

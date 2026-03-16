@@ -17,13 +17,12 @@ use crate::terminal::{FilterMatch, GridPos, Selection, SelectionMode};
 
 #[derive(Clone, Copy)]
 struct SeparatorDrag {
-    is_hsplit: bool,
+    is_column_sep: bool,
     origin_pixel: f32,
-    origin_ratio: f32,
     parent_dim: f32,
-    node_ptr: usize,
-    /// If Some(i), this is a column separator between columns[i] and columns[i+1].
     column_sep_index: Option<usize>,
+    col_index: usize,
+    row_sep_index: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -923,14 +922,18 @@ define_class!(
                         }));
                         drop(tabs);
                         self.resize_all_panes();
-                    } else {
-                        // VSplit separator: adjust ratio
-                        let current_pixel = if drag.is_hsplit { px } else { py };
-                        let new_ratio = drag.origin_ratio + (current_pixel - drag.origin_pixel) / drag.parent_dim;
-                        if tab.set_ratio_by_ptr(drag.node_ptr, new_ratio) {
-                            drop(tabs);
-                            self.resize_all_panes();
+                    } else if let Some(row_idx) = drag.row_sep_index {
+                        // Row separator: adjust row weights within column
+                        let delta_px = py - drag.origin_pixel;
+                        if drag.col_index < tab.columns.len() {
+                            tab.columns[drag.col_index].set_row_weights_by_drag(row_idx, delta_px, drag.parent_dim);
                         }
+                        self.ivars().drag_separator.set(Some(SeparatorDrag {
+                            origin_pixel: py,
+                            ..drag
+                        }));
+                        drop(tabs);
+                        self.resize_all_panes();
                     }
                 }
                 return;
@@ -1079,6 +1082,7 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
+            self.update_separator_cursor(event);
             self.update_hovered_url(event);
             self.update_tooltip(event);
         }
@@ -1306,6 +1310,46 @@ impl KovaView {
             return None;
         }
         Some((visible_row as usize, (col as u16).min(term.cols.saturating_sub(1))))
+    }
+
+    /// Update mouse cursor when hovering over a separator (±3px tolerance).
+    fn update_separator_cursor(&self, event: &NSEvent) {
+        let (px, py) = self.event_to_pixel(event);
+        let tabs = self.ivars().tabs.borrow();
+        let idx = self.ivars().active_tab.get();
+        let tab = match tabs.get(idx) {
+            Some(t) => t,
+            None => return,
+        };
+        // Only check if we have splits
+        if tab.columns.len() < 2 && tab.columns.first().map_or(true, |c| c.panes.len() == 1) {
+            return;
+        }
+        let vp = self.panes_viewport_for_tab(tab);
+        let mut seps = Vec::new();
+        tab.collect_separator_info(vp, &mut seps);
+        drop(tabs);
+
+        let scale = self.backing_scale();
+        let tolerance = 3.0 * scale;
+
+        for sep in &seps {
+            if sep.is_column_sep {
+                if (px - sep.pos).abs() < tolerance && py >= sep.cross_start && py <= sep.cross_end {
+                    #[allow(deprecated)]
+                    NSCursor::resizeLeftRightCursor().set();
+                    return;
+                }
+            } else {
+                if (py - sep.pos).abs() < tolerance && px >= sep.cross_start && px <= sep.cross_end {
+                    #[allow(deprecated)]
+                    NSCursor::resizeUpDownCursor().set();
+                    return;
+                }
+            }
+        }
+        // Not hovering any separator — reset to arrow
+        NSCursor::arrowCursor().set();
     }
 
     /// Update hovered URL state based on mouse position.
@@ -1547,26 +1591,26 @@ impl KovaView {
 
         // Separators are in screen space (viewport uses x: -scroll_offset_x)
         for sep in &seps {
-            if sep.is_hsplit {
+            if sep.is_column_sep {
                 if (px - sep.pos).abs() < tolerance && py >= sep.cross_start && py <= sep.cross_end {
                     return Some(SeparatorDrag {
-                        is_hsplit: true,
+                        is_column_sep: true,
                         origin_pixel: px,
-                        origin_ratio: sep.origin_ratio,
                         parent_dim: sep.parent_dim,
-                        node_ptr: sep.node_ptr,
                         column_sep_index: sep.column_sep_index,
+                        col_index: sep.col_index,
+                        row_sep_index: sep.row_sep_index,
                     });
                 }
             } else {
                 if (py - sep.pos).abs() < tolerance && px >= sep.cross_start && px <= sep.cross_end {
                     return Some(SeparatorDrag {
-                        is_hsplit: false,
+                        is_column_sep: false,
                         origin_pixel: py,
-                        origin_ratio: sep.origin_ratio,
                         parent_dim: sep.parent_dim,
-                        node_ptr: sep.node_ptr,
                         column_sep_index: sep.column_sep_index,
+                        col_index: sep.col_index,
+                        row_sep_index: sep.row_sep_index,
                     });
                 }
             }
@@ -2452,8 +2496,9 @@ impl KovaView {
                 // Create a new tab from the extracted pane
                 let new_tab = Tab {
                     id: alloc_tab_id(),
-                    columns: vec![extracted],
+                    columns: vec![crate::pane::Column::new(extracted)],
                     column_weights: vec![1.0],
+                    custom_weights: vec![false],
                     focused_pane: focused_id,
                     custom_title: None,
                     color: None,
@@ -2462,6 +2507,7 @@ impl KovaView {
                     minimized_stack: Vec::new(),
                     scroll_offset_x: 0.0,
                     virtual_width_override: 0.0,
+                    cell_h: std::cell::Cell::new(0.0),
                 };
 
                 // Resize the source tab's remaining panes while it's still active
@@ -2496,6 +2542,210 @@ impl KovaView {
         drop(tabs);
         self.ivars().active_tab.set(first_new);
         self.resize_all_panes();
+    }
+
+    // ---------------------------------------------------------------
+    // IPC methods (called from app.rs IPC command handlers)
+    // ---------------------------------------------------------------
+
+    /// IPC: create a split in the active tab's focused pane.
+    /// Returns the new pane's ID on success.
+    pub fn ipc_split(
+        &self,
+        config: &crate::config::Config,
+        direction: SplitDirection,
+        cwd: Option<&str>,
+        command: Option<String>,
+    ) -> Option<PaneId> {
+        let (focused_id, current_vp) = {
+            let tabs = self.ivars().tabs.borrow();
+            let idx = self.ivars().active_tab.get();
+            let tab = tabs.get(idx)?;
+            let fid = tab.focused_pane;
+            let vp = tab.viewport_for_pane(fid, self.panes_viewport_for_tab(tab))?;
+            (fid, vp)
+        };
+
+        let half_vp = match direction {
+            SplitDirection::Horizontal => PaneViewport {
+                x: current_vp.x,
+                y: current_vp.y,
+                width: current_vp.width / 2.0,
+                height: current_vp.height,
+            },
+            SplitDirection::Vertical => PaneViewport {
+                x: current_vp.x,
+                y: current_vp.y,
+                width: current_vp.width,
+                height: current_vp.height / 2.0,
+            },
+        };
+        let (cols, rows) = self.viewport_to_grid(&half_vp);
+
+        let new_pane = match Pane::spawn(cols, rows, config, cwd) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("IPC split: failed to spawn pane: {}", e);
+                return None;
+            }
+        };
+
+        // If a command was provided, set it as pending (will be injected once shell is ready)
+        if let Some(cmd) = command {
+            new_pane.pending_command.set(Some(cmd));
+        }
+
+        let new_id = new_pane.id;
+
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        if let Some(tab) = tabs.get_mut(idx) {
+            match direction {
+                SplitDirection::Horizontal => {
+                    tab.insert_column_after_focused(new_pane);
+                }
+                SplitDirection::Vertical => {
+                    tab.vsplit_at_pane(focused_id, new_pane);
+                }
+            }
+            tab.focused_pane = new_id;
+            self.scroll_to_reveal_pane(tab, new_id, self.drawable_viewport().width);
+        }
+        drop(tabs);
+
+        self.resize_all_panes();
+        log::info!("IPC: split created pane {}", new_id);
+        Some(new_id)
+    }
+
+    /// IPC: close a specific pane by ID. Returns true if found and closed.
+    /// Try to close a pane by ID. Returns:
+    /// - Some(true) = closed successfully
+    /// - Some(false) = found but refused (last pane in last tab)
+    /// - None = pane not in this window
+    pub fn ipc_close_pane(&self, pane_id: PaneId) -> Option<bool> {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+
+        // Find which tab contains this pane
+        let tab_idx = match tabs.iter().position(|tab| tab.contains(pane_id)) {
+            Some(i) => i,
+            None => return None,
+        };
+
+        // If it's the sole pane in the sole tab, refuse (would close the window)
+        if tabs.len() == 1 && tabs[0].is_single_pane() {
+            return Some(false);
+        }
+
+        if tabs[tab_idx].is_single_pane() {
+            // Close the entire tab
+            crate::recent_projects::add(&tabs[tab_idx]);
+            tabs.remove(tab_idx);
+            if tabs.is_empty() {
+                drop(tabs);
+                self.ivars().closing.set(true);
+                return Some(true);
+            }
+            let new_idx = if tab_idx >= tabs.len() { tabs.len() - 1 } else { tab_idx };
+            drop(tabs);
+            self.ivars().active_tab.set(new_idx);
+            self.resize_all_panes();
+            log::info!("IPC: closed tab containing pane {}", pane_id);
+            return Some(true);
+        }
+
+        // Multiple panes — close just this pane
+        let panes_vp = self.panes_viewport_for_tab(&tabs[tab_idx]);
+        let next_focus = tabs[tab_idx].neighbor(pane_id, crate::pane::NavDirection::Right, panes_vp)
+            .or_else(|| tabs[tab_idx].neighbor(pane_id, crate::pane::NavDirection::Left, panes_vp))
+            .or_else(|| tabs[tab_idx].neighbor(pane_id, crate::pane::NavDirection::Down, panes_vp))
+            .or_else(|| tabs[tab_idx].neighbor(pane_id, crate::pane::NavDirection::Up, panes_vp));
+
+        let old_columns = tabs[tab_idx].num_columns();
+        if !tabs[tab_idx].remove_pane(pane_id) {
+            drop(tabs);
+            return Some(false);
+        }
+        let new_focus = next_focus
+            .filter(|id| tabs[tab_idx].contains(*id))
+            .unwrap_or_else(|| tabs[tab_idx].first_pane().id);
+        tabs[tab_idx].focused_pane = new_focus;
+        let new_columns = tabs[tab_idx].num_columns();
+        tabs[tab_idx].scale_virtual_width(old_columns, new_columns);
+        tabs[tab_idx].minimized_stack.retain(|&pid| pid != pane_id);
+        let full = self.drawable_viewport();
+        let min_w = self.min_split_width_px();
+        tabs[tab_idx].clamp_scroll(full.width, min_w);
+        let tab = &mut tabs[tab_idx];
+        self.scroll_to_reveal_pane(tab, new_focus, full.width);
+        drop(tabs);
+        self.resize_all_panes();
+        log::info!("IPC: closed pane {}", pane_id);
+        Some(true)
+    }
+
+    /// IPC: get the CWD of the focused pane (for split fallback).
+    pub fn ipc_focused_cwd(&self) -> Option<String> {
+        let tabs = self.ivars().tabs.borrow();
+        let idx = self.ivars().active_tab.get();
+        tabs.get(idx).and_then(|tab| {
+            tab.pane(tab.focused_pane).and_then(|p| p.cwd())
+        })
+    }
+
+    /// IPC: collect pane info as JSON values for the list-panes command.
+    pub fn ipc_collect_panes(&self, win_idx: usize, is_key_window: bool, out: &mut Vec<serde_json::Value>) {
+        let tabs = self.ivars().tabs.borrow();
+        let active_tab = self.ivars().active_tab.get();
+        for (tab_idx, tab) in tabs.iter().enumerate() {
+            let focused_id = tab.focused_pane;
+            let is_active_tab = tab_idx == active_tab;
+            tab.for_each_pane(&mut |pane| {
+                let is_focused = pane.id == focused_id && is_active_tab && is_key_window;
+                out.push(serde_json::json!({
+                    "id": pane.id,
+                    "window": win_idx,
+                    "tab": tab_idx,
+                    "cwd": pane.cwd().unwrap_or_default(),
+                    "title": pane.display_title("shell"),
+                    "focused": is_focused,
+                }));
+            });
+        }
+    }
+
+    /// IPC: write text to a pane's PTY. Returns true if the pane was found.
+    pub fn ipc_send_keys(&self, pane_id: PaneId, text: &str) -> bool {
+        let tabs = self.ivars().tabs.borrow();
+        for tab in tabs.iter() {
+            if let Some(pane) = tab.pane(pane_id) {
+                pane.pty.write(text.as_bytes());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// IPC: focus a pane by ID (switch tab if needed). Returns true if found.
+    pub fn ipc_focus_pane(&self, pane_id: PaneId) -> bool {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let tab_idx = match tabs.iter().position(|tab| tab.contains(pane_id)) {
+            Some(i) => i,
+            None => return false,
+        };
+
+        tabs[tab_idx].focused_pane = pane_id;
+        let full = self.drawable_viewport();
+        let min_w = self.min_split_width_px();
+        tabs[tab_idx].clamp_scroll(full.width, min_w);
+        let tab = &mut tabs[tab_idx];
+        self.scroll_to_reveal_pane(tab, pane_id, full.width);
+        drop(tabs);
+
+        self.ivars().active_tab.set(tab_idx);
+        self.resize_all_panes();
+        log::info!("IPC: focused pane {}", pane_id);
+        true
     }
 
     /// Minimize the focused pane.
@@ -2644,6 +2894,7 @@ impl KovaView {
         let tabs = self.ivars().tabs.borrow();
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get(idx) {
+            tab.cell_h.set(cell_h);
             tab.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
                 // Skip PTY resize for minimized panes (keep old dimensions)
                 if pane.minimized {
@@ -3220,6 +3471,7 @@ impl KovaView {
 
             let mut pane_data: Vec<crate::renderer::PaneRenderData> = Vec::new();
             let cell_h = renderer.read().cell_size().1;
+            tab.cell_h.set(cell_h);
             let tab_bar_h = (cell_h * 2.0).round();
             let drawable_size = layer.drawableSize();
             let screen_width = drawable_size.width as f32;
