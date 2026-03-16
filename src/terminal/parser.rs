@@ -5,23 +5,44 @@ use vte::{Params, Perform};
 
 use super::{CursorShape, TerminalState};
 
-/// Walk up from `path` to find `.git/HEAD` and extract the branch name.
+/// Walk up from `path` to find `.git` and extract the branch name.
+/// Supports both regular repos (`.git/HEAD`) and worktrees (`.git` file pointing to gitdir).
 /// Returns `None` if not in a git repo.
 pub fn resolve_git_branch(path: &str) -> Option<String> {
     let mut dir = std::path::PathBuf::from(path);
     loop {
-        let head = dir.join(".git/HEAD");
-        if let Ok(content) = std::fs::read_to_string(&head) {
-            let content = content.trim();
-            if let Some(ref_path) = content.strip_prefix("ref: refs/heads/") {
-                return Some(ref_path.to_string());
-            }
-            // Detached HEAD — show short hash
-            return Some(content.chars().take(7).collect());
+        let git_path = dir.join(".git");
+        if let Some(head_content) = read_git_head(&git_path) {
+            return parse_head(&head_content);
         }
         if !dir.pop() {
             return None;
         }
+    }
+}
+
+/// Read the HEAD content from a `.git` path (directory or worktree file).
+fn read_git_head(git_path: &std::path::Path) -> Option<String> {
+    if git_path.is_dir() {
+        std::fs::read_to_string(git_path.join("HEAD")).ok()
+    } else if git_path.is_file() {
+        // Worktree: `.git` is a file containing "gitdir: <path>"
+        let content = std::fs::read_to_string(git_path).ok()?;
+        let gitdir = content.trim().strip_prefix("gitdir: ")?;
+        std::fs::read_to_string(std::path::Path::new(gitdir).join("HEAD")).ok()
+    } else {
+        None
+    }
+}
+
+/// Parse HEAD content into a branch name or short hash.
+fn parse_head(content: &str) -> Option<String> {
+    let content = content.trim();
+    if let Some(ref_path) = content.strip_prefix("ref: refs/heads/") {
+        Some(ref_path.to_string())
+    } else {
+        // Detached HEAD — show short hash
+        Some(content.chars().take(7).collect())
     }
 }
 
@@ -91,6 +112,8 @@ enum TermOp {
     // Kitty keyboard protocol
     KittyKeyboardPush(u8),
     KittyKeyboardPop(u16),
+    /// OSC 8 hyperlink — None clears, Some(url) sets
+    SetHyperlink(Option<String>),
     // Responses — read state during replay, write to PTY after lock release
     CursorPositionReport,
     DeviceAttributes,
@@ -266,6 +289,9 @@ impl VteHandler {
                     TermOp::SetLastCommand(cmd) => {
                         term.last_command = Some(cmd);
                     }
+                    TermOp::SetHyperlink(url) => {
+                        term.set_hyperlink(url);
+                    }
                     TermOp::CommandStarted => {
                         term.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -387,6 +413,30 @@ impl Perform for VteHandler {
                             self.ops.push(TermOp::SetCommandCompleted);
                         }
                         _ => {}
+                    }
+                }
+                b"8" => {
+                    // OSC 8 ; params ; URI ST — hyperlinks
+                    // params[1] = key-value params (ignored), params[2..] = URI
+                    // vte splits on ';', so URIs containing ';' are split across params[2..]
+                    if params.len() >= 3 {
+                        // Join params[2..] with ';' to reconstruct URI
+                        let uri_parts: Vec<&[u8]> = params[2..].to_vec();
+                        let uri = if uri_parts.len() == 1 {
+                            String::from_utf8_lossy(uri_parts[0]).into_owned()
+                        } else {
+                            uri_parts.iter()
+                                .map(|p| String::from_utf8_lossy(p))
+                                .collect::<Vec<_>>()
+                                .join(";")
+                        };
+                        if uri.is_empty() {
+                            log::trace!("OSC 8 hyperlink close");
+                            self.ops.push(TermOp::SetHyperlink(None));
+                        } else {
+                            log::trace!("OSC 8 hyperlink: {}", uri);
+                            self.ops.push(TermOp::SetHyperlink(Some(uri)));
+                        }
                     }
                 }
                 b"7777" => {

@@ -68,6 +68,8 @@ pub struct Cell {
     pub cluster: Option<Box<str>>,
     pub fg: [u8; 3],
     pub bg: [u8; 3],
+    /// OSC 8 hyperlink index into TerminalState::hyperlinks (0 = no link).
+    pub hyperlink_id: u16,
 }
 
 impl Cell {
@@ -83,6 +85,7 @@ impl Default for Cell {
             cluster: None,
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
+            hyperlink_id: 0,
         }
     }
 }
@@ -196,6 +199,10 @@ pub struct TerminalState {
     pub kitty_keyboard_flags: Vec<u8>,
     // Printable character counter (displayed in status bars)
     pub printable_chars: AtomicU64,
+    // OSC 8 hyperlink state
+    current_hyperlink: u16,
+    /// Hyperlink URL table, indexed by hyperlink_id (slot 0 unused).
+    hyperlinks: Vec<String>,
 }
 
 /// A single line matching a filter query.
@@ -207,7 +214,7 @@ pub struct FilterMatch {
 
 impl TerminalState {
     pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [u8; 3], bg: [u8; 3]) -> Self {
-        let blank = Cell { c: ' ', cluster: None, fg, bg };
+        let blank = Cell { c: ' ', cluster: None, fg, bg, hyperlink_id: 0 };
         let grid = (0..rows as usize).map(|_| Row::new(cols as usize, &blank)).collect();
         let terminal_id = TERMINAL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         log::info!("TerminalState::new id={} cols={} rows={}", terminal_id, cols, rows);
@@ -258,11 +265,35 @@ impl TerminalState {
             last_command: None,
             kitty_keyboard_flags: Vec::new(),
             printable_chars: AtomicU64::new(0),
+            current_hyperlink: 0,
+            hyperlinks: vec![String::new()], // slot 0 = no hyperlink
         }
     }
 
     pub fn kitty_flags(&self) -> u8 {
         self.kitty_keyboard_flags.last().copied().unwrap_or(0)
+    }
+
+    /// Set or clear the active OSC 8 hyperlink.
+    pub fn set_hyperlink(&mut self, url: Option<String>) {
+        match url {
+            None => self.current_hyperlink = 0,
+            Some(u) => {
+                // Reuse existing slot if URL already known
+                if let Some(id) = self.hyperlinks.iter().position(|s| s == &u) {
+                    self.current_hyperlink = id as u16;
+                } else if self.hyperlinks.len() < u16::MAX as usize {
+                    self.current_hyperlink = self.hyperlinks.len() as u16;
+                    self.hyperlinks.push(u);
+                }
+            }
+        }
+    }
+
+    /// Look up a hyperlink URL by ID.
+    pub fn hyperlink_url(&self, id: u16) -> Option<&str> {
+        if id == 0 { return None; }
+        self.hyperlinks.get(id as usize).map(|s| s.as_str())
     }
 
     pub fn visible_lines(&self) -> Vec<Cow<'_, [Cell]>> {
@@ -373,6 +404,7 @@ impl TerminalState {
                 cluster: None,
                 fg,
                 bg: self.current_bg,
+                hyperlink_id: self.current_hyperlink,
             };
 
             // Wide char: write placeholder '\0' in the next column
@@ -382,6 +414,7 @@ impl TerminalState {
                     cluster: None,
                     fg,
                     bg: self.current_bg,
+                    hyperlink_id: self.current_hyperlink,
                 };
             }
         }
@@ -452,6 +485,7 @@ impl TerminalState {
                 cluster: Some(cluster.into()),
                 fg,
                 bg: self.current_bg,
+                hyperlink_id: self.current_hyperlink,
             };
 
             // Write '\0' sentinel for remaining columns
@@ -462,6 +496,7 @@ impl TerminalState {
                         cluster: None,
                         fg,
                         bg: self.current_bg,
+                        hyperlink_id: self.current_hyperlink,
                     };
                 }
             }
@@ -1377,7 +1412,7 @@ impl TerminalState {
 
     /// Detect a URL at a given visible row/col position.
     /// Returns per-row highlight segments and the full URL string.
-    /// Handles URLs that span multiple soft-wrapped rows.
+    /// Checks OSC 8 hyperlinks first, then falls back to auto-detection.
     pub fn url_at(&self, visible_row: usize, col: u16) -> Option<(Vec<(usize, u16, u16)>, String)> {
         let display = self.visible_lines();
         let cells = display.get(visible_row)?;
@@ -1385,6 +1420,35 @@ impl TerminalState {
         if col >= cells.len() {
             return None;
         }
+
+        // --- OSC 8 hyperlink check ---
+        let hid = cells[col].hyperlink_id;
+        if hid != 0 {
+            if let Some(url) = self.hyperlink_url(hid) {
+                let url = url.to_string();
+                let mut segments = Vec::new();
+                // Scan all visible rows for contiguous cells with the same hyperlink_id
+                for r in 0..display.len() {
+                    let row_cells = &display[r];
+                    let mut seg_start: Option<usize> = None;
+                    for (c, cell) in row_cells.iter().enumerate() {
+                        if cell.hyperlink_id == hid {
+                            if seg_start.is_none() {
+                                seg_start = Some(c);
+                            }
+                        } else if let Some(s) = seg_start.take() {
+                            segments.push((r, s as u16, c as u16));
+                        }
+                    }
+                    if let Some(s) = seg_start {
+                        segments.push((r, s as u16, row_cells.len() as u16));
+                    }
+                }
+                return Some((segments, url));
+            }
+        }
+
+        // --- Fallback: auto-detect http(s):// URLs ---
 
         // Find the start of the logical line (go back while previous row was wrapped)
         let mut first_row = visible_row;
