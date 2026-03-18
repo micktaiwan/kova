@@ -356,8 +356,16 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
         ids.push(id);
     }
     if panes.is_empty() { return None; }
-    let row_weights = saved.row_weights.clone();
-    let custom_row_weights = saved.custom_row_weights.clone().unwrap_or_else(|| vec![false; panes.len()]);
+    let n = panes.len();
+    let row_weights = if saved.row_weights.len() == n {
+        saved.row_weights.clone()
+    } else {
+        log::warn!("Session: row_weights len {} != panes len {}, using equal weights", saved.row_weights.len(), n);
+        vec![1.0; n]
+    };
+    let custom_row_weights = saved.custom_row_weights.clone()
+        .filter(|v| v.len() == n)
+        .unwrap_or_else(|| vec![false; n]);
     Some((Column { panes, row_weights, custom_row_weights }, ids))
 }
 

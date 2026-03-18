@@ -1308,7 +1308,8 @@ impl KovaView {
         let tab = tabs.get(idx)?;
         let pane = tab.pane(tab.focused_pane)?;
         // SAFETY: The Tab lives in RefCell inside ivars, pinned in ObjC heap.
-        // We only mutate in the render timer (pane removal), never while an event handler holds this ref.
+        // Mutations (pane add/remove, IPC commands) happen only in the render timer tick,
+        // never while an event handler holds this ref.
         Some(unsafe { &*(pane as *const Pane) })
     }
 
@@ -1670,8 +1671,12 @@ impl KovaView {
         let renderer = self.ivars().renderer.get()?;
         let cell_w = renderer.read().cell_size().0;
         let max_tab_w = cell_w * 20.0;
-        let available_w = full.width - left_inset;
-        let tab_width = (available_w / tab_count as f32).min(max_tab_w);
+        // Reserve right inset for version label / drag handle
+        let version_label = format!("Kova v{}", env!("CARGO_PKG_VERSION"));
+        let version_chars = version_label.chars().count() as f32;
+        let right_inset = cell_w * (version_chars + 3.5);
+        let available_w = full.width - left_inset - right_inset;
+        let tab_width = (available_w / tab_count as f32).max(cell_w * 4.0).min(max_tab_w);
         for i in 0..tab_count {
             let x = left_inset + i as f32 * tab_width;
             if px >= x && px <= x + tab_width {
@@ -2647,14 +2652,18 @@ impl KovaView {
             .map(|p| p.id)
             .unwrap_or(source.focused_pane);
 
-        // Append source columns to target tab
-        let avg_weight: f32 = tabs[target].column_weights.iter().sum::<f32>()
+        // Append source columns to target tab, normalizing weights
+        let target_avg: f32 = tabs[target].column_weights.iter().sum::<f32>()
             / tabs[target].columns.len() as f32;
-        for (col, weight) in source.columns.into_iter().zip(source.column_weights.into_iter()) {
+        let source_avg: f32 = source.column_weights.iter().sum::<f32>()
+            / source.columns.len().max(1) as f32;
+        let scale = if source_avg > 0.0 { target_avg / source_avg } else { 1.0 };
+        for (i, (col, weight)) in source.columns.into_iter().zip(source.column_weights.into_iter()).enumerate() {
             tabs[target].columns.push(col);
-            // Use source weights scaled to target's average
-            tabs[target].column_weights.push(avg_weight * weight);
-            tabs[target].custom_weights.push(false);
+            tabs[target].column_weights.push(weight * scale);
+            tabs[target].custom_weights.push(
+                source.custom_weights.get(i).copied().unwrap_or(false)
+            );
         }
 
         // Merge minimized stacks
@@ -2844,6 +2853,13 @@ impl KovaView {
             let is_active_tab = tab_idx == active_tab;
             tab.for_each_pane(&mut |pane| {
                 let is_focused = pane.id == focused_id && is_active_tab && is_key_window;
+                let pid = pane.pty.pid();
+                let children = pane.pty.child_processes();
+                let is_idle = children.is_empty();
+                let child_json: Vec<serde_json::Value> = children
+                    .into_iter()
+                    .map(|(cpid, name)| serde_json::json!({"pid": cpid, "name": name}))
+                    .collect();
                 out.push(serde_json::json!({
                     "id": pane.id,
                     "window": win_idx,
@@ -2851,6 +2867,9 @@ impl KovaView {
                     "cwd": pane.cwd().unwrap_or_default(),
                     "title": pane.display_title("shell"),
                     "focused": is_focused,
+                    "pid": pid,
+                    "child_processes": child_json,
+                    "is_idle": is_idle,
                 }));
             });
         }
@@ -2888,6 +2907,42 @@ impl KovaView {
         self.resize_all_panes();
         log::info!("IPC: focused pane {}", pane_id);
         true
+    }
+
+    /// IPC: create a new tab. Returns (tab_id, pane_id) on success.
+    pub fn ipc_new_tab(
+        &self,
+        config: &crate::config::Config,
+        cwd: Option<&str>,
+        command: Option<String>,
+    ) -> Option<(u32, u32)> {
+        // Determine CWD: explicit param > focused pane's CWD
+        let effective_cwd: Option<String> = cwd.map(String::from).or_else(|| self.ipc_focused_cwd());
+
+        let tab = match Tab::new_with_cwd(config, effective_cwd.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("IPC new-tab: failed to create tab: {}", e);
+                return None;
+            }
+        };
+
+        let tab_id = tab.id;
+        let pane_id = tab.first_pane().id;
+
+        // If a command was provided, set it as pending
+        if let Some(cmd) = command {
+            tab.first_pane().pending_command.set(Some(cmd));
+        }
+
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        tabs.push(tab);
+        let new_idx = tabs.len() - 1;
+        drop(tabs);
+        self.ivars().active_tab.set(new_idx);
+        self.resize_all_panes();
+        log::info!("IPC: new tab created: tab_id={}, pane_id={}", tab_id, pane_id);
+        Some((tab_id, pane_id))
     }
 
     /// Minimize the focused pane.

@@ -153,7 +153,9 @@ pub struct PaneViewport {
     pub height: f32,
 }
 
-const MAX_VERTEX_BYTES: usize = 8 * 1024 * 1024; // 8MB
+const INITIAL_VERTEX_BYTES: usize = 8 * 1024 * 1024; // 8MB
+/// Current vertex buffer capacity (grows dynamically if needed).
+static VERTEX_BUF_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(INITIAL_VERTEX_BYTES);
 
 pub struct Renderer {
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -239,7 +241,7 @@ impl Renderer {
 
         let make_vertex_buf = || {
             device.newBufferWithLength_options(
-                MAX_VERTEX_BYTES,
+                INITIAL_VERTEX_BYTES,
                 MTLResourceOptions(
                     MTLResourceOptions::CPUCacheModeDefaultCache.0
                         | MTLResourceOptions::StorageModeShared.0
@@ -665,14 +667,27 @@ impl Renderer {
 
             let buf_idx = self.vertex_buf_idx;
             self.vertex_buf_idx = 1 - buf_idx;
-            let vertex_buf = &self.vertex_bufs[buf_idx];
 
-            if vertex_bytes.len() > MAX_VERTEX_BYTES {
-                log::error!("Vertex data ({} bytes) exceeds buffer size ({} bytes), skipping frame", vertex_bytes.len(), MAX_VERTEX_BYTES);
-                encoder.endEncoding();
-                cmd_buf.commit();
-                return;
+            let current_capacity = VERTEX_BUF_CAPACITY.load(std::sync::atomic::Ordering::Relaxed);
+            if vertex_bytes.len() > current_capacity {
+                // Grow to next power-of-two that fits
+                let new_capacity = vertex_bytes.len().next_power_of_two();
+                log::warn!("Vertex data ({} bytes) exceeds buffer ({} bytes), growing to {} bytes",
+                    vertex_bytes.len(), current_capacity, new_capacity);
+                let device = layer.device().expect("no Metal device on layer");
+                for i in 0..2 {
+                    self.vertex_bufs[i] = device.newBufferWithLength_options(
+                        new_capacity,
+                        MTLResourceOptions(
+                            MTLResourceOptions::CPUCacheModeDefaultCache.0
+                                | MTLResourceOptions::StorageModeShared.0
+                        ),
+                    ).expect("failed to reallocate vertex buffer");
+                }
+                VERTEX_BUF_CAPACITY.store(new_capacity, std::sync::atomic::Ordering::Relaxed);
             }
+
+            let vertex_buf = &self.vertex_bufs[buf_idx];
             unsafe {
                 let ptr = vertex_buf.contents().as_ptr() as *mut u8;
                 std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), ptr, vertex_bytes.len());
@@ -1158,17 +1173,15 @@ impl Renderer {
         // Full-width background
         Self::push_bg_quad(vertices, 0.0, 0.0, viewport_w, bar_h, self.tab_bar_bg);
 
-        // Fixed width per tab, capped at cell_w * 20
-        let max_tab_w = cell_w * 20.0;
-        let full_available_w = viewport_w - left_inset;
-        let tab_width = (full_available_w / tab_count as f32).min(max_tab_w);
-
-        // Version label: show only if tabs don't reach its area
+        // Version label — always visible, doubles as window drag handle
         let version_label = format!("Kova v{}", env!("CARGO_PKG_VERSION"));
         let version_chars = version_label.chars().count() as f32;
-        let version_padding = cell_w * (version_chars + 2.0);
-        let tabs_right_edge = left_inset + tab_count as f32 * tab_width;
-        let show_version = tabs_right_edge <= viewport_w - version_padding;
+        let right_inset = cell_w * (version_chars + 3.5);
+
+        // Fixed width per tab, capped at cell_w * 20, reserving right inset
+        let max_tab_w = cell_w * 20.0;
+        let full_available_w = viewport_w - left_inset - right_inset;
+        let tab_width = (full_available_w / tab_count as f32).max(cell_w * 4.0).min(max_tab_w);
         let no_bg = [0.0, 0.0, 0.0, 0.0];
 
         for (i, (title, is_active, color_idx, is_renaming, has_bell, has_completion)) in tab_titles.iter().enumerate() {
@@ -1256,11 +1269,14 @@ impl Renderer {
             }
         }
 
-        // Render version label on the right (if space allows)
-        if show_version {
+        // Render drag grip + version label on the right (always visible — drag handle zone)
+        {
+            let grip_fg = [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 1.0];
             let version_fg = [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 0.5];
-            let version_x = viewport_w - version_padding + cell_w;
+            let grip_x = viewport_w - right_inset + cell_w * 0.25;
+            let version_x = grip_x + cell_w * 1.5;
             let version_y = (bar_h - cell_h) / 2.0;
+            self.render_status_text(vertices, "⠿", grip_x, version_y, viewport_w, grip_fg, no_bg);
             self.render_status_text(vertices, &version_label, version_x, version_y, viewport_w - cell_w * 0.5, version_fg, no_bg);
         }
     }
@@ -1574,7 +1590,7 @@ impl Renderer {
         let atlas_bytes = self.atlas.mem_bytes();
         let atlas_dims = self.atlas.texture_size();
         let glyph_count = self.atlas.glyphs.len() + self.atlas.cluster_glyphs.len();
-        let vertex_bytes = MAX_VERTEX_BYTES * 2; // double-buffered
+        let vertex_bytes = VERTEX_BUF_CAPACITY.load(std::sync::atomic::Ordering::Relaxed) * 2; // double-buffered
         (atlas_bytes, atlas_dims, glyph_count, vertex_bytes)
     }
 

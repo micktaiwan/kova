@@ -240,6 +240,49 @@ impl Pty {
         }
     }
 
+    /// Returns the PID of the child shell process.
+    pub fn pid(&self) -> u32 {
+        self.child_pid
+    }
+
+    /// Returns the list of child processes of the shell (pid, comm).
+    /// Uses macOS `proc_listchildpids` + `proc_name`.
+    pub fn child_processes(&self) -> Vec<(u32, String)> {
+        let pid = self.child_pid as i32;
+        // First call to get count
+        let count = unsafe { libc::proc_listchildpids(pid, std::ptr::null_mut(), 0) };
+        if count <= 0 {
+            return Vec::new();
+        }
+        let mut pids = vec![0i32; count as usize];
+        let actual = unsafe {
+            libc::proc_listchildpids(
+                pid,
+                pids.as_mut_ptr() as *mut libc::c_void,
+                (pids.len() * std::mem::size_of::<i32>()) as i32,
+            )
+        };
+        if actual <= 0 {
+            return Vec::new();
+        }
+        let n = (actual as usize) / std::mem::size_of::<i32>();
+        pids.truncate(n);
+        pids.iter()
+            .map(|&cpid| {
+                let mut name_buf = [0u8; 256];
+                let len = unsafe {
+                    libc::proc_name(cpid, name_buf.as_mut_ptr() as *mut libc::c_void, 256)
+                };
+                let name = if len > 0 {
+                    String::from_utf8_lossy(&name_buf[..len as usize]).to_string()
+                } else {
+                    String::new()
+                };
+                (cpid as u32, name)
+            })
+            .collect()
+    }
+
     /// Returns the current working directory of the child shell process.
     /// Uses macOS `proc_pidinfo` with `PROC_PIDVNODEPATHINFO`.
     pub fn cwd(&self) -> Option<String> {

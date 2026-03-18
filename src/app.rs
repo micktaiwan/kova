@@ -378,6 +378,9 @@ fn handle_ipc_command(
         IpcCommand::FocusPane(pane_id) => {
             handle_ipc_focus_pane(windows, pane_id)
         }
+        IpcCommand::NewTab { cwd, cmd } => {
+            handle_ipc_new_tab(windows, config_cell, cwd, cmd)
+        }
     }
 }
 
@@ -516,6 +519,41 @@ fn handle_ipc_focus_pane(
     }
 
     IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: create a new tab in the key window.
+fn handle_ipc_new_tab(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    config_cell: &OnceCell<Config>,
+    cwd: Option<String>,
+    cmd: Option<String>,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let config = match config_cell.get() {
+        Some(c) => c,
+        None => return IpcResponse::Error { message: "config not loaded".to_string() },
+    };
+
+    let wins = windows.borrow();
+    let win = wins.iter()
+        .find(|w| w.isKeyWindow())
+        .or_else(|| wins.first());
+    let win = match win {
+        Some(w) => w,
+        None => return IpcResponse::Error { message: "no window".to_string() },
+    };
+    let view = match kova_view(win) {
+        Some(v) => v,
+        None => return IpcResponse::Error { message: "no view".to_string() },
+    };
+
+    match view.ipc_new_tab(config, cwd.as_deref(), cmd) {
+        Some((tab_id, pane_id)) => IpcResponse::Ok {
+            data: Some(serde_json::json!({"tab_id": tab_id, "pane_id": pane_id})),
+        },
+        None => IpcResponse::Error { message: "failed to create tab".to_string() },
+    }
 }
 
 fn setup_menu(mtm: MainThreadMarker) {
