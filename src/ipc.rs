@@ -28,6 +28,11 @@ pub enum IpcCommand {
     SendKeys { pane_id: u32, text: String },
     /// Focus a pane by its ID (switching tab/window if needed).
     FocusPane(u32),
+    /// Create a new tab with an optional CWD and command.
+    NewTab {
+        cwd: Option<String>,
+        cmd: Option<String>,
+    },
 }
 
 /// Response sent back to the IPC client.
@@ -247,6 +252,11 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 .ok_or_else(|| "missing \"pane_id\" field".to_string())?
                 as u32;
             Ok(IpcCommand::FocusPane(pane_id))
+        }
+        "new-tab" => {
+            let cwd = v.get("cwd").and_then(|c| c.as_str()).map(String::from);
+            let cmd_str = v.get("command").and_then(|c| c.as_str()).map(String::from);
+            Ok(IpcCommand::NewTab { cwd, cmd: cmd_str })
         }
         other => Err(format!("unknown command: {}", other)),
     }
