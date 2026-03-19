@@ -97,6 +97,12 @@ pub struct KovaViewIvars {
     resize_feedback: Cell<Option<ResizeFeedback>>,
     /// Deferred tabs to restore progressively (tab_index, saved_tab_data).
     deferred_tabs: RefCell<Vec<(usize, crate::session::SavedTab)>>,
+    /// Fixed total pane count for the loading counter (computed once at startup).
+    loading_total_panes: Cell<u32>,
+    /// Tab boundary guard: last time navigation hit a tab edge, and which direction.
+    boundary_hit: Cell<Option<BoundaryHit>>,
+    /// Boundary flash: remaining frames and which edge of the focused pane to flash.
+    boundary_flash: Cell<Option<BoundaryFlash>>,
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +115,19 @@ struct ResizeFeedback {
 
 #[derive(Clone, Copy)]
 enum ResizeMode { Ratio, Virtual, Edge }
+
+#[derive(Clone, Copy)]
+struct BoundaryHit {
+    time: std::time::Instant,
+    direction: NavDirection,
+}
+
+#[derive(Clone, Copy)]
+struct BoundaryFlash {
+    /// Which edge to flash (Left or Right).
+    edge: NavDirection,
+    remaining_frames: u32,
+}
 
 struct FilterState {
     query: String,
@@ -1192,6 +1211,9 @@ impl KovaView {
             scroll_axis_lock: Cell::new(ScrollAxisLock::None),
             resize_feedback: Cell::new(None),
             deferred_tabs: RefCell::new(Vec::new()),
+            loading_total_panes: Cell::new(0),
+            boundary_hit: Cell::new(None),
+            boundary_flash: Cell::new(None),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -3007,29 +3029,58 @@ impl KovaView {
             // Auto-scroll to reveal the newly focused pane
             self.scroll_to_reveal_pane(tab, neighbor_id, self.drawable_viewport().width);
         } else {
-            // No neighbor in this direction → overflow to adjacent tab
+            // No neighbor in this direction → tab boundary guard
             let count = tabs.len();
             if count <= 1 {
                 return;
             }
             drop(tabs);
-            let delta: i32 = match dir {
-                NavDirection::Left | NavDirection::Up => -1,
-                NavDirection::Right | NavDirection::Down => 1,
+
+            // Check if we recently hit the same boundary (double-press to cross)
+            let now = std::time::Instant::now();
+            if let Some(prev) = self.ivars().boundary_hit.get() {
+                if prev.direction == dir && now.duration_since(prev.time).as_millis() < 500 {
+                    // Second press within timeout → cross the boundary
+                    self.ivars().boundary_hit.set(None);
+                    self.ivars().boundary_flash.set(None);
+                    let delta: i32 = match dir {
+                        NavDirection::Left | NavDirection::Up => -1,
+                        NavDirection::Right | NavDirection::Down => 1,
+                    };
+                    self.do_switch_tab_relative(delta);
+                    let mut tabs = self.ivars().tabs.borrow_mut();
+                    let new_idx = self.ivars().active_tab.get();
+                    if let Some(new_tab) = tabs.get_mut(new_idx) {
+                        let target_id = match dir {
+                            NavDirection::Right | NavDirection::Down => new_tab.first_pane().id,
+                            NavDirection::Left | NavDirection::Up => new_tab.last_pane().id,
+                        };
+                        new_tab.focused_pane = target_id;
+                        self.scroll_to_reveal_pane(new_tab, target_id, self.drawable_viewport().width);
+                    }
+                    return;
+                }
+            }
+
+            // First press → record hit and flash the boundary edge
+            self.ivars().boundary_hit.set(Some(BoundaryHit { time: now, direction: dir }));
+            let flash_edge = match dir {
+                NavDirection::Right | NavDirection::Down => NavDirection::Right,
+                NavDirection::Left | NavDirection::Up => NavDirection::Left,
             };
-            self.do_switch_tab_relative(delta);
-            // Focus the appropriate pane in the new tab:
-            // going right/down → first pane, going left/up → last pane
-            let mut tabs = self.ivars().tabs.borrow_mut();
-            let new_idx = self.ivars().active_tab.get();
-            if let Some(new_tab) = tabs.get_mut(new_idx) {
-                let target_id = match dir {
-                    NavDirection::Right | NavDirection::Down => new_tab.first_pane().id,
-                    NavDirection::Left | NavDirection::Up => new_tab.last_pane().id,
-                };
-                new_tab.focused_pane = target_id;
-                // Auto-scroll to reveal the focused pane in the new tab
-                self.scroll_to_reveal_pane(new_tab, target_id, self.drawable_viewport().width);
+            let fps = self.ivars().config.get().map(|c| c.terminal.fps).unwrap_or(60) as u32;
+            let flash_frames = fps / 4; // ~250ms
+            self.ivars().boundary_flash.set(Some(BoundaryFlash {
+                edge: flash_edge,
+                remaining_frames: flash_frames,
+            }));
+            // Mark focused pane dirty so the next tick renders the flash immediately
+            let tabs = self.ivars().tabs.borrow();
+            let idx = self.ivars().active_tab.get();
+            if let Some(tab) = tabs.get(idx) {
+                if let Some(pane) = tab.pane(tab.focused_pane) {
+                    pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
@@ -3524,27 +3575,45 @@ impl KovaView {
             }
         }
 
-        // --- Progressive restore of deferred tabs (one per tick) ---
+        // --- Progressive restore of deferred tabs (batched) ---
+        // Allow up to MAX_CONCURRENT_SHELLS non-ready shells at once.
+        // This gives parallelism without the 30+ shell stampede.
         {
+            const MAX_CONCURRENT_SHELLS: u32 = 4;
+
             let mut deferred = ivars.deferred_tabs.borrow_mut();
-            if let Some((tab_idx, saved_tab)) = deferred.pop() {
-                let config = ivars.config.get().unwrap();
-                let cols = config.terminal.columns;
-                let rows = config.terminal.rows;
-                let t = std::time::Instant::now();
-                let pane_count = crate::session::count_panes_in_saved_tab(&saved_tab);
-                match crate::session::restore_saved_tab(&saved_tab, cols, rows, config) {
-                    Some(tab) => {
-                        log::info!("[STARTUP] deferred tab {} restored ({} panes) in {:?}", tab_idx, pane_count, t.elapsed());
-                        let mut tabs = ivars.tabs.borrow_mut();
-                        if tab_idx < tabs.len() {
-                            // Kill the placeholder pane before replacing
-                            tabs[tab_idx] = tab;
+            if !deferred.is_empty() {
+                // Count shells currently loading (live PTY, not yet ready)
+                let tabs = ivars.tabs.borrow();
+                let mut loading: u32 = 0;
+                for tab in tabs.iter() {
+                    tab.for_each_pane(&mut |pane| {
+                        if !pane.is_ready() && pane.pty.is_live() {
+                            loading += 1;
                         }
-                        drop(tabs);
-                        self.resize_all_panes();
+                    });
+                }
+                drop(tabs);
+
+                // Restore tabs until we hit the concurrency limit
+                while !deferred.is_empty() && loading < MAX_CONCURRENT_SHELLS {
+                    let (tab_idx, saved_tab) = deferred.pop().unwrap();
+                    let config = ivars.config.get().unwrap();
+                    let cols = config.terminal.columns;
+                    let rows = config.terminal.rows;
+                    let pane_count = crate::session::count_panes_in_saved_tab(&saved_tab);
+                    match crate::session::restore_saved_tab(&saved_tab, cols, rows, config) {
+                        Some(tab) => {
+                            loading += pane_count as u32;
+                            let mut tabs = ivars.tabs.borrow_mut();
+                            if tab_idx < tabs.len() {
+                                tabs[tab_idx] = tab;
+                            }
+                            drop(tabs);
+                            self.resize_all_panes();
+                        }
+                        None => log::warn!("Failed to restore deferred tab {}", tab_idx),
                     }
-                    None => log::warn!("Failed to restore deferred tab {}", tab_idx),
                 }
             }
         }
@@ -3940,29 +4009,49 @@ impl KovaView {
             r.resize_feedback_text = None;
         }
 
-        // Update loading progress: count shell_ready across ALL tabs
-        {
-            let tabs = ivars.tabs.borrow();
-            let deferred_remaining = ivars.deferred_tabs.borrow().len() as u32;
-            let mut ready: u32 = 0;
-            let mut total: u32 = 0;
-            for tab in tabs.iter() {
-                tab.for_each_pane(&mut |pane| {
-                    total += 1;
-                    if pane.is_ready() {
-                        ready += 1;
-                    }
-                });
-            }
-            // Add deferred tabs' pane count to total
-            let deferred_panes: u32 = ivars.deferred_tabs.borrow().iter()
-                .map(|(_, saved)| crate::session::count_panes_in_saved_tab(saved) as u32)
-                .sum();
-            total += deferred_panes;
-            if ready < total || deferred_remaining > 0 {
-                r.loading_progress = Some((ready, total));
+        // Update boundary flash (decrement frames, compute edge position)
+        if let Some(mut flash) = ivars.boundary_flash.get() {
+            if flash.remaining_frames > 0 {
+                flash.remaining_frames -= 1;
+                ivars.boundary_flash.set(Some(flash));
+                // Find focused pane viewport to position the flash line
+                if let Some(focused) = pane_data.iter().find(|p| p.is_focused) {
+                    let vp = &focused.viewport;
+                    let is_right = flash.edge == NavDirection::Right;
+                    let edge_x = if is_right { vp.x + vp.width } else { vp.x };
+                    r.boundary_flash = Some((edge_x, vp.y, vp.y + vp.height, 1.0, is_right));
+                } else {
+                    r.boundary_flash = None;
+                }
             } else {
-                r.loading_progress = None;
+                ivars.boundary_flash.set(None);
+                r.boundary_flash = None;
+            }
+        } else {
+            r.boundary_flash = None;
+        }
+
+        // Update loading progress: count shell_ready (live PTYs only) against fixed total
+        {
+            let fixed_total = ivars.loading_total_panes.get();
+            if fixed_total > 0 {
+                let tabs = ivars.tabs.borrow();
+                let deferred_remaining = ivars.deferred_tabs.borrow().len() as u32;
+                let mut ready: u32 = 0;
+                for tab in tabs.iter() {
+                    tab.for_each_pane(&mut |pane| {
+                        if pane.is_ready() && pane.pty.is_live() {
+                            ready += 1;
+                        }
+                    });
+                }
+                if ready < fixed_total || deferred_remaining > 0 {
+                    r.loading_progress = Some((ready, fixed_total));
+                } else {
+                    r.loading_progress = None;
+                    // Clear so we don't keep checking
+                    ivars.loading_total_panes.set(0);
+                }
             }
         }
 
@@ -4037,6 +4126,20 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, act
     let view = KovaView::new(mtm, content_rect);
     view.setup_metal(mtm, config, tabs, active_tab);
     if !deferred_tabs.is_empty() {
+        // Compute fixed total pane count: active tab's live panes + all deferred panes
+        let mut total: u32 = 0;
+        {
+            let tabs_ref = view.ivars().tabs.borrow();
+            for tab in tabs_ref.iter() {
+                tab.for_each_pane(&mut |pane| {
+                    if pane.pty.is_live() { total += 1; }
+                });
+            }
+        }
+        for (_, saved) in &deferred_tabs {
+            total += crate::session::count_panes_in_saved_tab(saved) as u32;
+        }
+        view.ivars().loading_total_panes.set(total);
         *view.ivars().deferred_tabs.borrow_mut() = deferred_tabs;
     }
     window.setContentView(Some(&view));

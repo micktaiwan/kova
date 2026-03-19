@@ -205,6 +205,8 @@ pub struct Renderer {
     pub hovered_url_text: Option<String>,
     /// Resize mode feedback text, displayed on the left of the global status bar.
     pub resize_feedback_text: Option<String>,
+    /// Boundary flash: (edge_x, top_y, bottom_y, alpha, is_right_edge). Set by window when navigation hits tab edge.
+    pub boundary_flash: Option<(f32, f32, f32, f32, bool)>,
     /// Loading progress: (ready_panes, total_panes). None when all loaded.
     pub loading_progress: Option<(u32, u32)>,
     /// Pane ID of the hovered URL (to show URL only in that pane's status bar)
@@ -309,6 +311,7 @@ impl Renderer {
             hovered_url: None,
             hovered_url_text: None,
             resize_feedback_text: None,
+            boundary_flash: None,
             loading_progress: None,
             hovered_url_pane_id: None,
             cached_help_hint: String::new(),
@@ -530,6 +533,26 @@ impl Renderer {
                     overlay_vertices.push(Vertex { position: [x1, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
                 }
             }
+        }
+
+        // Draw boundary flash (red line at tab edge)
+        if let Some((edge_x, top_y, bottom_y, alpha, is_right)) = self.boundary_flash {
+            let no_tex = [0.0_f32, 0.0];
+            let white = [1.0_f32, 1.0, 1.0, 0.0];
+            let flash_color = [0.9_f32, 0.2, 0.2, alpha];
+            let thickness = 5.0_f32;
+            // Draw inside the pane, flush against the edge
+            let (lx, rx) = if is_right {
+                (edge_x - thickness, edge_x)
+            } else {
+                (edge_x, edge_x + thickness)
+            };
+            overlay_vertices.push(Vertex { position: [lx, top_y], tex_coords: no_tex, color: white, bg_color: flash_color });
+            overlay_vertices.push(Vertex { position: [rx, top_y], tex_coords: no_tex, color: white, bg_color: flash_color });
+            overlay_vertices.push(Vertex { position: [lx, bottom_y], tex_coords: no_tex, color: white, bg_color: flash_color });
+            overlay_vertices.push(Vertex { position: [rx, top_y], tex_coords: no_tex, color: white, bg_color: flash_color });
+            overlay_vertices.push(Vertex { position: [rx, bottom_y], tex_coords: no_tex, color: white, bg_color: flash_color });
+            overlay_vertices.push(Vertex { position: [lx, bottom_y], tex_coords: no_tex, color: white, bg_color: flash_color });
         }
 
         // Draw tab bar

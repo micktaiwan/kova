@@ -304,7 +304,6 @@ impl GlyphAtlas {
             "Overlay font: cell {:.1}x{:.1}",
             overlay_cell_width, overlay_cell_height
         );
-
         atlas
     }
 
