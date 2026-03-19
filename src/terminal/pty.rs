@@ -53,6 +53,8 @@ pub struct Pty {
     shutdown: Arc<AtomicBool>,
     pub input_chars: Arc<AtomicU64>,
     reader_thread: Option<std::thread::JoinHandle<()>>,
+    /// True for placeholder PTYs that have no child process.
+    is_dummy: bool,
 }
 
 impl Pty {
@@ -140,7 +142,6 @@ impl Pty {
         };
 
         let child_pid = child.id();
-        log::info!("PTY spawned: pid={}, shell={}, cols={}, rows={}, cwd={}", child_pid, shell, cols, rows, start_dir);
         drop(slave_fd);
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -200,7 +201,29 @@ impl Pty {
             shutdown,
             input_chars,
             reader_thread: Some(reader_handle),
+            is_dummy: false,
         })
+    }
+
+    /// Create a lightweight dummy PTY with no child process.
+    /// Used for placeholder tabs during deferred restore — avoids spawning
+    /// a shell process that would compete with the active tab's shell for
+    /// zshrc/plugin loading time.
+    pub fn dummy() -> Result<Self, Box<dyn std::error::Error>> {
+        let pty_pair = openpty(None, None)?;
+        Ok(Pty {
+            master_fd: pty_pair.controller,
+            child_pid: 0,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            input_chars: Arc::new(AtomicU64::new(0)),
+            reader_thread: None,
+            is_dummy: true,
+        })
+    }
+
+    /// Returns true if this PTY has a real child process (not a dummy).
+    pub fn is_live(&self) -> bool {
+        !self.is_dummy
     }
 
     pub fn write(&self, data: &[u8]) {
@@ -361,6 +384,9 @@ pub fn shutdown_all() {
 
 impl Drop for Pty {
     fn drop(&mut self) {
+        if self.is_dummy {
+            return;
+        }
         self.shutdown.store(true, Ordering::Relaxed);
         // Send SIGHUP to the child so it exits, which causes EOF on the reader fd.
         // Without this, the reader thread could block indefinitely on read().

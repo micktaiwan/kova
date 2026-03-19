@@ -342,9 +342,7 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
     let mut panes = Vec::new();
     let mut ids = Vec::new();
     for sp in &saved.panes {
-        let t = std::time::Instant::now();
         let mut pane = Pane::spawn(cols, rows, config, sp.cwd.as_deref()).ok()?;
-        log::info!("[STARTUP] Pane::spawn id={} cwd={:?} in {:?}", pane.id, sp.cwd, t.elapsed());
         let id = pane.id;
         if let Some(ref cmd) = sp.last_command {
             pane.pending_command.set(Some(cmd.clone()));
@@ -396,9 +394,7 @@ fn flatten_saved_column(
 ) -> Option<()> {
     match saved {
         SavedColumn::Leaf { cwd, last_command, custom_title, minimized } => {
-            let t = std::time::Instant::now();
             let mut pane = Pane::spawn(cols, rows, config, cwd.as_deref()).ok()?;
-            log::info!("[STARTUP] Pane::spawn id={} cwd={:?} in {:?}", pane.id, cwd, t.elapsed());
             let id = pane.id;
             if let Some(cmd) = last_command {
                 pane.pending_command.set(Some(cmd.clone()));
@@ -583,13 +579,8 @@ fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>,
     let active_idx = ws.active_tab.min(total.saturating_sub(1));
 
     // Restore the active tab first (priority)
-    let t = std::time::Instant::now();
-    let pane_count = count_panes_in_saved_tab(&ws.tabs[active_idx]);
     let active_tab = match restore_saved_tab(&ws.tabs[active_idx], cols, rows, config) {
-        Some(tab) => {
-            log::info!("[STARTUP] active tab {}/{} restored ({} panes) in {:?}", active_idx + 1, total, pane_count, t.elapsed());
-            tab
-        }
+        Some(tab) => tab,
         None => {
             log::warn!("Failed to restore active tab, falling back to sequential restore");
             // Fallback: try all tabs sequentially
@@ -612,8 +603,8 @@ fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>,
         if i == active_idx {
             tabs.push(active_tab.take().unwrap());
         } else {
-            // Create a placeholder tab (single empty pane) so tab indices are stable
-            match crate::pane::Tab::new(config) {
+            // Create a placeholder tab (dummy PTY, no shell process) so tab indices are stable
+            match crate::pane::Tab::placeholder(config) {
                 Ok(mut placeholder) => {
                     // Copy visual metadata so the tab bar looks right
                     placeholder.custom_title = saved_tab.custom_title.clone();
@@ -627,7 +618,6 @@ fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>,
     }
 
     if tabs.is_empty() { return None; }
-    log::info!("[STARTUP] {} tab(s) deferred for progressive restore", deferred.len());
     Some((tabs, active_idx, deferred))
 }
 
