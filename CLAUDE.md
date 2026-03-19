@@ -24,7 +24,7 @@ Voir `roadmap.md` pour le détail des versions et l'avancement.
 
 - Le target directory Cargo est **global** : `~/.cargo/target` (pas `./target`)
 - Le binaire release se trouve donc dans `~/.cargo/target/release/kova`
-- **Build release** : **toujours** utiliser `./build.sh`. Ne jamais faire `cargo build --release` seul — le binaire ne serait pas copié dans le bundle `/Applications/Kova.app` et l'app ne serait pas mise à jour.
+- **Build** : **toujours** utiliser `./build.sh`, même pour vérifier que le code compile. Ne jamais lancer `cargo build` directement — le binaire ne serait pas copié dans le bundle `/Applications/Kova.app` et l'app ne serait pas mise à jour.
 - `build.sh` fait : cargo build → copie du binaire + Info.plist dans le bundle → codesign du bundle entier (nécessaire pour que macOS conserve les permissions TCC entre les builds).
 
 ## Installation
