@@ -1809,8 +1809,8 @@ impl KovaView {
         };
 
         let mut tabs = self.ivars().tabs.borrow_mut();
-        tabs.push(tab);
-        let new_idx = tabs.len() - 1;
+        let new_idx = self.ivars().active_tab.get() + 1;
+        tabs.insert(new_idx, tab);
         log::debug!("New tab created: index={}, total={}", new_idx, tabs.len());
         drop(tabs);
         self.ivars().active_tab.set(new_idx);
@@ -2306,8 +2306,8 @@ impl KovaView {
         match crate::session::restore_saved_tab(&entry.tab, cols, rows, config) {
             Some(tab) => {
                 let mut tabs = self.ivars().tabs.borrow_mut();
-                let new_idx = tabs.len();
-                tabs.push(tab);
+                let new_idx = self.ivars().active_tab.get() + 1;
+                tabs.insert(new_idx, tab);
                 drop(tabs);
                 self.ivars().active_tab.set(new_idx);
                 self.resize_all_panes();
@@ -2958,8 +2958,8 @@ impl KovaView {
         }
 
         let mut tabs = self.ivars().tabs.borrow_mut();
-        tabs.push(tab);
-        let new_idx = tabs.len() - 1;
+        let new_idx = self.ivars().active_tab.get() + 1;
+        tabs.insert(new_idx, tab);
         drop(tabs);
         self.ivars().active_tab.set(new_idx);
         self.resize_all_panes();
