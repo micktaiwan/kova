@@ -38,7 +38,6 @@ define_class!(
     unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
-            log::info!("Application launched");
             let mtm = MainThreadMarker::from(self);
             setup_menu(mtm);
 
@@ -46,13 +45,8 @@ define_class!(
             log::debug!("Config loaded: {}x{} cols/rows, {} scrollback", config.terminal.columns, config.terminal.rows, config.terminal.scrollback);
 
             // Restore session (all windows) or create a single fresh window
-            let t0 = std::time::Instant::now();
             let restored = crate::session::load(self.ivars().session_backup)
-                .and_then(|s| {
-                    log::info!("[STARTUP] session load+parse: {:?}", t0.elapsed());
-                    crate::session::restore_session(s, config)
-                });
-            log::info!("[STARTUP] total session restore (all spawns): {:?}", t0.elapsed());
+                .and_then(|s| crate::session::restore_session(s, config));
 
             match restored {
                 Some(windows) => {

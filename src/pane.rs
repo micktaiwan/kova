@@ -117,6 +117,28 @@ impl Tab {
         })
     }
 
+    /// Create a placeholder tab with a dummy pane (no shell process).
+    /// Used for deferred tab restore to avoid shell contention at startup.
+    pub fn placeholder(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let pane = Pane::placeholder(config.terminal.columns, config.terminal.rows, config)?;
+        let focused = pane.id;
+        Ok(Tab {
+            id: alloc_tab_id(),
+            columns: vec![Column::new(pane)],
+            column_weights: vec![1.0],
+            custom_weights: vec![false],
+            focused_pane: focused,
+            custom_title: None,
+            color: None,
+            has_bell: false,
+            has_completion: false,
+            minimized_stack: Vec::new(),
+            scroll_offset_x: 0.0,
+            virtual_width_override: 0.0,
+            cell_h: Cell::new(0.0),
+        })
+    }
+
     /// Create a new tab inheriting the CWD from another pane.
     pub fn new_with_cwd(config: &Config, cwd: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
         let pane = Pane::spawn(config.terminal.columns, config.terminal.rows, config, cwd)?;
@@ -1064,13 +1086,38 @@ impl Pane {
             working_dir,
             id,
         )?;
-        log::debug!("Pane spawned: id={}, cols={}, rows={}", id, cols, rows);
         Ok(Pane {
             id,
             terminal,
             pty,
             shell_exited,
             shell_ready,
+            scroll_accumulator: Cell::new(0.0),
+            pending_command: Cell::new(None),
+            custom_title: None,
+            minimized: false,
+        })
+    }
+
+    /// Create a lightweight placeholder pane with a dummy PTY (no shell process).
+    /// Used for deferred tab restore — avoids spawning a shell that would
+    /// compete with the active tab's shells for zshrc loading time.
+    pub fn placeholder(cols: u16, rows: u16, config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let id = alloc_pane_id();
+        let terminal = Arc::new(RwLock::new(TerminalState::new(
+            cols,
+            rows,
+            config.terminal.scrollback,
+            crate::terminal::color_to_u8(config.colors.foreground),
+            crate::terminal::color_to_u8(config.colors.background),
+        )));
+        let pty = Pty::dummy()?;
+        Ok(Pane {
+            id,
+            terminal,
+            pty,
+            shell_exited: Arc::new(AtomicBool::new(false)),
+            shell_ready: Arc::new(AtomicBool::new(true)), // placeholder is immediately "ready"
             scroll_accumulator: Cell::new(0.0),
             pending_command: Cell::new(None),
             custom_title: None,
