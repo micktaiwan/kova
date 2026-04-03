@@ -757,7 +757,7 @@ define_class!(
 
             // Vertical scroll (pane under cursor)
             if lock != ScrollAxisLock::Horizontal {
-                if let Some((pane, _vp)) = self.pane_at_event(event) {
+                if let Some((pane, vp)) = self.pane_at_event(event) {
                     let dy = event.scrollingDeltaY();
                     let lines = if is_trackpad {
                         let sensitivity = ivars.config.get()
@@ -771,16 +771,30 @@ define_class!(
                         dy as i32
                     };
                     if lines != 0 {
-                        let mut term = pane.terminal.write();
-                        let active_tab_idx = ivars.active_tab.get();
-                        log::debug!("SCROLL-EVENT tab={} pane={} term_id={} lines={} offset_before={}",
-                            active_tab_idx, pane.id, term.terminal_id, lines, term.scroll_offset());
-                        term.scroll(lines);
-                        // Reset accumulator when hitting bounds to avoid residual drift
-                        let at_bound = term.scroll_offset() == 0
-                            || term.scroll_offset() == term.scrollback_len() as i32;
-                        if at_bound {
-                            pane.scroll_accumulator.set(0.0);
+                        // Forward scroll to PTY if mouse reporting is active
+                        let mouse_mode = pane.terminal.read().mouse_mode;
+                        let sgr = pane.terminal.read().sgr_mouse;
+                        if mouse_mode >= 1000 && sgr {
+                            if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
+                                // Each discrete line = one scroll event
+                                let count = lines.unsigned_abs() as usize;
+                                let button = if lines > 0 { 64u8 } else { 65u8 }; // 64=up, 65=down
+                                for _ in 0..count {
+                                    self.send_sgr_mouse(pane, button, col, row, true, false, event);
+                                }
+                            }
+                        } else {
+                            let mut term = pane.terminal.write();
+                            let active_tab_idx = ivars.active_tab.get();
+                            log::debug!("SCROLL-EVENT tab={} pane={} term_id={} lines={} offset_before={}",
+                                active_tab_idx, pane.id, term.terminal_id, lines, term.scroll_offset());
+                            term.scroll(lines);
+                            // Reset accumulator when hitting bounds to avoid residual drift
+                            let at_bound = term.scroll_offset() == 0
+                                || term.scroll_offset() == term.scrollback_len() as i32;
+                            if at_bound {
+                                pane.scroll_accumulator.set(0.0);
+                            }
                         }
                     }
                 }
@@ -887,6 +901,20 @@ define_class!(
                         }
                     }
                 }
+                // Forward to PTY if mouse reporting is active
+                {
+                    let term = pane.terminal.read();
+                    if term.mouse_mode >= 1000 && term.sgr_mouse {
+                        drop(term);
+                        if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
+                            // button 0=left, 1=middle, 2=right
+                            let button_number = event.buttonNumber() as u8;
+                            let button_code = button_number.min(2);
+                            self.send_sgr_mouse(pane, button_code, col, row, true, false, event);
+                        }
+                        return;
+                    }
+                }
                 if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
                     let click_count = event.clickCount();
                     let mut term = pane.terminal.write();
@@ -977,6 +1005,28 @@ define_class!(
                 return;
             }
 
+            // Forward drag to PTY if mouse reporting mode 1002+ is active
+            if let Some(pane) = self.focused_pane() {
+                let term = pane.terminal.read();
+                if term.mouse_mode >= 1002 && term.sgr_mouse {
+                    drop(term);
+                    let vp = {
+                        let tabs = self.ivars().tabs.borrow();
+                        let idx = self.ivars().active_tab.get();
+                        tabs.get(idx).and_then(|t| t.viewport_for_pane(pane.id, self.panes_viewport_for_tab(t)))
+                    };
+                    if let Some(vp) = vp {
+                        if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
+                            let button_number = event.buttonNumber() as u8;
+                            let button_code = button_number.min(2);
+                            self.send_sgr_mouse(pane, button_code, col, row, true, true, event);
+                        }
+                    }
+                    return;
+                }
+                drop(term);
+            }
+
             // Drag continues on the focused pane (set by mouseDown)
             if let Some(pane) = self.focused_pane() {
                 let vp = {
@@ -1065,7 +1115,7 @@ define_class!(
         }
 
         #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, _event: &NSEvent) {
+        fn mouse_up(&self, event: &NSEvent) {
             self.ivars().auto_scroll_speed.set(0);
             if self.ivars().drag_tab.get().is_some() {
                 self.ivars().drag_tab.set(None);
@@ -1074,6 +1124,19 @@ define_class!(
             if self.ivars().drag_separator.get().is_some() {
                 self.ivars().drag_separator.set(None);
                 return;
+            }
+            // Forward to PTY if mouse reporting is active
+            if let Some((pane, vp)) = self.pane_at_event(event) {
+                let term = pane.terminal.read();
+                if term.mouse_mode >= 1000 && term.sgr_mouse {
+                    drop(term);
+                    if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
+                        let button_number = event.buttonNumber() as u8;
+                        let button_code = button_number.min(2);
+                        self.send_sgr_mouse(pane, button_code, col, row, false, false, event);
+                    }
+                    return;
+                }
             }
             if let Some(pane) = self.focused_pane() {
                 let mut term = pane.terminal.write();
@@ -1120,6 +1183,18 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
+            // Forward move to PTY if all-motion tracking (mode 1003) is active
+            if let Some((pane, vp)) = self.pane_at_event(event) {
+                let term = pane.terminal.read();
+                if term.mouse_mode >= 1003 && term.sgr_mouse {
+                    drop(term);
+                    if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
+                        // No button pressed during move → button code 3 (no button) + motion flag
+                        self.send_sgr_mouse(pane, 3, col, row, true, true, event);
+                    }
+                    return;
+                }
+            }
             self.update_separator_cursor(event);
             self.update_hovered_url(event);
             self.update_tooltip(event);
@@ -1770,6 +1845,53 @@ impl KovaView {
 
         let abs_line = (term.scrollback_len() as i64 - term.scroll_offset() as i64 + visible_row as i64) as usize;
         Some(GridPos { line: abs_line, col })
+    }
+
+    /// Convert pixel coords to 1-based (col, row) within a pane viewport.
+    /// Returns None if the pixel is outside the grid area.
+    fn pixel_to_cell_in(&self, event: &NSEvent, pane: &Pane, vp: &PaneViewport) -> Option<(u16, u16)> {
+        let renderer = self.ivars().renderer.get()?;
+        let (pixel_x, pixel_y) = self.event_to_pixel(event);
+        let renderer_r = renderer.read();
+        let (cell_w, cell_h) = renderer_r.cell_size();
+        drop(renderer_r);
+
+        let rel_x = pixel_x - vp.x - crate::renderer::PANE_H_PADDING;
+        let rel_y = pixel_y - vp.y;
+
+        let term = pane.terminal.read();
+        let y_offset = term.y_offset_rows();
+        let col = (rel_x / cell_w).floor() as i32;
+        let row = (rel_y / cell_h).floor() as i32 - y_offset as i32;
+
+        if row < 0 || col < 0 {
+            return None;
+        }
+        let col = (col as u16).min(term.cols.saturating_sub(1));
+        let row = (row as u16).min(term.rows.saturating_sub(1));
+        // SGR uses 1-based coordinates
+        Some((col + 1, row + 1))
+    }
+
+    /// Encode modifier flags for SGR mouse reporting.
+    fn mouse_modifiers(event: &NSEvent) -> u8 {
+        let flags = event.modifierFlags();
+        let mut m: u8 = 0;
+        if flags.contains(NSEventModifierFlags::Shift) { m |= 4; }
+        if flags.contains(NSEventModifierFlags::Option) { m |= 8; }
+        if flags.contains(NSEventModifierFlags::Control) { m |= 16; }
+        m
+    }
+
+    /// Send an SGR mouse event to the PTY. `button_code` is the base button (0=left, 1=middle, 2=right, 64/65=scroll).
+    /// `press` = true for press/motion ('M'), false for release ('m').
+    /// `motion` = true adds +32 to the button code for motion events.
+    fn send_sgr_mouse(&self, pane: &Pane, button_code: u8, col: u16, row: u16, press: bool, motion: bool, event: &NSEvent) {
+        let mods = Self::mouse_modifiers(event);
+        let cb = button_code | mods | if motion { 32 } else { 0 };
+        let suffix = if press { 'M' } else { 'm' };
+        let seq = format!("\x1b[<{};{};{}{}", cb, col, row, suffix);
+        pane.pty.write(seq.as_bytes());
     }
 
     /// Compute cols/rows for a pane viewport.

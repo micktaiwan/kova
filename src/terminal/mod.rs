@@ -195,6 +195,11 @@ pub struct TerminalState {
     pub command_completed: AtomicBool,
     // Last command executed (set via OSC 7777 from shell integration)
     pub last_command: Option<String>,
+    // Mouse reporting modes
+    // 0 = off, 1000 = button events, 1002 = button+motion, 1003 = all motion
+    pub mouse_mode: u16,
+    // SGR extended mouse format (mode 1006) — uses CSI < ... M/m instead of raw bytes
+    pub sgr_mouse: bool,
     // Kitty keyboard protocol — stack of pushed flag sets
     pub kitty_keyboard_flags: Vec<u8>,
     // Printable character counter (displayed in status bars)
@@ -263,6 +268,8 @@ impl TerminalState {
             bell: AtomicBool::new(false),
             command_completed: AtomicBool::new(false),
             last_command: None,
+            mouse_mode: 0,
+            sgr_mouse: false,
             kitty_keyboard_flags: Vec::new(),
             printable_chars: AtomicU64::new(0),
             current_hyperlink: 0,
