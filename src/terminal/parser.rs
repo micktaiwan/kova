@@ -230,6 +230,16 @@ impl VteHandler {
                                 term.cursor_visible = on;
                                 term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
+                            // Mouse tracking modes
+                            1000 | 1002 | 1003 => {
+                                if on {
+                                    term.mouse_mode = mode;
+                                } else if term.mouse_mode == mode {
+                                    term.mouse_mode = 0;
+                                }
+                            }
+                            // SGR extended mouse format
+                            1006 => term.sgr_mouse = on,
                             1049 => {
                                 if on { term.enter_alt_screen(); } else { term.leave_alt_screen(); }
                             }
@@ -321,7 +331,11 @@ impl VteHandler {
                             1 => if term.cursor_keys_application { 1 } else { 2 },
                             7 => if term.auto_wrap { 1 } else { 2 },
                             25 => if term.cursor_visible { 1 } else { 2 },
+                            1000 => if term.mouse_mode == 1000 { 1 } else { 2 },
+                            1002 => if term.mouse_mode == 1002 { 1 } else { 2 },
+                            1003 => if term.mouse_mode == 1003 { 1 } else { 2 },
                             1004 => if term.focus_reporting { 1 } else { 2 },
+                            1006 => if term.sgr_mouse { 1 } else { 2 },
                             1049 => if term.in_alt_screen { 1 } else { 2 },
                             2004 => if term.bracketed_paste { 1 } else { 2 },
                             2026 => if term.synchronized_output { 1 } else { 2 },
