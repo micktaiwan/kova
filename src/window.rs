@@ -3053,6 +3053,20 @@ impl KovaView {
         true
     }
 
+    /// IPC: set the custom title of the tab containing `pane_id`.
+    /// `title: None` clears the custom title (tab falls back to auto-derived title).
+    /// Returns true if the pane was found in this window.
+    pub fn ipc_set_tab_title(&self, pane_id: PaneId, title: Option<String>) -> bool {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let tab_idx = match tabs.iter().position(|tab| tab.contains(pane_id)) {
+            Some(i) => i,
+            None => return false,
+        };
+        tabs[tab_idx].custom_title = title;
+        log::info!("IPC: set tab title for pane {}", pane_id);
+        true
+    }
+
     /// IPC: create a new tab. Returns (tab_id, pane_id) on success.
     pub fn ipc_new_tab(
         &self,

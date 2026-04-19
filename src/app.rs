@@ -375,7 +375,32 @@ fn handle_ipc_command(
         IpcCommand::NewTab { cwd, cmd } => {
             handle_ipc_new_tab(windows, config_cell, cwd, cmd)
         }
+        IpcCommand::SetTabTitle { pane_id, title } => {
+            handle_ipc_set_tab_title(windows, pane_id, title)
+        }
     }
+}
+
+/// IPC: set the custom title of the tab containing `pane_id`.
+fn handle_ipc_set_tab_title(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    title: Option<String>,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        if view.ipc_set_tab_title(pane_id, title.clone()) {
+            return IpcResponse::Ok { data: None };
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
 }
 
 /// IPC: split the focused pane in the key window.

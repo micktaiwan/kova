@@ -33,6 +33,12 @@ pub enum IpcCommand {
         cwd: Option<String>,
         cmd: Option<String>,
     },
+    /// Set the custom title of the tab containing the given pane.
+    /// `title: None` clears the custom title (falls back to auto-derived title).
+    SetTabTitle {
+        pane_id: u32,
+        title: Option<String>,
+    },
 }
 
 /// Response sent back to the IPC client.
@@ -257,6 +263,19 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             let cwd = v.get("cwd").and_then(|c| c.as_str()).map(String::from);
             let cmd_str = v.get("command").and_then(|c| c.as_str()).map(String::from);
             Ok(IpcCommand::NewTab { cwd, cmd: cmd_str })
+        }
+        "set-tab-title" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            let title = match v.get("title") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err("\"title\" must be a string or null".to_string()),
+            };
+            Ok(IpcCommand::SetTabTitle { pane_id, title })
         }
         other => Err(format!("unknown command: {}", other)),
     }
