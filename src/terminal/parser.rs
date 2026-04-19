@@ -248,7 +248,12 @@ impl VteHandler {
                             2026 => {
                                 if on {
                                     term.synchronized_output = true;
-                                    term.sync_output_since = Some(std::time::Instant::now());
+                                    // Don't reset the timer on nested/repeated ?2026h —
+                                    // otherwise the fallback timeout never fires and the
+                                    // pane stays black for the whole burst.
+                                    if term.sync_output_since.is_none() {
+                                        term.sync_output_since = Some(std::time::Instant::now());
+                                    }
                                 } else {
                                     term.synchronized_output = false;
                                     term.sync_output_since = None;

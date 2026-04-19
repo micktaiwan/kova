@@ -418,7 +418,9 @@ impl Renderer {
             // Synchronized output: this pane wants to defer, but don't block others
             if t.synchronized_output {
                 if let Some(since) = t.sync_output_since {
-                    if since.elapsed().as_millis() < 100 {
+                    // ~1 frame @60Hz. Sync output is meant to avoid intra-frame
+                    // tearing, not to block rendering for long.
+                    if since.elapsed().as_millis() < 16 {
                         any_sync_deferred = true;
                         continue; // Don't consume dirty flag — pane will render later
                     }
