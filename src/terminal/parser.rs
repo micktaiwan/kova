@@ -166,6 +166,11 @@ impl VteHandler {
 
         {
             let mut term = self.terminal.write();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            term.last_activity_secs.store(now_secs, std::sync::atomic::Ordering::Relaxed);
             for op in self.ops.drain(..) {
                 match op {
                     TermOp::Print(buf) => {
@@ -286,7 +291,9 @@ impl VteHandler {
                         let scrollback_limit = term.scrollback_limit;
                         let fg = term.default_fg;
                         let bg = term.default_bg;
+                        let last_activity = term.last_activity_secs.clone();
                         *term = TerminalState::new(cols, rows, scrollback_limit, fg, bg);
+                        term.last_activity_secs = last_activity;
                     }
                     TermOp::SetTitle(title) => {
                         term.title = Some(title);
