@@ -401,7 +401,14 @@ impl Drop for Pty {
         self.shutdown.store(true, Ordering::Relaxed);
         // Send SIGHUP to the child so it exits, which causes EOF on the reader fd.
         // Without this, the reader thread could block indefinitely on read().
-        unsafe { libc::kill(self.child_pid as i32, libc::SIGHUP) };
+        let kill_rc = unsafe { libc::kill(self.child_pid as i32, libc::SIGHUP) };
+        if kill_rc != 0 {
+            let err = std::io::Error::last_os_error();
+            // ESRCH is expected if the child already exited — don't log noise.
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                log::warn!("PTY: kill(SIGHUP, {}) failed: {}", self.child_pid, err);
+            }
+        }
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
         }

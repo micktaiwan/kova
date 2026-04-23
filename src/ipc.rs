@@ -97,15 +97,25 @@ pub fn start(
                 let _ = std::fs::remove_file(&path);
             }
 
+            // Tighten umask so the socket inode is born owner-only (closes the
+            // TOCTOU window between bind() and the chmod below).
+            #[cfg(unix)]
+            let prev_umask = unsafe { libc::umask(0o077) };
+
             let listener = match UnixListener::bind(&path) {
                 Ok(l) => l,
                 Err(e) => {
+                    #[cfg(unix)]
+                    unsafe { libc::umask(prev_umask); }
                     log::error!("IPC: failed to bind {}: {}", path.display(), e);
                     return;
                 }
             };
 
-            // Restrict socket to owner only (mode 0o600)
+            #[cfg(unix)]
+            unsafe { libc::umask(prev_umask); }
+
+            // Belt and suspenders: enforce 0o600 even if umask didn't take.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -223,6 +233,15 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             }
             let cmd_str = v.get("command").and_then(|c| c.as_str()).map(String::from);
             let cwd = v.get("cwd").and_then(|c| c.as_str()).map(String::from);
+            if let Some(ref p) = cwd {
+                let path = std::path::Path::new(p);
+                if !path.is_absolute() {
+                    return Err(format!("cwd must be absolute: {}", p));
+                }
+                if !path.is_dir() {
+                    return Err(format!("cwd does not exist or is not a directory: {}", p));
+                }
+            }
             Ok(IpcCommand::Split {
                 direction,
                 cmd: cmd_str,

@@ -931,6 +931,15 @@ impl GlyphAtlas {
     /// Insert a rendered bitmap into the atlas, returning the GlyphInfo without storing it.
     fn insert_bitmap_raw(&mut self, bmp_buf: &[u8], bmp_w: usize, bmp_h: usize, is_color: bool) -> Option<GlyphInfo> {
         let bmp_bpr = bmp_w * 4;
+        // Defensive: a caller passing inconsistent dimensions would make the
+        // per-row copy below panic at copy_from_slice. Refuse instead.
+        if bmp_w == 0 || bmp_h == 0 || bmp_buf.len() < bmp_bpr * bmp_h {
+            log::warn!(
+                "insert_bitmap_raw: inconsistent buf (len={}, expected>={})",
+                bmp_buf.len(), bmp_bpr * bmp_h
+            );
+            return None;
+        }
         let slot_h = (bmp_h as u32).max(self.glyph_cell_h);
 
         // Check if we need to wrap to next row

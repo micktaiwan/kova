@@ -41,7 +41,7 @@ define_class!(
             let mtm = MainThreadMarker::from(self);
             setup_menu(mtm);
 
-            let config = self.ivars().config.get().unwrap();
+            let config = self.ivars().config.get().expect("config must be set before applicationDidFinishLaunching");
             log::debug!("Config loaded: {}x{} cols/rows, {} scrollback", config.terminal.columns, config.terminal.rows, config.terminal.scrollback);
 
             // Restore session (all windows) or create a single fresh window

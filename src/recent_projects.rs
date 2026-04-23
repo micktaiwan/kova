@@ -157,7 +157,9 @@ pub fn time_ago(epoch_secs: u64) -> String {
 
 /// Count the number of panes (leaves) in a saved tab.
 pub fn pane_count_tab(tab: &crate::session::SavedTab) -> usize {
-    if let Some(ref cols) = tab.columns {
+    if let Some(ref flat) = tab.flat_columns {
+        flat.iter().map(|c| c.panes.len()).sum()
+    } else if let Some(ref cols) = tab.columns {
         cols.iter().map(pane_count_column).sum()
     } else if let Some(ref tree) = tab.tree {
         pane_count_tree(tree)

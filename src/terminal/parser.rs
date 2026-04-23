@@ -404,20 +404,26 @@ impl Perform for VteHandler {
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         self.flush_print_buf();
+        // Cap OSC payloads to 4 KiB — a title or path longer than that is hostile,
+        // and we'd rather drop it than allocate unbounded memory.
+        const MAX_OSC_PAYLOAD: usize = 4096;
         if params.len() >= 2 {
             match params[0] {
                 b"0" | b"2" => {
+                    if params[1].len() > MAX_OSC_PAYLOAD { return; }
                     let title = String::from_utf8_lossy(params[1]).into_owned();
                     log::trace!("OSC title: {}", title);
                     self.ops.push(TermOp::SetTitle(title));
                 }
                 b"1" => {
+                    if params[1].len() > MAX_OSC_PAYLOAD { return; }
                     let title = String::from_utf8_lossy(params[1]).into_owned();
                     log::trace!("OSC 1 sticky title: {}", title);
                     self.ops.push(TermOp::SetOsc1Title(title));
                 }
                 b"7" => {
                     // Current working directory: file://hostname/path
+                    if params[1].len() > MAX_OSC_PAYLOAD { return; }
                     let uri = String::from_utf8_lossy(params[1]);
                     let path = if let Some(rest) = uri.strip_prefix("file://") {
                         rest.find('/').map(|i| rest[i..].to_string())
@@ -466,6 +472,7 @@ impl Perform for VteHandler {
                     }
                 }
                 b"7777" => {
+                    if params[1].len() > MAX_OSC_PAYLOAD { return; }
                     let command = String::from_utf8_lossy(params[1]).into_owned();
                     if !command.is_empty() {
                         log::debug!("OSC 7777 last_command: {}", command);

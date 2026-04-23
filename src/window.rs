@@ -1157,11 +1157,16 @@ define_class!(
 
         #[unsafe(method(tabColorSelected:))]
         fn tab_color_selected(&self, sender: &objc2_app_kit::NSMenuItem) {
+            const PALETTE_SIZE: isize = 6;
             let tag = sender.tag();
             let tab_idx = self.ivars().color_menu_tab.get();
             let mut tabs = self.ivars().tabs.borrow_mut();
             if let Some(tab) = tabs.get_mut(tab_idx) {
-                tab.color = if tag < 0 { None } else { Some(tag as usize) };
+                tab.color = if (0..PALETTE_SIZE).contains(&tag) {
+                    Some(tag as usize)
+                } else {
+                    None
+                };
             }
             drop(tabs);
             self.mark_dirty();
@@ -2271,16 +2276,17 @@ impl KovaView {
     /// Close the entire active tab (all its panes), with confirmation.
     /// Saves to recent projects before closing.
     fn do_close_tab(&self) {
-        // Collect running processes for confirmation BEFORE borrowing tabs
+        // Capture the target tab index once — the confirmation modal pumps events,
+        // so `active_tab` could drift before we call remove_tab.
+        let target_idx = self.ivars().active_tab.get();
         let procs = {
             let tabs = self.ivars().tabs.borrow();
-            let idx = self.ivars().active_tab.get();
-            if idx >= tabs.len() {
+            if target_idx >= tabs.len() {
                 return;
             }
-            let title = tabs[idx].title();
+            let title = tabs[target_idx].title();
             let mut result = Vec::new();
-            tabs[idx].for_each_pane(&mut |pane| {
+            tabs[target_idx].for_each_pane(&mut |pane| {
                 if let Some(name) = pane.foreground_process_name() {
                     result.push((title.clone(), name));
                 }
@@ -2293,9 +2299,8 @@ impl KovaView {
             return;
         }
 
-        let idx = self.ivars().active_tab.get();
-        log::debug!("Closing entire tab {}", idx);
-        self.remove_tab(idx);
+        log::debug!("Closing entire tab {}", target_idx);
+        self.remove_tab(target_idx);
     }
 
     /// Open the recent projects overlay.
@@ -3758,6 +3763,11 @@ impl KovaView {
                             let mut tabs = ivars.tabs.borrow_mut();
                             if tab_idx < tabs.len() {
                                 tabs[tab_idx] = tab;
+                            } else {
+                                log::warn!(
+                                    "Deferred-restore: tab_idx={} out of range (tabs.len()={}); dropping restored tab",
+                                    tab_idx, tabs.len()
+                                );
                             }
                             drop(tabs);
                             self.resize_all_panes();

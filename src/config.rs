@@ -195,15 +195,38 @@ impl Config {
                 return Config::default();
             }
         };
-        match toml::from_str(&content) {
-            Ok(config) => {
+        match toml::from_str::<Config>(&content) {
+            Ok(mut config) => {
                 log::info!("Loaded config from {}", path.display());
+                config.sanitize();
                 config
             }
             Err(e) => {
                 log::warn!("Invalid config at {}: {}. Using defaults.", path.display(), e);
                 Config::default()
             }
+        }
+    }
+
+    /// Clamp fields that would break the app if left at pathological values
+    /// (zero rows/cols, negative fps, etc.). Falls back to defaults field-by-field.
+    fn sanitize(&mut self) {
+        let d = TerminalConfig::default();
+        if self.terminal.columns == 0 {
+            log::warn!("config: terminal.columns=0, using default {}", d.columns);
+            self.terminal.columns = d.columns;
+        }
+        if self.terminal.rows == 0 {
+            log::warn!("config: terminal.rows=0, using default {}", d.rows);
+            self.terminal.rows = d.rows;
+        }
+        if self.terminal.fps == 0 {
+            self.terminal.fps = d.fps;
+        }
+        if self.font.size <= 0.0 {
+            let ds = FontConfig::default().size;
+            log::warn!("config: font.size<=0, using default {}", ds);
+            self.font.size = ds;
         }
     }
 }
