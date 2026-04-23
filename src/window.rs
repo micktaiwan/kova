@@ -3609,6 +3609,20 @@ impl KovaView {
             renderer.write().rebuild_atlas(scale);
         }
 
+        // Reflow every tab's layout against the new window size: cap panes that
+        // now exceed screen width (which may also shrink virtual_width_override)
+        // and clamp scroll_offset_x. Without this, a tab with a wide
+        // virtual_width_override from an external display keeps its absolute
+        // pixel widths after switching back to a smaller screen.
+        let screen_w = self.drawable_viewport().width;
+        let min_w = self.min_split_width_px();
+        {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            for tab in tabs.iter_mut() {
+                self.enforce_max_pane_width(tab, screen_w, min_w);
+            }
+        }
+
         self.resize_all_panes();
     }
 
