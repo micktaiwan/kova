@@ -204,6 +204,9 @@ pub struct TerminalState {
     pub kitty_keyboard_flags: Vec<u8>,
     // Printable character counter (displayed in status bars)
     pub printable_chars: AtomicU64,
+    // Unix timestamp (seconds) of the last input or output activity on this pane.
+    // Shared with Pty so writes update it without locking the terminal.
+    pub last_activity_secs: std::sync::Arc<AtomicU64>,
     // OSC 8 hyperlink state
     current_hyperlink: u16,
     /// Hyperlink URL table, indexed by hyperlink_id (slot 0 unused).
@@ -272,6 +275,7 @@ impl TerminalState {
             sgr_mouse: false,
             kitty_keyboard_flags: Vec::new(),
             printable_chars: AtomicU64::new(0),
+            last_activity_secs: std::sync::Arc::new(AtomicU64::new(0)),
             current_hyperlink: 0,
             hyperlinks: vec![String::new()], // slot 0 = no hyperlink
         }

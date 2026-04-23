@@ -39,6 +39,20 @@ pub const TAB_COLORS: [[f32; 3]; 6] = [
     [0.60, 0.35, 0.75], // Violet
 ];
 
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Format a Unix timestamp (seconds) as "DD/MMM HH:mm" in local time.
+fn format_last_activity(ts: u64) -> String {
+    let t = ts as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    let mon = MONTHS.get(tm.tm_mon as usize).copied().unwrap_or("???");
+    format!("{:02}/{} {:02}:{:02}", tm.tm_mday, mon, tm.tm_hour, tm.tm_min)
+}
+
 /// Format a count as human-readable string (e.g. "1.2K", "3.4M").
 fn format_count(n: u64) -> String {
     if n < 1_000 {
@@ -1046,10 +1060,24 @@ impl Renderer {
         let io_str = format!("↑{} ↓{}", format_count(pane_input_chars), format_count(pane_out));
         let io_w = io_str.chars().count() as f32 * cell_w;
         let io_x = right_content_start - io_w - cell_w * 2.0;
-        if io_x >= left_end + cell_w * 2.0 {
-            let io_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 0.4];
-            self.render_status_text(vertices, &io_str, io_x, bar_y, right_content_start, io_fg, no_bg);
+        let io_rendered = io_x >= left_end + cell_w * 2.0;
+        let dim_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 0.4];
+        if io_rendered {
+            self.render_status_text(vertices, &io_str, io_x, bar_y, right_content_start, dim_fg, no_bg);
             self.push_tooltip_zone(io_x, bar_y, io_w, cell_h, "Pane I/O — ↑ chars sent  ↓ chars received");
+        }
+
+        // Last interaction timestamp (DD/MMM HH:mm) — shown to the left of the I/O counters.
+        let last_activity = term.last_activity_secs.load(std::sync::atomic::Ordering::Relaxed);
+        if last_activity > 0 {
+            let ts_str = format_last_activity(last_activity);
+            let ts_w = ts_str.chars().count() as f32 * cell_w;
+            let ts_right = if io_rendered { io_x - cell_w * 2.0 } else { right_content_start };
+            let ts_x = ts_right - ts_w;
+            if ts_x >= left_end + cell_w * 2.0 {
+                self.render_status_text(vertices, &ts_str, ts_x, bar_y, ts_right, dim_fg, no_bg);
+                self.push_tooltip_zone(ts_x, bar_y, ts_w, cell_h, "Last input or output on this pane");
+            }
         }
     }
 

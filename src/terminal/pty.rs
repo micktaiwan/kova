@@ -52,6 +52,9 @@ pub struct Pty {
     child_pid: u32,
     shutdown: Arc<AtomicBool>,
     pub input_chars: Arc<AtomicU64>,
+    /// Shared with TerminalState — updated on every write (input) and by the
+    /// parser (output) so the status bar can show time since last interaction.
+    pub last_activity_secs: Arc<AtomicU64>,
     reader_thread: Option<std::thread::JoinHandle<()>>,
     /// True for placeholder PTYs that have no child process.
     is_dummy: bool,
@@ -161,6 +164,7 @@ impl Pty {
         let writer_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(writer_dup) });
 
         let input_chars = Arc::new(AtomicU64::new(0));
+        let last_activity_secs = terminal.read().last_activity_secs.clone();
 
         let reader_shutdown = shutdown.clone();
         let reader_handle = std::thread::Builder::new()
@@ -200,6 +204,7 @@ impl Pty {
             child_pid,
             shutdown,
             input_chars,
+            last_activity_secs,
             reader_thread: Some(reader_handle),
             is_dummy: false,
         })
@@ -216,6 +221,7 @@ impl Pty {
             child_pid: 0,
             shutdown: Arc::new(AtomicBool::new(false)),
             input_chars: Arc::new(AtomicU64::new(0)),
+            last_activity_secs: Arc::new(AtomicU64::new(0)),
             reader_thread: None,
             is_dummy: true,
         })
@@ -232,6 +238,11 @@ impl Pty {
         let n = data.iter().filter(|b| (*b & 0xC0) != 0x80).count() as u64;
         self.input_chars.fetch_add(n, Ordering::Relaxed);
         GLOBAL_INPUT_CHARS.fetch_add(n, Ordering::Relaxed);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.last_activity_secs.store(now_secs, Ordering::Relaxed);
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
