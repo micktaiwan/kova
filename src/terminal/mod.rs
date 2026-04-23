@@ -904,8 +904,16 @@ impl TerminalState {
     }
 
     pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {
-        self.scroll_top = top;
-        self.scroll_bottom = bottom.min(self.rows - 1);
+        let max_row = self.rows.saturating_sub(1);
+        let bottom_clamped = bottom.min(max_row);
+        // Per DEC VT spec: an invalid region (top >= bottom) resets to full screen.
+        if top >= bottom_clamped {
+            self.scroll_top = 0;
+            self.scroll_bottom = max_row;
+        } else {
+            self.scroll_top = top;
+            self.scroll_bottom = bottom_clamped;
+        }
         self.cursor_x = 0;
         self.cursor_y = if self.origin_mode { self.scroll_top } else { 0 };
         self.cursor_moved();
