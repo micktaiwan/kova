@@ -575,6 +575,7 @@ impl TerminalState {
 
         // Ensure grid has correct number of rows
         self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     fn scroll_down(&mut self, n: u16) {
@@ -590,6 +591,7 @@ impl TerminalState {
         }
 
         self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn set_sgr(&mut self, params: &[u16]) {
@@ -811,29 +813,52 @@ impl TerminalState {
         }
     }
 
+    /// IL — Insert Line(s). Per ECMA-48 / xterm: only effective when the cursor
+    /// is within the scroll region. Shifts lines [cursor_y .. scroll_bottom]
+    /// downward by `n` (clamped), filling with blanks. Cursor moves to column 0.
     pub fn insert_lines(&mut self, n: u16) {
-        let row = self.cursor_y as usize;
-        let bottom = self.scroll_bottom as usize;
+        let row = self.cursor_y;
+        if row < self.scroll_top || row > self.scroll_bottom {
+            return;
+        }
+        let max_n = self.scroll_bottom - row + 1;
+        let n = n.min(max_n);
+        let row_u = row as usize;
+        let bottom_u = self.scroll_bottom as usize;
         for _ in 0..n {
-            if bottom < self.grid.len() {
-                self.grid.remove(bottom);
+            if bottom_u < self.grid.len() {
+                self.grid.remove(bottom_u);
             }
-            self.grid.insert(row, Row::new(self.cols as usize, &self.blank));
+            self.grid.insert(row_u, Row::new(self.cols as usize, &self.blank));
         }
         self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
+        self.cursor_x = 0;
+        self.cursor_moved();
     }
 
+    /// DL — Delete Line(s). Per ECMA-48 / xterm: only effective when the cursor
+    /// is within the scroll region. Removes `n` lines starting at cursor_y,
+    /// shifting lines below up and appending blanks at scroll_bottom.
+    /// Cursor moves to column 0.
     pub fn delete_lines(&mut self, n: u16) {
-        let row = self.cursor_y as usize;
-        let bottom = self.scroll_bottom as usize;
+        let row = self.cursor_y;
+        if row < self.scroll_top || row > self.scroll_bottom {
+            return;
+        }
+        let max_n = self.scroll_bottom - row + 1;
+        let n = n.min(max_n);
+        let row_u = row as usize;
+        let bottom_u = self.scroll_bottom as usize;
         for _ in 0..n {
-            if row < self.grid.len() {
-                self.grid.remove(row);
+            if row_u < self.grid.len() {
+                self.grid.remove(row_u);
             }
-            let insert_pos = bottom.min(self.grid.len());
+            let insert_pos = bottom_u.min(self.grid.len());
             self.grid.insert(insert_pos, Row::new(self.cols as usize, &self.blank));
         }
         self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
+        self.cursor_x = 0;
+        self.cursor_moved();
     }
 
     pub fn delete_chars(&mut self, n: u16) {
@@ -847,6 +872,7 @@ impl TerminalState {
                 }
             }
         }
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn insert_chars(&mut self, n: u16) {
@@ -874,6 +900,7 @@ impl TerminalState {
                 }
             }
         }
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {
@@ -881,6 +908,7 @@ impl TerminalState {
         self.scroll_bottom = bottom.min(self.rows - 1);
         self.cursor_x = 0;
         self.cursor_y = if self.origin_mode { self.scroll_top } else { 0 };
+        self.cursor_moved();
     }
 
     pub fn scroll_up_region(&mut self, n: u16) {
@@ -1176,9 +1204,11 @@ impl TerminalState {
 
     pub fn reverse_index(&mut self) {
         if self.cursor_y == self.scroll_top {
+            // scroll_down sets dirty internally
             self.scroll_down(1);
         } else if self.cursor_y > 0 {
             self.cursor_y -= 1;
+            self.cursor_moved();
         }
     }
 
