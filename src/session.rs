@@ -576,7 +576,11 @@ fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>,
     let cols = config.terminal.columns;
     let rows = config.terminal.rows;
     let total = ws.tabs.len();
-    let active_idx = ws.active_tab.min(total.saturating_sub(1));
+    if total == 0 {
+        log::warn!("Skipping saved window with no tabs");
+        return None;
+    }
+    let active_idx = ws.active_tab.min(total - 1);
 
     // Restore the active tab first (priority)
     let active_tab = match restore_saved_tab(&ws.tabs[active_idx], cols, rows, config) {
