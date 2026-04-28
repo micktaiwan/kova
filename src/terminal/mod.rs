@@ -20,6 +20,26 @@ pub enum CursorShape {
 pub const DEFAULT_FG: [u8; 3] = [255, 255, 255];
 pub const DEFAULT_BG: [u8; 3] = [26, 26, 31];
 
+/// What part of a pane's buffer to include in a text dump.
+#[derive(Clone, Copy, Debug)]
+pub enum DumpMode {
+    /// Current visible grid only.
+    Visible,
+    /// Scrollback only (no grid).
+    Scrollback,
+    /// Scrollback followed by the current grid.
+    All,
+}
+
+/// Result of a text dump: the rendered text plus pane geometry / cursor at dump time.
+pub struct DumpResult {
+    pub text: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+}
+
 /// Convert [u8; 3] color to [f32; 3] for GPU rendering.
 /// Only called at render time — cells store compact [u8; 3] to save RAM.
 /// (Cell is 48→32 bytes, saving ~300MB+ with 10k scrollback × multiple panes)
@@ -305,6 +325,83 @@ impl TerminalState {
     pub fn hyperlink_url(&self, id: u16) -> Option<&str> {
         if id == 0 { return None; }
         self.hyperlinks.get(id as usize).map(|s| s.as_str())
+    }
+
+    /// Render `row` as text into `out`. Wide-char continuations (`c == '\0'`)
+    /// are skipped; multi-codepoint clusters are emitted via their cluster string.
+    /// Trailing spaces on the line are trimmed unless the row is wrapped (in which
+    /// case the next row is the logical continuation, so we don't trim or break).
+    fn render_row(row: &Row, out: &mut String) {
+        let line_start = out.len();
+        for cell in &row.cells {
+            if cell.c == '\0' {
+                continue; // wide-char continuation column
+            }
+            if let Some(cluster) = &cell.cluster {
+                out.push_str(cluster);
+            } else {
+                out.push(cell.c);
+            }
+        }
+        if !row.wrapped {
+            // Trim grid-padding spaces, then break the line.
+            let trimmed_len = out[line_start..].trim_end().len();
+            out.truncate(line_start + trimmed_len);
+            out.push('\n');
+        }
+    }
+
+    /// Build the rendered text representation of the requested rows.
+    ///
+    /// Per-line trailing spaces are always trimmed (grid is always padded to `cols`).
+    /// `trim_trailing_blank_lines` controls whether fully-empty trailing lines at the
+    /// end of the output are dropped.
+    fn build_text(&self, mode: DumpMode, trim_trailing_blank_lines: bool) -> String {
+        let mut text = String::new();
+        let push_rows = |rows: &mut dyn Iterator<Item = &Row>, out: &mut String| {
+            for row in rows {
+                Self::render_row(row, out);
+            }
+        };
+
+        match mode {
+            DumpMode::Visible => push_rows(&mut self.grid.iter(), &mut text),
+            DumpMode::Scrollback => push_rows(&mut self.scrollback.iter(), &mut text),
+            DumpMode::All => {
+                push_rows(&mut self.scrollback.iter(), &mut text);
+                push_rows(&mut self.grid.iter(), &mut text);
+            }
+        }
+
+        if trim_trailing_blank_lines {
+            let trimmed_len = text.trim_end().len();
+            text.truncate(trimmed_len);
+            if !text.is_empty() {
+                text.push('\n');
+            }
+        }
+
+        text
+    }
+
+    /// Build a text dump of this pane's content. See `build_text` for trim semantics.
+    pub fn dump_text(&self, mode: DumpMode, trim_trailing_blank_lines: bool) -> DumpResult {
+        let text = self.build_text(mode, trim_trailing_blank_lines);
+        DumpResult {
+            text,
+            cols: self.cols,
+            rows: self.rows,
+            cursor_row: self.cursor_y,
+            cursor_col: self.cursor_x,
+        }
+    }
+
+    /// Return `(chars, bytes)` that `dump_text` would produce with the same args.
+    /// Builds the text and measures it — same code path as `dump_text` to keep the
+    /// totals exact. The temporary string is dropped immediately.
+    pub fn measure_text(&self, mode: DumpMode, trim_trailing_blank_lines: bool) -> (usize, usize) {
+        let text = self.build_text(mode, trim_trailing_blank_lines);
+        (text.chars().count(), text.len())
     }
 
     pub fn visible_lines(&self) -> Vec<Cow<'_, [Cell]>> {

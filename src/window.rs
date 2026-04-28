@@ -3058,6 +3058,74 @@ impl KovaView {
         true
     }
 
+    /// IPC: collect all pane IDs in this window (used to expand `panes: "all"`).
+    pub fn ipc_collect_pane_ids(&self, out: &mut Vec<PaneId>) {
+        let tabs = self.ivars().tabs.borrow();
+        for tab in tabs.iter() {
+            tab.for_each_pane(&mut |p| out.push(p.id));
+        }
+    }
+
+    /// IPC: build a JSON entry with the rendered text of a pane.
+    /// Returns `None` if the pane is not in this window.
+    pub fn ipc_dump_pane_text(
+        &self,
+        pane_id: PaneId,
+        mode: crate::terminal::DumpMode,
+        trim: bool,
+    ) -> Option<serde_json::Value> {
+        let tabs = self.ivars().tabs.borrow();
+        for tab in tabs.iter() {
+            if let Some(pane) = tab.pane(pane_id) {
+                let term = pane.terminal.read();
+                let dump = term.dump_text(mode, trim);
+                return Some(serde_json::json!({
+                    "id": pane_id,
+                    "text": dump.text,
+                    "cols": dump.cols,
+                    "rows": dump.rows,
+                    "cursor": { "row": dump.cursor_row, "col": dump.cursor_col },
+                }));
+            }
+        }
+        None
+    }
+
+    /// IPC: report whether the OSC 133;D flag is set for a pane.
+    /// `None` means the pane is not in this window; `Some(b)` is the flag's value.
+    pub fn ipc_check_completion(&self, pane_id: PaneId) -> Option<bool> {
+        let tabs = self.ivars().tabs.borrow();
+        for tab in tabs.iter() {
+            if let Some(pane) = tab.pane(pane_id) {
+                let flag = pane
+                    .terminal
+                    .read()
+                    .command_completed
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                return Some(flag);
+            }
+        }
+        None
+    }
+
+    /// IPC: measure how big the rendered text of a pane would be.
+    /// Returns `(chars, bytes)`, or `None` if the pane is not in this window.
+    pub fn ipc_measure_pane_text(
+        &self,
+        pane_id: PaneId,
+        mode: crate::terminal::DumpMode,
+        trim: bool,
+    ) -> Option<(usize, usize)> {
+        let tabs = self.ivars().tabs.borrow();
+        for tab in tabs.iter() {
+            if let Some(pane) = tab.pane(pane_id) {
+                let term = pane.terminal.read();
+                return Some(term.measure_text(mode, trim));
+            }
+        }
+        None
+    }
+
     /// IPC: set the custom title of the tab containing `pane_id`.
     /// `title: None` clears the custom title (tab falls back to auto-derived title).
     /// Returns true if the pane was found in this window.
