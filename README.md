@@ -48,6 +48,10 @@ Full support for emoji and CJK characters with proper 2-column rendering.
 | Cmd+Backspace | Kill line |
 | Shift+Enter | Newline without executing |
 
+### IPC / scripting
+
+Each running Kova listens on a Unix socket (`/tmp/kova-{pid}.sock`) and accepts JSON commands: list panes, spawn splits, send keystrokes, capture pane content, wait for command completion. Inside any pane, `$KOVA_SOCKET` and `$KOVA_PANE_ID` let scripts self-identify. See [`docs/ipc.md`](docs/ipc.md) for the full protocol.
+
 ### Configuration
 
 TOML config at `~/.config/kova/config.toml`. All settings have sensible defaults — the file is entirely optional.

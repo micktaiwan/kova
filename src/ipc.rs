@@ -12,6 +12,14 @@ use std::sync::mpsc;
 /// Maximum length of a single JSON line from a client (64 KB).
 const MAX_LINE_LEN: usize = 65536;
 
+/// Filter for commands that act on a set of panes.
+pub enum PaneFilter {
+    /// All panes across all windows.
+    All,
+    /// Specific pane IDs (preserves caller's order, including duplicates).
+    Ids(Vec<u32>),
+}
+
 /// A command received from an IPC client.
 pub enum IpcCommand {
     /// Create a new split in the focused pane of the active window.
@@ -39,6 +47,39 @@ pub enum IpcCommand {
         pane_id: u32,
         title: Option<String>,
     },
+    /// Return the rendered text of the requested panes.
+    GetPaneContent {
+        panes: PaneFilter,
+        mode: String,
+        trim_trailing_blank_lines: bool,
+    },
+    /// Return the size (chars + bytes) the equivalent `GetPaneContent` would produce.
+    /// Lets the caller decide whether the payload is worth fetching — no cap is enforced.
+    CountPaneContent {
+        panes: PaneFilter,
+        mode: String,
+        trim_trailing_blank_lines: bool,
+    },
+    /// Block until a shell command in `pane_id` reports completion via OSC 133;D,
+    /// or until `timeout_ms` elapses. Returns immediately if the flag is already set.
+    WaitForCompletion {
+        pane_id: u32,
+        timeout_ms: u64,
+    },
+}
+
+/// How long the IPC connection thread should wait for the main thread's response.
+/// Most commands reply within microseconds; `wait-for-completion` may legitimately
+/// take up to its requested timeout, so we extend the deadline accordingly.
+pub fn command_recv_timeout(cmd: &IpcCommand) -> std::time::Duration {
+    match cmd {
+        IpcCommand::WaitForCompletion { timeout_ms, .. } => {
+            // Add a 2s buffer so the main thread always has time to send back
+            // the timeout response itself before the connection gives up.
+            std::time::Duration::from_millis(timeout_ms.saturating_add(2_000))
+        }
+        _ => std::time::Duration::from_secs(10),
+    }
 }
 
 /// Response sent back to the IPC client.
@@ -184,6 +225,7 @@ fn handle_connection(
 
         let response = match parse_command(&line) {
             Ok(cmd) => {
+                let timeout = command_recv_timeout(&cmd);
                 // Create a one-shot response channel
                 let (resp_tx, resp_rx) = mpsc::channel::<IpcResponse>();
                 if tx.send((cmd, resp_tx)).is_err() {
@@ -192,7 +234,7 @@ fn handle_connection(
                     }
                 } else {
                     // Block until the main thread sends a response (or channel drops)
-                    match resp_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    match resp_rx.recv_timeout(timeout) {
                         Ok(r) => r,
                         Err(_) => IpcResponse::Error {
                             message: "timeout waiting for response".to_string(),
@@ -296,8 +338,94 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             };
             Ok(IpcCommand::SetTabTitle { pane_id, title })
         }
+        "get-pane-content" => {
+            let (panes, mode, trim) = parse_pane_content_args(&v)?;
+            Ok(IpcCommand::GetPaneContent { panes, mode, trim_trailing_blank_lines: trim })
+        }
+        "count-pane-content" => {
+            let (panes, mode, trim) = parse_pane_content_args(&v)?;
+            Ok(IpcCommand::CountPaneContent { panes, mode, trim_trailing_blank_lines: trim })
+        }
+        "wait-for-completion" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            // Default 30s, capped at 5 min — keeps the connection thread from
+            // sitting on a half-dead client indefinitely.
+            let timeout_ms = match v.get("timeout_ms") {
+                None | Some(serde_json::Value::Null) => 30_000,
+                Some(t) => t
+                    .as_u64()
+                    .ok_or_else(|| "\"timeout_ms\" must be a non-negative integer".to_string())?,
+            };
+            const MAX_TIMEOUT_MS: u64 = 300_000;
+            if timeout_ms > MAX_TIMEOUT_MS {
+                return Err(format!(
+                    "\"timeout_ms\" too large ({}ms) — max is {}ms",
+                    timeout_ms, MAX_TIMEOUT_MS
+                ));
+            }
+            Ok(IpcCommand::WaitForCompletion { pane_id, timeout_ms })
+        }
         other => Err(format!("unknown command: {}", other)),
     }
+}
+
+/// Shared parser for `get-pane-content` and `count-pane-content` arguments.
+///
+/// Returns `(panes, mode, trim_trailing_blank_lines)`. Defaults:
+/// - `panes`: omitted / null → `All`; `"all"` → `All`; array of integers → `Ids`.
+/// - `mode`: `"visible"` (must be one of `visible|scrollback|all`).
+/// - `trim_trailing_blank_lines`: `true`.
+fn parse_pane_content_args(
+    v: &serde_json::Value,
+) -> Result<(PaneFilter, String, bool), String> {
+    let panes = match v.get("panes") {
+        None | Some(serde_json::Value::Null) => PaneFilter::All,
+        Some(serde_json::Value::String(s)) if s == "all" => PaneFilter::All,
+        Some(serde_json::Value::String(s)) => {
+            return Err(format!("\"panes\" string must be \"all\", got \"{}\"", s));
+        }
+        Some(serde_json::Value::Array(arr)) => {
+            let mut ids = Vec::with_capacity(arr.len());
+            for (i, item) in arr.iter().enumerate() {
+                let id = item.as_u64().ok_or_else(|| {
+                    format!("\"panes\"[{}] must be a non-negative integer", i)
+                })?;
+                ids.push(id as u32);
+            }
+            PaneFilter::Ids(ids)
+        }
+        Some(_) => {
+            return Err(
+                "\"panes\" must be the string \"all\" or an array of integer ids".to_string(),
+            );
+        }
+    };
+
+    let mode = v
+        .get("mode")
+        .and_then(|m| m.as_str())
+        .unwrap_or("visible")
+        .to_string();
+    if mode != "visible" && mode != "scrollback" && mode != "all" {
+        return Err(format!(
+            "\"mode\" must be one of \"visible\", \"scrollback\", \"all\" (got \"{}\")",
+            mode
+        ));
+    }
+
+    let trim = match v.get("trim_trailing_blank_lines") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err("\"trim_trailing_blank_lines\" must be a boolean".to_string());
+        }
+    };
+
+    Ok((panes, mode, trim))
 }
 
 /// The canonical socket path for this process.

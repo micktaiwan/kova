@@ -24,6 +24,15 @@ pub struct AppDelegateIvars {
     session_backup: Option<usize>,
     /// IPC command receiver — polled in the timer tick on the main thread.
     ipc_rx: RefCell<Option<std::sync::mpsc::Receiver<crate::ipc::IpcRequest>>>,
+    /// `wait-for-completion` requests that haven't fired yet — checked on each tick.
+    pending_waits: RefCell<Vec<PendingWait>>,
+}
+
+/// A `wait-for-completion` request the main thread is still polling.
+struct PendingWait {
+    pane_id: u32,
+    response_tx: std::sync::mpsc::Sender<crate::ipc::IpcResponse>,
+    deadline: std::time::Instant,
 }
 
 define_class!(
@@ -137,6 +146,7 @@ impl AppDelegate {
             config: OnceCell::new(),
             session_backup,
             ipc_rx: RefCell::new(None),
+            pending_waits: RefCell::new(Vec::new()),
         });
         let retained: Retained<Self> = unsafe { msg_send![super(this), init] };
         retained.ivars().config.set(config).ok();
@@ -171,13 +181,27 @@ impl AppDelegate {
                         }
                     }
 
+                    // Resolve any pending `wait-for-completion` requests first,
+                    // so a command that just finished is reported on this tick.
+                    poll_pending_waits(&ivars.pending_waits, &ivars.windows);
+
                     // Process IPC commands from external processes
                     {
                         let rx_borrow = ivars.ipc_rx.borrow();
                         if let Some(ref rx) = *rx_borrow {
                             while let Ok((cmd, responder)) = rx.try_recv() {
-                                let response = handle_ipc_command(cmd, &ivars.windows, &ivars.config);
-                                let _ = responder.send(response);
+                                match handle_ipc_command(cmd, &ivars.windows, &ivars.config) {
+                                    Disposition::Reply(response) => {
+                                        let _ = responder.send(response);
+                                    }
+                                    Disposition::Pending(wait) => {
+                                        ivars.pending_waits.borrow_mut().push(PendingWait {
+                                            pane_id: wait.pane_id,
+                                            response_tx: responder,
+                                            deadline: wait.deadline,
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -347,9 +371,37 @@ pub fn kova_view(window: &NSWindow) -> Option<&crate::window::KovaView> {
     })
 }
 
-/// Handle a single IPC command on the main thread.
-/// All window/pane operations happen here (AppKit requirement).
+/// What `handle_ipc_command` decided to do with the request.
+enum Disposition {
+    /// Reply to the client now with this response.
+    Reply(crate::ipc::IpcResponse),
+    /// Defer the response — the main thread keeps polling until the wait
+    /// resolves (or its deadline passes), at which point it sends back.
+    Pending(DeferredWait),
+}
+
+/// A wait that the main thread has accepted but not yet resolved.
+struct DeferredWait {
+    pane_id: u32,
+    deadline: std::time::Instant,
+}
+
+/// Dispatch an IPC command. Most commands reply synchronously; only
+/// `wait-for-completion` returns `Pending` so the main thread can defer the reply.
 fn handle_ipc_command(
+    cmd: crate::ipc::IpcCommand,
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    config_cell: &OnceCell<Config>,
+) -> Disposition {
+    use crate::ipc::IpcCommand;
+    if let IpcCommand::WaitForCompletion { pane_id, timeout_ms } = cmd {
+        return handle_ipc_wait_for_completion(windows, pane_id, timeout_ms);
+    }
+    Disposition::Reply(handle_ipc_command_sync(cmd, windows, config_cell))
+}
+
+/// Synchronous handler for every command except `wait-for-completion`.
+fn handle_ipc_command_sync(
     cmd: crate::ipc::IpcCommand,
     windows: &RefCell<Vec<Retained<NSWindow>>>,
     config_cell: &OnceCell<Config>,
@@ -378,7 +430,241 @@ fn handle_ipc_command(
         IpcCommand::SetTabTitle { pane_id, title } => {
             handle_ipc_set_tab_title(windows, pane_id, title)
         }
+        IpcCommand::GetPaneContent { panes, mode, trim_trailing_blank_lines } => {
+            handle_ipc_get_pane_content(windows, panes, &mode, trim_trailing_blank_lines)
+        }
+        IpcCommand::CountPaneContent { panes, mode, trim_trailing_blank_lines } => {
+            handle_ipc_count_pane_content(windows, panes, &mode, trim_trailing_blank_lines)
+        }
+        IpcCommand::WaitForCompletion { .. } => {
+            // Routed in `handle_ipc_command` before this fn is called.
+            unreachable!("WaitForCompletion handled by handle_ipc_command, not the sync path");
+        }
     }
+}
+
+/// Translate an IPC mode string into a `DumpMode`. Caller has already validated
+/// the value, but we map defensively to keep the boundary explicit.
+fn parse_dump_mode(mode: &str) -> crate::terminal::DumpMode {
+    use crate::terminal::DumpMode;
+    match mode {
+        "scrollback" => DumpMode::Scrollback,
+        "all" => DumpMode::All,
+        _ => DumpMode::Visible,
+    }
+}
+
+/// Resolve a `PaneFilter` into the concrete list of pane IDs to act on.
+/// For `All`, walks every window in order; for `Ids`, returns the list as-is.
+fn resolve_pane_filter(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    filter: crate::ipc::PaneFilter,
+) -> Vec<u32> {
+    use crate::ipc::PaneFilter;
+    match filter {
+        PaneFilter::Ids(ids) => ids,
+        PaneFilter::All => {
+            let wins = windows.borrow();
+            let mut ids = Vec::new();
+            for win in wins.iter() {
+                if let Some(view) = kova_view(win) {
+                    view.ipc_collect_pane_ids(&mut ids);
+                }
+            }
+            ids
+        }
+    }
+}
+
+/// IPC: return the rendered text of the requested panes.
+fn handle_ipc_get_pane_content(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    filter: crate::ipc::PaneFilter,
+    mode_str: &str,
+    trim: bool,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let mode = parse_dump_mode(mode_str);
+    let ids = resolve_pane_filter(windows, filter);
+    let wins = windows.borrow();
+
+    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(ids.len());
+    for pane_id in ids {
+        let mut found: Option<serde_json::Value> = None;
+        for win in wins.iter() {
+            if let Some(view) = kova_view(win) {
+                if let Some(entry) = view.ipc_dump_pane_text(pane_id, mode, trim) {
+                    found = Some(entry);
+                    break;
+                }
+            }
+        }
+        match found {
+            Some(entry) => entries.push(entry),
+            None => entries.push(serde_json::json!({
+                "id": pane_id,
+                "error": "not found",
+            })),
+        }
+    }
+
+    IpcResponse::Ok {
+        data: Some(serde_json::json!({ "panes": entries })),
+    }
+}
+
+/// IPC: return only the size (chars/bytes) of what `get-pane-content` would return.
+fn handle_ipc_count_pane_content(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    filter: crate::ipc::PaneFilter,
+    mode_str: &str,
+    trim: bool,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let mode = parse_dump_mode(mode_str);
+    let ids = resolve_pane_filter(windows, filter);
+    let wins = windows.borrow();
+
+    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(ids.len());
+    let mut total_chars: u64 = 0;
+    let mut total_bytes: u64 = 0;
+
+    for pane_id in ids {
+        let mut measured: Option<(usize, usize)> = None;
+        for win in wins.iter() {
+            if let Some(view) = kova_view(win) {
+                if let Some(m) = view.ipc_measure_pane_text(pane_id, mode, trim) {
+                    measured = Some(m);
+                    break;
+                }
+            }
+        }
+        match measured {
+            Some((chars, bytes)) => {
+                total_chars += chars as u64;
+                total_bytes += bytes as u64;
+                entries.push(serde_json::json!({
+                    "id": pane_id,
+                    "chars": chars,
+                    "bytes": bytes,
+                }));
+            }
+            None => entries.push(serde_json::json!({
+                "id": pane_id,
+                "error": "not found",
+            })),
+        }
+    }
+
+    IpcResponse::Ok {
+        data: Some(serde_json::json!({
+            "total_chars": total_chars,
+            "total_bytes": total_bytes,
+            "panes": entries,
+        })),
+    }
+}
+
+/// IPC: wait for OSC 133;D on a pane.
+///
+/// If the flag is already set when the request arrives, reply immediately
+/// (don't make the client wait an extra tick for the obvious answer).
+/// Otherwise return `Pending` so the main thread keeps polling on each tick.
+fn handle_ipc_wait_for_completion(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    timeout_ms: u64,
+) -> Disposition {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        if let Some(view) = kova_view(win) {
+            match view.ipc_check_completion(pane_id) {
+                Some(true) => {
+                    return Disposition::Reply(IpcResponse::Ok {
+                        data: Some(serde_json::json!({
+                            "completed": true,
+                            "pane_id": pane_id,
+                            "timed_out": false,
+                        })),
+                    });
+                }
+                Some(false) => {
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_millis(timeout_ms);
+                    return Disposition::Pending(DeferredWait { pane_id, deadline });
+                }
+                None => continue, // pane not in this window
+            }
+        }
+    }
+
+    Disposition::Reply(IpcResponse::Error {
+        message: format!("pane {} not found", pane_id),
+    })
+}
+
+/// On each main-thread tick, resolve any `wait-for-completion` requests
+/// whose pane fired OSC 133;D, hit their deadline, or got closed.
+fn poll_pending_waits(
+    pending: &RefCell<Vec<PendingWait>>,
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+) {
+    let mut waits = pending.borrow_mut();
+    if waits.is_empty() {
+        return;
+    }
+
+    let now = std::time::Instant::now();
+    let wins = windows.borrow();
+
+    waits.retain(|wait| {
+        let mut completion: Option<bool> = None;
+        let mut found = false;
+        for win in wins.iter() {
+            if let Some(view) = kova_view(win) {
+                if let Some(c) = view.ipc_check_completion(wait.pane_id) {
+                    completion = Some(c);
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if !found {
+            let _ = wait.response_tx.send(crate::ipc::IpcResponse::Error {
+                message: format!("pane {} closed during wait", wait.pane_id),
+            });
+            return false;
+        }
+
+        if completion == Some(true) {
+            let _ = wait.response_tx.send(crate::ipc::IpcResponse::Ok {
+                data: Some(serde_json::json!({
+                    "completed": true,
+                    "pane_id": wait.pane_id,
+                    "timed_out": false,
+                })),
+            });
+            return false;
+        }
+
+        if now >= wait.deadline {
+            let _ = wait.response_tx.send(crate::ipc::IpcResponse::Ok {
+                data: Some(serde_json::json!({
+                    "completed": false,
+                    "pane_id": wait.pane_id,
+                    "timed_out": true,
+                })),
+            });
+            return false;
+        }
+
+        true // still waiting
+    });
 }
 
 /// IPC: set the custom title of the tab containing `pane_id`.
