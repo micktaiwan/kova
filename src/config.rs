@@ -294,6 +294,7 @@ pub struct KeysConfig {
     pub toggle_help: String,
     pub close_tab: String,
     pub open_recent_project: String,
+    pub open_search: String,
     pub equalize: String,
     pub terminal: TerminalKeysConfig,
 }
@@ -355,6 +356,7 @@ impl Default for KeysConfig {
             toggle_help: "cmd+shift+/".into(),
             close_tab: "cmd+shift+w".into(),
             open_recent_project: "cmd+o".into(),
+            open_search: "cmd+p".into(),
             equalize: "cmd+shift++".into(),
             terminal: TerminalKeysConfig::default(),
         }

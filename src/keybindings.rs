@@ -61,6 +61,7 @@ pub enum Action {
     MemReport,
     CloseTab,
     OpenRecentProject,
+    OpenSearchPalette,
     Equalize,
 }
 
@@ -246,6 +247,7 @@ impl Keybindings {
         bind(&keys.toggle_help, Action::ToggleHelp);
         bind(&keys.close_tab, Action::CloseTab);
         bind(&keys.open_recent_project, Action::OpenRecentProject);
+        bind(&keys.open_search, Action::OpenSearchPalette);
         bind(&keys.equalize, Action::Equalize);
 
         // Hard-coded debug binding (not user-configurable)

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::config::{Config, TerminalConfig};
 use crate::input;
 use crate::keybindings::{Action, Keybindings, KeyCombo};
-use crate::pane::{alloc_tab_id, NavDirection, Pane, PaneId, SplitDirection, Tab};
+use crate::pane::{alloc_tab_id, NavDirection, Pane, PaneId, SplitDirection, Tab, TabId};
 use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
 use crate::terminal::{FilterMatch, GridPos, Selection, SelectionMode};
 
@@ -103,6 +103,15 @@ pub struct KovaViewIvars {
     boundary_hit: Cell<Option<BoundaryHit>>,
     /// Boundary flash: remaining frames and which edge of the focused pane to flash.
     boundary_flash: Cell<Option<BoundaryFlash>>,
+    /// Search palette overlay state (Cmd+P).
+    search_palette: RefCell<Option<SearchPaletteState>>,
+    /// Highlight a pane after a search-palette jump (decremented per tick).
+    pane_flash: Cell<Option<PaneFlash>>,
+    /// Original `SavedTab` for tabs that are still placeholders or whose
+    /// deferred restoration failed. Looked up by `TabId` at save time so we
+    /// snapshot the placeholder's *original* data rather than its empty live
+    /// state — otherwise periodic autosave silently overwrites the user's tab.
+    tab_backup: RefCell<std::collections::HashMap<TabId, crate::session::SavedTab>>,
 }
 
 #[derive(Clone, Copy)]
@@ -132,6 +141,46 @@ struct BoundaryFlash {
 struct FilterState {
     query: String,
     matches: Vec<FilterMatch>,
+}
+
+/// One hit returned by the search worker. Stable across window/tab reordering
+/// because we look up by tab_id / pane_id at jump time rather than by index.
+#[derive(Clone)]
+struct SearchHit {
+    /// Tab containing this hit (always set, even for pane/content hits).
+    tab_id: TabId,
+    /// Pane the hit lives in. `None` for tab-title hits — jump uses the tab's
+    /// currently focused pane and skips the per-pane flash.
+    pane_id: Option<PaneId>,
+    /// Pre-rendered label shown in the result list.
+    label: String,
+}
+
+struct SearchPaletteState {
+    /// Current input string.
+    query: String,
+    /// Caret position in `query`, in chars.
+    cursor: usize,
+    /// Generation counter — bumped on each new submit so stale worker results are dropped.
+    query_id: u64,
+    /// Receiver from the worker thread, if a search is in flight.
+    rx: Option<std::sync::mpsc::Receiver<(u64, Vec<SearchHit>)>>,
+    /// True while a worker is running.
+    searching: bool,
+    /// Last submitted query string, kept so the user can see what produced the results.
+    submitted_query: String,
+    /// Hits returned by the last completed search (empty until results arrive).
+    results: Vec<SearchHit>,
+    /// Selected index into `results`.
+    selected: usize,
+    /// Scroll offset (index of first visible row in the list).
+    scroll: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PaneFlash {
+    pane_id: PaneId,
+    remaining_frames: u32,
 }
 
 struct RenameTabState {
@@ -350,6 +399,12 @@ define_class!(
                 return;
             }
 
+            // Search palette overlay handles its own keys
+            if self.ivars().search_palette.borrow().is_some() {
+                self.handle_search_palette_key(event);
+                return;
+            }
+
             // Escape closes help/mem report overlays
             if event.keyCode() == 0x35 {
                 if self.ivars().show_help.get() {
@@ -465,6 +520,13 @@ define_class!(
                 return objc2::runtime::Bool::YES;
             }
 
+            // When the search palette is open, route keys through its handler so
+            // shortcuts like Cmd+V/Cmd+P don't fall through to the global map.
+            if self.ivars().search_palette.borrow().is_some() {
+                self.handle_search_palette_key(event);
+                return objc2::runtime::Bool::YES;
+            }
+
             // When help overlay is shown, close it first then let the action through
             if self.ivars().show_help.get() {
                 self.ivars().show_help.set(false);
@@ -551,6 +613,7 @@ define_class!(
                     Action::ClosePaneOrTab => self.do_close_pane_or_tab(),
                     Action::CloseTab => self.do_close_tab(),
                     Action::OpenRecentProject => self.do_open_recent_projects(),
+                    Action::OpenSearchPalette => self.do_open_search_palette(),
                     Action::Equalize => {
                         let mut tabs = self.ivars().tabs.borrow_mut();
                         let idx = self.ivars().active_tab.get();
@@ -1294,6 +1357,9 @@ impl KovaView {
             loading_total_panes: Cell::new(0),
             boundary_hit: Cell::new(None),
             boundary_flash: Cell::new(None),
+            search_palette: RefCell::new(None),
+            pane_flash: Cell::new(None),
+            tab_backup: RefCell::new(std::collections::HashMap::new()),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -2446,6 +2512,391 @@ impl KovaView {
         }
     }
 
+    /// Open the search palette overlay (Cmd+P).
+    fn do_open_search_palette(&self) {
+        *self.ivars().search_palette.borrow_mut() = Some(SearchPaletteState {
+            query: String::new(),
+            cursor: 0,
+            query_id: 0,
+            rx: None,
+            searching: false,
+            submitted_query: String::new(),
+            results: Vec::new(),
+            selected: 0,
+            scroll: 0,
+        });
+        self.mark_dirty();
+    }
+
+    /// Walk every Kova window in the process and collect a snapshot suitable for
+    /// off-thread substring search. Cloning Arc<RwLock<TerminalState>> is cheap.
+    fn collect_search_snapshot() -> (Vec<SearchTabSnapshot>, Vec<SearchPaneSnapshot>) {
+        let mut tabs_snap = Vec::new();
+        let mut panes_snap = Vec::new();
+
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let app = NSApplication::sharedApplication(mtm);
+        let ns_windows = app.windows();
+        for i in 0..ns_windows.count() {
+            let win = &ns_windows.objectAtIndex(i);
+            let view = match crate::app::kova_view(win) {
+                Some(v) => v,
+                None => continue,
+            };
+            let tabs = view.ivars().tabs.borrow();
+            for tab in tabs.iter() {
+                let tab_title = tab.title();
+                tabs_snap.push(SearchTabSnapshot { tab_id: tab.id, title: tab_title.clone() });
+                tab.for_each_pane(&mut |pane| {
+                    panes_snap.push(SearchPaneSnapshot {
+                        tab_id: tab.id,
+                        tab_title: tab_title.clone(),
+                        pane_id: pane.id,
+                        pane_title: pane.display_title("shell"),
+                        terminal: pane.terminal.clone(),
+                    });
+                });
+            }
+        }
+        (tabs_snap, panes_snap)
+    }
+
+    /// Submit the current query: snapshot panes on the main thread, spawn a
+    /// worker thread to scan, and stash a Receiver on the palette state.
+    fn submit_search_palette(&self) {
+        let (query, query_id) = {
+            let mut guard = self.ivars().search_palette.borrow_mut();
+            let state = match guard.as_mut() {
+                Some(s) => s,
+                None => return,
+            };
+            if state.query.is_empty() || state.searching {
+                return;
+            }
+            state.query_id = state.query_id.wrapping_add(1);
+            state.searching = true;
+            state.submitted_query = state.query.clone();
+            state.results.clear();
+            state.selected = 0;
+            state.scroll = 0;
+            (state.query.clone(), state.query_id)
+        };
+
+        let (tabs_snap, panes_snap) = Self::collect_search_snapshot();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // Store rx into state before spawning, so the polling tick can pick it up
+        // even if the worker finishes immediately.
+        if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
+            state.rx = Some(rx);
+        }
+
+        std::thread::spawn(move || {
+            let hits = run_search_worker(&query, &tabs_snap, &panes_snap);
+            let _ = tx.send((query_id, hits));
+        });
+
+        self.mark_dirty();
+    }
+
+    /// Drain any pending worker results into the palette state. Called by the
+    /// app delegate's tick on each frame so results land without the user
+    /// having to press a key.
+    pub fn poll_search_palette(&self) {
+        let mut guard = self.ivars().search_palette.borrow_mut();
+        let state = match guard.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        let rx = match state.rx.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+        let mut updated = false;
+        while let Ok((id, hits)) = rx.try_recv() {
+            if id == state.query_id {
+                state.results = hits;
+                state.searching = false;
+                state.selected = 0;
+                state.scroll = 0;
+                updated = true;
+            }
+            // else: stale query, drop the hits silently
+        }
+        // Drop the receiver once a result for the current query has arrived;
+        // the worker thread is done writing to it.
+        if !state.searching {
+            state.rx = None;
+        }
+        drop(guard);
+        if updated {
+            self.mark_dirty();
+        }
+    }
+
+    /// Handle key events while the search palette overlay is active.
+    fn handle_search_palette_key(&self, event: &NSEvent) {
+        let key_code = event.keyCode();
+        let chars = event.charactersIgnoringModifiers();
+        let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
+        let ch = ch_str.chars().next().unwrap_or('\0');
+
+        // Up/Down navigate the result list (only meaningful with results).
+        match key_code {
+            0x7E => {
+                let mut guard = self.ivars().search_palette.borrow_mut();
+                if let Some(state) = guard.as_mut() {
+                    if !state.results.is_empty() && state.selected > 0 {
+                        state.selected -= 1;
+                        if state.selected < state.scroll {
+                            state.scroll = state.selected;
+                        }
+                    }
+                }
+                drop(guard);
+                self.mark_dirty();
+                return;
+            }
+            0x7D => {
+                let mut guard = self.ivars().search_palette.borrow_mut();
+                if let Some(state) = guard.as_mut() {
+                    if state.selected + 1 < state.results.len() {
+                        state.selected += 1;
+                    }
+                }
+                drop(guard);
+                self.mark_dirty();
+                return;
+            }
+            // Left/Right arrows move the input caret.
+            0x7B => {
+                let mut guard = self.ivars().search_palette.borrow_mut();
+                if let Some(state) = guard.as_mut() {
+                    if state.cursor > 0 { state.cursor -= 1; }
+                }
+                drop(guard);
+                self.mark_dirty();
+                return;
+            }
+            0x7C => {
+                let mut guard = self.ivars().search_palette.borrow_mut();
+                if let Some(state) = guard.as_mut() {
+                    let len = state.query.chars().count();
+                    if state.cursor < len { state.cursor += 1; }
+                }
+                drop(guard);
+                self.mark_dirty();
+                return;
+            }
+            _ => {}
+        }
+
+        match ch {
+            '\u{1B}' => {
+                // Escape — close the palette.
+                *self.ivars().search_palette.borrow_mut() = None;
+                self.mark_dirty();
+            }
+            '\r' => {
+                // Enter: select if results are showing, otherwise submit.
+                let action = {
+                    let guard = self.ivars().search_palette.borrow();
+                    let state = match guard.as_ref() {
+                        Some(s) => s,
+                        None => return,
+                    };
+                    if state.searching {
+                        return;
+                    }
+                    if !state.results.is_empty() && state.selected < state.results.len() {
+                        Some(state.results[state.selected].clone())
+                    } else {
+                        None
+                    }
+                };
+                match action {
+                    Some(hit) => {
+                        *self.ivars().search_palette.borrow_mut() = None;
+                        jump_to_search_hit(&hit);
+                    }
+                    None => self.submit_search_palette(),
+                }
+            }
+            '\u{7F}' | '\u{08}' => {
+                // Backspace — remove char before cursor; clear stale results.
+                let mut guard = self.ivars().search_palette.borrow_mut();
+                if let Some(state) = guard.as_mut() {
+                    if state.cursor > 0 {
+                        if let Some((byte_idx, _)) = state.query.char_indices().nth(state.cursor - 1) {
+                            state.query.remove(byte_idx);
+                            state.cursor -= 1;
+                            state.results.clear();
+                            state.selected = 0;
+                            state.scroll = 0;
+                        }
+                    }
+                }
+                drop(guard);
+                self.mark_dirty();
+            }
+            c if c >= ' ' && !c.is_control() => {
+                // Insert printable character, clear stale results.
+                let mut guard = self.ivars().search_palette.borrow_mut();
+                if let Some(state) = guard.as_mut() {
+                    let byte_idx = state.query.char_indices()
+                        .nth(state.cursor).map(|(i, _)| i)
+                        .unwrap_or(state.query.len());
+                    state.query.insert(byte_idx, c);
+                    state.cursor += 1;
+                    state.results.clear();
+                    state.selected = 0;
+                    state.scroll = 0;
+                }
+                drop(guard);
+                self.mark_dirty();
+            }
+            _ => {}
+        }
+    }
+
+    /// Set the highlight pulse on a pane (used by jump_to_search_hit).
+    fn set_pane_flash(&self, pane_id: PaneId, frames: u32) {
+        self.ivars().pane_flash.set(Some(PaneFlash { pane_id, remaining_frames: frames }));
+        self.mark_dirty();
+    }
+
+    /// Activate the tab containing `tab_id`. Returns true if found.
+    fn activate_tab(&self, tab_id: TabId) -> bool {
+        let tabs = self.ivars().tabs.borrow();
+        for (idx, tab) in tabs.iter().enumerate() {
+            if tab.id == tab_id {
+                drop(tabs);
+                self.ivars().active_tab.set(idx);
+                self.mark_dirty();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Focus a specific pane within the active tab. Returns true if found.
+    fn focus_pane_in_active_tab(&self, pane_id: PaneId) -> bool {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let idx = self.ivars().active_tab.get();
+        if let Some(tab) = tabs.get_mut(idx) {
+            // Walk panes to confirm the id exists in this tab before assigning.
+            let mut found = false;
+            tab.for_each_pane(&mut |p| {
+                if p.id == pane_id { found = true; }
+            });
+            if found {
+                tab.focused_pane = pane_id;
+                drop(tabs);
+                self.mark_dirty();
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Off-thread snapshot of a tab's identity for substring search.
+struct SearchTabSnapshot {
+    tab_id: TabId,
+    title: String,
+}
+
+/// Off-thread snapshot of a pane's identity + terminal handle for substring search.
+struct SearchPaneSnapshot {
+    tab_id: TabId,
+    tab_title: String,
+    pane_id: PaneId,
+    pane_title: String,
+    terminal: Arc<parking_lot::RwLock<crate::terminal::TerminalState>>,
+}
+
+/// Worker-thread search. Uses ASCII case-insensitive `contains` — good enough
+/// for terminal text, which is overwhelmingly ASCII.
+fn run_search_worker(
+    query: &str,
+    tabs: &[SearchTabSnapshot],
+    panes: &[SearchPaneSnapshot],
+) -> Vec<SearchHit> {
+    let needle = query.to_ascii_lowercase();
+    let mut hits: Vec<SearchHit> = Vec::new();
+
+    for tab in tabs {
+        if tab.title.to_ascii_lowercase().contains(&needle) {
+            hits.push(SearchHit {
+                tab_id: tab.tab_id,
+                pane_id: None,
+                label: format!("Tab: {}", tab.title),
+            });
+        }
+    }
+
+    for p in panes {
+        if p.pane_title.to_ascii_lowercase().contains(&needle) {
+            hits.push(SearchHit {
+                tab_id: p.tab_id,
+                pane_id: Some(p.pane_id),
+                label: format!("Pane: {} — Tab: {}", p.pane_title, p.tab_title),
+            });
+        }
+    }
+
+    for p in panes {
+        let text = {
+            let term = p.terminal.read();
+            term.dump_text(crate::terminal::DumpMode::All, true).text
+        };
+        if text.to_ascii_lowercase().contains(&needle) {
+            hits.push(SearchHit {
+                tab_id: p.tab_id,
+                pane_id: Some(p.pane_id),
+                label: format!("Tab: {} / Pane: {}", p.tab_title, p.pane_title),
+            });
+        }
+    }
+
+    hits
+}
+
+/// Bring the right window/tab/pane to focus and trigger the highlight flash.
+/// Walks every Kova window in the process to find the hit's tab_id.
+fn jump_to_search_hit(hit: &SearchHit) {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let ns_windows = app.windows();
+    for i in 0..ns_windows.count() {
+        let win = ns_windows.objectAtIndex(i);
+        let view = match crate::app::kova_view(&win) {
+            Some(v) => v,
+            None => continue,
+        };
+        let has_tab = {
+            let tabs = view.ivars().tabs.borrow();
+            tabs.iter().any(|t| t.id == hit.tab_id)
+        };
+        if !has_tab {
+            continue;
+        }
+        // Order the window front and make it key so it visibly takes focus.
+        win.makeKeyAndOrderFront(None);
+        if !view.activate_tab(hit.tab_id) {
+            return;
+        }
+        if let Some(pane_id) = hit.pane_id {
+            view.focus_pane_in_active_tab(pane_id);
+            // ~30 frames ≈ 0.5s @ 60fps; renderer pulses the pane border for that span.
+            view.set_pane_flash(pane_id, 30);
+        }
+        return;
+    }
+    log::debug!("jump_to_search_hit: tab_id {} not found in any window", hit.tab_id);
+}
+
+impl KovaView {
     /// Handle key events in the "Send Tab to Window" overlay.
     fn handle_send_to_window_key(&self, event: &NSEvent) {
         let keycode = event.keyCode();
@@ -3716,6 +4167,9 @@ impl KovaView {
 
     /// Append this window's session data to the given Vec.
     /// Called by AppDelegate to collect all windows before saving.
+    /// Tabs that are still placeholders (or whose deferred restore failed) are
+    /// serialized from `tab_backup` so the user's original data is preserved
+    /// across autosave cycles.
     pub fn append_session_data(&self, out: &mut Vec<crate::session::WindowSession>) {
         let tabs = self.ivars().tabs.borrow();
         let active_tab = self.ivars().active_tab.get();
@@ -3723,7 +4177,15 @@ impl KovaView {
             let f = win.frame();
             (f.origin.x, f.origin.y, f.size.width, f.size.height)
         });
-        out.push(crate::session::WindowSession::from_tabs(&tabs, active_tab, frame));
+        let backup = self.ivars().tab_backup.borrow();
+        let saved_tabs: Vec<crate::session::SavedTab> = tabs.iter().map(|t| {
+            backup.get(&t.id).cloned().unwrap_or_else(|| crate::session::snapshot_tab(t))
+        }).collect();
+        out.push(crate::session::WindowSession {
+            tabs: saved_tabs,
+            active_tab,
+            frame,
+        });
     }
 
     /// Initialize Metal rendering with the given tabs.
@@ -3830,7 +4292,11 @@ impl KovaView {
                             loading += pane_count as u32;
                             let mut tabs = ivars.tabs.borrow_mut();
                             if tab_idx < tabs.len() {
+                                let old_id = tabs[tab_idx].id;
                                 tabs[tab_idx] = tab;
+                                // Drop the placeholder's backup entry — its data
+                                // has been replaced by the live restored tab.
+                                ivars.tab_backup.borrow_mut().remove(&old_id);
                             } else {
                                 log::warn!(
                                     "Deferred-restore: tab_idx={} out of range (tabs.len()={}); dropping restored tab",
@@ -3840,7 +4306,16 @@ impl KovaView {
                             drop(tabs);
                             self.resize_all_panes();
                         }
-                        None => log::warn!("Failed to restore deferred tab {}", tab_idx),
+                        None => {
+                            log::warn!("Failed to restore deferred tab {}", tab_idx);
+                            // The placeholder stays put — its tab_backup entry
+                            // already preserves the original SavedTab, so save
+                            // won't overwrite the user's data. But the loading
+                            // counter would otherwise hang forever, so drop
+                            // these panes from the expected total.
+                            let cur = ivars.loading_total_panes.get();
+                            ivars.loading_total_panes.set(cur.saturating_sub(pane_count as u32));
+                        }
                     }
                 }
             }
@@ -4190,6 +4665,47 @@ impl KovaView {
             }
         });
 
+        // Build search palette render data + decrement pane flash counter
+        let sp_guard = ivars.search_palette.borrow();
+        let sp_labels: Vec<&str> = sp_guard.as_ref()
+            .map(|state| state.results.iter().map(|h| h.label.as_str()).collect())
+            .unwrap_or_default();
+        let sp_data = sp_guard.as_ref().map(|state| {
+            crate::renderer::SearchPaletteRenderData {
+                query: &state.query,
+                cursor: state.cursor,
+                submitted_query: &state.submitted_query,
+                searching: state.searching,
+                results: &sp_labels,
+                selected: state.selected,
+                scroll: state.scroll,
+            }
+        });
+
+        // Pane flash for search-palette jumps: pulse the matching pane's border
+        // for the configured number of frames, then clear.
+        if let Some(mut flash) = ivars.pane_flash.get() {
+            if flash.remaining_frames > 0 {
+                flash.remaining_frames -= 1;
+                ivars.pane_flash.set(Some(flash));
+                if let Some(target) = pane_data.iter().find(|p| p.pane_id == flash.pane_id) {
+                    let vp = &target.viewport;
+                    // Linear fade from 1.0 → 0.0 over the lifetime.
+                    let alpha = (flash.remaining_frames as f32 / 30.0).clamp(0.0, 1.0);
+                    r.pane_flash = Some((vp.x, vp.y, vp.width, vp.height, alpha));
+                } else {
+                    // Pane disappeared (e.g. closed) — drop the flash.
+                    ivars.pane_flash.set(None);
+                    r.pane_flash = None;
+                }
+            } else {
+                ivars.pane_flash.set(None);
+                r.pane_flash = None;
+            }
+        } else {
+            r.pane_flash = None;
+        }
+
         // Build list-overlay render data (send-to-window or merge-tab)
         let stw_guard = ivars.send_to_window.borrow();
         let mt_guard = ivars.merge_tab.borrow();
@@ -4283,7 +4799,7 @@ impl KovaView {
             }
         }
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 
@@ -4368,6 +4884,17 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, act
             total += crate::session::count_panes_in_saved_tab(saved) as u32;
         }
         view.ivars().loading_total_panes.set(total);
+        // Populate tab_backup so periodic autosave preserves the original SavedTab
+        // for any placeholder still waiting (or that fails to restore).
+        {
+            let tabs_ref = view.ivars().tabs.borrow();
+            let mut backup = view.ivars().tab_backup.borrow_mut();
+            for (tab_idx, saved) in &deferred_tabs {
+                if let Some(tab) = tabs_ref.get(*tab_idx) {
+                    backup.insert(tab.id, saved.clone());
+                }
+            }
+        }
         *view.ivars().deferred_tabs.borrow_mut() = deferred_tabs;
     }
     window.setContentView(Some(&view));

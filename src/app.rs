@@ -185,6 +185,17 @@ impl AppDelegate {
                     // so a command that just finished is reported on this tick.
                     poll_pending_waits(&ivars.pending_waits, &ivars.windows);
 
+                    // Drain any pending search-palette worker results so the UI
+                    // updates without the user pressing a key.
+                    {
+                        let windows = ivars.windows.borrow();
+                        for win in windows.iter() {
+                            if let Some(view) = kova_view(win) {
+                                view.poll_search_palette();
+                            }
+                        }
+                    }
+
                     // Process IPC commands from external processes
                     {
                         let rx_borrow = ivars.ipc_rx.borrow();
@@ -214,7 +225,7 @@ impl AppDelegate {
                         let sessions = collect_window_sessions(&ivars.windows.borrow());
                         if !sessions.is_empty() {
                             std::thread::spawn(move || {
-                                crate::session::save(&sessions);
+                                crate::session::save_periodic(&sessions);
                             });
                         }
                     }

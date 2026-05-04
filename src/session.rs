@@ -176,26 +176,24 @@ pub fn snapshot_tab(tab: &Tab) -> SavedTab {
     }
 }
 
-fn snapshot_tabs(tabs: &[Tab]) -> Vec<SavedTab> {
-    tabs.iter().map(snapshot_tab).collect()
-}
-
-impl WindowSession {
-    /// Build a WindowSession from live tab data.
-    pub fn from_tabs(tabs: &[Tab], active_tab: usize, frame: Option<(f64, f64, f64, f64)>) -> Self {
-        Self {
-            tabs: snapshot_tabs(tabs),
-            active_tab,
-            frame,
-        }
-    }
-}
-
 /// Maximum number of session backups to keep.
 const SESSION_HISTORY_COUNT: usize = 10;
 
 /// Save all windows to a single session file.
+/// Save the current session, rotating backups (`session.1.json` → … → `session.10.json`).
+/// Use this on user-initiated checkpoints — quit, kill, manual save.
 pub fn save(windows: &[WindowSession]) {
+    save_internal(windows, true);
+}
+
+/// Save the current session WITHOUT rotating backups. Use this for the periodic
+/// autosave: if Kova ever serializes a corrupted state (failed restore, race),
+/// the rotated history of clean checkpoints remains intact and recoverable.
+pub fn save_periodic(windows: &[WindowSession]) {
+    save_internal(windows, false);
+}
+
+fn save_internal(windows: &[WindowSession], rotate: bool) {
     let session = Session {
         version: SESSION_VERSION,
         windows: windows.to_vec(),
@@ -210,7 +208,16 @@ pub fn save(windows: &[WindowSession]) {
     }
     match serde_json::to_string_pretty(&session) {
         Ok(json) => {
-            rotate_session_backups(&path, json.as_bytes());
+            if rotate {
+                rotate_session_backups(&path, json.as_bytes());
+            }
+            // Skip the write if the file is byte-identical — autosaves of an
+            // idle Kova would otherwise re-write the same JSON every 30s.
+            if let Ok(existing) = std::fs::read(&path) {
+                if existing == json.as_bytes() {
+                    return;
+                }
+            }
             if let Err(e) = std::fs::write(&path, json) {
                 log::warn!("Failed to write session file: {}", e);
             } else {
@@ -342,7 +349,13 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
     let mut panes = Vec::new();
     let mut ids = Vec::new();
     for sp in &saved.panes {
-        let mut pane = Pane::spawn(cols, rows, config, sp.cwd.as_deref()).ok()?;
+        let mut pane = match Pane::spawn(cols, rows, config, sp.cwd.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Pane::spawn failed (cwd={:?}): {}", sp.cwd, e);
+                return None;
+            }
+        };
         let id = pane.id;
         if let Some(ref cmd) = sp.last_command {
             pane.pending_command.set(Some(cmd.clone()));
@@ -394,7 +407,13 @@ fn flatten_saved_column(
 ) -> Option<()> {
     match saved {
         SavedColumn::Leaf { cwd, last_command, custom_title, minimized } => {
-            let mut pane = Pane::spawn(cols, rows, config, cwd.as_deref()).ok()?;
+            let mut pane = match Pane::spawn(cols, rows, config, cwd.as_deref()) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("Pane::spawn failed (cwd={:?}): {}", cwd, e);
+                    return None;
+                }
+            };
             let id = pane.id;
             if let Some(cmd) = last_command {
                 pane.pending_command.set(Some(cmd.clone()));
@@ -419,7 +438,13 @@ fn flatten_saved_column(
 fn restore_legacy_tree(saved: &SavedTree, cols: u16, rows: u16, config: &Config) -> Option<(Vec<Column>, Vec<f32>, Vec<PaneId>)> {
     match saved {
         SavedTree::Leaf { cwd, last_command, custom_title, minimized } => {
-            let mut pane = Pane::spawn(cols, rows, config, cwd.as_deref()).ok()?;
+            let mut pane = match Pane::spawn(cols, rows, config, cwd.as_deref()) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("Pane::spawn failed (cwd={:?}): {}", cwd, e);
+                    return None;
+                }
+            };
             let id = pane.id;
             if let Some(cmd) = last_command {
                 pane.pending_command.set(Some(cmd.clone()));
