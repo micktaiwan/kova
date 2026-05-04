@@ -132,6 +132,25 @@ pub struct RecentProjectsRenderData<'a> {
     pub scroll: usize,
 }
 
+/// Data passed to the renderer for drawing the search palette overlay.
+pub struct SearchPaletteRenderData<'a> {
+    /// Current input string.
+    pub query: &'a str,
+    /// Caret position in `query`, in chars.
+    pub cursor: usize,
+    /// Last submitted query (used to label the result list while the user
+    /// continues typing — drives the "Results for: …" header).
+    pub submitted_query: &'a str,
+    /// True while a worker thread is still running for the submitted query.
+    pub searching: bool,
+    /// Pre-rendered hit labels.
+    pub results: &'a [&'a str],
+    /// Selected index into `results`.
+    pub selected: usize,
+    /// First visible row in the result list (vertical scroll offset).
+    pub scroll: usize,
+}
+
 /// Data passed to the renderer for drawing a list-selection overlay
 /// (used by "Send Tab to Window" and "Merge Tab").
 pub struct SendToWindowRenderData<'a> {
@@ -221,6 +240,9 @@ pub struct Renderer {
     pub resize_feedback_text: Option<String>,
     /// Boundary flash: (edge_x, top_y, bottom_y, alpha, is_right_edge). Set by window when navigation hits tab edge.
     pub boundary_flash: Option<(f32, f32, f32, f32, bool)>,
+    /// Pane flash for search-palette jumps: (x, y, width, height, alpha).
+    /// A pulsing rectangle drawn around a pane's viewport for ~half a second.
+    pub pane_flash: Option<(f32, f32, f32, f32, f32)>,
     /// Loading progress: (ready_panes, total_panes). None when all loaded.
     pub loading_progress: Option<(u32, u32)>,
     /// Pane ID of the hovered URL (to show URL only in that pane's status bar)
@@ -326,6 +348,7 @@ impl Renderer {
             hovered_url_text: None,
             resize_feedback_text: None,
             boundary_flash: None,
+            pane_flash: None,
             loading_progress: None,
             hovered_url_pane_id: None,
             cached_help_hint: String::new(),
@@ -359,6 +382,7 @@ impl Renderer {
         show_mem_report: bool,
         recent_projects: Option<&RecentProjectsRenderData<'_>>,
         send_to_window: Option<&SendToWindowRenderData<'_>>,
+        search_palette: Option<&SearchPaletteRenderData<'_>>,
         help_hint_remaining: u32,
         keys_config: Option<&KeysConfig>,
     ) {
@@ -449,9 +473,11 @@ impl Renderer {
         let all_ready = !any_not_ready;
         let has_filter = filter.is_some();
         let has_recent_projects = recent_projects.is_some();
+        let has_search_palette = search_palette.is_some();
         let tooltip_animating = self.tooltip_anim > 0 && self.tooltip_anim < TOOLTIP_ANIM_FRAMES;
         let has_loading = self.loading_progress.is_some();
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && help_hint_remaining == 0 && !tooltip_animating && !has_loading {
+        let has_pane_flash = self.pane_flash.is_some();
+        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && help_hint_remaining == 0 && !tooltip_animating && !has_loading {
             return;
         }
 
@@ -613,6 +639,34 @@ impl Renderer {
         // Draw send-to-window overlay
         if let Some(stw) = send_to_window {
             self.build_send_to_window_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, stw);
+        }
+
+        // Draw pane flash border (search-palette jump highlight) — drawn before
+        // the search palette so the palette overlay would cover it if both were
+        // somehow active simultaneously (palette closes before flash starts).
+        if let Some((x, y, w, h, alpha)) = self.pane_flash {
+            let no_tex = [0.0_f32, 0.0];
+            let white = [1.0_f32, 1.0, 1.0, 0.0];
+            let color = [1.0_f32, 0.85, 0.3, alpha];
+            let thickness = 4.0_f32;
+            let mut push_quad = |x: f32, y: f32, w: f32, h: f32| {
+                overlay_vertices.push(Vertex { position: [x, y], tex_coords: no_tex, color: white, bg_color: color });
+                overlay_vertices.push(Vertex { position: [x + w, y], tex_coords: no_tex, color: white, bg_color: color });
+                overlay_vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: color });
+                overlay_vertices.push(Vertex { position: [x + w, y], tex_coords: no_tex, color: white, bg_color: color });
+                overlay_vertices.push(Vertex { position: [x + w, y + h], tex_coords: no_tex, color: white, bg_color: color });
+                overlay_vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: color });
+            };
+            // Top, bottom, left, right edges as four thin quads.
+            push_quad(x, y, w, thickness);
+            push_quad(x, y + h - thickness, w, thickness);
+            push_quad(x, y, thickness, h);
+            push_quad(x + w - thickness, y, thickness, h);
+        }
+
+        // Draw search palette overlay (on top of everything except tooltip)
+        if let Some(sp) = search_palette {
+            self.build_search_palette_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, sp);
         }
 
         // Tooltip animation: update visible state and animation counter
@@ -1974,6 +2028,119 @@ impl Renderer {
             self.render_text(vertices, arrow, ax, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
         }
         if scroll + max_visible < data.entries.len() {
+            let arrow = "▼";
+            let ax = (viewport_w - scaled_cell_w) / 2.0;
+            self.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);
+        }
+    }
+
+    fn build_search_palette_overlay_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        viewport_w: f32,
+        viewport_h: f32,
+        data: &SearchPaletteRenderData<'_>,
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+
+        // Dim the world behind the palette.
+        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.85);
+
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let title_fg = [1.0, 0.85, 0.3, 1.0];
+        let label_fg = [0.85, 0.85, 0.9, 1.0];
+        let dim_fg = [0.55, 0.55, 0.6, 1.0];
+        let input_bg = [0.18, 0.18, 0.22];
+        let selected_bg = [0.25, 0.35, 0.55];
+        let caret_fg = [1.0, 1.0, 1.0];
+
+        let title_scale = 1.8_f32;
+        let body_scale = 1.3_f32;
+        let scaled_cell_w = cell_w * body_scale;
+        let scaled_cell_h = cell_h * body_scale;
+        let row_height = scaled_cell_h * 1.6;
+
+        // Title
+        let title = "Search";
+        let title_chars = title.chars().count() as f32;
+        let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
+        let mut y = cell_h * 3.0;
+        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        y += cell_h * title_scale * 1.5;
+
+        // Subtitle
+        let subtitle = "↑↓ Navigate  ⏎ Search / Open  esc Cancel";
+        let sub_chars = subtitle.chars().count() as f32;
+        let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
+        self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        y += scaled_cell_h * 2.0;
+
+        // Input box: a single full-width row with the query and caret.
+        let left_margin = scaled_cell_w * 3.0;
+        let right_margin = viewport_w - scaled_cell_w * 3.0;
+        let input_h = row_height;
+        Self::push_bg_quad(vertices, left_margin - scaled_cell_w, y, right_margin - left_margin + scaled_cell_w * 2.0, input_h, input_bg);
+
+        let prompt = "› ";
+        let text_y = y + (input_h - scaled_cell_h) / 2.0;
+        self.render_text(vertices, prompt, left_margin, text_y, right_margin, dim_fg, no_bg, body_scale);
+        let prompt_w = prompt.chars().count() as f32 * scaled_cell_w;
+        self.render_text(vertices, data.query, left_margin + prompt_w, text_y, right_margin, label_fg, no_bg, body_scale);
+
+        // Caret as a thin vertical bar at the cursor position.
+        let caret_x = left_margin + prompt_w + (data.cursor as f32) * scaled_cell_w;
+        Self::push_bg_quad(vertices, caret_x, text_y, 1.5, scaled_cell_h, caret_fg);
+
+        y += input_h + scaled_cell_h * 0.75;
+
+        // Status line: searching / "N results" / hint when query empty.
+        let status = if data.searching {
+            format!("Searching for \"{}\"...", data.submitted_query)
+        } else if data.submitted_query.is_empty() {
+            "Type a query and press Enter to search.".to_string()
+        } else if data.results.is_empty() {
+            format!("No matches for \"{}\".", data.submitted_query)
+        } else {
+            format!("{} match{} for \"{}\"", data.results.len(), if data.results.len() == 1 { "" } else { "es" }, data.submitted_query)
+        };
+        self.render_text(vertices, &status, left_margin, y, right_margin, dim_fg, no_bg, body_scale);
+        y += scaled_cell_h * 1.5;
+
+        if data.results.is_empty() {
+            return;
+        }
+
+        let content_top = y;
+        let content_bottom = viewport_h - cell_h * 2.0;
+        let max_visible = ((content_bottom - content_top) / row_height) as usize;
+        if max_visible == 0 {
+            return;
+        }
+
+        // Compute scroll to keep selected visible.
+        let scroll = if data.selected >= data.scroll + max_visible {
+            data.selected - max_visible + 1
+        } else {
+            data.scroll
+        };
+
+        for (i, label) in data.results.iter().enumerate().skip(scroll).take(max_visible) {
+            let row_y = content_top + (i - scroll) as f32 * row_height;
+            let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
+
+            if i == data.selected {
+                Self::push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+            }
+            self.render_text(vertices, label, left_margin, text_y, right_margin, label_fg, no_bg, body_scale);
+        }
+
+        if scroll > 0 {
+            let arrow = "▲";
+            let ax = (viewport_w - scaled_cell_w) / 2.0;
+            self.render_text(vertices, arrow, ax, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
+        }
+        if scroll + max_visible < data.results.len() {
             let arrow = "▼";
             let ax = (viewport_w - scaled_cell_w) / 2.0;
             self.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);

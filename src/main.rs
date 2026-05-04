@@ -151,6 +151,29 @@ fn setup_logging() {
     CombinedLogger::init(loggers).expect("cannot init logger");
 }
 
+/// Raise the soft `RLIMIT_NOFILE` so a session with many panes (each pane uses
+/// ~5 fds for PTY master + dups) can restore without hitting EMFILE during the
+/// per-tab spawn burst. macOS GUI apps inherit a 256 soft limit from launchd;
+/// the hard limit is `kern.maxfilesperproc` (typically 24576+).
+fn raise_fd_limit() {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+    if rc != 0 {
+        log::warn!("getrlimit(RLIMIT_NOFILE) failed: {}", std::io::Error::last_os_error());
+        return;
+    }
+    let target = rl.rlim_max.min(8192);
+    if target > rl.rlim_cur {
+        let new = libc::rlimit { rlim_cur: target, rlim_max: rl.rlim_max };
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new) };
+        if rc != 0 {
+            log::warn!("setrlimit(RLIMIT_NOFILE, {}) failed: {}", target, std::io::Error::last_os_error());
+        } else {
+            log::info!("Raised RLIMIT_NOFILE soft limit: {} -> {} (hard {})", rl.rlim_cur, target, rl.rlim_max);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -167,6 +190,7 @@ fn main() {
     setup_logging();
     log::info!("========== Kova starting ==========");
     install_crash_signal_handlers();
+    raise_fd_limit();
 
     // Log panics: write directly to crash fd (guaranteed), then try logger (best effort)
     std::panic::set_hook(Box::new(|info| {
