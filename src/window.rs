@@ -1685,7 +1685,7 @@ impl KovaView {
     /// Mode 2: adjust the virtual width override of the active tab (all panes scale proportionally).
     fn adjust_virtual_width(&self, dir: f32) {
         let screen_w = self.drawable_viewport().width;
-        let step = (0.15 * screen_w).max(200.0 * self.backing_scale());
+        let step = (0.33 * screen_w).max(200.0 * self.backing_scale());
         let min_w = self.min_split_width_px();
         let mut tabs = self.ivars().tabs.borrow_mut();
         let idx = self.ivars().active_tab.get();
