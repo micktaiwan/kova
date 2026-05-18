@@ -228,6 +228,31 @@ struct SendToWindowState {
     selected: usize,
 }
 
+/// Outcome of `KovaView::ipc_close_tab`. Lets the caller distinguish "not in this window"
+/// (keep scanning) from "last tab — refuse" (final answer).
+pub enum IpcCloseTabResult {
+    Closed,
+    WouldTerminate,
+    NotFound,
+}
+
+/// Outcome of `KovaView::ipc_merge_tab`. `SourceMissing` lets the caller keep scanning
+/// across windows; `TargetMissing` is a final answer because we found the source here.
+pub enum IpcMergeTabResult {
+    Merged,
+    SourceMissing,
+    TargetMissing,
+}
+
+/// Outcome of `KovaView::ipc_swap_pane`. Same pattern as merge: only `AMissing` keeps
+/// scanning across windows.
+pub enum IpcSwapPaneResult {
+    Swapped,
+    AMissing,
+    BMissing,
+    Failed,
+}
+
 fn build_items(entries: Vec<crate::recent_projects::RecentProject>) -> Vec<RecentProjectItem> {
     entries.into_iter().map(|e| {
         let render = crate::renderer::RecentProjectEntry {
@@ -3625,6 +3650,197 @@ impl KovaView {
         self.resize_all_panes();
         log::info!("IPC: new tab created: tab_id={}, pane_id={}", tab_id, pane_id);
         Some((tab_id, pane_id))
+    }
+
+    /// IPC: collect this window's tabs as JSON entries.
+    pub fn ipc_collect_tabs(&self, win_idx: usize, is_key_window: bool, out: &mut Vec<serde_json::Value>) {
+        let tabs = self.ivars().tabs.borrow();
+        let active_tab = self.ivars().active_tab.get();
+        for (tab_idx, tab) in tabs.iter().enumerate() {
+            let mut pane_count = 0;
+            tab.for_each_pane(&mut |_| { pane_count += 1; });
+            let is_active = tab_idx == active_tab && is_key_window;
+            out.push(serde_json::json!({
+                "id": tab.id,
+                "window": win_idx,
+                "tab_index": tab_idx,
+                "title": tab.title(),
+                "pane_count": pane_count,
+                "focused_pane_id": tab.focused_pane,
+                "active": is_active,
+                "has_bell": tab.has_bell,
+                "has_completion": tab.has_completion,
+            }));
+        }
+    }
+
+    /// IPC: close a tab by ID. Refuses to close the very last tab — that would
+    /// terminate the app, which is too surprising for a remote caller.
+    pub fn ipc_close_tab(&self, tab_id: u32) -> IpcCloseTabResult {
+        let idx = {
+            let tabs = self.ivars().tabs.borrow();
+            match tabs.iter().position(|t| t.id == tab_id) {
+                Some(i) => i,
+                None => return IpcCloseTabResult::NotFound,
+            }
+        };
+        // Refuse if this would empty the window (remove_tab terminates the app in that case).
+        if self.ivars().tabs.borrow().len() <= 1 {
+            return IpcCloseTabResult::WouldTerminate;
+        }
+        self.remove_tab(idx);
+        log::info!("IPC: closed tab {}", tab_id);
+        IpcCloseTabResult::Closed
+    }
+
+    /// IPC: merge `source_tab_id` into `target_tab_id` (both must be in this window).
+    pub fn ipc_merge_tab(&self, source_tab_id: u32, target_tab_id: u32) -> IpcMergeTabResult {
+        let (source_idx, target_idx) = {
+            let tabs = self.ivars().tabs.borrow();
+            let s = match tabs.iter().position(|t| t.id == source_tab_id) {
+                Some(i) => i,
+                None => return IpcMergeTabResult::SourceMissing,
+            };
+            let t = match tabs.iter().position(|t| t.id == target_tab_id) {
+                Some(i) => i,
+                None => return IpcMergeTabResult::TargetMissing,
+            };
+            (s, t)
+        };
+
+        // `merge_active_tab_into` operates on the active tab, so move the active
+        // pointer to the source first, then call it. The function adjusts the
+        // target index internally to account for the source removal.
+        self.ivars().active_tab.set(source_idx);
+        self.merge_active_tab_into(target_idx);
+        log::info!("IPC: merged tab {} into tab {}", source_tab_id, target_tab_id);
+        IpcMergeTabResult::Merged
+    }
+
+    /// IPC: swap two panes. Both must live in the same tab.
+    pub fn ipc_swap_pane(&self, pane_id_a: PaneId, pane_id_b: PaneId) -> IpcSwapPaneResult {
+        if pane_id_a == pane_id_b {
+            return IpcSwapPaneResult::Failed;
+        }
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let tab_idx = match tabs.iter().position(|t| t.contains(pane_id_a)) {
+            Some(i) => i,
+            None => return IpcSwapPaneResult::AMissing,
+        };
+        if !tabs[tab_idx].contains(pane_id_b) {
+            return IpcSwapPaneResult::BMissing;
+        }
+        // Pick a synthetic direction based on layout: same column → Up (in-column),
+        // different columns → Right (swap whole columns). This reuses the existing
+        // direction-aware logic without forcing the caller to know layout details.
+        let tab = &mut tabs[tab_idx];
+        let col_a = tab.column_index_of(pane_id_a);
+        let col_b = tab.column_index_of(pane_id_b);
+        let dir = match (col_a, col_b) {
+            (Some(a), Some(b)) if a == b => crate::pane::NavDirection::Up,
+            (Some(_), Some(_)) => crate::pane::NavDirection::Right,
+            _ => return IpcSwapPaneResult::Failed,
+        };
+        let ok = tab.swap_panes(pane_id_a, pane_id_b, dir);
+        if !ok {
+            return IpcSwapPaneResult::Failed;
+        }
+        // Mark both panes dirty so they redraw in their new positions.
+        if let Some(p) = tab.pane(pane_id_a) {
+            p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(p) = tab.pane(pane_id_b) {
+            p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        drop(tabs);
+        self.resize_all_panes();
+        log::info!("IPC: swapped panes {} and {}", pane_id_a, pane_id_b);
+        IpcSwapPaneResult::Swapped
+    }
+
+    /// IPC: resize the split containing `pane_id`. `grow=true` makes that pane's
+    /// column/row larger; `grow=false` makes it smaller. Returns:
+    /// - `None` if the pane isn't in this window (caller should keep scanning).
+    /// - `Some(false)` if there's no neighbor to resize against (single-pane axis).
+    /// - `Some(true)` on success.
+    pub fn ipc_resize_pane(
+        &self,
+        pane_id: PaneId,
+        axis: crate::pane::SplitAxis,
+        grow: bool,
+        amount_pct: f32,
+    ) -> Option<bool> {
+        use crate::pane::SplitAxis;
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let tab_idx = tabs.iter().position(|t| t.contains(pane_id))?;
+        let tab = &mut tabs[tab_idx];
+
+        // Translate grow/shrink into the signed delta the internal API expects.
+        // For non-last position, delta>0 = grow. For last position, delta<0 = grow.
+        // (Mirrors adjust_column_weight_directional / adjust_row_weight_directional.)
+        let is_last = match axis {
+            SplitAxis::Horizontal => {
+                let col_idx = tab.column_index_of(pane_id);
+                if tab.columns.len() < 2 { return Some(false); }
+                col_idx.map(|i| i == tab.columns.len() - 1).unwrap_or(false)
+            }
+            SplitAxis::Vertical => {
+                let col_idx = match tab.column_index_of(pane_id) {
+                    Some(i) => i,
+                    None => return Some(false),
+                };
+                let col = &tab.columns[col_idx];
+                if col.panes.len() < 2 { return Some(false); }
+                col.panes.iter().position(|p| p.id == pane_id)
+                    .map(|i| i == col.panes.len() - 1)
+                    .unwrap_or(false)
+            }
+        };
+        let mag = amount_pct / 100.0;
+        let delta = match (grow, is_last) {
+            (true, false) => mag,
+            (true, true) => -mag,
+            (false, false) => -mag,
+            (false, true) => mag,
+        };
+
+        let changed = tab.adjust_ratio_directional(pane_id, delta, axis);
+        if !changed {
+            return Some(false);
+        }
+        let full = self.drawable_viewport();
+        let min_w = self.min_split_width_px();
+        self.cap_virtual_width(tab, full.width, min_w);
+        tab.clamp_scroll(full.width, min_w);
+        drop(tabs);
+        self.resize_all_panes();
+        self.mark_dirty();
+        log::info!("IPC: resized pane {} ({:?} {}{}%)", pane_id, axis, if grow {"+"} else {"-"}, amount_pct);
+        Some(true)
+    }
+
+    /// IPC: set/clear a pane's sticky custom title (equivalent to OSC 1 / Cmd-Option-R).
+    /// Returns true if the pane was found.
+    pub fn ipc_rename_pane(&self, pane_id: PaneId, title: Option<String>) -> bool {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        for tab in tabs.iter_mut() {
+            // for_each_pane is read-only; we need mutable access to set custom_title.
+            // Walk columns directly for that.
+            for col in tab.columns.iter_mut() {
+                for pane in col.panes.iter_mut() {
+                    if pane.id == pane_id {
+                        pane.custom_title = title.clone();
+                        // Also clear any pending OSC 1 sticky from the terminal so a stale
+                        // OSC 1 doesn't immediately overwrite the IPC title on next frame.
+                        pane.terminal.write().osc1_title = None;
+                        pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        log::info!("IPC: renamed pane {}", pane_id);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Minimize the focused pane.

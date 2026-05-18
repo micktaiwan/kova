@@ -451,6 +451,24 @@ fn handle_ipc_command_sync(
             // Routed in `handle_ipc_command` before this fn is called.
             unreachable!("WaitForCompletion handled by handle_ipc_command, not the sync path");
         }
+        IpcCommand::ListTabs => {
+            handle_ipc_list_tabs(windows)
+        }
+        IpcCommand::CloseTab(tab_id) => {
+            handle_ipc_close_tab(windows, tab_id)
+        }
+        IpcCommand::MergeTab { source_tab_id, target_tab_id } => {
+            handle_ipc_merge_tab(windows, source_tab_id, target_tab_id)
+        }
+        IpcCommand::SwapPane { pane_id_a, pane_id_b } => {
+            handle_ipc_swap_pane(windows, pane_id_a, pane_id_b)
+        }
+        IpcCommand::ResizePane { pane_id, axis, direction, amount_pct } => {
+            handle_ipc_resize_pane(windows, pane_id, &axis, &direction, amount_pct)
+        }
+        IpcCommand::RenamePane { pane_id, title } => {
+            handle_ipc_rename_pane(windows, pane_id, title)
+        }
     }
 }
 
@@ -870,6 +888,179 @@ fn handle_ipc_new_tab(
         },
         None => IpcResponse::Error { message: "failed to create tab".to_string() },
     }
+}
+
+/// IPC: list all tabs across all windows.
+fn handle_ipc_list_tabs(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    let mut tabs_json = Vec::new();
+    for (win_idx, win) in wins.iter().enumerate() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        let is_key = win.isKeyWindow();
+        view.ipc_collect_tabs(win_idx, is_key, &mut tabs_json);
+    }
+
+    IpcResponse::Ok {
+        data: Some(serde_json::Value::Array(tabs_json)),
+    }
+}
+
+/// IPC: close a tab by ID. Refuses to close the last tab of its window
+/// (would terminate the app — use a dedicated shutdown path for that).
+fn handle_ipc_close_tab(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    tab_id: u32,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+    use crate::window::IpcCloseTabResult;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        match view.ipc_close_tab(tab_id) {
+            IpcCloseTabResult::Closed => return IpcResponse::Ok { data: None },
+            IpcCloseTabResult::WouldTerminate => {
+                return IpcResponse::Error {
+                    message: format!("tab {} is the last tab in its window — refusing to close (would terminate app)", tab_id),
+                };
+            }
+            IpcCloseTabResult::NotFound => continue,
+        }
+    }
+
+    IpcResponse::Error { message: format!("tab {} not found", tab_id) }
+}
+
+/// IPC: merge a source tab into a target tab.
+fn handle_ipc_merge_tab(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    source_tab_id: u32,
+    target_tab_id: u32,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+    use crate::window::IpcMergeTabResult;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        match view.ipc_merge_tab(source_tab_id, target_tab_id) {
+            IpcMergeTabResult::Merged => return IpcResponse::Ok { data: None },
+            IpcMergeTabResult::SourceMissing => continue,
+            IpcMergeTabResult::TargetMissing => {
+                return IpcResponse::Error {
+                    message: format!("target tab {} not found in the same window as source tab {}", target_tab_id, source_tab_id),
+                };
+            }
+        }
+    }
+
+    IpcResponse::Error { message: format!("source tab {} not found", source_tab_id) }
+}
+
+/// IPC: swap two panes.
+fn handle_ipc_swap_pane(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id_a: u32,
+    pane_id_b: u32,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+    use crate::window::IpcSwapPaneResult;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        match view.ipc_swap_pane(pane_id_a, pane_id_b) {
+            IpcSwapPaneResult::Swapped => return IpcResponse::Ok { data: None },
+            IpcSwapPaneResult::AMissing => continue,
+            IpcSwapPaneResult::BMissing => {
+                return IpcResponse::Error {
+                    message: format!("pane {} not found in the same tab as pane {}", pane_id_b, pane_id_a),
+                };
+            }
+            IpcSwapPaneResult::Failed => {
+                return IpcResponse::Error {
+                    message: format!("could not swap panes {} and {}", pane_id_a, pane_id_b),
+                };
+            }
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id_a) }
+}
+
+/// IPC: resize the split containing `pane_id`.
+fn handle_ipc_resize_pane(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    axis: &str,
+    direction: &str,
+    amount_pct: f32,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+    use crate::pane::SplitAxis;
+
+    let split_axis = match axis {
+        "vertical" => SplitAxis::Vertical,
+        _ => SplitAxis::Horizontal,
+    };
+    let grow = direction == "grow";
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        match view.ipc_resize_pane(pane_id, split_axis, grow, amount_pct) {
+            Some(true) => return IpcResponse::Ok { data: None },
+            Some(false) => {
+                return IpcResponse::Error {
+                    message: format!("pane {} has no neighbor along {} axis to resize against", pane_id, axis),
+                };
+            }
+            None => continue,
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: rename a pane (set sticky custom title, like OSC 1).
+fn handle_ipc_rename_pane(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    title: Option<String>,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        if view.ipc_rename_pane(pane_id, title.clone()) {
+            return IpcResponse::Ok { data: None };
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
 }
 
 fn setup_menu(mtm: MainThreadMarker) {

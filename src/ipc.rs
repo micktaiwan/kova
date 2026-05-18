@@ -66,6 +66,37 @@ pub enum IpcCommand {
         pane_id: u32,
         timeout_ms: u64,
     },
+    /// List all tabs across all windows.
+    ListTabs,
+    /// Close a tab by ID. Refuses if it would close the last tab (would terminate the app).
+    CloseTab(u32),
+    /// Merge `source_tab_id` into `target_tab_id`: source columns are appended to target,
+    /// then the source tab is removed. Both tabs must live in the same window.
+    MergeTab {
+        source_tab_id: u32,
+        target_tab_id: u32,
+    },
+    /// Swap two panes. Both must live in the same tab.
+    /// Same column → swap inside the column. Different columns → swap the whole columns.
+    SwapPane {
+        pane_id_a: u32,
+        pane_id_b: u32,
+    },
+    /// Adjust the ratio of the split containing `pane_id`.
+    /// `axis = "horizontal"` resizes the column; `axis = "vertical"` resizes the row.
+    /// `direction = "grow" | "shrink"`. `amount_pct` is in [0.1, 50.0].
+    ResizePane {
+        pane_id: u32,
+        axis: String,
+        direction: String,
+        amount_pct: f32,
+    },
+    /// Set/clear a pane's custom title (sticky — equivalent to OSC 1 or Cmd+Option+R).
+    /// `title: None` clears the custom title (pane falls back to OSC 0/2 or auto-derived).
+    RenamePane {
+        pane_id: u32,
+        title: Option<String>,
+    },
 }
 
 /// How long the IPC connection thread should wait for the main thread's response.
@@ -368,6 +399,97 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 ));
             }
             Ok(IpcCommand::WaitForCompletion { pane_id, timeout_ms })
+        }
+        "list-tabs" => Ok(IpcCommand::ListTabs),
+        "close-tab" => {
+            let tab_id = v
+                .get("tab_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"tab_id\" field".to_string())?
+                as u32;
+            Ok(IpcCommand::CloseTab(tab_id))
+        }
+        "merge-tab" => {
+            let source_tab_id = v
+                .get("source_tab_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"source_tab_id\" field".to_string())?
+                as u32;
+            let target_tab_id = v
+                .get("target_tab_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"target_tab_id\" field".to_string())?
+                as u32;
+            if source_tab_id == target_tab_id {
+                return Err("source_tab_id and target_tab_id must differ".to_string());
+            }
+            Ok(IpcCommand::MergeTab { source_tab_id, target_tab_id })
+        }
+        "swap-pane" => {
+            let pane_id_a = v
+                .get("pane_id_a")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id_a\" field".to_string())?
+                as u32;
+            let pane_id_b = v
+                .get("pane_id_b")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id_b\" field".to_string())?
+                as u32;
+            if pane_id_a == pane_id_b {
+                return Err("pane_id_a and pane_id_b must differ".to_string());
+            }
+            Ok(IpcCommand::SwapPane { pane_id_a, pane_id_b })
+        }
+        "resize-pane" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            let axis = v
+                .get("axis")
+                .and_then(|a| a.as_str())
+                .unwrap_or("horizontal")
+                .to_string();
+            if axis != "horizontal" && axis != "vertical" {
+                return Err(format!("\"axis\" must be \"horizontal\" or \"vertical\" (got \"{}\")", axis));
+            }
+            let direction = v
+                .get("direction")
+                .and_then(|d| d.as_str())
+                .ok_or_else(|| "missing \"direction\" field".to_string())?
+                .to_string();
+            if direction != "grow" && direction != "shrink" {
+                return Err(format!("\"direction\" must be \"grow\" or \"shrink\" (got \"{}\")", direction));
+            }
+            let amount_pct = match v.get("amount_pct") {
+                None | Some(serde_json::Value::Null) => 5.0_f32,
+                Some(a) => {
+                    let f = a
+                        .as_f64()
+                        .ok_or_else(|| "\"amount_pct\" must be a number".to_string())?
+                        as f32;
+                    if !(0.1..=50.0).contains(&f) {
+                        return Err(format!("\"amount_pct\" must be in [0.1, 50.0] (got {})", f));
+                    }
+                    f
+                }
+            };
+            Ok(IpcCommand::ResizePane { pane_id, axis, direction, amount_pct })
+        }
+        "rename-pane" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            let title = match v.get("title") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err("\"title\" must be a string or null".to_string()),
+            };
+            Ok(IpcCommand::RenamePane { pane_id, title })
         }
         other => Err(format!("unknown command: {}", other)),
     }
