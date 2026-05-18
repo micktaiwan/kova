@@ -49,6 +49,7 @@ Every response uses the same wrapper:
 | `missing "<field>" field` | required field absent |
 | `unknown command: <x>` | typo in `cmd` |
 | `pane <N> not found` | unknown pane ID |
+| `tab <N> not found` | unknown tab ID |
 | `request too large` | line exceeded 64 KB |
 | `timeout waiting for response` | main thread didn't reply within the connection deadline |
 
@@ -76,6 +77,30 @@ Response: `{ "data": { "pane_id": <new-id> } }`
 ```
 
 Response: `{ "data": { "tab_id": <int>, "pane_id": <int> } }`
+
+---
+
+### `list-tabs` — enumerate every tab across every window
+
+```json
+{ "cmd": "list-tabs" }
+```
+
+Response: `{ "data": [ { ... }, ... ] }` where each entry has:
+
+```json
+{
+  "id": 7, "window": 0, "tab_index": 2,
+  "title": "build watch",
+  "pane_count": 3,
+  "focused_pane_id": 42,
+  "active": true,
+  "has_bell": false,
+  "has_completion": false
+}
+```
+
+`id` is the stable tab ID (use for `close-tab` / `merge-tab` / `set-tab-title`); `tab_index` is the positional index in its window's tab bar (changes when tabs are reordered/closed). `active: true` only on the tab of the key window.
 
 ---
 
@@ -119,6 +144,76 @@ Switches tab and window if needed. Response: `{ "ok": true }`.
 ```
 
 Response: `{ "ok": true }`. Closes the tab if it was the last pane.
+
+---
+
+### `close-tab` — close a tab by ID
+
+```json
+{ "cmd": "close-tab", "tab_id": 7 }
+```
+
+Response: `{ "ok": true }`. Returns an error if the target is the **last tab** of its window — closing it would terminate the app, which is too surprising for a remote caller. (To shut down Kova, kill the process or use Cmd-Q on the window.)
+
+---
+
+### `merge-tab` — merge one tab into another
+
+```json
+{ "cmd": "merge-tab", "source_tab_id": 7, "target_tab_id": 4 }
+```
+
+Appends `source`'s columns to `target`, then removes `source`. Both tabs must be in the same window. The merged result becomes the active tab. Equivalent of the `Cmd+Ctrl+M` keybinding but addressable by ID.
+
+Response: `{ "ok": true }`.
+
+---
+
+### `swap-pane` — swap two panes
+
+```json
+{ "cmd": "swap-pane", "pane_id_a": 42, "pane_id_b": 99 }
+```
+
+Both panes must be in the same tab.
+
+- **Same column** → swap the two panes within their column (other panes unaffected).
+- **Different columns** → swap the two **whole columns** (any other panes in those columns swap with them). Matches the `Cmd+Shift+Left/Right` keyboard semantic. To move a single pane across a multi-pane column, use [reparent semantics] on the keyboard side instead.
+
+Response: `{ "ok": true }`.
+
+---
+
+### `resize-pane` — adjust the ratio of a split
+
+```json
+{ "cmd": "resize-pane", "pane_id": 42,
+  "axis": "horizontal" | "vertical",
+  "direction": "grow" | "shrink",
+  "amount_pct": 5.0 }
+```
+
+| Field | Default | Range | Meaning |
+|---|---|---|---|
+| `axis` | `"horizontal"` | — | `horizontal` resizes the **column** containing `pane_id`; `vertical` resizes the **row** within its column |
+| `direction` | required | `grow` \| `shrink` | what to do to the pane's column/row |
+| `amount_pct` | `5.0` | `[0.1, 50.0]` | percentage of weight to transfer (one keyboard nudge ≈ 5%) |
+
+Equivalent of `Cmd+Ctrl+Arrows` keyboard resize, addressable by pane ID. Returns an error if the pane has no neighbor along the chosen axis (e.g. `vertical` on a column with a single row).
+
+Response: `{ "ok": true }`.
+
+---
+
+### `rename-pane` — set a pane's sticky title
+
+```json
+{ "cmd": "rename-pane", "pane_id": 42, "title": "agent: claude" }
+```
+
+Sets the pane's custom title — the same field that `Cmd+Option+R` and `OSC 1` write to. Sticky: survives OSC 0/2 (window title) sequences emitted by programs running in the pane. Pass `"title": null` to clear (pane falls back to its OSC 0/2 / auto-derived title).
+
+Response: `{ "ok": true }`.
 
 ---
 

@@ -22,5 +22,7 @@
     <string>kova</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Kova needs microphone access so that terminal commands like ffmpeg, sox, or recording tools can capture audio.</string>
 </dict>
 </plist>
