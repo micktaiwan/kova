@@ -296,6 +296,7 @@ pub struct KeysConfig {
     pub open_recent_project: String,
     pub open_search: String,
     pub equalize: String,
+    pub repaint_pane: String,
     pub terminal: TerminalKeysConfig,
 }
 
@@ -358,6 +359,7 @@ impl Default for KeysConfig {
             open_recent_project: "cmd+o".into(),
             open_search: "cmd+p".into(),
             equalize: "cmd+shift++".into(),
+            repaint_pane: "cmd+r".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }

@@ -63,6 +63,7 @@ pub enum Action {
     OpenRecentProject,
     OpenSearchPalette,
     Equalize,
+    RepaintPane,
 }
 
 /// Terminal-level actions dispatched from handle_key_event.
@@ -249,6 +250,7 @@ impl Keybindings {
         bind(&keys.open_recent_project, Action::OpenRecentProject);
         bind(&keys.open_search, Action::OpenSearchPalette);
         bind(&keys.equalize, Action::Equalize);
+        bind(&keys.repaint_pane, Action::RepaintPane);
 
         // Hard-coded debug binding (not user-configurable)
         window_map.insert(parse_key_combo("cmd+shift+i"), Action::MemReport);

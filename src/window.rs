@@ -648,6 +648,7 @@ define_class!(
                             self.resize_all_panes();
                         }
                     }
+                    Action::RepaintPane => self.do_repaint_pane(),
                     Action::PrevTab => self.do_switch_tab_relative(-1),
                     Action::NextTab => self.do_switch_tab_relative(1),
                     Action::RenameTab => self.start_rename_tab(),
@@ -1493,6 +1494,35 @@ impl KovaView {
         }
         self.ivars().show_mem_report.set(true);
         self.mark_dirty();
+    }
+
+    /// Force a repaint of the focused pane — workaround for occasional display
+    /// corruption that otherwise only clears after a detach/reattach.
+    ///
+    /// Two levers, mirroring what detach/reattach does:
+    /// 1. Mark the terminal dirty so Kova rebuilds its vertices from the grid
+    ///    (clears any GPU-side glitch).
+    /// 2. Nudge the PTY winsize (rows ±1 then back) to provoke a SIGWINCH, which
+    ///    makes the foreground program (vim, tmux, htop, the shell prompt…)
+    ///    redraw its own content. The nudge touches only the PTY winsize, never
+    ///    Kova's grid, so no content is lost. A same-size set wouldn't work: the
+    ///    kernel only emits SIGWINCH when the dimensions actually change.
+    fn do_repaint_pane(&self) {
+        let pane = match self.focused_pane() {
+            Some(p) => p,
+            None => return,
+        };
+        if pane.minimized {
+            return;
+        }
+        let (cols, rows) = {
+            let term = pane.terminal.read();
+            (term.cols, term.rows)
+        };
+        let nudged = if rows > 1 { rows - 1 } else { rows + 1 };
+        pane.pty.resize(cols, nudged);
+        pane.pty.resize(cols, rows);
+        pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn focused_pane(&self) -> Option<&Pane> {
