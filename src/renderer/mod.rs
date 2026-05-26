@@ -1777,6 +1777,7 @@ impl Renderer {
                 ("Minimize Pane", &keys_config.minimize_pane),
                 ("Restore Minimized", &keys_config.restore_minimized),
                 ("Equalize", &keys_config.equalize),
+                ("Repaint Pane", &keys_config.repaint_pane),
                 ("Kill Window", &keys_config.kill_window),
                 ("Help", &keys_config.toggle_help),
             ];

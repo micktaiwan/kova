@@ -106,6 +106,7 @@ min_width = 300.0  # minimum pane width in points before horizontal scroll activ
 | Cmd+M | Minimize pane |
 | Cmd+Option+M | Restore last minimized pane |
 | Cmd+Shift+= | Equalize all splits |
+| Cmd+R | Repaint focused pane (force redraw via SIGWINCH) |
 | Cmd+F | Search scrollback |
 | Cmd+O | Open recent project |
 | Cmd+Shift+W | Close tab |
