@@ -1071,6 +1071,26 @@ impl TerminalState {
         self.user_scrolled = false;
     }
 
+    /// Soft reset: restore rendering-critical state to sane defaults without
+    /// clearing grid content or scrollback. Fixes persistent display corruption
+    /// (wrong scroll region, hidden cursor, stuck SGR attributes).
+    pub fn soft_reset(&mut self) {
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
+        self.cursor_visible = true;
+        self.origin_mode = false;
+        self.auto_wrap = true;
+        self.insert_mode = false;
+        self.current_fg = self.default_fg;
+        self.current_bg = self.default_bg;
+        self.reversed = false;
+        self.bold = false;
+        self.dim = false;
+        self.synchronized_output = false;
+        self.sync_output_since = None;
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn resize(&mut self, new_cols: u16, new_rows: u16) {
         if new_cols == self.cols && new_rows == self.rows {
             return;
