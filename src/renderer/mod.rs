@@ -1453,6 +1453,8 @@ impl Renderer {
     }
 
     /// Render text using the overlay font (rasterized at larger size, no bitmap stretching).
+    /// `scale` upscales the overlay glyphs (1.0 = native overlay size). Keep close to 1.0:
+    /// large factors reintroduce bilinear blur. Used >1.0 only for the help title.
     fn render_overlay_text(
         &mut self,
         vertices: &mut Vec<Vertex>,
@@ -1462,8 +1464,9 @@ impl Renderer {
         max_x: f32,
         fg: [f32; 4],
         no_bg: [f32; 4],
+        scale: f32,
     ) -> f32 {
-        let cell_w = self.atlas.overlay_cell_width;
+        let cell_w = self.atlas.overlay_cell_width * scale;
         let atlas_w = self.atlas.atlas_width as f32;
         let atlas_h = self.atlas.atlas_height as f32;
 
@@ -1482,19 +1485,24 @@ impl Renderer {
             };
             if glyph.width == 0 || glyph.height == 0 { x += cell_w; continue; }
 
-            let gw = glyph.width as f32;
-            let gh = glyph.height as f32;
+            let gw = glyph.width as f32 * scale;
+            let gh = glyph.height as f32 * scale;
             let tx = glyph.x as f32 / atlas_w;
             let ty = glyph.y as f32 / atlas_h;
             let tw = glyph.width as f32 / atlas_w;
             let th = glyph.height as f32 / atlas_h;
 
-            vertices.push(Vertex { position: [x, y], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x + gw, y + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+            // Snap to integer pixels so the nearest-sampled glyph stays crisp
+            // (fractional positions smear the bitmap edges).
+            let px = x.round();
+            let py = y.round();
+
+            vertices.push(Vertex { position: [px, py], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [px + gw, py], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [px, py + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [px + gw, py], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [px + gw, py + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
+            vertices.push(Vertex { position: [px, py + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
             x += cell_w;
         }
         x
@@ -1708,8 +1716,11 @@ impl Renderer {
         viewport_h: f32,
         keys_config: &KeysConfig,
     ) {
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
+        // Overlay atlas: glyphs rasterized natively at ~1.3x the terminal font,
+        // so they render sharp instead of bilinearly upscaling the base atlas.
+        let ocw = self.atlas.overlay_cell_width;
+        let och = self.atlas.overlay_cell_height;
+        let base_ch = self.atlas.cell_height;
 
         // Semi-transparent dark overlay
         Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
@@ -1718,19 +1729,18 @@ impl Renderer {
         let title_fg = [1.0, 0.85, 0.3, 1.0]; // accent yellow
         let label_fg = [0.7, 0.7, 0.75, 1.0];
         let key_fg = [1.0, 1.0, 1.0, 1.0];
+        let dim_fg = [0.55, 0.55, 0.6, 1.0];
 
-        let title_scale = 1.8_f32;
-        let body_scale = 1.3_f32;
-        let scaled_cell_w = cell_w * body_scale;
-        let scaled_cell_h = cell_h * body_scale;
+        // Title lightly upscaled from the overlay atlas (kept near 1.0 to stay crisp).
+        let title_scale = 1.4_f32;
 
         // Title centered
         let title = "Keyboard Shortcuts";
         let title_chars = title.chars().count() as f32;
-        let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
-        let mut y = cell_h * 3.0;
-        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
-        y += cell_h * title_scale * 2.0;
+        let title_x = (viewport_w - title_chars * ocw * title_scale) / 2.0;
+        let mut y = och * 2.0;
+        self.render_overlay_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        y += och * title_scale * 1.6;
 
         // Subtitle
         if self.cached_help_hint.is_empty() {
@@ -1738,10 +1748,29 @@ impl Renderer {
         }
         let subtitle = format!("Press {} or Esc to close", &self.cached_help_hint);
         let sub_chars = subtitle.chars().count() as f32;
-        let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
-        self.render_text(vertices, &subtitle, sub_x, y, viewport_w, label_fg, no_bg, body_scale);
+        let sub_x = (viewport_w - sub_chars * ocw) / 2.0;
+        self.render_overlay_text(vertices, &subtitle, sub_x, y, viewport_w, label_fg, no_bg, 1.0);
         drop(subtitle);
-        y += scaled_cell_h * 2.5;
+        y += och * 1.4;
+
+        // Actually-resolved font (CoreText may substitute / fall back silently).
+        let font_line = {
+            let actual = self.atlas.actual_font_name.clone();
+            let configured = &self.font_name;
+            if actual.to_lowercase().contains(&configured.to_lowercase()) {
+                format!("Font: {} {:.1}pt", actual, self.font_size)
+            } else {
+                format!(
+                    "Font: {} {:.1}pt  (\"{}\" not found, using fallback)",
+                    actual, self.font_size, configured
+                )
+            }
+        };
+        let fl_chars = font_line.chars().count() as f32;
+        let fl_x = (viewport_w - fl_chars * ocw) / 2.0;
+        self.render_overlay_text(vertices, &font_line, fl_x, y, viewport_w, dim_fg, no_bg, 1.0);
+        drop(font_line);
+        y += och * 2.2;
 
         // Build shortcut list (cached to avoid per-frame allocation)
         if self.cached_help_shortcuts.is_empty() {
@@ -1790,26 +1819,26 @@ impl Renderer {
 
         // Render in 2 columns
         let col_width = viewport_w / 2.0;
-        let label_offset = scaled_cell_w * 2.0;
+        let label_offset = ocw * 2.0;
         let max_label_len = shortcuts.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as f32;
-        let key_offset = label_offset + (max_label_len + 2.0) * scaled_cell_w;
+        let key_offset = label_offset + (max_label_len + 2.0) * ocw;
 
         let rows_per_col = (shortcuts.len() + 1) / 2;
         for (i, (label, formatted)) in shortcuts.iter().enumerate() {
             let col = if i < rows_per_col { 0 } else { 1 };
             let row = if i < rows_per_col { i } else { i - rows_per_col };
             let base_x = col as f32 * col_width;
-            let row_y = y + row as f32 * (scaled_cell_h * 1.4);
+            let row_y = y + row as f32 * (och * 1.4);
 
-            if row_y + scaled_cell_h > viewport_h - cell_h {
+            if row_y + och > viewport_h - base_ch {
                 break; // Don't overflow past global status bar
             }
 
             // Label
-            self.render_text(vertices, label, base_x + label_offset, row_y, base_x + key_offset - scaled_cell_w, label_fg, no_bg, body_scale);
+            self.render_overlay_text(vertices, label, base_x + label_offset, row_y, base_x + key_offset - ocw, label_fg, no_bg, 1.0);
 
             // Key combo
-            self.render_text(vertices, formatted, base_x + key_offset, row_y, base_x + col_width - scaled_cell_w, key_fg, no_bg, body_scale);
+            self.render_overlay_text(vertices, formatted, base_x + key_offset, row_y, base_x + col_width - ocw, key_fg, no_bg, 1.0);
         }
 
         // Put shortcuts back
@@ -1839,14 +1868,14 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * overlay_cw) / 2.0;
         let mut y = overlay_ch * 2.0;
-        self.render_overlay_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg);
+        self.render_overlay_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, 1.0);
         y += overlay_ch * 2.0;
 
         // Subtitle
         let subtitle = "Press Esc to close";
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * overlay_cw) / 2.0;
-        self.render_overlay_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg);
+        self.render_overlay_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, 1.0);
         y += overlay_ch * 2.5;
 
         // Report lines
@@ -1865,7 +1894,7 @@ impl Renderer {
             } else {
                 (line.as_str(), label_fg)
             };
-            self.render_overlay_text(vertices, text, left_margin, y, viewport_w - overlay_cw, fg, no_bg);
+            self.render_overlay_text(vertices, text, left_margin, y, viewport_w - overlay_cw, fg, no_bg, 1.0);
             y += overlay_ch * 1.3;
         }
         self.cached_mem_report = report;

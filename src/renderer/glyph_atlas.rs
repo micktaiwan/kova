@@ -43,10 +43,15 @@ pub struct GlyphAtlas {
     fallback_fonts: HashMap<char, CFRetained<CTFont>>,
     // Overlay font (larger, for overlays like Memory Report)
     overlay_font: Retained<CTFont>,
+    // Per-char fallback fonts for the overlay font (Apple symbols ⌘⌥⌃ etc. absent from the main font)
+    overlay_fallback_fonts: HashMap<char, CFRetained<CTFont>>,
     overlay_descent: f64,
     pub overlay_glyphs: HashMap<char, GlyphInfo>,
     pub overlay_cell_width: f32,
     pub overlay_cell_height: f32,
+    /// Display name of the font CoreText actually resolved (differs from the
+    /// requested family when CoreText substitutes or we fall back to Menlo).
+    pub actual_font_name: String,
 }
 
 impl GlyphAtlas {
@@ -64,6 +69,8 @@ impl GlyphAtlas {
             let fallback_name = CFString::from_str("Menlo");
             font = unsafe { CTFont::with_name(&fallback_name, font_size, ptr::null()) };
         }
+        // Name CoreText actually resolved (after any substitution / fallback).
+        let actual_font_name = unsafe { font.display_name() }.to_string();
 
         let ascent = unsafe { font.ascent() };
         let descent = unsafe { font.descent() };
@@ -289,10 +296,12 @@ impl GlyphAtlas {
             color_space: color_space.into(),
             fallback_fonts: HashMap::new(),
             overlay_font: overlay_font.into(),
+            overlay_fallback_fonts: HashMap::new(),
             overlay_descent,
             overlay_glyphs: HashMap::new(),
             overlay_cell_width,
             overlay_cell_height,
+            actual_font_name,
         };
 
         // Pre-rasterize ASCII glyphs at overlay size
@@ -325,6 +334,9 @@ impl GlyphAtlas {
         let bmp_h = self.overlay_cell_height as usize;
         let bmp_bpr = bmp_w * 4;
 
+        // Resolve glyph id + font (with fallback) at overlay size. Mirrors resolve_glyph
+        // for the base atlas: the main font lacks Apple symbols (⌘⌥⌃) which would
+        // otherwise render as blank advancing cells and misalign the help overlay.
         let mut uni_buf = [0u16; 2];
         let encoded = c.encode_utf16(&mut uni_buf);
         let count = encoded.len();
@@ -336,10 +348,36 @@ impl GlyphAtlas {
                 count as isize,
             )
         };
-        let mut glyph_id = glyph_buf[0];
-        if !ok || glyph_id == 0 {
-            return None;
-        }
+        let (mut glyph_id, font_ptr): (u16, *const CTFont) = if ok && glyph_buf[0] != 0 {
+            (glyph_buf[0], &*self.overlay_font as *const CTFont)
+        } else {
+            // CoreText font fallback, cached, at the overlay font size.
+            if !self.overlay_fallback_fonts.contains_key(&c) {
+                let s = c.to_string();
+                let cf_str = CFString::from_str(&s);
+                let fallback = unsafe {
+                    self.overlay_font.for_string(
+                        &cf_str,
+                        CFRange { location: 0, length: cf_str.length() },
+                    )
+                };
+                self.overlay_fallback_fonts.insert(c, fallback);
+            }
+            let fallback = self.overlay_fallback_fonts.get(&c)?;
+            let mut glyph_buf2 = [0u16; 2];
+            let ok2 = unsafe {
+                fallback.glyphs_for_characters(
+                    NonNull::new(uni_buf.as_mut_ptr()).unwrap(),
+                    NonNull::new(glyph_buf2.as_mut_ptr()).unwrap(),
+                    count as isize,
+                )
+            };
+            if ok2 && glyph_buf2[0] != 0 {
+                (glyph_buf2[0], &**fallback as *const CTFont)
+            } else {
+                return None;
+            }
+        };
 
         let mut bmp_buf = vec![0u8; bmp_bpr * bmp_h];
         let bmp_ctx = unsafe {
@@ -362,7 +400,7 @@ impl GlyphAtlas {
 
         let mut pos = CGPoint { x: 0.0, y: self.overlay_descent };
         unsafe {
-            self.overlay_font.draw_glyphs(
+            (*font_ptr).draw_glyphs(
                 NonNull::new(&mut glyph_id).unwrap(),
                 NonNull::new(&mut pos).unwrap(),
                 1,
