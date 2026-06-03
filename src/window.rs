@@ -2917,6 +2917,13 @@ impl KovaView {
             });
             if found {
                 tab.focused_pane = pane_id;
+                // Scroll the virtual viewport so the pane is on-screen if it
+                // sits outside the visible horizontal span (e.g. jumped to from
+                // global search).
+                let screen_w = self.drawable_viewport().width;
+                let min_w = self.min_split_width_px();
+                tab.clamp_scroll(screen_w, min_w);
+                self.scroll_to_reveal_pane(tab, pane_id, screen_w);
                 drop(tabs);
                 self.mark_dirty();
                 return true;
