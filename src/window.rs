@@ -103,7 +103,7 @@ pub struct KovaViewIvars {
     boundary_hit: Cell<Option<BoundaryHit>>,
     /// Boundary flash: remaining frames and which edge of the focused pane to flash.
     boundary_flash: Cell<Option<BoundaryFlash>>,
-    /// Search palette overlay state (Cmd+P).
+    /// Search palette overlay state (Cmd+Shift+F — global search across all panes).
     search_palette: RefCell<Option<SearchPaletteState>>,
     /// Highlight a pane after a search-palette jump (decremented per tick).
     pane_flash: Cell<Option<PaneFlash>>,
@@ -156,6 +156,24 @@ struct SearchHit {
     label: String,
 }
 
+/// A row in the result list. Headers are non-selectable group titles (a tab name
+/// for the panes section, or the "Tabs" section divider); hits are the selectable
+/// entries. Navigation skips headers; `selected` always lands on a `Hit`.
+#[derive(Clone)]
+enum SearchRow {
+    Header(String),
+    Hit(SearchHit),
+}
+
+impl SearchRow {
+    fn is_hit(&self) -> bool {
+        matches!(self, SearchRow::Hit(_))
+    }
+}
+
+/// Debounce window before a keystroke kicks off a live search.
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(140);
+
 struct SearchPaletteState {
     /// Current input string.
     query: String,
@@ -164,17 +182,21 @@ struct SearchPaletteState {
     /// Generation counter — bumped on each new submit so stale worker results are dropped.
     query_id: u64,
     /// Receiver from the worker thread, if a search is in flight.
-    rx: Option<std::sync::mpsc::Receiver<(u64, Vec<SearchHit>)>>,
+    rx: Option<std::sync::mpsc::Receiver<(u64, Vec<SearchRow>)>>,
     /// True while a worker is running.
     searching: bool,
     /// Last submitted query string, kept so the user can see what produced the results.
     submitted_query: String,
-    /// Hits returned by the last completed search (empty until results arrive).
-    results: Vec<SearchHit>,
-    /// Selected index into `results`.
+    /// Result rows (headers + hits) from the last completed search.
+    rows: Vec<SearchRow>,
+    /// Selected index into `rows` — always points at a `Hit` when one exists.
     selected: usize,
     /// Scroll offset (index of first visible row in the list).
     scroll: usize,
+    /// Set when the query changed and a live search is owed once debounced.
+    needs_search: bool,
+    /// Timestamp of the last edit, for debouncing the live search.
+    last_edit: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -2569,7 +2591,7 @@ impl KovaView {
         }
     }
 
-    /// Open the search palette overlay (Cmd+P).
+    /// Open the search palette overlay (Cmd+Shift+F — global search across all panes).
     fn do_open_search_palette(&self) {
         *self.ivars().search_palette.borrow_mut() = Some(SearchPaletteState {
             query: String::new(),
@@ -2578,9 +2600,11 @@ impl KovaView {
             rx: None,
             searching: false,
             submitted_query: String::new(),
-            results: Vec::new(),
+            rows: Vec::new(),
             selected: 0,
             scroll: 0,
+            needs_search: false,
+            last_edit: None,
         });
         self.mark_dirty();
     }
@@ -2620,6 +2644,8 @@ impl KovaView {
 
     /// Submit the current query: snapshot panes on the main thread, spawn a
     /// worker thread to scan, and stash a Receiver on the palette state.
+    /// Keeps the previous rows visible until the new ones land (no flicker while
+    /// live-typing); `poll_search_palette` replaces them and resets the selection.
     fn submit_search_palette(&self) {
         let (query, query_id) = {
             let mut guard = self.ivars().search_palette.borrow_mut();
@@ -2627,15 +2653,13 @@ impl KovaView {
                 Some(s) => s,
                 None => return,
             };
+            state.needs_search = false;
             if state.query.is_empty() || state.searching {
                 return;
             }
             state.query_id = state.query_id.wrapping_add(1);
             state.searching = true;
             state.submitted_query = state.query.clone();
-            state.results.clear();
-            state.selected = 0;
-            state.scroll = 0;
             (state.query.clone(), state.query_id)
         };
 
@@ -2660,32 +2684,71 @@ impl KovaView {
     /// app delegate's tick on each frame so results land without the user
     /// having to press a key.
     pub fn poll_search_palette(&self) {
-        let mut guard = self.ivars().search_palette.borrow_mut();
-        let state = match guard.as_mut() {
-            Some(s) => s,
-            None => return,
-        };
-        let rx = match state.rx.as_ref() {
-            Some(r) => r,
-            None => return,
-        };
         let mut updated = false;
-        while let Ok((id, hits)) = rx.try_recv() {
-            if id == state.query_id {
-                state.results = hits;
-                state.searching = false;
+        // Decide whether a debounced live search is owed; do it without holding a
+        // mutable borrow across the call to submit_search_palette (which re-borrows).
+        let mut trigger_search = false;
+        let mut clear_for_empty = false;
+        {
+            let mut guard = self.ivars().search_palette.borrow_mut();
+            let state = match guard.as_mut() {
+                Some(s) => s,
+                None => return,
+            };
+
+            // Phase 1: drain any pending worker results.
+            if let Some(rx) = state.rx.as_ref() {
+                while let Ok((id, rows)) = rx.try_recv() {
+                    if id == state.query_id {
+                        state.rows = rows;
+                        state.searching = false;
+                        // Land the selection on the first selectable hit.
+                        state.selected = state
+                            .rows
+                            .iter()
+                            .position(SearchRow::is_hit)
+                            .unwrap_or(0);
+                        state.scroll = 0;
+                        updated = true;
+                    }
+                    // else: stale query, drop the rows silently
+                }
+                // Drop the receiver once a result for the current query has arrived.
+                if !state.searching {
+                    state.rx = None;
+                }
+            }
+
+            // Phase 2: fire a debounced live search if the query changed.
+            if state.needs_search && !state.searching {
+                let ready = state
+                    .last_edit
+                    .map(|t| t.elapsed() >= SEARCH_DEBOUNCE)
+                    .unwrap_or(true);
+                if ready {
+                    if state.query.is_empty() {
+                        clear_for_empty = true;
+                    } else {
+                        trigger_search = true;
+                    }
+                }
+            }
+        }
+
+        if clear_for_empty {
+            if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
+                state.needs_search = false;
+                state.submitted_query.clear();
+                state.rows.clear();
                 state.selected = 0;
                 state.scroll = 0;
-                updated = true;
             }
-            // else: stale query, drop the hits silently
+            updated = true;
+        } else if trigger_search {
+            self.submit_search_palette();
+            updated = true;
         }
-        // Drop the receiver once a result for the current query has arrived;
-        // the worker thread is done writing to it.
-        if !state.searching {
-            state.rx = None;
-        }
-        drop(guard);
+
         if updated {
             self.mark_dirty();
         }
@@ -2701,12 +2764,18 @@ impl KovaView {
         // Up/Down navigate the result list (only meaningful with results).
         match key_code {
             0x7E => {
+                // Up: select the previous hit row, skipping headers.
                 let mut guard = self.ivars().search_palette.borrow_mut();
                 if let Some(state) = guard.as_mut() {
-                    if !state.results.is_empty() && state.selected > 0 {
-                        state.selected -= 1;
-                        if state.selected < state.scroll {
-                            state.scroll = state.selected;
+                    if let Some(prev) = state.rows[..state.selected]
+                        .iter()
+                        .rposition(SearchRow::is_hit)
+                    {
+                        state.selected = prev;
+                        // Pull a preceding header into view if there is one.
+                        let top = state.selected.saturating_sub(1);
+                        if top < state.scroll {
+                            state.scroll = top;
                         }
                     }
                 }
@@ -2715,10 +2784,14 @@ impl KovaView {
                 return;
             }
             0x7D => {
+                // Down: select the next hit row, skipping headers.
                 let mut guard = self.ivars().search_palette.borrow_mut();
                 if let Some(state) = guard.as_mut() {
-                    if state.selected + 1 < state.results.len() {
-                        state.selected += 1;
+                    let next = state.selected + 1;
+                    if next < state.rows.len() {
+                        if let Some(off) = state.rows[next..].iter().position(SearchRow::is_hit) {
+                            state.selected = next + off;
+                        }
                     }
                 }
                 drop(guard);
@@ -2755,20 +2828,18 @@ impl KovaView {
                 self.mark_dirty();
             }
             '\r' => {
-                // Enter: select if results are showing, otherwise submit.
+                // Enter: open the selected hit. Live search keeps the rows fresh,
+                // so the only fallback is to force a scan if one is owed but the
+                // debounce hasn't fired yet.
                 let action = {
                     let guard = self.ivars().search_palette.borrow();
                     let state = match guard.as_ref() {
                         Some(s) => s,
                         None => return,
                     };
-                    if state.searching {
-                        return;
-                    }
-                    if !state.results.is_empty() && state.selected < state.results.len() {
-                        Some(state.results[state.selected].clone())
-                    } else {
-                        None
+                    match state.rows.get(state.selected) {
+                        Some(SearchRow::Hit(hit)) => Some(hit.clone()),
+                        _ => None,
                     }
                 };
                 match action {
@@ -2780,16 +2851,15 @@ impl KovaView {
                 }
             }
             '\u{7F}' | '\u{08}' => {
-                // Backspace — remove char before cursor; clear stale results.
+                // Backspace — remove char before cursor; queue a live search.
                 let mut guard = self.ivars().search_palette.borrow_mut();
                 if let Some(state) = guard.as_mut() {
                     if state.cursor > 0 {
                         if let Some((byte_idx, _)) = state.query.char_indices().nth(state.cursor - 1) {
                             state.query.remove(byte_idx);
                             state.cursor -= 1;
-                            state.results.clear();
-                            state.selected = 0;
-                            state.scroll = 0;
+                            state.needs_search = true;
+                            state.last_edit = Some(std::time::Instant::now());
                         }
                     }
                 }
@@ -2797,7 +2867,7 @@ impl KovaView {
                 self.mark_dirty();
             }
             c if c >= ' ' && !c.is_control() => {
-                // Insert printable character, clear stale results.
+                // Insert printable character; queue a live search.
                 let mut guard = self.ivars().search_palette.borrow_mut();
                 if let Some(state) = guard.as_mut() {
                     let byte_idx = state.query.char_indices()
@@ -2805,9 +2875,8 @@ impl KovaView {
                         .unwrap_or(state.query.len());
                     state.query.insert(byte_idx, c);
                     state.cursor += 1;
-                    state.results.clear();
-                    state.selected = 0;
-                    state.scroll = 0;
+                    state.needs_search = true;
+                    state.last_edit = Some(std::time::Instant::now());
                 }
                 drop(guard);
                 self.mark_dirty();
@@ -2874,49 +2943,62 @@ struct SearchPaneSnapshot {
 
 /// Worker-thread search. Uses ASCII case-insensitive `contains` — good enough
 /// for terminal text, which is overwhelmingly ASCII.
+///
+/// Produces a two-section row list:
+///   1. Panes whose title OR content matches, grouped under a per-tab header
+///      (one entry per pane — title and content matches are deduped).
+///   2. A "Tabs" section listing tabs whose title matches.
+/// `panes` arrives already ordered by tab (window → tab → pane), so consecutive
+/// grouping by `tab_id` reconstructs the per-tab groups without sorting.
 fn run_search_worker(
     query: &str,
     tabs: &[SearchTabSnapshot],
     panes: &[SearchPaneSnapshot],
-) -> Vec<SearchHit> {
+) -> Vec<SearchRow> {
     let needle = query.to_ascii_lowercase();
-    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut rows: Vec<SearchRow> = Vec::new();
 
+    // Section 1: matching panes, grouped by tab.
+    let mut current_tab: Option<TabId> = None;
+    for p in panes {
+        let matches = p.pane_title.to_ascii_lowercase().contains(&needle) || {
+            let term = p.terminal.read();
+            term.dump_text(crate::terminal::DumpMode::All, true)
+                .text
+                .to_ascii_lowercase()
+                .contains(&needle)
+        };
+        if !matches {
+            continue;
+        }
+        if current_tab != Some(p.tab_id) {
+            rows.push(SearchRow::Header(p.tab_title.clone()));
+            current_tab = Some(p.tab_id);
+        }
+        rows.push(SearchRow::Hit(SearchHit {
+            tab_id: p.tab_id,
+            pane_id: Some(p.pane_id),
+            label: p.pane_title.clone(),
+        }));
+    }
+
+    // Section 2: tabs whose title matches.
+    let mut tab_section_open = false;
     for tab in tabs {
         if tab.title.to_ascii_lowercase().contains(&needle) {
-            hits.push(SearchHit {
+            if !tab_section_open {
+                rows.push(SearchRow::Header("Tabs".to_string()));
+                tab_section_open = true;
+            }
+            rows.push(SearchRow::Hit(SearchHit {
                 tab_id: tab.tab_id,
                 pane_id: None,
-                label: format!("Tab: {}", tab.title),
-            });
+                label: tab.title.clone(),
+            }));
         }
     }
 
-    for p in panes {
-        if p.pane_title.to_ascii_lowercase().contains(&needle) {
-            hits.push(SearchHit {
-                tab_id: p.tab_id,
-                pane_id: Some(p.pane_id),
-                label: format!("Pane: {} — Tab: {}", p.pane_title, p.tab_title),
-            });
-        }
-    }
-
-    for p in panes {
-        let text = {
-            let term = p.terminal.read();
-            term.dump_text(crate::terminal::DumpMode::All, true).text
-        };
-        if text.to_ascii_lowercase().contains(&needle) {
-            hits.push(SearchHit {
-                tab_id: p.tab_id,
-                pane_id: Some(p.pane_id),
-                label: format!("Tab: {} / Pane: {}", p.tab_title, p.pane_title),
-            });
-        }
-    }
-
-    hits
+    rows
 }
 
 /// Bring the right window/tab/pane to focus and trigger the highlight flash.
@@ -4915,8 +4997,11 @@ impl KovaView {
 
         // Build search palette render data + decrement pane flash counter
         let sp_guard = ivars.search_palette.borrow();
-        let sp_labels: Vec<&str> = sp_guard.as_ref()
-            .map(|state| state.results.iter().map(|h| h.label.as_str()).collect())
+        let sp_rows: Vec<crate::renderer::SearchRowRender> = sp_guard.as_ref()
+            .map(|state| state.rows.iter().map(|r| match r {
+                SearchRow::Header(t) => crate::renderer::SearchRowRender { text: t.as_str(), is_header: true },
+                SearchRow::Hit(h) => crate::renderer::SearchRowRender { text: h.label.as_str(), is_header: false },
+            }).collect())
             .unwrap_or_default();
         let sp_data = sp_guard.as_ref().map(|state| {
             crate::renderer::SearchPaletteRenderData {
@@ -4924,7 +5009,7 @@ impl KovaView {
                 cursor: state.cursor,
                 submitted_query: &state.submitted_query,
                 searching: state.searching,
-                results: &sp_labels,
+                rows: &sp_rows,
                 selected: state.selected,
                 scroll: state.scroll,
             }

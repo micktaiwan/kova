@@ -132,6 +132,13 @@ pub struct RecentProjectsRenderData<'a> {
     pub scroll: usize,
 }
 
+/// One row of the search palette result list: either a non-selectable group
+/// header (a tab name, or the "Tabs" section divider) or a selectable hit.
+pub struct SearchRowRender<'a> {
+    pub text: &'a str,
+    pub is_header: bool,
+}
+
 /// Data passed to the renderer for drawing the search palette overlay.
 pub struct SearchPaletteRenderData<'a> {
     /// Current input string.
@@ -143,9 +150,9 @@ pub struct SearchPaletteRenderData<'a> {
     pub submitted_query: &'a str,
     /// True while a worker thread is still running for the submitted query.
     pub searching: bool,
-    /// Pre-rendered hit labels.
-    pub results: &'a [&'a str],
-    /// Selected index into `results`.
+    /// Result rows (headers + hits) to display.
+    pub rows: &'a [SearchRowRender<'a>],
+    /// Selected index into `rows` — always a hit row when one exists.
     pub selected: usize,
     /// First visible row in the result list (vertical scroll offset).
     pub scroll: usize,
@@ -1789,6 +1796,7 @@ impl Renderer {
                 ("Copy Raw", &keys_config.copy_raw),
                 ("Paste", &keys_config.paste),
                 ("Find", &keys_config.toggle_filter),
+                ("Global Search", &keys_config.open_search),
                 ("Clear Scrollback", &keys_config.clear_scrollback),
                 ("Previous Tab", &keys_config.prev_tab),
                 ("Next Tab", &keys_config.next_tab),
@@ -2100,7 +2108,7 @@ impl Renderer {
         y += cell_h * title_scale * 1.5;
 
         // Subtitle
-        let subtitle = "↑↓ Navigate  ⏎ Search / Open  esc Cancel";
+        let subtitle = "↑↓ Navigate  ⏎ Open  esc Cancel";
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
         self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
@@ -2125,19 +2133,20 @@ impl Renderer {
         y += input_h + scaled_cell_h * 0.75;
 
         // Status line: searching / "N results" / hint when query empty.
+        let hit_count = data.rows.iter().filter(|r| !r.is_header).count();
         let status = if data.searching {
             format!("Searching for \"{}\"...", data.submitted_query)
         } else if data.submitted_query.is_empty() {
-            "Type a query and press Enter to search.".to_string()
-        } else if data.results.is_empty() {
+            "Type to search across all panes.".to_string()
+        } else if hit_count == 0 {
             format!("No matches for \"{}\".", data.submitted_query)
         } else {
-            format!("{} match{} for \"{}\"", data.results.len(), if data.results.len() == 1 { "" } else { "es" }, data.submitted_query)
+            format!("{} match{} for \"{}\"", hit_count, if hit_count == 1 { "" } else { "es" }, data.submitted_query)
         };
         self.render_text(vertices, &status, left_margin, y, right_margin, dim_fg, no_bg, body_scale);
         y += scaled_cell_h * 1.5;
 
-        if data.results.is_empty() {
+        if data.rows.is_empty() {
             return;
         }
 
@@ -2155,14 +2164,21 @@ impl Renderer {
             data.scroll
         };
 
-        for (i, label) in data.results.iter().enumerate().skip(scroll).take(max_visible) {
+        let header_fg = [1.0, 0.85, 0.3, 1.0];
+        let hit_indent = scaled_cell_w * 2.0;
+        for (i, row) in data.rows.iter().enumerate().skip(scroll).take(max_visible) {
             let row_y = content_top + (i - scroll) as f32 * row_height;
             let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
 
-            if i == data.selected {
-                Self::push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+            if row.is_header {
+                // Group header: tab name (section 1) or the "Tabs" divider.
+                self.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
+            } else {
+                if i == data.selected {
+                    Self::push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+                }
+                self.render_text(vertices, row.text, left_margin + hit_indent, text_y, right_margin, label_fg, no_bg, body_scale);
             }
-            self.render_text(vertices, label, left_margin, text_y, right_margin, label_fg, no_bg, body_scale);
         }
 
         if scroll > 0 {
@@ -2170,7 +2186,7 @@ impl Renderer {
             let ax = (viewport_w - scaled_cell_w) / 2.0;
             self.render_text(vertices, arrow, ax, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
         }
-        if scroll + max_visible < data.results.len() {
+        if scroll + max_visible < data.rows.len() {
             let arrow = "▼";
             let ax = (viewport_w - scaled_cell_w) / 2.0;
             self.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);

@@ -357,7 +357,7 @@ impl Default for KeysConfig {
             toggle_help: "cmd+shift+/".into(),
             close_tab: "cmd+shift+w".into(),
             open_recent_project: "cmd+o".into(),
-            open_search: "cmd+p".into(),
+            open_search: "cmd+shift+f".into(),
             equalize: "cmd+shift++".into(),
             repaint_pane: "cmd+r".into(),
             terminal: TerminalKeysConfig::default(),
