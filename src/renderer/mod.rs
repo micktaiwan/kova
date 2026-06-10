@@ -1329,6 +1329,21 @@ impl Renderer {
                 Self::push_bg_quad(vertices, x, bar_h - border_h, tab_width, border_h, border_color);
             }
 
+            // Tab indicator: bell (orange ●) > completion (green ●) > running
+            // (yellow ▶). Bell/completion only on non-active tabs (the active
+            // tab's content is visible); running shows everywhere — the
+            // churning pane may be minimized or scrolled out of view.
+            // Computed before the title so the title can reserve its slot.
+            let indicator: Option<([f32; 3], &str)> = if *has_bell && !is_active {
+                Some(([1.0_f32, 0.45, 0.1], "●"))
+            } else if *has_completion && !is_active {
+                Some(([0.2_f32, 0.8, 0.3], "●"))
+            } else if *has_running {
+                Some(([1.0_f32, 0.8, 0.2], "▶"))
+            } else {
+                None
+            };
+
             // Tab number + title: "1: title"
             // When renaming, show the end of the text so the cursor is visible
             let truncated: String;
@@ -1354,26 +1369,19 @@ impl Renderer {
                 [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 1.0]
             };
 
-            // Center text vertically and horizontally in the tab
+            // Center text vertically and horizontally in the tab.
+            // When an indicator is shown, clip the title before its slot
+            // (indicator at tab_width - 2 cells) instead of running under it.
             let text_w = label.chars().count() as f32 * cell_w;
             let text_x = x + (tab_width - text_w) / 2.0;
             let text_y = (bar_h - cell_h) / 2.0;
-            let max_x = x + tab_width - cell_w;
+            let max_x = if indicator.is_some() {
+                x + tab_width - cell_w * 2.5
+            } else {
+                x + tab_width - cell_w
+            };
             self.render_status_text(vertices, &label, text_x.max(x + cell_w * 0.5), text_y, max_x, fg, no_bg);
 
-            // Tab indicator: bell (orange ●) > completion (green ●) > running
-            // (yellow ▶). Bell/completion only on non-active tabs (the active
-            // tab's content is visible); running shows everywhere — the
-            // churning pane may be minimized or scrolled out of view.
-            let indicator: Option<([f32; 3], &str)> = if *has_bell && !is_active {
-                Some(([1.0_f32, 0.45, 0.1], "●"))
-            } else if *has_completion && !is_active {
-                Some(([0.2_f32, 0.8, 0.3], "●"))
-            } else if *has_running {
-                Some(([1.0_f32, 0.8, 0.2], "▶"))
-            } else {
-                None
-            };
             if let Some((color, glyph)) = indicator {
                 let dot_x = x + tab_width - cell_w * 2.0;
                 let dot_y = (bar_h - cell_h) / 2.0;

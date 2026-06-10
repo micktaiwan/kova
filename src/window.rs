@@ -77,6 +77,9 @@ pub struct KovaViewIvars {
     last_title: RefCell<Option<String>>,
     /// Git branch poll counter (ticks since last poll).
     git_poll_counter: Cell<u32>,
+    /// Foreground-process poll counter for the tab running indicator
+    /// (tcgetpgrp per pane — probed every ~0.5s, not every tick).
+    fg_poll_counter: Cell<u32>,
     /// Git branch poll interval in ticks (fps * 2 ≈ every 2 seconds).
     git_poll_interval: Cell<u32>,
     /// Whether the help overlay is visible.
@@ -1407,6 +1410,7 @@ impl KovaView {
             skip_session_save: Cell::new(false),
             last_title: RefCell::new(None),
             git_poll_counter: Cell::new(0),
+            fg_poll_counter: Cell::new(0),
             git_poll_interval: Cell::new(120), // updated in setup_metal
             keybindings: OnceCell::new(),
             show_help: Cell::new(false),
@@ -3297,6 +3301,7 @@ impl KovaView {
                     has_bell: false,
                     has_completion: false,
                     has_running: false,
+                    fg_running_cache: false,
                     minimized_stack: Vec::new(),
                     scroll_offset_x: 0.0,
                     virtual_width_override: 0.0,
@@ -4856,12 +4861,6 @@ impl KovaView {
                 // Read bell without consuming — check_bell will drain it for tab-level
                 let has_bell = !is_focused
                     && term.bell.load(std::sync::atomic::Ordering::Relaxed);
-                // Log pane→terminal mapping when scrolled (cross-terminal bug investigation)
-                if term.scroll_offset() > 0 {
-                    log::info!("RENDER-SCROLLED tab={} pane={} term_id={} scroll_offset={} sb_len={} cwd={:?}",
-                        active_idx, pane.id, term.terminal_id, term.scroll_offset(), term.scrollback_len(),
-                        term.cwd);
-                }
                 drop(term);
                 pane_data.push(crate::renderer::PaneRenderData {
                     terminal: pane.terminal.clone(),
@@ -4909,9 +4908,14 @@ impl KovaView {
             let pty_ptr = focused.map(|p| &p.pty as *const crate::terminal::pty::Pty);
             let focus_reporting = focused.map_or(false, |p| p.terminal.read().focus_reporting);
 
+            // Probe foreground process groups every ~0.5s (30 ticks @60fps);
+            // OSC-based running state is still refreshed every tick.
+            let fg_count = ivars.fg_poll_counter.get() + 1;
+            let refresh_fg = fg_count >= 30;
+            ivars.fg_poll_counter.set(if refresh_fg { 0 } else { fg_count });
             for (i, t) in tabs.iter_mut().enumerate() {
                 t.check_bell();
-                t.check_running();
+                t.check_running(refresh_fg);
                 // Skip active tab: completion already read into pane_data
                 if i != active_idx {
                     t.check_completion();
