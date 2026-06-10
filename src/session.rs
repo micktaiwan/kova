@@ -336,6 +336,9 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
         return None;
     };
 
+    // Destructive: the loaded file is consumed. Leave a trace so a lost
+    // session (e.g. a --session N backup) can be diagnosed from the log.
+    log::info!("Session file {} deleted after load", path.display());
     let _ = std::fs::remove_file(&path);
     Some(session)
 }
