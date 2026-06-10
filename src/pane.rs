@@ -10,8 +10,14 @@ use crate::terminal::TerminalState;
 
 pub type PaneId = u32;
 
-/// Height of a minimized pane bar (in pixels).
+/// Minimum height of a minimized pane bar (in pixels). The effective height
+/// is at least one cell row so the label isn't vertically clipped on retina.
 pub const MINIMIZED_BAR_PX: f32 = 24.0;
+
+/// Effective minimized-bar height for a given cell height.
+pub fn minimized_bar_px(cell_h: f32) -> f32 {
+    if cell_h > 0.0 { MINIMIZED_BAR_PX.max(cell_h) } else { MINIMIZED_BAR_PX }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SplitDirection {
@@ -466,8 +472,9 @@ impl Tab {
             return self.column_weights.iter().map(|w| total_width * w / sum).collect();
         }
 
-        // Reserve MINIMIZED_BAR_PX for each minimized column
-        let minimized_total = min_count as f32 * MINIMIZED_BAR_PX;
+        // Reserve the minimized-bar size for each minimized column
+        let bar_px = minimized_bar_px(self.cell_h.get());
+        let minimized_total = min_count as f32 * bar_px;
         let remaining = (total_width - minimized_total).max(0.0);
 
         // Distribute remaining width among non-minimized columns by weight
@@ -481,7 +488,7 @@ impl Tab {
             .zip(minimized.iter())
             .map(|(w, &m)| {
                 if m {
-                    MINIMIZED_BAR_PX
+                    bar_px
                 } else if non_min_sum > 0.0 {
                     remaining * w / non_min_sum
                 } else {
@@ -1276,10 +1283,11 @@ impl Column {
         let mut heights = vec![0.0f32; n];
         let mut minimized_total = 0.0f32;
         let mut weight_sum = 0.0f32;
+        let bar_px = minimized_bar_px(cell_h);
         for i in 0..n {
             if self.panes[i].minimized {
-                heights[i] = MINIMIZED_BAR_PX;
-                minimized_total += MINIMIZED_BAR_PX;
+                heights[i] = bar_px;
+                minimized_total += bar_px;
             } else {
                 weight_sum += self.row_weights[i];
             }
