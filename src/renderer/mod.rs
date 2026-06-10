@@ -194,8 +194,6 @@ pub struct PaneViewport {
 }
 
 const INITIAL_VERTEX_BYTES: usize = 8 * 1024 * 1024; // 8MB
-/// Current vertex buffer capacity (grows dynamically if needed).
-static VERTEX_BUF_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(INITIAL_VERTEX_BYTES);
 
 pub struct Renderer {
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -205,6 +203,10 @@ pub struct Renderer {
     viewport_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     atlas_size_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     vertex_bufs: [Retained<ProtocolObject<dyn MTLBuffer>>; 2],
+    /// Capacity of each vertex buffer; per-Renderer because each window has
+    /// its own buffers (a process-global value would skip reallocation when
+    /// another window already grew, overflowing this window's buffers).
+    vertex_buf_capacity: usize,
     vertex_buf_idx: usize,
     last_viewport: [f32; 2],
     last_atlas_size: [f32; 2],
@@ -319,6 +321,7 @@ impl Renderer {
             viewport_buf,
             atlas_size_buf,
             vertex_bufs: [make_vertex_buf(), make_vertex_buf()],
+            vertex_buf_capacity: INITIAL_VERTEX_BYTES,
             vertex_buf_idx: 0,
             last_viewport: [0.0; 2],
             last_atlas_size: atlas_size,
@@ -768,7 +771,7 @@ impl Renderer {
             let buf_idx = self.vertex_buf_idx;
             self.vertex_buf_idx = 1 - buf_idx;
 
-            let current_capacity = VERTEX_BUF_CAPACITY.load(std::sync::atomic::Ordering::Relaxed);
+            let current_capacity = self.vertex_buf_capacity;
             if vertex_bytes.len() > current_capacity {
                 // Grow to next power-of-two that fits
                 let new_capacity = vertex_bytes.len().next_power_of_two();
@@ -784,7 +787,7 @@ impl Renderer {
                         ),
                     ).expect("failed to reallocate vertex buffer");
                 }
-                VERTEX_BUF_CAPACITY.store(new_capacity, std::sync::atomic::Ordering::Relaxed);
+                self.vertex_buf_capacity = new_capacity;
             }
 
             let vertex_buf = &self.vertex_bufs[buf_idx];
@@ -1712,7 +1715,7 @@ impl Renderer {
         let atlas_bytes = self.atlas.mem_bytes();
         let atlas_dims = self.atlas.texture_size();
         let glyph_count = self.atlas.glyphs.len() + self.atlas.cluster_glyphs.len();
-        let vertex_bytes = VERTEX_BUF_CAPACITY.load(std::sync::atomic::Ordering::Relaxed) * 2; // double-buffered
+        let vertex_bytes = self.vertex_buf_capacity * 2; // double-buffered
         (atlas_bytes, atlas_dims, glyph_count, vertex_bytes)
     }
 
