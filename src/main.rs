@@ -15,7 +15,7 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSImage};
 use objc2_foundation::{MainThreadMarker, NSData};
 
 use log::LevelFilter;
-use simplelog::{CombinedLogger, Config, TermLogger, TerminalMode, WriteLogger};
+use simplelog::{CombinedLogger, ConfigBuilder, TermLogger, TerminalMode, WriteLogger};
 use std::fs;
 use std::path::PathBuf;
 
@@ -138,14 +138,23 @@ fn setup_logging() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(LevelFilter::Info);
 
+    // Timestamps in local time (simplelog defaults to UTC). Falls back to
+    // UTC if the local offset can't be determined (the `time` crate refuses
+    // once other threads exist; setup_logging runs before any are spawned).
+    let mut config_builder = ConfigBuilder::new();
+    if config_builder.set_time_offset_to_local().is_err() {
+        eprintln!("kova: could not determine local UTC offset, logging in UTC");
+    }
+    let log_config = config_builder.build();
+
     let mut loggers: Vec<Box<dyn simplelog::SharedLogger>> =
-        vec![WriteLogger::new(level, Config::default(), log_file)];
+        vec![WriteLogger::new(level, log_config.clone(), log_file)];
 
     // Stderr logger only when RUST_LOG is set (dev in terminal)
     if std::env::var("RUST_LOG").is_ok() {
         loggers.push(TermLogger::new(
             level,
-            Config::default(),
+            log_config,
             TerminalMode::Stderr,
             simplelog::ColorChoice::Auto,
         ));
