@@ -989,7 +989,21 @@ impl GlyphAtlas {
 
         // Grow atlas if needed
         while self.next_y + slot_h > self.atlas_height {
-            self.grow_atlas();
+            if self.grow_atlas() {
+                continue;
+            }
+            // The atlas hit the Metal texture size limit: evict everything
+            // and restart packing from the top. Evicted glyphs re-rasterize
+            // lazily on their next lookup (all render paths rasterize on
+            // cache miss), so the cost is one stale frame at worst.
+            self.evict_all();
+            if self.next_y + slot_h > self.atlas_height {
+                log::warn!(
+                    "insert_bitmap_raw: glyph {}x{} larger than the whole atlas; skipping",
+                    bmp_w, bmp_h
+                );
+                return None;
+            }
         }
 
         let atlas_x = self.next_x;
@@ -1037,8 +1051,17 @@ impl GlyphAtlas {
     }
 
     /// Double the atlas height, creating a new texture and re-uploading.
-    fn grow_atlas(&mut self) {
+    /// Returns false when the atlas can't grow any further (Metal texture
+    /// dimension limit) — the caller must evict instead.
+    fn grow_atlas(&mut self) -> bool {
+        // Max 2D texture dimension on every Metal GPU family Kova targets
+        // (Apple silicon and modern AMD/Intel Macs).
+        const MAX_TEXTURE_DIM: u32 = 16384;
+
         let new_height = self.atlas_height * 2;
+        if new_height > MAX_TEXTURE_DIM {
+            return false;
+        }
         let atlas_bpr = self.atlas_width as usize * 4;
         self.atlas_buf.resize(atlas_bpr * new_height as usize, 0);
 
@@ -1053,9 +1076,14 @@ impl GlyphAtlas {
             d
         };
 
-        let new_texture = self.device
-            .newTextureWithDescriptor(&desc)
-            .expect("failed to grow atlas texture");
+        let new_texture = match self.device.newTextureWithDescriptor(&desc) {
+            Some(t) => t,
+            None => {
+                log::warn!("Atlas grow to {}x{} failed (texture allocation)", self.atlas_width, new_height);
+                self.atlas_buf.resize(atlas_bpr * self.atlas_height as usize, 0);
+                return false;
+            }
+        };
 
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
@@ -1078,6 +1106,23 @@ impl GlyphAtlas {
         self.atlas_height = new_height;
         self.texture = new_texture;
         log::info!("Atlas grew to {}x{}", self.atlas_width, self.atlas_height);
+        true
+    }
+
+    /// Drop every cached glyph and restart packing from the top of the
+    /// (max-size) atlas. Called when the atlas can no longer grow.
+    fn evict_all(&mut self) {
+        log::warn!(
+            "Glyph atlas full at {}x{}: evicting all glyphs ({} chars, {} clusters, {} overlay)",
+            self.atlas_width, self.atlas_height,
+            self.glyphs.len(), self.cluster_glyphs.len(), self.overlay_glyphs.len()
+        );
+        self.glyphs.clear();
+        self.cluster_glyphs.clear();
+        self.overlay_glyphs.clear();
+        self.atlas_buf.fill(0);
+        self.next_x = 0;
+        self.next_y = 0;
     }
 
     /// Estimated heap bytes used by the atlas CPU buffer.
