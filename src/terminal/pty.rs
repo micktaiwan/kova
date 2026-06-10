@@ -171,6 +171,7 @@ impl Pty {
             .name("pty-reader".into())
             .spawn(move || {
                 let mut file = unsafe { std::fs::File::from_raw_fd(reader_fd.into_raw_fd()) };
+                let raw_fd = file.as_raw_fd();
                 let mut parser = vte::Parser::new();
                 let mut handler = VteHandler::new(terminal, writer_fd);
                 let mut buf = [0u8; 4096];
@@ -179,6 +180,27 @@ impl Pty {
                 loop {
                     if reader_shutdown.load(Ordering::Relaxed) {
                         break;
+                    }
+                    // Wait for data with a timeout instead of a bare blocking
+                    // read(): EOF on the master requires *every* slave fd to
+                    // close, so a HUP-ignoring descendant (nohup, disowned
+                    // job) keeps read() blocked forever — and Pty::drop joins
+                    // this thread from the AppKit main thread, freezing the
+                    // whole app. The timeout guarantees the shutdown flag is
+                    // re-checked within ~100ms.
+                    let mut pfd = libc::pollfd { fd: raw_fd, events: libc::POLLIN, revents: 0 };
+                    let rc = unsafe { libc::poll(&mut pfd, 1, 100) };
+                    if rc < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        log::warn!("PTY poll error: {}", err);
+                        eof = true;
+                        break;
+                    }
+                    if rc == 0 {
+                        continue; // timeout — re-check shutdown
                     }
                     match file.read(&mut buf) {
                         Ok(0) => { eof = true; break; }
@@ -410,7 +432,15 @@ impl Drop for Pty {
             }
         }
         if let Some(handle) = self.reader_thread.take() {
+            // With the polling reader this join is bounded (~100ms + parse
+            // time); anything slower means the shutdown path regressed and
+            // we're back to freezing the main thread on pane close.
+            let t0 = std::time::Instant::now();
             let _ = handle.join();
+            let elapsed = t0.elapsed();
+            if elapsed.as_millis() > 500 {
+                log::warn!("PTY: reader join for child {} took {:?}", self.child_pid, elapsed);
+            }
         }
         let pid = self.child_pid;
         PTY_REGISTRY.lock().retain(|e| e.child_pid != pid);
