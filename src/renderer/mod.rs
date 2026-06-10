@@ -184,6 +184,18 @@ pub struct PaneRenderData {
     pub input_chars: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Cached vertex list for one pane, with the conditions it was built under.
+/// Reused as the pane's "previous coherent frame" while the pane defers
+/// rendering inside a DEC-2026 sync burst — but only when the viewport is
+/// unchanged (vertices are absolute pixels), the build wasn't itself torn
+/// (mid_sync) and it wasn't the loading placeholder (ready).
+struct PaneVertexEntry {
+    vp: PaneViewport,
+    verts: Vec<Vertex>,
+    mid_sync: bool,
+    ready: bool,
+}
+
 /// Sub-region of the drawable where a pane is rendered (in pixels).
 #[derive(Clone, Copy)]
 pub struct PaneViewport {
@@ -262,6 +274,11 @@ pub struct Renderer {
     cached_help_shortcuts: Vec<(String, String)>,
     /// Hoverable zones in status bars (rebuilt each frame).
     tooltip_zones: Vec<TooltipZone>,
+    /// Last built vertices per pane. While a pane defers rendering inside a
+    /// synchronized-output burst (DEC 2026), its previous frame is drawn from
+    /// this cache instead of rebuilding from the mid-update grid — rebuilding
+    /// would present exactly the torn frames mode 2026 exists to hide.
+    pane_vertex_cache: std::collections::HashMap<u32, PaneVertexEntry>,
     /// Active tooltip to render. Set by window on mouse hover.
     pub active_tooltip: Option<ActiveTooltip>,
     /// Tooltip being animated (kept for fade-out after active_tooltip becomes None).
@@ -364,6 +381,7 @@ impl Renderer {
             cached_help_hint: String::new(),
             cached_help_shortcuts: Vec::new(),
             tooltip_zones: Vec::new(),
+            pane_vertex_cache: std::collections::HashMap::new(),
             active_tooltip: None,
             tooltip_visible: None,
             tooltip_anim: 0,
@@ -373,6 +391,126 @@ impl Renderer {
 
     /// Render multiple panes. Each entry: (terminal, viewport, shell_ready, is_focused, pane_id, custom_title, has_completion, has_bell, minimized).
     /// `separators` are line segments (x1, y1, x2, y2) drawn between splits.
+    /// True while a pane is inside a synchronized-output burst (DEC 2026)
+    /// and should be drawn from its cached previous frame. Capped so a lost
+    /// ?2026l can't freeze the pane; a full TUI repaint spanning several PTY
+    /// chunks fits comfortably within the window.
+    fn in_sync_window(pane: &PaneRenderData) -> bool {
+        let t = pane.terminal.read();
+        t.synchronized_output
+            && t.sync_output_since.is_some_and(|s| s.elapsed().as_millis() < 150)
+    }
+
+    /// Build per-pane vertex lists into the cache and return the draw list
+    /// (pane id + scissor). Retried (max 3 passes) when rasterizing new
+    /// glyphs changes the atlas generation mid-loop: UVs computed before the
+    /// change point into the wrong texture location for this frame.
+    fn rebuild_pane_draws(
+        &mut self,
+        panes: &[PaneRenderData],
+        viewport_w: f32,
+        viewport_h: f32,
+        has_filter: bool,
+        blink_on: bool,
+    ) -> Vec<(u32, MTLScissorRect)> {
+        let mut pane_draws: Vec<(u32, MTLScissorRect)> = Vec::new();
+        let (cell_w, cell_h) = self.cell_size();
+        let saved_hover_text = self.hovered_url_text.clone();
+        let saved_hover_segments = self.hovered_url.clone();
+        for _pass in 0..3 {
+            let atlas_gen = self.atlas.generation;
+            pane_draws.clear();
+            self.tooltip_zones.clear();
+            for pane in panes {
+                let vp = &pane.viewport;
+                // Scope hovered URL to the pane that owns it
+                let is_hover_pane = self.hovered_url_pane_id == Some(pane.pane_id);
+                self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
+                self.hovered_url = if is_hover_pane { saved_hover_segments.clone() } else { None };
+                // Skip panes entirely off-screen (hidden by horizontal scroll)
+                if vp.x + vp.width <= 0.0 || vp.x >= viewport_w {
+                    continue;
+                }
+                if pane.is_focused && has_filter && !pane.minimized {
+                    continue; // Skip: filter overlay covers focused pane
+                }
+                let in_sync = Self::in_sync_window(pane);
+                // Sync-deferred pane: draw its previous coherent frame from
+                // the cache instead of rebuilding from the mid-update grid.
+                // Only valid while the viewport is unchanged (vertices are
+                // absolute pixels), the cached build itself wasn't torn
+                // (mid_sync) and it isn't the loading placeholder (ready).
+                let reuse_cached = !pane.minimized
+                    && pane.shell_ready
+                    && in_sync
+                    && self.pane_vertex_cache.get(&pane.pane_id).is_some_and(|e| {
+                        e.ready
+                            && !e.mid_sync
+                            && e.vp.x == vp.x
+                            && e.vp.y == vp.y
+                            && e.vp.width == vp.width
+                            && e.vp.height == vp.height
+                    });
+                if !reuse_cached {
+                    // Build pane vertices (minimized bar or full content)
+                    let pane_verts = if pane.minimized {
+                        self.build_minimized_bar_vertices(vp, &pane.display_title, pane.has_bell, pane.has_completion)
+                    } else {
+                        let pane_attention = PaneAttention::from_flags(pane.has_bell, pane.has_completion);
+                        let mut verts = if pane.shell_ready {
+                            let t = pane.terminal.read();
+                            let show_blink = if pane.is_focused { blink_on } else { true };
+                            let pin = pane.input_chars.load(std::sync::atomic::Ordering::Relaxed);
+                            self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin)
+                        } else {
+                            self.build_loading_vertices(vp)
+                        };
+                        // Attention indicator dot on non-focused panes
+                        if let Some(color) = pane_attention.dot_color() {
+                            let dot_x = vp.x + vp.width - cell_w * 2.5;
+                            let dot_y = vp.y + cell_h * 0.5;
+                            let no_bg = [0.0_f32, 0.0, 0.0, 0.0];
+                            self.render_status_text(&mut verts, "●", dot_x, dot_y, vp.x + vp.width, color, no_bg);
+                        }
+                        verts
+                    };
+                    self.pane_vertex_cache.insert(pane.pane_id, PaneVertexEntry {
+                        vp: *vp,
+                        verts: pane_verts,
+                        // A cache-miss build during a sync burst is possibly
+                        // torn: never reuse it as a "coherent previous frame";
+                        // it refreshes every tick until a clean build replaces it.
+                        mid_sync: in_sync,
+                        ready: pane.shell_ready,
+                    });
+                }
+                // Compute scissor rect clamped to drawable bounds. Ceil the
+                // extent: truncation shaves up to 1px off the right/bottom
+                // painted edge at fractional split boundaries.
+                let sx = (vp.x.max(0.0)) as usize;
+                let sy = (vp.y.max(0.0)) as usize;
+                let sw = ((vp.width).min(viewport_w - sx as f32).max(0.0)).ceil() as usize;
+                let sh = ((vp.height).min(viewport_h - sy as f32).max(0.0)).ceil() as usize;
+                let has_verts = self.pane_vertex_cache.get(&pane.pane_id).is_some_and(|e| !e.verts.is_empty());
+                if has_verts && sw > 0 && sh > 0 {
+                    pane_draws.push((pane.pane_id, MTLScissorRect { x: sx, y: sy, width: sw, height: sh }));
+                }
+            }
+            if self.atlas.generation == atlas_gen {
+                break;
+            }
+            // Atlas grew or was repacked while building: every cached vertex
+            // list has stale UVs — drop them all and rebuild (the needed
+            // glyphs are rasterized now, so the next pass is stable).
+            self.pane_vertex_cache.clear();
+        }
+        // Drop cache entries of panes that no longer exist
+        self.pane_vertex_cache.retain(|id, _| panes.iter().any(|p| p.pane_id == *id));
+        self.hovered_url_text = saved_hover_text;
+        self.hovered_url = saved_hover_segments;
+        pane_draws
+    }
+
     pub fn render_panes(
         &mut self,
         layer: &CAMetalLayer,
@@ -457,24 +595,17 @@ impl Renderer {
         };
 
         // Check if any pane is dirty (consume ALL flags, no short-circuit)
+        // Sync-deferred panes keep their dirty flag and are drawn from the
+        // vertex cache below (their previous, coherent frame).
         let mut any_dirty = false;
         let mut any_not_ready = false;
         let mut any_sync_deferred = false;
         for pane in panes {
             if !pane.shell_ready { any_not_ready = true; }
-            let t = pane.terminal.read();
-            // Synchronized output: this pane wants to defer, but don't block others
-            if t.synchronized_output {
-                if let Some(since) = t.sync_output_since {
-                    // ~1 frame @60Hz. Sync output is meant to avoid intra-frame
-                    // tearing, not to block rendering for long.
-                    if since.elapsed().as_millis() < 16 {
-                        any_sync_deferred = true;
-                        continue; // Don't consume dirty flag — pane will render later
-                    }
-                }
+            if Self::in_sync_window(pane) {
+                any_sync_deferred = true;
+                continue; // Don't consume dirty flag — pane will render later
             }
-            drop(t);
             if pane.terminal.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
                 any_dirty = true;
             }
@@ -500,58 +631,13 @@ impl Renderer {
         let viewport_w = drawable_size.width as f32;
         let viewport_h = drawable_size.height as f32;
 
-        // Build vertices for each pane with its own scissor rect for clipping
-        let mut pane_draws: Vec<(Vec<Vertex>, MTLScissorRect)> = Vec::new();
+        // Build vertices for each pane with its own scissor rect for clipping.
+        // pane_draws references the vertex cache by pane id (vertices live in
+        // self.pane_vertex_cache).
+        let mut pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on);
+        let atlas_gen_after_panes = self.atlas.generation;
+        let pane_zone_count = self.tooltip_zones.len();
         let mut overlay_vertices = Vec::new();
-        self.tooltip_zones.clear();
-        let (cell_w, cell_h) = self.cell_size();
-        let saved_hover_text = self.hovered_url_text.clone();
-        let saved_hover_segments = self.hovered_url.clone();
-        for pane in panes {
-            let vp = &pane.viewport;
-            // Scope hovered URL to the pane that owns it
-            let is_hover_pane = self.hovered_url_pane_id == Some(pane.pane_id);
-            self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
-            self.hovered_url = if is_hover_pane { saved_hover_segments.clone() } else { None };
-            // Skip panes entirely off-screen (hidden by horizontal scroll)
-            if vp.x + vp.width <= 0.0 || vp.x >= viewport_w {
-                continue;
-            }
-            // Build pane vertices (minimized bar or full content)
-            let pane_verts = if pane.minimized {
-                self.build_minimized_bar_vertices(vp, &pane.display_title, pane.has_bell, pane.has_completion)
-            } else if pane.is_focused && filter.is_some() {
-                continue; // Skip: filter overlay covers focused pane
-            } else {
-                let pane_attention = PaneAttention::from_flags(pane.has_bell, pane.has_completion);
-                let mut verts = if pane.shell_ready {
-                    let t = pane.terminal.read();
-                    let show_blink = if pane.is_focused { blink_on } else { true };
-                    let pin = pane.input_chars.load(std::sync::atomic::Ordering::Relaxed);
-                    self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin)
-                } else {
-                    self.build_loading_vertices(vp)
-                };
-                // Attention indicator dot on non-focused panes
-                if let Some(color) = pane_attention.dot_color() {
-                    let dot_x = vp.x + vp.width - cell_w * 2.5;
-                    let dot_y = vp.y + cell_h * 0.5;
-                    let no_bg = [0.0_f32, 0.0, 0.0, 0.0];
-                    self.render_status_text(&mut verts, "●", dot_x, dot_y, vp.x + vp.width, color, no_bg);
-                }
-                verts
-            };
-            // Compute scissor rect clamped to drawable bounds
-            let sx = (vp.x.max(0.0)) as usize;
-            let sy = (vp.y.max(0.0)) as usize;
-            let sw = ((vp.width).min(viewport_w - sx as f32).max(0.0)) as usize;
-            let sh = ((vp.height).min(viewport_h - sy as f32).max(0.0)) as usize;
-            if !pane_verts.is_empty() && sw > 0 && sh > 0 {
-                pane_draws.push((pane_verts, MTLScissorRect { x: sx, y: sy, width: sw, height: sh }));
-            }
-        }
-        self.hovered_url_text = saved_hover_text;
-        self.hovered_url = saved_hover_segments;
 
         // Build overlay vertices (separators, tab bar, status bar, filter, help)
         // These are drawn with a global scissor rect (no per-pane clipping needed)
@@ -701,7 +787,22 @@ impl Renderer {
             height: viewport_h as usize,
         };
 
-        for (verts, scissor) in &pane_draws {
+        // Overlay text (tab bar, global bar, palettes) may have rasterized new
+        // glyphs and grown/repacked the atlas AFTER the pane build — pane UVs
+        // would point into the wrong texture. Rebuild the panes once; the
+        // overlay vertices themselves are at worst stale for this one frame.
+        if self.atlas.generation != atlas_gen_after_panes {
+            let overlay_zones: Vec<TooltipZone> = self.tooltip_zones.split_off(pane_zone_count);
+            self.pane_vertex_cache.clear();
+            pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on);
+            self.tooltip_zones.extend(overlay_zones);
+        }
+
+        for (pane_id, scissor) in &pane_draws {
+            let verts = match self.pane_vertex_cache.get(pane_id) {
+                Some(entry) => &entry.verts,
+                None => continue,
+            };
             let start = all_vertices.len();
             all_vertices.extend_from_slice(verts);
             draw_calls.push((start, verts.len(), *scissor));

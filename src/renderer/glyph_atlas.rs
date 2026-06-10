@@ -35,6 +35,16 @@ pub struct GlyphAtlas {
     atlas_buf: Vec<u8>,
     next_x: u32,
     next_y: u32,
+    /// Bumped whenever existing glyph positions/UVs become invalid (atlas
+    /// growth changes normalized UV denominators; evict_all moves glyphs).
+    /// The renderer compares generations around its vertex-build loop and
+    /// rebuilds when it changed mid-frame.
+    pub generation: u64,
+    /// Height of the tallest glyph in the current packing shelf. Advancing to
+    /// the next shelf must use THIS height, not the new glyph's height —
+    /// otherwise a taller glyph placed earlier in the shelf (overlay font,
+    /// emoji cluster) gets its bottom overwritten by the next shelf's uploads.
+    shelf_h: u32,
     glyph_cell_h: u32,
     font: Retained<CTFont>,
     descent: f64,
@@ -289,6 +299,8 @@ impl GlyphAtlas {
             atlas_buf,
             next_x: next_x * glyph_cell_w,
             next_y: next_y * glyph_cell_h,
+            generation: 0,
+            shelf_h: glyph_cell_h,
             glyph_cell_h,
             font: font.clone().into(),
             descent,
@@ -980,11 +992,13 @@ impl GlyphAtlas {
         }
         let slot_h = (bmp_h as u32).max(self.glyph_cell_h);
 
-        // Check if we need to wrap to next row
+        // Check if we need to wrap to next row (shelf packing: close the
+        // current shelf by its real height — the tallest glyph it contains)
         let slot_w = bmp_w as u32;
         if self.next_x + slot_w > self.atlas_width {
             self.next_x = 0;
-            self.next_y += slot_h;
+            self.next_y += self.shelf_h.max(1);
+            self.shelf_h = 0;
         }
 
         // Grow atlas if needed
@@ -1005,6 +1019,10 @@ impl GlyphAtlas {
                 return None;
             }
         }
+
+        // Register this glyph's height in the current shelf (after the
+        // grow/evict loop — evict_all resets shelf_h)
+        self.shelf_h = self.shelf_h.max(slot_h);
 
         let atlas_x = self.next_x;
         let atlas_y = self.next_y;
@@ -1105,6 +1123,7 @@ impl GlyphAtlas {
 
         self.atlas_height = new_height;
         self.texture = new_texture;
+        self.generation += 1;
         log::info!("Atlas grew to {}x{}", self.atlas_width, self.atlas_height);
         true
     }
@@ -1123,6 +1142,8 @@ impl GlyphAtlas {
         self.atlas_buf.fill(0);
         self.next_x = 0;
         self.next_y = 0;
+        self.shelf_h = 0;
+        self.generation += 1;
     }
 
     /// Estimated heap bytes used by the atlas CPU buffer.
