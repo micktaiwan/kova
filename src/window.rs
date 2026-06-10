@@ -96,7 +96,10 @@ pub struct KovaViewIvars {
     /// Resize feedback: (mode_name, screen_w, virtual_w, remaining_frames).
     resize_feedback: Cell<Option<ResizeFeedback>>,
     /// Deferred tabs to restore progressively (tab_index, saved_tab_data).
-    deferred_tabs: RefCell<Vec<(usize, crate::session::SavedTab)>>,
+    /// Deferred tabs keyed by their placeholder's TabId (not by index: the
+    /// window is interactive during progressive restore, so indices shift
+    /// when the user creates/closes/reorders tabs before an entry fires).
+    deferred_tabs: RefCell<Vec<(TabId, crate::session::SavedTab)>>,
     /// Fixed total pane count for the loading counter (computed once at startup).
     loading_total_panes: Cell<u32>,
     /// Tab boundary guard: last time navigation hit a tab edge, and which direction.
@@ -4638,32 +4641,42 @@ impl KovaView {
 
                 // Restore tabs until we hit the concurrency limit
                 while !deferred.is_empty() && loading < MAX_CONCURRENT_SHELLS {
-                    let (tab_idx, saved_tab) = deferred.pop().unwrap();
+                    let (tab_id, saved_tab) = deferred.pop().unwrap();
+                    let pane_count = crate::session::count_panes_in_saved_tab(&saved_tab);
+                    // The placeholder may have been closed by the user while
+                    // waiting — skip the entry instead of restoring it.
+                    if !ivars.tabs.borrow().iter().any(|t| t.id == tab_id) {
+                        log::info!("Deferred-restore: placeholder tab {:?} was closed; skipping", tab_id);
+                        ivars.tab_backup.borrow_mut().remove(&tab_id);
+                        let cur = ivars.loading_total_panes.get();
+                        ivars.loading_total_panes.set(cur.saturating_sub(pane_count as u32));
+                        continue;
+                    }
                     let config = ivars.config.get().unwrap();
                     let cols = config.terminal.columns;
                     let rows = config.terminal.rows;
-                    let pane_count = crate::session::count_panes_in_saved_tab(&saved_tab);
                     match crate::session::restore_saved_tab(&saved_tab, cols, rows, config) {
                         Some(tab) => {
                             loading += pane_count as u32;
                             let mut tabs = ivars.tabs.borrow_mut();
-                            if tab_idx < tabs.len() {
-                                let old_id = tabs[tab_idx].id;
-                                tabs[tab_idx] = tab;
+                            if let Some(pos) = tabs.iter().position(|t| t.id == tab_id) {
+                                tabs[pos] = tab;
                                 // Drop the placeholder's backup entry — its data
                                 // has been replaced by the live restored tab.
-                                ivars.tab_backup.borrow_mut().remove(&old_id);
+                                ivars.tab_backup.borrow_mut().remove(&tab_id);
                             } else {
                                 log::warn!(
-                                    "Deferred-restore: tab_idx={} out of range (tabs.len()={}); dropping restored tab",
-                                    tab_idx, tabs.len()
+                                    "Deferred-restore: placeholder tab {:?} disappeared during restore; dropping restored tab",
+                                    tab_id
                                 );
+                                let cur = ivars.loading_total_panes.get();
+                                ivars.loading_total_panes.set(cur.saturating_sub(pane_count as u32));
                             }
                             drop(tabs);
                             self.resize_all_panes();
                         }
                         None => {
-                            log::warn!("Failed to restore deferred tab {}", tab_idx);
+                            log::warn!("Failed to restore deferred tab {:?}", tab_id);
                             // The placeholder stays put — its tab_backup entry
                             // already preserves the original SavedTab, so save
                             // won't overwrite the user's data. But the loading
@@ -5254,6 +5267,15 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, act
     let view = KovaView::new(mtm, content_rect);
     view.setup_metal(mtm, config, tabs, active_tab);
     if !deferred_tabs.is_empty() {
+        // Re-key deferred entries from saved index to the placeholder's TabId:
+        // indices go stale as soon as the user touches the tab strip, ids don't.
+        let deferred_by_id: Vec<(TabId, crate::session::SavedTab)> = {
+            let tabs_ref = view.ivars().tabs.borrow();
+            deferred_tabs
+                .into_iter()
+                .filter_map(|(tab_idx, saved)| tabs_ref.get(tab_idx).map(|tab| (tab.id, saved)))
+                .collect()
+        };
         // Compute fixed total pane count: active tab's live panes + all deferred panes
         let mut total: u32 = 0;
         {
@@ -5264,22 +5286,19 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, act
                 });
             }
         }
-        for (_, saved) in &deferred_tabs {
+        for (_, saved) in &deferred_by_id {
             total += crate::session::count_panes_in_saved_tab(saved) as u32;
         }
         view.ivars().loading_total_panes.set(total);
         // Populate tab_backup so periodic autosave preserves the original SavedTab
         // for any placeholder still waiting (or that fails to restore).
         {
-            let tabs_ref = view.ivars().tabs.borrow();
             let mut backup = view.ivars().tab_backup.borrow_mut();
-            for (tab_idx, saved) in &deferred_tabs {
-                if let Some(tab) = tabs_ref.get(*tab_idx) {
-                    backup.insert(tab.id, saved.clone());
-                }
+            for (tab_id, saved) in &deferred_by_id {
+                backup.insert(*tab_id, saved.clone());
             }
         }
-        *view.ivars().deferred_tabs.borrow_mut() = deferred_tabs;
+        *view.ivars().deferred_tabs.borrow_mut() = deferred_by_id;
     }
     window.setContentView(Some(&view));
     window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*view)));
