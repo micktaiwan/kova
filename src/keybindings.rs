@@ -144,6 +144,11 @@ fn parse_key_combo(s: &str) -> KeyCombo {
 
     for part in modifier_parts {
         let trimmed = part.trim();
+        if trimmed.is_empty() {
+            // Artifact of splitting a literal '+' key on '+' (e.g.
+            // "cmd+shift++" → ["cmd", "shift", "", ""]) — not a modifier.
+            continue;
+        }
         if trimmed.eq_ignore_ascii_case("cmd") || trimmed.eq_ignore_ascii_case("command") {
             combo.cmd = true;
         } else if trimmed.eq_ignore_ascii_case("ctrl") || trimmed.eq_ignore_ascii_case("control") {
