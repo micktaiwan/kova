@@ -3296,6 +3296,7 @@ impl KovaView {
                     color: None,
                     has_bell: false,
                     has_completion: false,
+                    has_running: false,
                     minimized_stack: Vec::new(),
                     scroll_offset_x: 0.0,
                     virtual_width_override: 0.0,
@@ -3813,6 +3814,7 @@ impl KovaView {
                 "active": is_active,
                 "has_bell": tab.has_bell,
                 "has_completion": tab.has_completion,
+                "has_running": tab.has_running,
             }));
         }
     }
@@ -4909,6 +4911,7 @@ impl KovaView {
 
             for (i, t) in tabs.iter_mut().enumerate() {
                 t.check_bell();
+                t.check_running();
                 // Skip active tab: completion already read into pane_data
                 if i != active_idx {
                     t.check_completion();
@@ -4919,7 +4922,7 @@ impl KovaView {
             tabs[active_idx].has_completion = pane_data.iter().any(|p| p.has_completion);
 
             let rename = ivars.rename_tab.borrow();
-            let tab_titles: Vec<(String, bool, Option<usize>, bool, bool, bool)> = tabs.iter().enumerate()
+            let tab_titles: Vec<(String, bool, Option<usize>, bool, bool, bool, bool)> = tabs.iter().enumerate()
                 .map(|(i, t)| {
                     let is_renaming = i == active_idx && rename.is_some();
                     let title = if is_renaming {
@@ -4930,7 +4933,7 @@ impl KovaView {
                     } else {
                         t.title()
                     };
-                    (title, i == active_idx, t.color, is_renaming, t.has_bell, t.has_completion)
+                    (title, i == active_idx, t.color, is_renaming, t.has_bell, t.has_completion, t.has_running)
                 })
                 .collect();
             drop(rename);

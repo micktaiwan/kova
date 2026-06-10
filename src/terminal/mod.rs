@@ -213,6 +213,8 @@ pub struct TerminalState {
     pub bell: AtomicBool,
     // Command completed (OSC 133;D) — used for pane/tab completion indicator
     pub command_completed: AtomicBool,
+    // Command running (between OSC 133;C and 133;D) — tab running indicator
+    pub command_running: AtomicBool,
     // Last command executed (set via OSC 7777 from shell integration)
     pub last_command: Option<String>,
     // Mouse reporting modes
@@ -290,6 +292,7 @@ impl TerminalState {
             insert_mode: false,
             bell: AtomicBool::new(false),
             command_completed: AtomicBool::new(false),
+            command_running: AtomicBool::new(false),
             last_command: None,
             mouse_mode: 0,
             sgr_mouse: false,

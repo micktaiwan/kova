@@ -84,6 +84,8 @@ pub struct Tab {
     pub has_bell: bool,
     /// Command completed in a non-focused pane/tab — show completion indicator.
     pub has_completion: bool,
+    /// A command is running in any pane of the tab (between OSC 133;C and D).
+    pub has_running: bool,
     /// FILO stack of minimized pane IDs.
     pub minimized_stack: Vec<PaneId>,
     /// Horizontal scroll offset in pixels (0 = no scroll).
@@ -110,6 +112,7 @@ impl Tab {
             color: None,
             has_bell: false,
             has_completion: false,
+            has_running: false,
             minimized_stack: Vec::new(),
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
@@ -132,6 +135,7 @@ impl Tab {
             color: None,
             has_bell: false,
             has_completion: false,
+            has_running: false,
             minimized_stack: Vec::new(),
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
@@ -153,6 +157,7 @@ impl Tab {
             color: None,
             has_bell: false,
             has_completion: false,
+            has_running: false,
             minimized_stack: Vec::new(),
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
@@ -243,6 +248,24 @@ impl Tab {
         });
         self.has_completion = any;
         self.has_completion
+    }
+
+    /// Check if any pane in the tab is running a command (between OSC 133;C
+    /// and 133;D). Unlike completion, the focused pane counts too: the
+    /// indicator says "something is still churning in this tab". Sets the
+    /// tab-level flag. Panes whose shell exited are skipped — a shell killed
+    /// mid-command never emits 133;D, which would strand the flag.
+    pub fn check_running(&mut self) -> bool {
+        let mut any = false;
+        self.for_each_pane(&mut |pane| {
+            if pane.is_alive()
+                && pane.terminal.read().command_running.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                any = true;
+            }
+        });
+        self.has_running = any;
+        self.has_running
     }
 
     /// Minimize the pane with given id. Refuses if it's the last non-minimized pane.

@@ -316,9 +316,11 @@ impl VteHandler {
                     }
                     TermOp::CommandStarted => {
                         term.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+                        term.command_running.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     TermOp::SetCommandCompleted => {
                         term.command_completed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        term.command_running.store(false, std::sync::atomic::Ordering::Relaxed);
                         term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     TermOp::KittyKeyboardPush(flags) => {

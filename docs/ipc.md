@@ -96,7 +96,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "focused_pane_id": 42,
   "active": true,
   "has_bell": false,
-  "has_completion": false
+  "has_completion": false,
+  "has_running": false
 }
 ```
 
