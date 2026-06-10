@@ -84,8 +84,12 @@ pub struct Tab {
     pub has_bell: bool,
     /// Command completed in a non-focused pane/tab — show completion indicator.
     pub has_completion: bool,
-    /// A command is running in any pane of the tab (between OSC 133;C and D).
+    /// A command is running in any pane of the tab (OSC 133;C/D or a
+    /// foreground process other than the shell, e.g. claude, vim).
     pub has_running: bool,
+    /// Cached "a pane has a foreground process" result — tcgetpgrp is an
+    /// ioctl per pane, so it's refreshed on a throttle, not every tick.
+    pub fg_running_cache: bool,
     /// FILO stack of minimized pane IDs.
     pub minimized_stack: Vec<PaneId>,
     /// Horizontal scroll offset in pixels (0 = no scroll).
@@ -113,6 +117,7 @@ impl Tab {
             has_bell: false,
             has_completion: false,
             has_running: false,
+            fg_running_cache: false,
             minimized_stack: Vec::new(),
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
@@ -136,6 +141,7 @@ impl Tab {
             has_bell: false,
             has_completion: false,
             has_running: false,
+            fg_running_cache: false,
             minimized_stack: Vec::new(),
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
@@ -158,6 +164,7 @@ impl Tab {
             has_bell: false,
             has_completion: false,
             has_running: false,
+            fg_running_cache: false,
             minimized_stack: Vec::new(),
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
@@ -250,21 +257,35 @@ impl Tab {
         self.has_completion
     }
 
-    /// Check if any pane in the tab is running a command (between OSC 133;C
-    /// and 133;D). Unlike completion, the focused pane counts too: the
-    /// indicator says "something is still churning in this tab". Sets the
-    /// tab-level flag. Panes whose shell exited are skipped — a shell killed
-    /// mid-command never emits 133;D, which would strand the flag.
-    pub fn check_running(&mut self) -> bool {
-        let mut any = false;
+    /// Check if any pane in the tab is running a command. Two sources, OR'd:
+    /// - OSC 133;C/D from shell integration (precise prompt cycles) — note
+    ///   that Claude Code emits a 133;D at the end of each of its turns, so
+    ///   this flag alone dies while claude is still open;
+    /// - a foreground process group other than the shell (tcgetpgrp) — covers
+    ///   claude, vim, any TUI, no shell integration needed. Only re-probed
+    ///   when `refresh_fg` is true (one ioctl per pane).
+    /// Unlike completion, the focused pane counts too: the indicator says
+    /// "something occupies this tab". Panes whose shell exited are skipped —
+    /// a shell killed mid-command never emits 133;D, which would strand the
+    /// OSC flag.
+    pub fn check_running(&mut self, refresh_fg: bool) -> bool {
+        let mut osc_any = false;
+        let mut fg_any = false;
         self.for_each_pane(&mut |pane| {
-            if pane.is_alive()
-                && pane.terminal.read().command_running.load(std::sync::atomic::Ordering::Relaxed)
-            {
-                any = true;
+            if !pane.is_alive() {
+                return;
+            }
+            if pane.terminal.read().command_running.load(std::sync::atomic::Ordering::Relaxed) {
+                osc_any = true;
+            }
+            if refresh_fg && pane.pty.has_foreground_process() {
+                fg_any = true;
             }
         });
-        self.has_running = any;
+        if refresh_fg {
+            self.fg_running_cache = fg_any;
+        }
+        self.has_running = osc_any || self.fg_running_cache;
         self.has_running
     }
 

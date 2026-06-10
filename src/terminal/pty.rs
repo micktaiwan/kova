@@ -268,7 +268,7 @@ impl Pty {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
-        log::debug!("PTY resize: pid={}, cols={}, rows={}", self.child_pid, cols, rows);
+        log::trace!("PTY resize: pid={}, cols={}, rows={}", self.child_pid, cols, rows);
         let winsize = Winsize {
             ws_row: rows,
             ws_col: cols,
@@ -283,6 +283,12 @@ impl Pty {
 
     /// Returns the name of the foreground process if it differs from the shell
     /// (i.e. a command like vim, cargo, etc. is running).
+    /// True when a process other than the shell owns the terminal foreground
+    /// (one tcgetpgrp ioctl — no process-name resolution).
+    pub fn has_foreground_process(&self) -> bool {
+        !self.is_dummy && foreground_pgid(self.master_fd.as_raw_fd(), self.child_pid).is_some()
+    }
+
     pub fn foreground_process_name(&self) -> Option<String> {
         let fg_pgid = foreground_pgid(self.master_fd.as_raw_fd(), self.child_pid)?;
         let mut name_buf = [0u8; 256];
