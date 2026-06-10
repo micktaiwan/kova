@@ -378,7 +378,7 @@ impl Renderer {
         layer: &CAMetalLayer,
         panes: &[PaneRenderData],
         separators: &[(f32, f32, f32, f32)],
-        tab_titles: &[(String, bool, Option<usize>, bool, bool, bool)],
+        tab_titles: &[(String, bool, Option<usize>, bool, bool, bool, bool)],
         filter: Option<&FilterRenderData>,
         tab_bar_left_inset: f32,
         hidden_left: usize,
@@ -1279,7 +1279,7 @@ impl Renderer {
         &mut self,
         vertices: &mut Vec<Vertex>,
         viewport_w: f32,
-        tab_titles: &[(String, bool, Option<usize>, bool, bool, bool)],
+        tab_titles: &[(String, bool, Option<usize>, bool, bool, bool, bool)],
         left_inset: f32,
     ) {
         let cell_w = self.atlas.cell_width;
@@ -1301,7 +1301,7 @@ impl Renderer {
         let tab_width = (full_available_w / tab_count as f32).max(cell_w * 4.0).min(max_tab_w);
         let no_bg = [0.0, 0.0, 0.0, 0.0];
 
-        for (i, (title, is_active, color_idx, is_renaming, has_bell, has_completion)) in tab_titles.iter().enumerate() {
+        for (i, (title, is_active, color_idx, is_renaming, has_bell, has_completion, has_running)) in tab_titles.iter().enumerate() {
             let x = left_inset + i as f32 * tab_width;
 
             // Tab background color
@@ -1361,15 +1361,20 @@ impl Renderer {
             let max_x = x + tab_width - cell_w;
             self.render_status_text(vertices, &label, text_x.max(x + cell_w * 0.5), text_y, max_x, fg, no_bg);
 
-            // Tab indicator dot: bell (orange) takes priority, then completion (green)
-            let indicator_color = if *has_bell && !is_active {
-                Some([1.0_f32, 0.45, 0.1])
+            // Tab indicator: bell (orange ●) > completion (green ●) > running
+            // (yellow ▶). Bell/completion only on non-active tabs (the active
+            // tab's content is visible); running shows everywhere — the
+            // churning pane may be minimized or scrolled out of view.
+            let indicator: Option<([f32; 3], &str)> = if *has_bell && !is_active {
+                Some(([1.0_f32, 0.45, 0.1], "●"))
             } else if *has_completion && !is_active {
-                Some([0.2_f32, 0.8, 0.3])
+                Some(([0.2_f32, 0.8, 0.3], "●"))
+            } else if *has_running {
+                Some(([1.0_f32, 0.8, 0.2], "▶"))
             } else {
                 None
             };
-            if let Some(color) = indicator_color {
+            if let Some((color, glyph)) = indicator {
                 let dot_x = x + tab_width - cell_w * 2.0;
                 let dot_y = (bar_h - cell_h) / 2.0;
                 let dot_color = if let Some(bg) = tab_bg {
@@ -1382,7 +1387,7 @@ impl Renderer {
                 } else {
                     [color[0], color[1], color[2], 1.0]
                 };
-                self.render_status_text(vertices, "●", dot_x, dot_y, x + tab_width, dot_color, no_bg);
+                self.render_status_text(vertices, glyph, dot_x, dot_y, x + tab_width, dot_color, no_bg);
             }
         }
 

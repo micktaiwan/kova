@@ -591,6 +591,7 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         color: saved.color,
         has_bell: false,
         has_completion: false,
+        has_running: false,
         minimized_stack: Vec::new(),
         scroll_offset_x: saved.scroll_offset_x.unwrap_or(0.0),
         virtual_width_override: saved.virtual_width_override.unwrap_or(0.0),
