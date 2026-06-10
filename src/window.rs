@@ -114,7 +114,12 @@ pub struct KovaViewIvars {
     /// Highlight a pane after a search-palette jump (decremented per tick).
     pane_flash: Cell<Option<PaneFlash>>,
     /// Deferred PTY winsize restore after a Cmd+R nudge (decremented per tick).
-    pty_restore: Cell<Option<PtyRestore>>,
+    pty_restore: RefCell<Vec<PtyRestore>>,
+    /// Recent pane sizes (bounded history per pane) for round-trip
+    /// detection: a rapid return to ANY recently-seen size can coalesce the
+    /// SIGWINCHs — the child reads an unchanged winsize and skips its
+    /// repaint while our grid went through a lossy reflow round-trip.
+    recent_resizes: RefCell<std::collections::HashMap<PaneId, Vec<((u16, u16), std::time::Instant)>>>,
     /// Original `SavedTab` for tabs that are still placeholders or whose
     /// deferred restoration failed. Looked up by `TabId` at save time so we
     /// snapshot the placeholder's *original* data rather than its empty live
@@ -812,9 +817,19 @@ define_class!(
                                 pane.pty.write(path.as_bytes());
                                 if bracketed { pane.pty.write(b"\x1b[201~"); }
                             } else if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
-                                let text = text.to_string();
+                                let mut text = text.to_string();
                                 let bracketed = pane.terminal.read().bracketed_paste;
-                                if bracketed { pane.pty.write(b"\x1b[200~"); }
+                                if bracketed {
+                                    // A paste containing the bracketed-paste
+                                    // terminator would break out of the paste
+                                    // and inject keystrokes into the app.
+                                    // Loop to a fixpoint: a single replace can
+                                    // re-form the terminator from its halves.
+                                    while text.contains("\x1b[201~") {
+                                        text = text.replace("\x1b[201~", "");
+                                    }
+                                    pane.pty.write(b"\x1b[200~");
+                                }
                                 pane.pty.write(text.as_bytes());
                                 if bracketed { pane.pty.write(b"\x1b[201~"); }
                             }
@@ -1427,7 +1442,8 @@ impl KovaView {
             boundary_flash: Cell::new(None),
             search_palette: RefCell::new(None),
             pane_flash: Cell::new(None),
-            pty_restore: Cell::new(None),
+            pty_restore: RefCell::new(Vec::new()),
+            recent_resizes: RefCell::new(std::collections::HashMap::new()),
             tab_backup: RefCell::new(std::collections::HashMap::new()),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -1571,7 +1587,14 @@ impl KovaView {
         pane.pty.resize(cols, nudged);
         // ~50ms @60fps before restoring the real winsize, so the foreground
         // program sees two distinct SIGWINCHs with two distinct sizes.
-        self.ivars().pty_restore.set(Some(PtyRestore { pane_id, remaining_frames: 3 }));
+        {
+            // One slot per pane: a second Cmd+R re-arms its own pane's restore
+            // without dropping another pane's pending restore (a dropped
+            // restore would leave that PTY one row short permanently).
+            let mut restores = self.ivars().pty_restore.borrow_mut();
+            restores.retain(|r| r.pane_id != pane_id);
+            restores.push(PtyRestore { pane_id, remaining_frames: 3 });
+        }
         self.set_pane_flash(pane_id, 20);
     }
 
@@ -4164,6 +4187,11 @@ impl KovaView {
         let status_bar = renderer_r.status_bar_enabled();
         drop(renderer_r);
 
+        // Drop expired resize histories (also clears entries of closed panes)
+        self.ivars().recent_resizes.borrow_mut().retain(|_, h| {
+            h.iter().any(|&(_, t)| t.elapsed().as_millis() < 500)
+        });
+
         let panes_vp = self.panes_viewport();
         let tabs = self.ivars().tabs.borrow();
         let idx = self.ivars().active_tab.get();
@@ -4179,9 +4207,33 @@ impl KovaView {
                 let rows = (usable_h / cell_h).floor().max(1.0) as u16;
                 let mut term = pane.terminal.write();
                 if cols != term.cols || rows != term.rows {
+                    let old = (term.cols, term.rows);
                     term.resize(cols, rows);
                     drop(term);
                     pane.pty.resize(cols, rows);
+
+                    // Round-trip detection: returning within 500ms to ANY
+                    // recently-seen size means the child may coalesce the
+                    // SIGWINCHs into one no-op and skip its repaint while our
+                    // reflow round-trip lost information. Nudge it.
+                    let now = std::time::Instant::now();
+                    let mut recent = self.ivars().recent_resizes.borrow_mut();
+                    let history = recent.entry(pane.id).or_default();
+                    history.retain(|&(_, t)| now.duration_since(t).as_millis() < 500);
+                    let round_trip = history.iter().any(|&(sz, _)| sz == (cols, rows));
+                    if round_trip {
+                        history.clear();
+                        drop(recent);
+                        pane.pty.resize(cols, if rows > 1 { rows - 1 } else { rows + 1 });
+                        let mut restores = self.ivars().pty_restore.borrow_mut();
+                        restores.retain(|r| r.pane_id != pane.id);
+                        restores.push(PtyRestore { pane_id: pane.id, remaining_frames: 3 });
+                    } else {
+                        history.push((old, now));
+                        if history.len() > 8 {
+                            history.remove(0);
+                        }
+                    }
                 }
             });
         }
@@ -4729,20 +4781,27 @@ impl KovaView {
             }
         }
 
-        // --- Deferred PTY winsize restore after a Cmd+R nudge ---
-        if let Some(mut restore) = ivars.pty_restore.get() {
-            if restore.remaining_frames > 1 {
-                restore.remaining_frames -= 1;
-                ivars.pty_restore.set(Some(restore));
-            } else {
-                ivars.pty_restore.set(None);
+        // --- Deferred PTY winsize restores after Cmd+R nudges ---
+        {
+            let mut due: Vec<PaneId> = Vec::new();
+            {
+                let mut restores = ivars.pty_restore.borrow_mut();
+                for r in restores.iter_mut() {
+                    r.remaining_frames = r.remaining_frames.saturating_sub(1);
+                    if r.remaining_frames == 0 {
+                        due.push(r.pane_id);
+                    }
+                }
+                restores.retain(|r| r.remaining_frames > 0);
+            }
+            if !due.is_empty() {
                 // Dims are re-read at fire time: a window resize in between
                 // already set the PTY to the new size, and the terminal grid
                 // is the source of truth for what the winsize should be.
                 let tabs = ivars.tabs.borrow();
                 for tab in tabs.iter() {
                     tab.for_each_pane(&mut |pane| {
-                        if pane.id == restore.pane_id {
+                        if due.contains(&pane.id) {
                             let (cols, rows) = {
                                 let t = pane.terminal.read();
                                 (t.cols, t.rows)
