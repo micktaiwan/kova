@@ -96,6 +96,8 @@ enum TermOp {
     SetSgr(Vec<u16>),
     // Cursor shape (DECSCUSR param)
     SetCursorShape(u16),
+    /// REP — repeat last printed char
+    RepeatLastChar(u16),
     // Screen
     ReverseIndex,
     FullReset,
@@ -117,6 +119,20 @@ enum TermOp {
     // Responses — read state during replay, write to PTY after lock release
     CursorPositionReport,
     DeviceAttributes,
+    /// CSI > c — Secondary Device Attributes
+    SecondaryDeviceAttributes,
+    /// CSI > q — XTVERSION (terminal name and version)
+    XtVersion,
+    /// Charset designation: (is_g1, is_dec_graphics)
+    SetCharset(bool, bool),
+    /// HTS — set tab stop at cursor
+    SetTabStop,
+    /// TBC — clear tab stop(s)
+    ClearTabStops(u16),
+    /// CBT — cursor backward n tab stops
+    BackTab(u16),
+    /// SO/SI: shift to G1 (true) or G0 (false)
+    ShiftCharset(bool),
     ReportPrivateMode(u16),
     KittyKeyboardQuery,
 }
@@ -129,6 +145,10 @@ pub struct VteHandler {
     print_buf: String,
     /// Buffered operations — accumulated during parsing, replayed in apply_ops().
     ops: Vec<TermOp>,
+    /// A trailing incomplete grapheme was held back at the last chunk end.
+    /// Bounds the holdback to one chunk: if the stream goes quiet, the next
+    /// flush shows the fragment instead of withholding it forever.
+    held_tail: bool,
 }
 
 impl VteHandler {
@@ -138,14 +158,69 @@ impl VteHandler {
             pty_writer,
             print_buf: String::new(),
             ops: Vec::with_capacity(256),
+            held_tail: false,
         }
     }
 
     /// Flush the print buffer into a Print op.
     fn flush_print_buf(&mut self) {
+        self.held_tail = false;
         if !self.print_buf.is_empty() {
             let buf = std::mem::take(&mut self.print_buf);
             self.ops.push(TermOp::Print(buf));
+        }
+    }
+
+    /// Flush at PTY chunk end, holding back a trailing grapheme that the next
+    /// chunk may still extend (ends with ZWJ, or an unpaired regional
+    /// indicator). Flushing such a fragment would render it as a separate
+    /// cluster with a different width than the completed grapheme, desyncing
+    /// the row layout from the application's model.
+    fn flush_print_buf_chunk_end(&mut self) {
+        if self.print_buf.is_empty() {
+            return;
+        }
+        let hold = Self::incomplete_tail_len(&self.print_buf);
+        if hold == 0 || self.held_tail {
+            // Complete tail, or already held once: flush everything. One
+            // chunk of grace is enough — withholding longer would hide the
+            // app's final output when the stream simply stops.
+            self.flush_print_buf();
+        } else if hold < self.print_buf.len() {
+            let tail = self.print_buf.split_off(self.print_buf.len() - hold);
+            self.flush_print_buf();
+            self.print_buf = tail;
+            self.held_tail = true;
+        } else {
+            // Entire buffer is one incomplete grapheme — keep it all
+            self.held_tail = true;
+        }
+    }
+
+    /// Byte length of a trailing fragment that may be completed by upcoming
+    /// output: a grapheme ending in ZWJ, or the unpaired half of a flag.
+    fn incomplete_tail_len(buf: &str) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        if buf.ends_with('\u{200D}') {
+            // ZWJ joins with whatever comes next — hold the whole last grapheme
+            return match buf.grapheme_indices(true).last() {
+                Some((idx, _)) => buf.len() - idx,
+                None => buf.len(),
+            };
+        }
+        // Trailing run of regional indicators: odd count = half a flag pair
+        let mut count = 0usize;
+        for ch in buf.chars().rev() {
+            if ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch) {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        if count % 2 == 1 {
+            4 // a regional indicator is always 4 bytes in UTF-8
+        } else {
+            0
         }
     }
 
@@ -156,7 +231,7 @@ impl VteHandler {
     /// Take the write lock once, replay all buffered ops, release the lock,
     /// then write any PTY responses.
     pub fn apply_ops(&mut self) {
-        self.flush_print_buf();
+        self.flush_print_buf_chunk_end();
         if self.ops.is_empty() {
             return;
         }
@@ -195,10 +270,7 @@ impl VteHandler {
                     TermOp::CursorForward(n) => term.cursor_forward(n),
                     TermOp::CursorBackward(n) => term.cursor_backward(n),
                     TermOp::SetCursorPos(row, col) => term.set_cursor_pos(row, col),
-                    TermOp::SetCursorCol(col) => {
-                        let row = term.cursor_y;
-                        term.set_cursor_pos(row, col);
-                    }
+                    TermOp::SetCursorCol(col) => term.set_cursor_col(col),
                     TermOp::SetCursorRow(row) => {
                         let col = term.cursor_x;
                         term.set_cursor_pos(row, col);
@@ -229,7 +301,8 @@ impl VteHandler {
                     TermOp::SetDecMode(mode, on) => {
                         match mode {
                             1 => term.cursor_keys_application = on,
-                            7 => term.auto_wrap = on,
+                            6 => term.set_origin_mode(on),
+                            7 => term.set_auto_wrap(on),
                             12 => {} // Cursor blink — ignored
                             25 => {
                                 term.cursor_visible = on;
@@ -248,15 +321,28 @@ impl VteHandler {
                             1049 => {
                                 if on { term.enter_alt_screen(); } else { term.leave_alt_screen(); }
                             }
+                            // Legacy alt-screen variants (47/1047: switch
+                            // without cursor save; 1048: cursor save only)
+                            47 | 1047 => {
+                                if on { term.enter_alt_screen(); } else { term.leave_alt_screen(); }
+                            }
+                            1048 => {
+                                if on { term.save_cursor(); } else { term.restore_cursor(); }
+                            }
                             1004 => term.focus_reporting = on,
                             2004 => term.bracketed_paste = on,
                             2026 => {
                                 if on {
                                     term.synchronized_output = true;
-                                    // Don't reset the timer on nested/repeated ?2026h —
-                                    // otherwise the fallback timeout never fires and the
-                                    // pane stays black for the whole burst.
-                                    if term.sync_output_since.is_none() {
+                                    // Don't reset the timer on nested/repeated ?2026h
+                                    // within an active window — otherwise the fallback
+                                    // timeout never fires and the pane stays stale for
+                                    // the whole burst. But if the previous window
+                                    // already EXPIRED (a ?2026l was lost), this h is a
+                                    // new burst: re-arm, or sync stays dead forever.
+                                    let expired = term.sync_output_since
+                                        .is_none_or(|s| s.elapsed().as_millis() >= 150);
+                                    if expired {
                                         term.sync_output_since = Some(std::time::Instant::now());
                                     }
                                 } else {
@@ -284,6 +370,7 @@ impl VteHandler {
                         };
                         term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
+                    TermOp::RepeatLastChar(n) => term.repeat_last_char(n),
                     TermOp::ReverseIndex => term.reverse_index(),
                     TermOp::FullReset => {
                         let cols = term.cols;
@@ -342,6 +429,19 @@ impl VteHandler {
                     TermOp::DeviceAttributes => {
                         pty_responses.push(b"\x1b[?62;22c".to_vec());
                     }
+                    TermOp::SecondaryDeviceAttributes => {
+                        // VT220-class, "firmware version" 100, no options
+                        pty_responses.push(b"\x1b[>1;100;0c".to_vec());
+                    }
+                    TermOp::SetCharset(g1, dec) => term.set_charset(g1, dec),
+                    TermOp::SetTabStop => term.set_tab_stop(),
+                    TermOp::ClearTabStops(mode) => term.clear_tab_stops(mode),
+                    TermOp::BackTab(n) => term.back_tab(n),
+                    TermOp::ShiftCharset(g1) => term.shift_charset(g1),
+                    TermOp::XtVersion => {
+                        let v = env!("CARGO_PKG_VERSION");
+                        pty_responses.push(format!("\x1bP>|Kova {}\x1b\\", v).into_bytes());
+                    }
                     TermOp::ReportPrivateMode(mode) => {
                         let value = match mode {
                             1 => if term.cursor_keys_application { 1 } else { 2 },
@@ -389,9 +489,9 @@ impl Perform for VteHandler {
                 log::trace!("BEL received");
                 self.ops.push(TermOp::Bell);
             }
-            // SO/SI (charset shift out/in) — no charset support, deliberately
-            // ignored. Every zsh prompt emits SI; logging it floods the log.
-            0x0E | 0x0F => {}
+            // SO selects G1, SI selects G0 (DEC graphics for ncurses borders)
+            0x0E => self.ops.push(TermOp::ShiftCharset(true)),
+            0x0F => self.ops.push(TermOp::ShiftCharset(false)),
             _ => log::debug!("unhandled execute: byte=0x{:02X}", byte),
         }
     }
@@ -494,6 +594,9 @@ impl Perform for VteHandler {
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         self.flush_print_buf();
+        // Parameter groups: colon subparameters (ITU SGR forms) arrive as one
+        // group — only the 'm' arm needs them; everything else uses the flat list.
+        let raw_groups: Vec<Vec<u16>> = params.iter().map(|p| p.to_vec()).collect();
         let params: Vec<u16> = params.iter().flat_map(|p| p.iter().map(|&v| v)).collect();
 
         match (action, intermediates) {
@@ -567,10 +670,36 @@ impl Perform for VteHandler {
                 self.ops.push(TermOp::SetCursorRow(row));
             }
             ('m', []) => {
-                if params.is_empty() {
-                    self.ops.push(TermOp::SetSgr(vec![0]));
-                } else {
-                    self.ops.push(TermOp::SetSgr(params));
+                // Normalize parameter groups. Colon subparameters (ITU forms
+                // like 38:2::R:G:B or 4:3) arrive as ONE group; flattening
+                // them blindly corrupts the list (e.g. 4:0 flattened to 4;0
+                // triggers a full SGR reset). Convert known colon forms to
+                // their legacy layout and drop unsupported ones.
+                let mut flat: Vec<u16> = Vec::new();
+                for group in &raw_groups {
+                    match group.as_slice() {
+                        [] => flat.push(0),
+                        [single] => flat.push(*single),
+                        [head @ (38 | 48), 2, rest @ ..] if rest.len() >= 3 => {
+                            // Colon form with optional colorspace id: the last
+                            // three subparams are R, G, B
+                            let rgb = &rest[rest.len() - 3..];
+                            flat.extend_from_slice(&[*head, 2, rgb[0], rgb[1], rgb[2]]);
+                        }
+                        [head @ (38 | 48), 5, idx, ..] => {
+                            flat.extend_from_slice(&[*head, 5, *idx]);
+                        }
+                        // Unsupported attribute with subparams (4:x underline
+                        // styles, 58/59 underline color): drop the whole group
+                        _ => {}
+                    }
+                }
+                if raw_groups.is_empty() {
+                    // CSI m with no parameters = SGR 0
+                    flat.push(0);
+                }
+                if !flat.is_empty() {
+                    self.ops.push(TermOp::SetSgr(flat));
                 }
             }
             ('r', []) => {
@@ -616,8 +745,26 @@ impl Perform for VteHandler {
                     self.ops.push(TermOp::CursorPositionReport);
                 }
             }
+            ('b', []) => {
+                let n = params.first().copied().unwrap_or(1).max(1);
+                self.ops.push(TermOp::RepeatLastChar(n));
+            }
+            ('Z', []) => {
+                let n = params.first().copied().unwrap_or(1).max(1);
+                self.ops.push(TermOp::BackTab(n));
+            }
+            ('g', []) => {
+                let mode = params.first().copied().unwrap_or(0);
+                self.ops.push(TermOp::ClearTabStops(mode));
+            }
             ('c', []) | ('c', [b'?']) => {
                 self.ops.push(TermOp::DeviceAttributes);
+            }
+            ('c', [b'>']) => {
+                self.ops.push(TermOp::SecondaryDeviceAttributes);
+            }
+            ('q', [b'>']) => {
+                self.ops.push(TermOp::XtVersion);
             }
             ('p', [b'?', b'$']) => {
                 if let Some(&mode) = params.first() {
@@ -643,12 +790,15 @@ impl Perform for VteHandler {
         self.flush_print_buf();
         match (byte, intermediates) {
             (b'M', []) => self.ops.push(TermOp::ReverseIndex),
+            (b'H', []) => self.ops.push(TermOp::SetTabStop),
             (b'7', []) => self.ops.push(TermOp::SaveCursor),
             (b'8', []) => self.ops.push(TermOp::RestoreCursor),
             (b'c', []) => self.ops.push(TermOp::FullReset),
-            // Charset designation (ESC ( B, ESC ) 0, …) — no charset support,
-            // deliberately ignored. Every zsh prompt emits ESC ( B.
-            (_, [b'('] | [b')'] | [b'*'] | [b'+']) => {}
+            // Charset designation: '0' = DEC Special Graphics, anything else
+            // (B, A, …) treated as ASCII. G2/G3 (*/+) are ignored.
+            (b, [b'(']) => self.ops.push(TermOp::SetCharset(false, b == b'0')),
+            (b, [b')']) => self.ops.push(TermOp::SetCharset(true, b == b'0')),
+            (_, [b'*'] | [b'+']) => {}
             _ => {
                 log::debug!(
                     "unhandled ESC: byte=0x{:02X}, intermediates={:?}",
@@ -742,5 +892,117 @@ impl AnsiColor {
                 [v, v, v]
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::{DEFAULT_BG, DEFAULT_FG};
+
+    /// Feed raw bytes through the real vte parser into a TerminalState.
+    fn drive(cols: u16, rows: u16, chunks: &[&[u8]]) -> Arc<RwLock<TerminalState>> {
+        let term = Arc::new(RwLock::new(TerminalState::new(
+            cols, rows, 100, DEFAULT_FG, DEFAULT_BG,
+        )));
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let writer: Arc<OwnedFd> = Arc::new(devnull.into());
+        let mut parser = vte::Parser::new();
+        let mut handler = VteHandler::new(term.clone(), writer);
+        for chunk in chunks {
+            parser.advance(&mut handler, chunk);
+            handler.apply_ops();
+        }
+        term
+    }
+
+    fn cell(term: &Arc<RwLock<TerminalState>>, row: usize, col: usize) -> crate::terminal::Cell {
+        term.read().visible_lines()[row][col].clone()
+    }
+
+    #[test]
+    fn sgr_colon_underline_off_does_not_reset_colors() {
+        // 4:0 (underline off, ITU form) must not be misread as SGR 0
+        let t = drive(20, 5, &[b"\x1b[31mA\x1b[4:0mB"]);
+        let red = AnsiColor::from_index(1).to_rgb();
+        assert_eq!(cell(&t, 0, 0).fg, red);
+        assert_eq!(cell(&t, 0, 1).fg, red, "4:0 must not reset the red foreground");
+    }
+
+    #[test]
+    fn sgr_colon_truecolor_with_colorspace_id() {
+        let t = drive(20, 5, &[b"\x1b[38:2::10:20:30mX"]);
+        assert_eq!(cell(&t, 0, 0).fg, [10, 20, 30]);
+    }
+
+    #[test]
+    fn sgr_legacy_semicolon_truecolor_still_works() {
+        let t = drive(20, 5, &[b"\x1b[38;2;10;20;30mX"]);
+        assert_eq!(cell(&t, 0, 0).fg, [10, 20, 30]);
+    }
+
+    #[test]
+    fn ed3_clears_scrollback_not_screen() {
+        let t = drive(10, 3, &[b"a\r\nb\r\nc\r\nd\r\ne\r\nf", b"\x1b[3J"]);
+        let term = t.read();
+        assert_eq!(term.scrollback_len(), 0, "3J must clear the scrollback");
+        let lines = term.visible_lines();
+        assert!(lines.iter().any(|l| l.iter().any(|c| c.c != ' ')), "3J must not clear the screen");
+    }
+
+    #[test]
+    fn rep_via_csi_b() {
+        let t = drive(20, 5, &[b"-\x1b[4b"]);
+        let term = t.read();
+        let text: String = term.visible_lines()[0].iter().map(|c| c.c).collect();
+        assert!(text.starts_with("-----"), "CSI 4 b must repeat the dash, got {:?}", text);
+    }
+
+    #[test]
+    fn split_combining_mark_across_chunks_merges() {
+        let t = drive(20, 5, &[b"e", b"\xcc\x81x"]); // U+0301 then 'x' in chunk 2
+        assert_eq!(cell(&t, 0, 0).cluster.as_deref(), Some("e\u{0301}"));
+        assert_eq!(cell(&t, 0, 1).c, 'x');
+    }
+
+    #[test]
+    fn zwj_holdback_completes_across_chunks() {
+        // "👩" + ZWJ in chunk 1, "🚀" in chunk 2 → single cluster cell
+        let t = drive(20, 5, &[
+            "👩\u{200d}".as_bytes(),
+            "🚀".as_bytes(),
+        ]);
+        assert_eq!(
+            cell(&t, 0, 0).cluster.as_deref(),
+            Some("👩\u{200d}🚀"),
+            "ZWJ sequence split across chunks must render as one cluster"
+        );
+    }
+
+    #[test]
+    fn held_tail_flushes_when_stream_goes_quiet() {
+        // Lone ZWJ-terminated grapheme, then an empty chunk (apply_ops with
+        // no new data) — the held fragment must flush, not vanish forever.
+        let t = drive(20, 5, &["A\u{200d}".as_bytes(), b""]);
+        assert_eq!(cell(&t, 0, 0).c, 'A', "held grapheme must flush after one chunk of grace");
+    }
+
+    #[test]
+    fn decom_makes_cup_region_relative() {
+        // Region rows 2-4 (1-based: \x1b[2;4r is rows 2..4), origin mode on,
+        // CUP 1;1 must land on the region top (row index 1), not screen top.
+        let t = drive(10, 5, &[b"\x1b[2;4r\x1b[?6h\x1b[1;1HX"]);
+        assert_eq!(cell(&t, 1, 0).c, 'X');
+        assert_eq!(cell(&t, 0, 0).c, ' ');
+    }
+
+    #[test]
+    fn cuu_stops_at_region_top_margin() {
+        let t = drive(10, 5, &[b"\x1b[2;4r\x1b[3;1H\x1b[9AX"]);
+        // cursor was inside region (row idx 2); CUU 9 must stop at region top (idx 1)
+        assert_eq!(cell(&t, 1, 0).c, 'X');
     }
 }
