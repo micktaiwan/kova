@@ -107,6 +107,8 @@ pub struct KovaViewIvars {
     search_palette: RefCell<Option<SearchPaletteState>>,
     /// Highlight a pane after a search-palette jump (decremented per tick).
     pane_flash: Cell<Option<PaneFlash>>,
+    /// Deferred PTY winsize restore after a Cmd+R nudge (decremented per tick).
+    pty_restore: Cell<Option<PtyRestore>>,
     /// Original `SavedTab` for tabs that are still placeholders or whose
     /// deferred restoration failed. Looked up by `TabId` at save time so we
     /// snapshot the placeholder's *original* data rather than its empty live
@@ -201,6 +203,17 @@ struct SearchPaletteState {
 
 #[derive(Clone, Copy)]
 struct PaneFlash {
+    pane_id: PaneId,
+    remaining_frames: u32,
+}
+
+/// Pending restore of a PTY winsize after the Cmd+R repaint nudge.
+/// The restore must NOT happen back-to-back with the nudge: two immediate
+/// TIOCSWINSZ calls coalesce their SIGWINCHs, and the foreground program
+/// then reads a winsize identical to its cached one — programs that compare
+/// old == new size skip the redraw entirely.
+#[derive(Clone, Copy)]
+struct PtyRestore {
     pane_id: PaneId,
     remaining_frames: u32,
 }
@@ -1407,6 +1420,7 @@ impl KovaView {
             boundary_flash: Cell::new(None),
             search_palette: RefCell::new(None),
             pane_flash: Cell::new(None),
+            pty_restore: Cell::new(None),
             tab_backup: RefCell::new(std::collections::HashMap::new()),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -1524,9 +1538,12 @@ impl KovaView {
     /// Three levers:
     /// 1. Soft-reset the Kova terminal state (scroll region, cursor visibility,
     ///    SGR attributes) to fix corruption that persists in state, not just GPU.
-    /// 2. Nudge the PTY winsize (rows ±1 then back) to provoke a SIGWINCH so the
-    ///    foreground program redraws. A same-size set wouldn't work: the kernel
-    ///    only emits SIGWINCH when the dimensions actually change.
+    /// 2. Nudge the PTY winsize (rows ±1, restored a few ticks later) to provoke
+    ///    a SIGWINCH so the foreground program redraws. A same-size set wouldn't
+    ///    work: the kernel only emits SIGWINCH when the dimensions actually
+    ///    change. The restore is deferred (see `PtyRestore`): restoring
+    ///    back-to-back coalesces both SIGWINCHs and the program may then see an
+    ///    unchanged winsize and skip the redraw.
     /// 3. Flash the pane border as visible confirmation that the repaint fired,
     ///    even when content doesn't change (e.g. idle shell ignores SIGWINCH).
     fn do_repaint_pane(&self) {
@@ -1545,7 +1562,9 @@ impl KovaView {
         pane.terminal.write().soft_reset();
         let nudged = if rows > 1 { rows - 1 } else { rows + 1 };
         pane.pty.resize(cols, nudged);
-        pane.pty.resize(cols, rows);
+        // ~50ms @60fps before restoring the real winsize, so the foreground
+        // program sees two distinct SIGWINCHs with two distinct sizes.
+        self.ivars().pty_restore.set(Some(PtyRestore { pane_id, remaining_frames: 3 }));
         self.set_pane_flash(pane_id, 20);
     }
 
@@ -4686,6 +4705,31 @@ impl KovaView {
                             term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
+                }
+            }
+        }
+
+        // --- Deferred PTY winsize restore after a Cmd+R nudge ---
+        if let Some(mut restore) = ivars.pty_restore.get() {
+            if restore.remaining_frames > 1 {
+                restore.remaining_frames -= 1;
+                ivars.pty_restore.set(Some(restore));
+            } else {
+                ivars.pty_restore.set(None);
+                // Dims are re-read at fire time: a window resize in between
+                // already set the PTY to the new size, and the terminal grid
+                // is the source of truth for what the winsize should be.
+                let tabs = ivars.tabs.borrow();
+                for tab in tabs.iter() {
+                    tab.for_each_pane(&mut |pane| {
+                        if pane.id == restore.pane_id {
+                            let (cols, rows) = {
+                                let t = pane.terminal.read();
+                                (t.cols, t.rows)
+                            };
+                            pane.pty.resize(cols, rows);
+                        }
+                    });
                 }
             }
         }
