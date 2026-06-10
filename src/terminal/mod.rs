@@ -2589,17 +2589,12 @@ mod tests {
         assert!(t.scrollback_len() > 0);
         // Resize wider: the 25-char line must reassemble
         t.resize(30, 3);
-        let mut all = String::new();
-        for i in 0..t.scrollback_len() {
-            // visible_lines only shows the grid; dump everything instead
-        }
         let dump = t.dump_text(DumpMode::All, true).text;
         assert!(
             dump.contains("ABCDEFGHIJKLMNOPQRSTUVWXY"),
             "soft-wrapped line must rejoin across the scrollback boundary, got:\n{}",
             dump
         );
-        let _ = all;
     }
 
     #[test]
