@@ -1571,20 +1571,38 @@ impl Renderer {
             if query_lower.is_empty() {
                 self.render_status_text(vertices, &display_text, after_prefix, y, max_x, match_fg, no_bg);
             } else {
-                // Split text into spans: alternating normal/highlighted
-                let text_lower: String = display_text.to_lowercase();
+                // Split text into spans: alternating normal/highlighted.
+                // to_lowercase() is not byte-length-preserving ('İ' is 2
+                // bytes, lowercases to 3), so byte offsets found in the
+                // lowercased copy can't slice display_text directly — build
+                // a map from each text_lower byte back to the byte offset of
+                // its source char in display_text.
+                let mut text_lower = String::with_capacity(display_text.len());
+                let mut lower_to_orig: Vec<usize> = Vec::with_capacity(display_text.len() + 1);
+                for (orig_idx, ch) in display_text.char_indices() {
+                    for lc in ch.to_lowercase() {
+                        text_lower.push(lc);
+                        lower_to_orig.resize(text_lower.len(), orig_idx);
+                    }
+                }
+                lower_to_orig.push(display_text.len());
+
                 let mut spans: Vec<(&str, bool)> = Vec::new();
-                let mut pos = 0;
-                while pos < display_text.len() {
+                let mut pos = 0; // byte position in text_lower
+                while pos < text_lower.len() {
                     if let Some(found) = text_lower[pos..].find(&query_lower) {
-                        if found > 0 {
-                            spans.push((&display_text[pos..pos + found], false));
+                        let m_start = pos + found;
+                        let m_end = m_start + query_lower.len();
+                        let o_pos = lower_to_orig[pos];
+                        let o_start = lower_to_orig[m_start];
+                        let o_end = lower_to_orig[m_end];
+                        if o_start > o_pos {
+                            spans.push((&display_text[o_pos..o_start], false));
                         }
-                        let end = pos + found + filter.query.len();
-                        spans.push((&display_text[pos + found..end], true));
-                        pos = end;
+                        spans.push((&display_text[o_start..o_end], true));
+                        pos = m_end;
                     } else {
-                        spans.push((&display_text[pos..], false));
+                        spans.push((&display_text[lower_to_orig[pos]..], false));
                         break;
                     }
                 }
