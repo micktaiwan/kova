@@ -315,10 +315,12 @@ impl VteHandler {
                         term.set_hyperlink(url);
                     }
                     TermOp::CommandStarted => {
+                        log::debug!("OSC 133;C command started (terminal {})", term.terminal_id);
                         term.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
                         term.command_running.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     TermOp::SetCommandCompleted => {
+                        log::debug!("OSC 133;D command completed (terminal {})", term.terminal_id);
                         term.command_completed.store(true, std::sync::atomic::Ordering::Relaxed);
                         term.command_running.store(false, std::sync::atomic::Ordering::Relaxed);
                         term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -387,6 +389,9 @@ impl Perform for VteHandler {
                 log::trace!("BEL received");
                 self.ops.push(TermOp::Bell);
             }
+            // SO/SI (charset shift out/in) — no charset support, deliberately
+            // ignored. Every zsh prompt emits SI; logging it floods the log.
+            0x0E | 0x0F => {}
             _ => log::debug!("unhandled execute: byte=0x{:02X}", byte),
         }
     }
@@ -440,12 +445,10 @@ impl Perform for VteHandler {
                 }
                 b"133" => {
                     let sub = params[1];
+                    // C/D are logged with the terminal id when the op is applied.
                     match sub.first() {
                         Some(b'C') => self.ops.push(TermOp::CommandStarted),
-                        Some(b'D') => {
-                            log::debug!("OSC 133;D command completed");
-                            self.ops.push(TermOp::SetCommandCompleted);
-                        }
+                        Some(b'D') => self.ops.push(TermOp::SetCommandCompleted),
                         _ => {}
                     }
                 }
@@ -643,6 +646,9 @@ impl Perform for VteHandler {
             (b'7', []) => self.ops.push(TermOp::SaveCursor),
             (b'8', []) => self.ops.push(TermOp::RestoreCursor),
             (b'c', []) => self.ops.push(TermOp::FullReset),
+            // Charset designation (ESC ( B, ESC ) 0, …) — no charset support,
+            // deliberately ignored. Every zsh prompt emits ESC ( B.
+            (_, [b'('] | [b')'] | [b'*'] | [b'+']) => {}
             _ => {
                 log::debug!(
                     "unhandled ESC: byte=0x{:02X}, intermediates={:?}",

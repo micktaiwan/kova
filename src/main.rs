@@ -130,13 +130,10 @@ fn setup_logging() {
         .open(&log_path)
         .expect("cannot open log file");
 
-    // Info by default: debug is parser/input noise (thousands of lines per
-    // day); everything diagnostic is logged at info or above. Set RUST_LOG
-    // (e.g. RUST_LOG=debug) to investigate.
     let level = std::env::var("RUST_LOG")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(LevelFilter::Info);
+        .unwrap_or(LevelFilter::Debug);
 
     // Timestamps in local time (simplelog defaults to UTC). Falls back to
     // UTC if the local offset can't be determined (the `time` crate refuses
