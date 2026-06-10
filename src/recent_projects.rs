@@ -30,7 +30,18 @@ pub fn load() -> RecentProjects {
         Ok(d) => d,
         Err(_) => return RecentProjects::default(),
     };
-    serde_json::from_str(&data).unwrap_or_default()
+    match serde_json::from_str(&data) {
+        Ok(p) => p,
+        Err(e) => {
+            // A corrupt file silently became an empty list before; the next
+            // save then wiped the history. At least leave a trace.
+            log::warn!(
+                "Failed to parse {} ({}); starting with an empty list (history will be overwritten on next save)",
+                path.display(), e
+            );
+            RecentProjects::default()
+        }
+    }
 }
 
 fn save(projects: &RecentProjects) {

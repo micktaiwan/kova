@@ -42,7 +42,7 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 
 ## Logs
 
-`~/Library/Logs/Kova/kova.log` (level DEBUG par défaut, configurable via `RUST_LOG`).
+`~/Library/Logs/Kova/kova.log` (level INFO par défaut, configurable via `RUST_LOG`, ex. `RUST_LOG=debug`).
 
 ## Notes techniques
 
