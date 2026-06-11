@@ -4,7 +4,7 @@
 //! Each connection is one request → one response (newline-delimited JSON).
 //! All window/pane mutations are forwarded to the main thread via mpsc channel.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -231,25 +231,35 @@ fn handle_connection(
     // Set a read timeout so a misbehaving client doesn't block the thread forever
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
 
-    let reader = BufReader::new(&stream);
+    let mut reader = BufReader::new(&stream);
     let mut writer = &stream;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        // Bound each read so an unterminated line can't grow memory without
+        // limit — the length check must happen BEFORE the full line is buffered.
+        match std::io::Read::by_ref(&mut reader)
+            .take((MAX_LINE_LEN + 2) as u64)
+            .read_until(b'\n', &mut buf)
+        {
+            Ok(0) => break,
+            Ok(_) => {}
             Err(e) => {
                 log::debug!("IPC: read error: {}", e);
                 break;
             }
-        };
-
-        if line.len() > MAX_LINE_LEN {
+        }
+        while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+            buf.pop();
+        }
+        if buf.len() > MAX_LINE_LEN {
             let resp = IpcResponse::Error { message: "request too large".to_string() };
             let _ = writeln!(writer, "{}", resp.to_json());
             break;
         }
 
-        let line = line.trim().to_string();
+        let line = String::from_utf8_lossy(&buf).trim().to_string();
         if line.is_empty() {
             continue;
         }
