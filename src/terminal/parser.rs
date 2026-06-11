@@ -1005,4 +1005,74 @@ mod tests {
         // cursor was inside region (row idx 2); CUU 9 must stop at region top (idx 1)
         assert_eq!(cell(&t, 1, 0).c, 'X');
     }
+
+    /// Deterministic fuzz: pseudo-random byte streams (biased toward VT
+    /// introducers) plus mid-stream resizes must never panic, and the
+    /// terminal invariants must hold after every chunk.
+    #[test]
+    fn fuzz_parser_never_panics_and_invariants_hold() {
+        // LCG — fixed seed, fully reproducible.
+        let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |bound: u32| -> u32 {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng_state >> 33) as u32) % bound
+        };
+
+        // Bytes that exercise the parser state machine, mixed with raw noise.
+        const SPICE: &[&[u8]] = &[
+            b"\x1b[", b"\x1b]", b"\x1bP", b"\x1b(0", b"\x1b)B", b"\x07", b"\x1b\\",
+            b"\x1b[?", b"\x1b[>", b"\x1b[=", b";", b":", b"m", b"H", b"r", b"J", b"K",
+            b"L", b"M", b"@", b"P", b"S", b"T", b"b", b"c", b"g", b"h", b"l", b"n",
+            b"\x1b[99999999;99999999H", b"\x1b[38;2;999;999;999m", b"\x1b[38:5:300m",
+            b"\x1b[?1049h", b"\x1b[?1049l", b"\x1b[?2004h", b"\x1b[3J", b"\x1b[2J",
+            b"\x1b]8;;https://x\x07", b"\x1b]0;title\x07", b"\x1b]52;c;Zm9v\x07",
+            b"\xf0\x9f\x91\xa9", b"\xe2\x80\x8d", b"\xf0\x9f", b"\xcc\x81", b"\xff\xfe",
+            b"\r", b"\n", b"\t", b"\x08", b"\x0e", b"\x0f", b"\x1b7", b"\x1b8", b"\x1bM",
+            b"\x1b[0;1;4;7;38;5;42;48;2;1;2;3m", b"\x1b[10000000b", b"\x1b[1;1;1;1;1;1r",
+        ];
+
+        for round in 0..64u32 {
+            let cols = 2 + next(118) as u16;
+            let rows = 1 + next(49) as u16;
+            let term = Arc::new(RwLock::new(TerminalState::new(
+                cols, rows, 50, DEFAULT_FG, DEFAULT_BG,
+            )));
+            let devnull = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+            let writer: Arc<OwnedFd> = Arc::new(devnull.into());
+            let mut parser = vte::Parser::new();
+            let mut handler = VteHandler::new(term.clone(), writer);
+
+            for _chunk_idx in 0..8 {
+                let mut chunk: Vec<u8> = Vec::with_capacity(512);
+                for _ in 0..(64 + next(448)) {
+                    if next(3) == 0 {
+                        chunk.extend_from_slice(SPICE[next(SPICE.len() as u32) as usize]);
+                    } else {
+                        chunk.push(next(256) as u8);
+                    }
+                }
+                parser.advance(&mut handler, &chunk);
+                handler.apply_ops();
+
+                // Occasionally resize mid-stream (reflow path under fire)
+                if next(4) == 0 {
+                    let nc = 2 + next(118) as u16;
+                    let nr = 1 + next(49) as u16;
+                    term.write().resize(nc, nr);
+                }
+
+                let t = term.read();
+                assert!(t.cursor_x < t.cols, "round {}: cursor_x {} >= cols {}", round, t.cursor_x, t.cols);
+                assert!(t.cursor_y < t.rows, "round {}: cursor_y {} >= rows {}", round, t.cursor_y, t.rows);
+                assert_eq!(t.grid.len(), t.rows as usize, "round {}: grid height drifted", round);
+                for (i, row) in t.grid.iter().enumerate() {
+                    assert_eq!(row.cells.len(), t.cols as usize, "round {}: grid row {} width drifted", round, i);
+                }
+                assert!(t.scroll_offset >= 0 && t.scroll_offset as usize <= t.scrollback.len(),
+                    "round {}: scroll_offset {} out of [0, {}]", round, t.scroll_offset, t.scrollback.len());
+            }
+        }
+    }
 }
