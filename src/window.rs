@@ -933,6 +933,13 @@ define_class!(
                             let active_tab_idx = ivars.active_tab.get();
                             log::debug!("SCROLL-EVENT tab={} pane={} term_id={} lines={} offset_before={}",
                                 active_tab_idx, pane.id, term.terminal_id, lines, term.scroll_offset());
+                            // One info line per scroll session (offset 0 → >0), to pair
+                            // tab/pane with the SCROLL-START line for the cross-tab
+                            // scrollback bug — without needing RUST_LOG=debug.
+                            if term.scroll_offset() == 0 && lines > 0 {
+                                log::info!("SCROLL-BEGIN tab={} pane={} term_id={}",
+                                    active_tab_idx, pane.id, term.terminal_id);
+                            }
                             term.scroll(lines);
                             // Reset accumulator when hitting bounds to avoid residual drift
                             let at_bound = term.scroll_offset() == 0
