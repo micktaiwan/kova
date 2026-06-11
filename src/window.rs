@@ -990,6 +990,9 @@ define_class!(
             // Cmd+Click opens URL
             let modifiers = event.modifierFlags();
             if modifiers.contains(NSEventModifierFlags::Command) {
+                // Re-validate: the cached hover may be stale if output arrived
+                // since the last mouse move (content shifted under the cursor).
+                self.update_hovered_url(event);
                 if let Some(url) = self.ivars().hovered_url.borrow().as_ref().map(|h| h.2.clone()) {
                     let _ = std::process::Command::new("open").arg(&url).spawn();
                     return;
