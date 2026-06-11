@@ -403,14 +403,23 @@ impl VteHandler {
                     }
                     TermOp::CommandStarted => {
                         log::debug!("OSC 133;C command started (terminal {})", term.terminal_id);
+                        term.osc133_primed = true;
                         term.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
                         term.command_running.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     TermOp::SetCommandCompleted => {
                         log::debug!("OSC 133;D command completed (terminal {})", term.terminal_id);
-                        term.command_completed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // The first D with no prior C is the shell's startup
+                        // precmd — swallow it (no command actually completed).
+                        // Later D-without-C (e.g. Claude Code's Stop hook)
+                        // must still fire: the startup D already primed us.
+                        if term.osc133_primed {
+                            term.command_completed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            term.osc133_primed = true;
+                        }
                         term.command_running.store(false, std::sync::atomic::Ordering::Relaxed);
-                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     TermOp::KittyKeyboardPush(flags) => {
                         term.kitty_keyboard_flags.push(flags);
@@ -988,6 +997,24 @@ mod tests {
         // no new data) — the held fragment must flush, not vanish forever.
         let t = drive(20, 5, &["A\u{200d}".as_bytes(), b""]);
         assert_eq!(cell(&t, 0, 0).c, 'A', "held grapheme must flush after one chunk of grace");
+    }
+
+    #[test]
+    fn first_osc133_d_without_c_is_swallowed() {
+        // Shell startup precmd emits a lone 133;D before any command —
+        // it must not light the completion indicator.
+        let t = drive(20, 5, &[b"\x1b]133;D\x07"]);
+        assert!(!t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
+        // A later D without C (Claude Code Stop hook) must fire.
+        let t = drive(20, 5, &[b"\x1b]133;D\x07", b"\x1b]133;D\x07"]);
+        assert!(t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn osc133_c_then_d_sets_completed() {
+        let t = drive(20, 5, &[b"\x1b]133;C\x07\x1b]133;D\x07"]);
+        assert!(t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!t.read().command_running.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]

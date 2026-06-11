@@ -226,13 +226,15 @@ impl Tab {
         "shell".to_string()
     }
 
-    /// Drain bell flags from panes and accumulate into tab-level flag.
+    /// Accumulate pane bell flags into the tab-level flag. The per-pane flag
+    /// is NOT consumed here — it stays set until the pane gets focus (cleared
+    /// in the render loop) so the pane-level dot survives across frames.
     /// Returns true if this tab needs attention.
     pub fn check_bell(&mut self) -> bool {
         let mut any_bell = false;
         for col in &self.columns {
             col.for_each_pane(&mut |pane| {
-                if pane.terminal.read().bell.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                if pane.terminal.read().bell.load(std::sync::atomic::Ordering::Relaxed) {
                     any_bell = true;
                 }
             });
