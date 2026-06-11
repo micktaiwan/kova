@@ -366,6 +366,10 @@ impl TerminalState {
                 } else if self.hyperlinks.len() < u16::MAX as usize {
                     self.current_hyperlink = self.hyperlinks.len() as u16;
                     self.hyperlinks.push(u);
+                } else {
+                    // Table full — degrade to "no link" rather than silently
+                    // attaching the previous link's URL to this text.
+                    self.current_hyperlink = 0;
                 }
             }
         }
@@ -911,6 +915,16 @@ impl TerminalState {
         if self.scrollback.len() > self.scrollback_limit {
             // Buffer full: 1 in, 1 out — net zero, viewport stays put.
             self.scrollback.pop_front();
+            // All absolute line indices shift up by one — move the selection
+            // with its content, or drop it once it reaches the trimmed edge.
+            if let Some(sel) = &mut self.selection {
+                if sel.anchor.line == 0 || sel.end.line == 0 {
+                    self.selection = None;
+                } else {
+                    sel.anchor.line -= 1;
+                    sel.end.line -= 1;
+                }
+            }
         } else if self.scroll_offset > 0 {
             // Buffer still growing: shift viewport to keep the same content visible.
             self.scroll_offset += 1;
@@ -982,13 +996,13 @@ impl TerminalState {
                 }
                 38 => {
                     if i + 2 < params.len() && params[i + 1] == 5 {
-                        self.current_fg = AnsiColor::from_256(params[i + 2] as u8);
+                        self.current_fg = AnsiColor::from_256(params[i + 2].min(255) as u8);
                         i += 2;
                     } else if i + 4 < params.len() && params[i + 1] == 2 {
                         self.current_fg = [
-                            params[i + 2] as u8,
-                            params[i + 3] as u8,
-                            params[i + 4] as u8,
+                            params[i + 2].min(255) as u8,
+                            params[i + 3].min(255) as u8,
+                            params[i + 4].min(255) as u8,
                         ];
                         i += 4;
                     }
@@ -999,13 +1013,13 @@ impl TerminalState {
                 }
                 48 => {
                     if i + 2 < params.len() && params[i + 1] == 5 {
-                        self.current_bg = AnsiColor::from_256(params[i + 2] as u8);
+                        self.current_bg = AnsiColor::from_256(params[i + 2].min(255) as u8);
                         i += 2;
                     } else if i + 4 < params.len() && params[i + 1] == 2 {
                         self.current_bg = [
-                            params[i + 2] as u8,
-                            params[i + 3] as u8,
-                            params[i + 4] as u8,
+                            params[i + 2].min(255) as u8,
+                            params[i + 3].min(255) as u8,
+                            params[i + 4].min(255) as u8,
                         ];
                         i += 4;
                     }
@@ -1069,6 +1083,7 @@ impl TerminalState {
                 // 2J left stale UI snapshots in the scrollback forever.
                 self.scrollback.clear();
                 self.reset_scroll();
+                self.selection = None;
             }
             2 => {
                 // Erase entire display — push current content to scrollback first
@@ -1103,6 +1118,7 @@ impl TerminalState {
         self.dirty.store(true, Ordering::Relaxed);
         self.scrollback.clear();
         self.reset_scroll();
+        self.selection = None;
         for row in &mut self.grid {
             for cell in row.cells.iter_mut() {
                 *cell = self.blank.clone();
@@ -1392,6 +1408,7 @@ impl TerminalState {
         self.cursor_y = 0;
         self.pending_wrap = false;
         self.reset_scroll();
+        self.selection = None;
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -1410,6 +1427,7 @@ impl TerminalState {
         }
         self.pending_wrap = false;
         self.reset_scroll();
+        self.selection = None;
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -1469,6 +1487,9 @@ impl TerminalState {
         if new_cols == self.cols && new_rows == self.rows {
             return;
         }
+        // Reflow rebuilds the scrollback/grid — absolute line indices held by
+        // the selection no longer point at the same content.
+        self.selection = None;
 
         let old_cols = self.cols;
         self.cols = new_cols;
@@ -2095,18 +2116,29 @@ impl TerminalState {
         let mut results = Vec::new();
         let sb_len = self.scrollback.len();
 
+        let row_text = |row: &Row| -> String {
+            row.cells.iter().map(|c| {
+                if let Some(ref cluster) = c.cluster {
+                    cluster.to_string()
+                } else if c.c == '\0' {
+                    String::new()
+                } else {
+                    c.c.to_string()
+                }
+            }).collect::<String>().trim_end().to_string()
+        };
+
         // Search scrollback
         for (i, row) in self.scrollback.iter().enumerate() {
-            let text: String = row.cells.iter().map(|c| c.c).collect::<String>().trim_end().to_string();
+            let text = row_text(row);
             if text.to_lowercase().contains(&query_lower) {
                 results.push(FilterMatch { abs_line: i, text });
             }
         }
 
-
         // Search grid
         for (i, row) in self.grid.iter().enumerate() {
-            let text: String = row.cells.iter().map(|c| c.c).collect::<String>().trim_end().to_string();
+            let text = row_text(row);
             if text.to_lowercase().contains(&query_lower) {
                 results.push(FilterMatch { abs_line: sb_len + i, text });
             }
@@ -2236,10 +2268,15 @@ impl TerminalState {
             let start = i;
             let mut end = start + prefix_len;
 
-            // Extend to end of URL (stop at whitespace, common delimiters, or null/space)
+            // Extend to end of URL (stop at whitespace or common delimiters)
             while end < len {
                 let ch = chars[end];
-                if ch <= ' ' || ch == '"' || ch == '\'' || ch == '<' || ch == '>' || ch == '`' || ch == '\0' {
+                if ch == '\0' {
+                    // Wide-char continuation cell — belongs to the previous char
+                    end += 1;
+                    continue;
+                }
+                if ch <= ' ' || ch == '"' || ch == '\'' || ch == '<' || ch == '>' || ch == '`' {
                     break;
                 }
                 end += 1;
@@ -2255,7 +2292,7 @@ impl TerminalState {
             }
 
             if logical_col >= start && logical_col < end && end > start {
-                let url: String = chars[start..end].iter().collect();
+                let url: String = chars[start..end].iter().filter(|&&c| c != '\0').collect();
 
                 // Build per-row highlight segments
                 let mut segments = Vec::new();
@@ -2777,6 +2814,62 @@ mod tests {
         assert_eq!(row_text(&t, 2), "L3");
         assert_eq!(row_text(&t, 3), "", "scrolled-in blank row");
         assert_eq!(row_text(&t, 4), "L4", "below region untouched");
+    }
+
+    // --- Regression: text extraction across wide chars / clusters ---
+
+    #[test]
+    fn search_finds_text_with_wide_chars() {
+        let mut t = term(20, 5);
+        put_str(&mut t, "前 hello");
+        let res = t.search_lines("前 hello");
+        assert_eq!(res.len(), 1, "wide-char continuation cells must not break matching");
+        assert_eq!(res[0].text, "前 hello");
+    }
+
+    #[test]
+    fn url_detection_spans_wide_chars() {
+        let mut t = term(30, 5);
+        put_str(&mut t, "https://例.jp next");
+        let (_, url) = t.url_at(0, 2).expect("URL with a wide char must be detected");
+        assert_eq!(url, "https://例.jp", "URL must not be cut at the wide char");
+    }
+
+    #[test]
+    fn selection_follows_content_when_scrollback_trims() {
+        let mut t = TerminalState::new(10, 3, 5, FG, BG); // scrollback limit 5
+        for i in 0..8 {
+            put_str(&mut t, &format!("L{}", i));
+            t.newline();
+            t.carriage_return();
+        }
+        // Scrollback is full (5 rows). Select the line containing "L4".
+        let (line, _) = (0..t.scrollback.len() + t.grid.len())
+            .find_map(|i| {
+                let row = t.row_at(i)?;
+                let text: String = row.cells.iter().map(|c| c.c).collect();
+                text.starts_with("L4").then_some((i, ()))
+            })
+            .expect("L4 must exist");
+        t.selection = Some(Selection {
+            anchor: GridPos { line, col: 0 },
+            end: GridPos { line, col: 1 },
+            mode: SelectionMode::Normal,
+        });
+        assert_eq!(t.selected_text(), "L4");
+        // One more line scrolls in → scrollback pops the oldest row.
+        put_str(&mut t, "L8");
+        t.newline();
+        assert_eq!(t.selected_text(), "L4", "selection must follow its content after trim");
+    }
+
+    #[test]
+    fn sgr_clamps_out_of_range_color_params() {
+        let mut t = term(10, 5);
+        t.set_sgr(&[38, 2, 300, 50, 100]);
+        assert_eq!(t.current_fg, [255, 50, 100], "RGB params >255 must clamp, not truncate");
+        t.set_sgr(&[48, 2, 10, 999, 20]);
+        assert_eq!(t.current_bg, [10, 255, 20]);
     }
 
 }
