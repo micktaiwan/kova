@@ -544,8 +544,12 @@ pub fn count_panes_in_saved_tab(tab: &SavedTab) -> usize {
 pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config) -> Option<Tab> {
     let (columns, column_weights, custom_weights, pane_ids) = if let Some(ref flat_cols) = saved.flat_columns {
         // New flat format (v4)
-        let weights = saved.column_weights.clone().unwrap_or_else(|| vec![1.0; flat_cols.len()]);
-        let cweights = saved.custom_weights.clone().unwrap_or_else(|| vec![false; flat_cols.len()]);
+        let weights = saved.column_weights.clone()
+            .filter(|v| v.len() == flat_cols.len())
+            .unwrap_or_else(|| vec![1.0; flat_cols.len()]);
+        let cweights = saved.custom_weights.clone()
+            .filter(|v| v.len() == flat_cols.len())
+            .unwrap_or_else(|| vec![false; flat_cols.len()]);
         let mut all_ids = Vec::new();
         let mut cols_vec = Vec::new();
         for fc in flat_cols {
@@ -556,8 +560,12 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         (cols_vec, weights, cweights, all_ids)
     } else if let Some(ref saved_cols) = saved.columns {
         // Legacy format (v3) — flatten SavedColumn trees into flat Columns
-        let weights = saved.column_weights.clone().unwrap_or_else(|| vec![1.0; saved_cols.len()]);
-        let cweights = saved.custom_weights.clone().unwrap_or_else(|| vec![false; saved_cols.len()]);
+        let weights = saved.column_weights.clone()
+            .filter(|v| v.len() == saved_cols.len())
+            .unwrap_or_else(|| vec![1.0; saved_cols.len()]);
+        let cweights = saved.custom_weights.clone()
+            .filter(|v| v.len() == saved_cols.len())
+            .unwrap_or_else(|| vec![false; saved_cols.len()]);
         let mut all_ids = Vec::new();
         let mut cols_vec = Vec::new();
         for sc in saved_cols {
