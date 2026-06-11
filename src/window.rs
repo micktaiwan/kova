@@ -4918,9 +4918,15 @@ impl KovaView {
             tab.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
                 let is_focused = pane.id == focused_id;
                 let term = pane.terminal.read();
+                // The focused pane is "seen": acknowledge its bell every frame
+                // so it doesn't reappear stale once focus moves away. Do NOT
+                // touch command_completed here — the IPC wait-for-completion
+                // contract needs it sticky until the next OSC 133;C.
+                if is_focused {
+                    term.bell.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
                 let completed = !is_focused
                     && term.command_completed.load(std::sync::atomic::Ordering::Relaxed);
-                // Read bell without consuming — check_bell will drain it for tab-level
                 let has_bell = !is_focused
                     && term.bell.load(std::sync::atomic::Ordering::Relaxed);
                 drop(term);

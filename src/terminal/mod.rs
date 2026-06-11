@@ -246,6 +246,10 @@ pub struct TerminalState {
     pub command_completed: AtomicBool,
     // Command running (between OSC 133;C and 133;D) — tab running indicator
     pub command_running: AtomicBool,
+    // The first OSC 133;D after spawn comes from the shell's startup precmd
+    // (no command ran yet) and must not light the completion indicator.
+    // Set on the first 133;C or 133;D seen.
+    pub osc133_primed: bool,
     // Last command executed (set via OSC 7777 from shell integration)
     pub last_command: Option<String>,
     // Mouse reporting modes
@@ -335,6 +339,7 @@ impl TerminalState {
             bell: AtomicBool::new(false),
             command_completed: AtomicBool::new(false),
             command_running: AtomicBool::new(false),
+            osc133_primed: false,
             last_command: None,
             last_printed: None,
             g0_dec_graphics: false,
