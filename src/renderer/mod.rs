@@ -1951,6 +1951,7 @@ impl Renderer {
                 ("Equalize", &keys_config.equalize),
                 ("Repaint Pane", &keys_config.repaint_pane),
                 ("Kill Window", &keys_config.kill_window),
+                ("Memory Report", "cmd+shift+i"),
                 ("Help", &keys_config.toggle_help),
             ];
             self.cached_help_shortcuts = raw.into_iter()
