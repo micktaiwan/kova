@@ -101,7 +101,7 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 }
 ```
 
-`id` is the stable tab ID (use for `close-tab` / `merge-tab` / `set-tab-title`); `tab_index` is the positional index in its window's tab bar (changes when tabs are reordered/closed). `active: true` only on the tab of the key window.
+`id` is the stable tab ID (use for `close-tab` / `merge-tab`; note `set-tab-title` is addressed by `pane_id`, not tab ID); `tab_index` is the positional index in its window's tab bar (changes when tabs are reordered/closed). `active: true` only on the tab of the key window.
 
 ---
 
