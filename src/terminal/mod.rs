@@ -2877,4 +2877,122 @@ mod tests {
         assert_eq!(t.current_bg, [10, 255, 20]);
     }
 
+    // --- Cmd+R rows-nudge round-trip (probe) ---
+    fn sb_dump(t: &TerminalState) -> Vec<String> {
+        (0..t.scrollback_len()).map(|i| {
+            t.scrollback[i].cells.iter().filter(|c| c.c != '\0').map(|c| c.c).collect::<String>().trim_end().to_string()
+        }).collect()
+    }
+
+    #[test]
+    fn probe_scroll_region_top0_pushes_blank_to_scrollback() {
+        // Layout like Claude Code: content area = region [0..2], footer rows 3,4.
+        let mut t = term(10, 5);
+        for i in 0..5u16 { t.set_cursor_pos(i, 0); put_str(&mut t, &format!("R{}", i)); }
+        // Set scroll region top=0 bottom=2 (content scrolls above a fixed footer)
+        t.set_scroll_region(0, 2);
+        // Reverse-index at top of region: inserts a BLANK at grid[0]
+        t.set_cursor_pos(0, 0);
+        t.reverse_index();
+        eprintln!("AFTER RI grid: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+        // Now drop the region back to full screen (TUI exits its region)
+        t.set_scroll_region(0, 4);
+        // Normal output scrolls the screen; the blank at grid[0] gets pushed to scrollback
+        t.set_cursor_pos(4, 0);
+        for _ in 0..3 { t.newline(); }
+        eprintln!("scrollback: {:?}", sb_dump(&t));
+        eprintln!("grid: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn probe_ri_full_screen_no_region() {
+        let mut t = term(10, 5);
+        for i in 0..10u16 { put_str(&mut t, &format!("A{}", i)); t.newline(); t.set_cursor_pos(t.cursor_y, 0); }
+        // No DECSTBM. Reverse Index at top of full screen (ESC M when cursor at row 0).
+        t.set_cursor_pos(0, 0);
+        t.reverse_index(); // scroll_down(1): blank at grid[0]
+        eprintln!("grid after RI: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+        t.set_cursor_pos(4, 0);
+        for _ in 0..3 { t.newline(); }
+        eprintln!("sb after scroll: {:?}", sb_dump(&t));
+    }
+
+    #[test]
+    fn probe_blank_lands_mid_scrollback() {
+        let mut t = term(10, 5);
+        // Fill scrollback with real content A0..A5 via scrolling.
+        for i in 0..10u16 { put_str(&mut t, &format!("A{}", i)); t.newline(); t.set_cursor_pos(t.cursor_y, 0); }
+        eprintln!("sb after fill: {:?}", sb_dump(&t));
+        eprintln!("grid: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+        // A TUI sets a region with top=0 and reverse-indexes (inserts blank at grid[0]).
+        t.set_scroll_region(0, 2);
+        t.set_cursor_pos(0, 0);
+        t.reverse_index();
+        // TUI exits region, normal flow resumes, blank scrolls into scrollback.
+        t.set_scroll_region(0, 4);
+        t.set_cursor_pos(4, 0);
+        for _ in 0..4 { t.newline(); }
+        eprintln!("sb after blank scrolls in: {:?}", sb_dump(&t));
+    }
+
+    #[test]
+    fn probe_il_dl_in_region() {
+        let mut t = term(10, 5);
+        for i in 0..5u16 { t.set_cursor_pos(i, 0); put_str(&mut t, &format!("R{}", i)); }
+        t.set_scroll_region(0, 3); // region 0..3, footer row 4
+        t.set_cursor_pos(1, 0);
+        t.insert_lines(1);
+        eprintln!("after IL@1: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+        t.set_cursor_pos(1, 0);
+        t.delete_lines(1);
+        eprintln!("after DL@1: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn probe_rows_nudge_roundtrip_full_screen() {
+        // Full screen of content, cursor on the last (prompt) row.
+        let mut t = term(10, 5);
+        for i in 0..5u16 {
+            t.set_cursor_pos(i, 0);
+            put_str(&mut t, &format!("L{}", i));
+        }
+        t.set_cursor_pos(4, 2); // cursor on bottom prompt row
+        let before: Vec<String> = (0..5).map(|r| row_text(&t, r)).collect();
+        let sb_before = t.scrollback_len();
+        // Nudge R -> R-1 -> R (what the window tick does on a real resize).
+        t.resize(10, 4);
+        t.resize(10, 5);
+        let after: Vec<String> = (0..5).map(|r| row_text(&t, r)).collect();
+        eprintln!("BEFORE {:?} sb={}", before, sb_before);
+        eprintln!("AFTER  {:?} sb={}", after, t.scrollback_len());
+        eprintln!("SCROLLBACK {:?}", (0..t.scrollback_len()).map(|i| {
+            t.scrollback[i].cells.iter().filter(|c| c.c != '\0').map(|c| c.c).collect::<String>().trim_end().to_string()
+        }).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn probe_rows_nudge_roundtrip_with_scrollback_and_blank_bottom() {
+        // Content already in scrollback, blank bottom row on screen.
+        let mut t = term(10, 5);
+        for i in 0..12u16 {
+            put_str(&mut t, &format!("L{}", i));
+            t.newline();
+        }
+        // Now scrollback has older lines; grid bottom row is the blank line after L11.
+        let before: Vec<String> = (0..5).map(|r| row_text(&t, r)).collect();
+        let sb_before: Vec<String> = (0..t.scrollback_len()).map(|i| {
+            t.scrollback[i].cells.iter().filter(|c| c.c != '\0').map(|c| c.c).collect::<String>().trim_end().to_string()
+        }).collect();
+        t.resize(10, 4);
+        t.resize(10, 5);
+        let after: Vec<String> = (0..5).map(|r| row_text(&t, r)).collect();
+        let sb_after: Vec<String> = (0..t.scrollback_len()).map(|i| {
+            t.scrollback[i].cells.iter().filter(|c| c.c != '\0').map(|c| c.c).collect::<String>().trim_end().to_string()
+        }).collect();
+        eprintln!("GRID BEFORE {:?}", before);
+        eprintln!("GRID AFTER  {:?}", after);
+        eprintln!("SB BEFORE {:?}", sb_before);
+        eprintln!("SB AFTER  {:?}", sb_after);
+    }
+
 }
