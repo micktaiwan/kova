@@ -73,3 +73,93 @@ côté terminal persiste indéfiniment.
   dernier pilote le vrai parser vte avec des bytes bruts, chunks séparés).
 - Les repros des bugs de reflow sont encodés en tests — toute régression du
   chunking ou de la relocalisation du curseur casse la suite.
+
+---
+
+# Round 2 — « le trou revient » (juin 2026) : c'est l'alt-screen, PAS le scrollback
+
+Symptôme rapporté (2026-06-17, Mickael, sur Kova **v1.8.0**) : bande blanche
+(« trou ») au milieu du texte dans une pane Claude Code. Cmd+R répare. En
+re-scrollant (haut puis bas), le **même** trou réapparaît au même endroit.
+
+## Méthode
+
+Revue de code multi-agents (7 reviewers + vérification adversariale) PUIS
+vérité-terrain par dump IPC (`get-pane-content`) des panes Claude Code en
+live. **La vérité-terrain a invalidé une partie des conclusions de la revue.**
+
+## Faits établis (VÉRIFIÉS)
+
+1. **Claude Code tourne en écran alterné.** `count-pane-content mode=scrollback`
+   renvoie **0 octet** sur les 6 panes Claude testées (98, 100, 113, 135, 182,
+   194). Donc : aucun scrollback Kova, `scroll_offset` reste 0, `visible_lines()`
+   == la grille, et `y_offset_rows()` renvoie 0 (early-return alt-screen,
+   `mod.rs:2330`). → Tout le pan « scrollback » des analyses précédentes
+   (push_to_scrollback, stitch visible_lines+offset, gravité) est **hors-sujet**
+   pour ce bug.
+
+2. **Le trou est une bande de N rangées vides dans la grille alt.** Dump de la
+   pane 194 (rows=65, cols=85, curseur {row:60,col:2}) au moment du trou :
+   lignes **33–41 vides (9 rangées consécutives)**, juste après un bloc
+   `⏺ Update(~/.claude/skills/emails-filter/SKILL.md)` contenant des **lignes
+   soft-wrappées** (continuations aux lignes 22-23, 25-26, 27-28), et juste avant
+   `⏺ Capitalisé …`. Snapshot : `/tmp/kova_hole_194.json`.
+
+3. **Mécanisme du scroll.** Claude active le mouse reporting SGR (mode ≥1000 +
+   1006). Au scroll, Kova forward des événements molette (`button 64/65`) au PTY
+   (`window.rs:919-930`) ; Claude redessine sa grille alt **en différentiel**.
+   Kova parse ce redraw. Le trou = cellules que Kova ne met pas à jour pendant ce
+   redraw.
+
+4. **Cmd+R = RepaintPane** (`window.rs:1582`) : `soft_reset` (réinit région de
+   scroll/SGR/curseur, `mod.rs:1470`) + nudge winsize rows±1 → double SIGWINCH →
+   Claude repeint TOUT → répare la grille. Le trou revient au scroll suivant car
+   le repaint différentiel re-déclenche le bug.
+
+## Innocenté (revue + lecture du HEAD actuel)
+
+- **Renderer / cache de vertices** : reconstruit depuis la grille à chaque frame
+  dirty ; `reuse_cached` borné à la fenêtre sync DEC 2026 (≤150 ms) + viewport
+  (`renderer/mod.rs:443-453`, `605-623`). (Corriger la note Round 1 : il n'y a
+  PAS de « rebuild forcé toutes les 2 s ».)
+- **Gravité `y_offset_rows`** : renvoie 0 en alt-screen (`mod.rs:2330`).
+- **Bleed cross-tab** : `pane_id` globalement uniques, cache scopé au tab actif.
+- **Flag `wrapped` / reflow** : le renderer ne consulte jamais `wrapped` au
+  dessin ; reflow ne tourne que sur changement de colonnes (jamais via Cmd+R).
+- **`reverse_index` (1930), `scroll_down` (961), `scroll_up` (939), IL (1281) /
+  DL (1307), `set_scroll_region` (1376)** : conformes VT, pas d'off-by-one à la
+  lecture.
+
+## Pas encore élucidé (la CAUSE)
+
+La séquence VT exacte que Kova rate pendant le repaint différentiel de scroll.
+Forte présomption : **désync de hauteur** entre ce que Claude croit avoir écrit
+et ce que Kova place, autour d'un bloc soft-wrappé → piste **wrap / wide-char /
+largeur**, ou une séquence région+repaint. Non prouvable par lecture seule
+(une autre session a fini par ajouter des sondes `probe_*` **non-commitées** dans
+`mod.rs`, sur une hypothèse « scrollback » que la vérité-terrain écarte).
+
+## Déjà corrigé ? NON (VÉRIFIÉ)
+
+- Process Kova qui tourne : démarré **2026-06-11 07:18** → binaire = **v1.8.0**
+  (`afd6e9a`), aucun commit entre v1.8.0 et 07:18.
+- Seul commit terminal post-v1.8.0 : `48625d1` (search/URL wide-char, clamp SGR,
+  invalidation sélection, cap OSC8) — **ne touche pas** scroll/RI/région/wrap.
+- → Le bug est présent dans le HEAD actuel (`0e30761`) aussi : un rebuild ne le
+  corrige pas.
+
+## Reprise (plan)
+
+1. Capturer le flux PTY d'un repro : `script -q /tmp/kova_cap.raw claude` dans une
+   pane neuve, générer des blocs hauts, scroller pour faire apparaître le trou.
+2. Rejouer le fichier via le harness `drive(cols, rows, chunks)` (`parser.rs:913`)
+   à 85×65 (ou dims réelles), reproduire la bande hors de Kova.
+3. Bissecter le flux jusqu'à la séquence fautive ; chunker à la taille de lecture
+   PTY si le bug dépend des frontières de chunk.
+4. Test de régression (`parser.rs`) + fix.
+- Alternative si non reproductible en session neuve : hook de capture des bytes
+  bruts dans `pty.rs` (gated par env var), build via `build.sh`, lancé en 2ᵉ
+  instance pour ne pas tuer les sessions en cours.
+
+Snapshots de cette session : `/tmp/kova_hole_194.json` (grille avec trou),
+`/tmp/kova_dump_194_visible.json`, `/tmp/kova_dump_194_all.json`.
