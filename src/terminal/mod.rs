@@ -2347,8 +2347,20 @@ impl TerminalState {
         // line) addresses the screen absolutely — shifting its content down
         // would desync the display from the app's model and leave a large
         // blank band where the app drew rows.
-        if (self.cursor_y as usize) + 1 < last_used {
-            return 0;
+        //
+        // Exception: content below the cursor that is the soft-wrapped tail of
+        // the cursor's OWN logical line (a prompt + input + zsh-autosuggestions
+        // suggestion that overflowed a narrow pane) is still shell flow — the
+        // gravity must stay on. Such rows form an unbroken `wrapped` chain from
+        // the cursor down to last_used-1; a break in that chain means the rows
+        // are independent (a real absolute-positioned TUI), so we bail out.
+        let cy = self.cursor_y as usize;
+        if cy + 1 < last_used {
+            let unbroken_wrap_chain = (cy..last_used.saturating_sub(1))
+                .all(|r| self.grid.get(r).map_or(false, |row| row.wrapped));
+            if !unbroken_wrap_chain {
+                return 0;
+            }
         }
         if last_used < self.rows as usize {
             self.rows as usize - last_used
@@ -2574,6 +2586,23 @@ mod tests {
         }
         t.set_cursor_pos(1, 1);
         assert_eq!(t.y_offset_rows(), 0, "absolute-positioned TUI must not be shifted");
+    }
+
+    #[test]
+    fn gravity_active_when_wrapped_suggestion_below_cursor() {
+        // Narrow pane: prompt + input fills row 0 and overflows, so the tail
+        // (a zsh-autosuggestions suggestion) autowraps onto row 1; row 0 is
+        // marked `wrapped`. zsh then restores the cursor to the input position
+        // on row 0. The wrapped tail below the cursor must NOT disable gravity.
+        let mut t = term(6, 10);
+        put_str(&mut t, "ab cde"); // fills row 0 (6 cols) -> pending_wrap
+        put_str(&mut t, "fg"); // wraps: row 0 marked wrapped, tail "fg" on row 1
+        assert!(t.grid[0].wrapped, "row 0 must be a wrapped continuation");
+        t.set_cursor_pos(0, 2); // cursor restored to input position on row 0
+        assert!(
+            t.y_offset_rows() > 0,
+            "wrapped suggestion below the cursor must NOT disable bottom-gravity"
+        );
     }
 
     #[test]
