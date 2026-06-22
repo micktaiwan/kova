@@ -62,6 +62,7 @@ pub enum Action {
     CloseTab,
     OpenRecentProject,
     OpenSearchPalette,
+    OpenPaneSwitcher,
     Equalize,
     RepaintPane,
 }
@@ -254,6 +255,7 @@ impl Keybindings {
         bind(&keys.close_tab, Action::CloseTab);
         bind(&keys.open_recent_project, Action::OpenRecentProject);
         bind(&keys.open_search, Action::OpenSearchPalette);
+        bind(&keys.open_pane_switcher, Action::OpenPaneSwitcher);
         bind(&keys.equalize, Action::Equalize);
         bind(&keys.repaint_pane, Action::RepaintPane);
 

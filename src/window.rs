@@ -111,6 +111,8 @@ pub struct KovaViewIvars {
     boundary_flash: Cell<Option<BoundaryFlash>>,
     /// Search palette overlay state (Cmd+Shift+F — global search across all panes).
     search_palette: RefCell<Option<SearchPaletteState>>,
+    /// Tab/pane switcher overlay state (Cmd+Shift+P — list tabs & panes, click to focus).
+    pane_switcher: RefCell<Option<PaneSwitcherState>>,
     /// Highlight a pane after a search-palette jump (decremented per tick).
     pane_flash: Cell<Option<PaneFlash>>,
     /// Deferred PTY winsize restore after a Cmd+R nudge (decremented per tick).
@@ -272,6 +274,28 @@ struct MergeTabState {
 struct SendToWindowState {
     entries: Vec<SendToWindowEntry>,
     selected: usize,
+}
+
+/// One row of the tab/pane switcher overlay.
+enum SwitcherRow {
+    /// A tab name — not selectable.
+    TabHeader(String),
+    /// A pane entry — selectable, focuses the pane on Enter/click.
+    Pane { pane_id: PaneId, title: String, is_current: bool },
+}
+
+impl SwitcherRow {
+    fn is_pane(&self) -> bool {
+        matches!(self, SwitcherRow::Pane { .. })
+    }
+}
+
+struct PaneSwitcherState {
+    rows: Vec<SwitcherRow>,
+    /// Index into `rows`; always points at a `Pane` row (or 0 if none exist).
+    selected: usize,
+    /// First visible row (vertical scroll offset).
+    scroll: usize,
 }
 
 /// Outcome of `KovaView::ipc_close_tab`. Lets the caller distinguish "not in this window"
@@ -476,6 +500,12 @@ define_class!(
                 return;
             }
 
+            // Pane switcher overlay handles its own keys
+            if self.ivars().pane_switcher.borrow().is_some() {
+                self.handle_pane_switcher_key(event);
+                return;
+            }
+
             // Escape closes help/mem report overlays
             if event.keyCode() == 0x35 {
                 if self.ivars().show_help.get() {
@@ -598,6 +628,13 @@ define_class!(
                 return objc2::runtime::Bool::YES;
             }
 
+            // When the pane switcher is open, route keys through its handler so
+            // shortcuts don't fall through to the global map.
+            if self.ivars().pane_switcher.borrow().is_some() {
+                self.handle_pane_switcher_key(event);
+                return objc2::runtime::Bool::YES;
+            }
+
             // When help overlay is shown, close it first then let the action through
             if self.ivars().show_help.get() {
                 self.ivars().show_help.set(false);
@@ -685,6 +722,7 @@ define_class!(
                     Action::CloseTab => self.do_close_tab(),
                     Action::OpenRecentProject => self.do_open_recent_projects(),
                     Action::OpenSearchPalette => self.do_open_search_palette(),
+                    Action::OpenPaneSwitcher => self.do_open_pane_switcher(),
                     Action::Equalize => {
                         let mut tabs = self.ivars().tabs.borrow_mut();
                         let idx = self.ivars().active_tab.get();
@@ -980,6 +1018,12 @@ define_class!(
             // Check filter click
             if self.ivars().filter.borrow().is_some() {
                 self.handle_filter_click(px, py);
+                return;
+            }
+
+            // Pane switcher overlay click → focus the clicked pane
+            if self.ivars().pane_switcher.borrow().is_some() {
+                self.handle_pane_switcher_click(px, py);
                 return;
             }
 
@@ -1451,6 +1495,7 @@ impl KovaView {
             boundary_hit: Cell::new(None),
             boundary_flash: Cell::new(None),
             search_palette: RefCell::new(None),
+            pane_switcher: RefCell::new(None),
             pane_flash: Cell::new(None),
             pty_restore: RefCell::new(Vec::new()),
             recent_resizes: RefCell::new(std::collections::HashMap::new()),
@@ -3146,6 +3191,152 @@ impl KovaView {
                 }
                 _ => {}
             }
+        }
+        self.mark_dirty();
+    }
+
+    /// Open the tab/pane switcher overlay: every tab with its panes, click or
+    /// Enter to focus. Selection starts on the currently-focused pane.
+    fn do_open_pane_switcher(&self) {
+        let mut rows: Vec<SwitcherRow> = Vec::new();
+        let mut selected = 0usize;
+        {
+            let tabs = self.ivars().tabs.borrow();
+            let active = self.ivars().active_tab.get();
+            for (ti, tab) in tabs.iter().enumerate() {
+                rows.push(SwitcherRow::TabHeader(format!("{}  {}", ti + 1, tab.title())));
+                let focused_pane = tab.focused_pane;
+                tab.for_each_pane(&mut |pane| {
+                    let is_current = ti == active && pane.id == focused_pane;
+                    if is_current {
+                        selected = rows.len();
+                    }
+                    rows.push(SwitcherRow::Pane {
+                        pane_id: pane.id,
+                        title: pane.display_title("shell"),
+                        is_current,
+                    });
+                });
+            }
+        }
+        if rows.iter().all(|r| !r.is_pane()) {
+            return; // nothing to switch to
+        }
+        // If the focused pane wasn't matched, land on the first pane row.
+        if !matches!(rows.get(selected), Some(SwitcherRow::Pane { .. })) {
+            selected = rows.iter().position(|r| r.is_pane()).unwrap_or(0);
+        }
+        *self.ivars().pane_switcher.borrow_mut() = Some(PaneSwitcherState { rows, selected, scroll: 0 });
+        self.pane_switcher_clamp_scroll();
+        self.mark_dirty();
+    }
+
+    /// Adjust the switcher's scroll offset so the selected row stays visible.
+    fn pane_switcher_clamp_scroll(&self) {
+        let max_visible = {
+            let renderer = match self.ivars().renderer.get() { Some(r) => r, None => return };
+            let vh = self.drawable_viewport().height;
+            renderer.read().overlay_list_geometry(vh).max_visible.max(1)
+        };
+        let mut guard = self.ivars().pane_switcher.borrow_mut();
+        if let Some(state) = guard.as_mut() {
+            if state.selected < state.scroll {
+                state.scroll = state.selected;
+            } else if state.selected >= state.scroll + max_visible {
+                state.scroll = state.selected + 1 - max_visible;
+            }
+        }
+    }
+
+    /// Handle key events in the tab/pane switcher overlay.
+    fn handle_pane_switcher_key(&self, event: &NSEvent) {
+        let keycode = event.keyCode();
+
+        // Escape → close
+        if keycode == 0x35 {
+            *self.ivars().pane_switcher.borrow_mut() = None;
+            self.mark_dirty();
+            return;
+        }
+
+        // Enter → focus selected pane
+        if keycode == 0x24 {
+            self.pane_switcher_focus_selected();
+            return;
+        }
+
+        // Arrow keys move selection across pane rows (headers are skipped)
+        {
+            let mut guard = self.ivars().pane_switcher.borrow_mut();
+            let state = match guard.as_mut() {
+                Some(s) => s,
+                None => return,
+            };
+            match keycode {
+                0x7E => { // Up
+                    if let Some(i) = state.rows[..state.selected].iter().rposition(|r| r.is_pane()) {
+                        state.selected = i;
+                    }
+                }
+                0x7D => { // Down
+                    if let Some(off) = state.rows.get(state.selected + 1..)
+                        .and_then(|tail| tail.iter().position(|r| r.is_pane()))
+                    {
+                        state.selected = state.selected + 1 + off;
+                    }
+                }
+                _ => return,
+            }
+        }
+        self.pane_switcher_clamp_scroll();
+        self.mark_dirty();
+    }
+
+    /// Focus the pane on the currently-selected switcher row and close the overlay.
+    fn pane_switcher_focus_selected(&self) {
+        let pane_id = {
+            let guard = self.ivars().pane_switcher.borrow();
+            guard.as_ref().and_then(|s| match s.rows.get(s.selected) {
+                Some(SwitcherRow::Pane { pane_id, .. }) => Some(*pane_id),
+                _ => None,
+            })
+        };
+        *self.ivars().pane_switcher.borrow_mut() = None;
+        if let Some(pid) = pane_id {
+            self.ipc_focus_pane(pid);
+        }
+        self.mark_dirty();
+    }
+
+    /// Handle a click in the tab/pane switcher overlay. A click on a pane row
+    /// focuses it; a click anywhere else dismisses the overlay.
+    fn handle_pane_switcher_click(&self, _px: f32, py: f32) {
+        let row_idx = {
+            let renderer = match self.ivars().renderer.get() { Some(r) => r, None => return };
+            let vh = self.drawable_viewport().height;
+            let geom = renderer.read().overlay_list_geometry(vh);
+            if py < geom.content_top {
+                None
+            } else {
+                let vis = ((py - geom.content_top) / geom.row_height).floor() as usize;
+                if vis >= geom.max_visible {
+                    None
+                } else {
+                    let guard = self.ivars().pane_switcher.borrow();
+                    guard.as_ref().map(|s| s.scroll + vis)
+                }
+            }
+        };
+        let pane_id = row_idx.and_then(|idx| {
+            let guard = self.ivars().pane_switcher.borrow();
+            guard.as_ref().and_then(|s| match s.rows.get(idx) {
+                Some(SwitcherRow::Pane { pane_id, .. }) => Some(*pane_id),
+                _ => None,
+            })
+        });
+        *self.ivars().pane_switcher.borrow_mut() = None;
+        if let Some(pid) = pane_id {
+            self.ipc_focus_pane(pid);
         }
         self.mark_dirty();
     }
@@ -5213,6 +5404,20 @@ impl KovaView {
             None
         };
 
+        // Build tab/pane switcher render data
+        let ps_guard = ivars.pane_switcher.borrow();
+        let ps_rows: Vec<crate::renderer::PaneSwitcherRowRender> = ps_guard.as_ref()
+            .map(|state| state.rows.iter().map(|r| match r {
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, is_current: false },
+                SwitcherRow::Pane { title, is_current, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, is_current: *is_current },
+            }).collect())
+            .unwrap_or_default();
+        let ps_data = ps_guard.as_ref().map(|state| crate::renderer::PaneSwitcherRenderData {
+            rows: &ps_rows,
+            selected: state.selected,
+            scroll: state.scroll,
+        });
+
         // Update resize feedback (decrement frames, build text)
         if let Some(mut fb) = ivars.resize_feedback.get() {
             if fb.remaining_frames > 0 {
@@ -5278,7 +5483,7 @@ impl KovaView {
             }
         }
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 

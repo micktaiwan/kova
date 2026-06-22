@@ -168,6 +168,33 @@ pub struct SendToWindowRenderData<'a> {
     pub has_new_entry: bool,
 }
 
+/// One row of the pane-switcher overlay: either a non-selectable tab header
+/// or a selectable pane entry.
+pub struct PaneSwitcherRowRender<'a> {
+    pub text: &'a str,
+    pub is_header: bool,
+    /// True for the row of the currently-focused pane (gets a marker).
+    pub is_current: bool,
+}
+
+/// Data passed to the renderer for drawing the tab/pane switcher overlay.
+pub struct PaneSwitcherRenderData<'a> {
+    pub rows: &'a [PaneSwitcherRowRender<'a>],
+    /// Selected index into `rows` — always a pane row.
+    pub selected: usize,
+    /// First visible row (vertical scroll offset).
+    pub scroll: usize,
+}
+
+/// Vertical geometry of a list overlay (title + subtitle + scrolling rows),
+/// shared between the renderer and mouse hit-testing so a click maps to the
+/// exact row that was drawn. Computed purely from cell size + viewport height.
+pub struct OverlayListGeometry {
+    pub content_top: f32,
+    pub row_height: f32,
+    pub max_visible: usize,
+}
+
 /// Per-pane data passed from window to renderer.
 pub struct PaneRenderData {
     pub terminal: Arc<RwLock<TerminalState>>,
@@ -270,6 +297,9 @@ pub struct Renderer {
     pub hovered_url_pane_id: Option<PaneId>,
     /// Cached help hint text for status bar (avoid per-frame allocation).
     cached_help_hint: String,
+    /// Cached permanent shortcuts reminder for the global status bar
+    /// (help + overlay combos), built once from the key config.
+    cached_shortcuts_hint: String,
     /// Cached formatted shortcuts for help overlay (label, formatted key combo).
     cached_help_shortcuts: Vec<(String, String)>,
     /// Hoverable zones in status bars (rebuilt each frame).
@@ -379,6 +409,7 @@ impl Renderer {
             loading_progress: None,
             hovered_url_pane_id: None,
             cached_help_hint: String::new(),
+            cached_shortcuts_hint: String::new(),
             cached_help_shortcuts: Vec::new(),
             tooltip_zones: Vec::new(),
             pane_vertex_cache: std::collections::HashMap::new(),
@@ -531,6 +562,7 @@ impl Renderer {
         recent_projects: Option<&RecentProjectsRenderData<'_>>,
         send_to_window: Option<&SendToWindowRenderData<'_>>,
         search_palette: Option<&SearchPaletteRenderData<'_>>,
+        pane_switcher: Option<&PaneSwitcherRenderData<'_>>,
         help_hint_remaining: u32,
         keys_config: Option<&KeysConfig>,
     ) {
@@ -735,6 +767,11 @@ impl Renderer {
         // Draw send-to-window overlay
         if let Some(stw) = send_to_window {
             self.build_send_to_window_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, stw);
+        }
+
+        // Draw tab/pane switcher overlay
+        if let Some(ps) = pane_switcher {
+            self.build_pane_switcher_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, ps);
         }
 
         // Draw pane flash border (search-palette jump highlight) — drawn before
@@ -1315,23 +1352,26 @@ impl Renderer {
             let info_fg = [0.6, 0.85, 0.6, 1.0];
             self.render_status_text(vertices, &text, cell_w, bar_y, viewport_w, info_fg, no_bg);
         }
-        // Left: help hint with fade (only if no resize feedback)
-        else if help_hint_remaining > 0 {
-            if self.cached_help_hint.is_empty() {
+        // Left: permanent shortcuts reminder (help + overlays), unless loading
+        // or resize feedback is shown. Brighter for the first few seconds after
+        // startup (help_hint_remaining), then a dim steady state.
+        else {
+            if self.cached_shortcuts_hint.is_empty() {
                 if let Some(kc) = keys_config {
-                    self.cached_help_hint = format_key_combo(&kc.toggle_help);
+                    self.cached_shortcuts_hint = format!(
+                        "{} help   {} panes   {} search   {} recent",
+                        format_key_combo(&kc.toggle_help),
+                        format_key_combo(&kc.open_pane_switcher),
+                        format_key_combo(&kc.open_search),
+                        format_key_combo(&kc.open_recent_project),
+                    );
                 }
             }
-            if !self.cached_help_hint.is_empty() {
-                let fade_frames = 30u32;
-                let alpha = if help_hint_remaining <= fade_frames {
-                    help_hint_remaining as f32 / fade_frames as f32
-                } else {
-                    1.0
-                };
+            if !self.cached_shortcuts_hint.is_empty() {
+                let alpha = if help_hint_remaining > 0 { 0.85 } else { 0.4 };
                 let hint_fg = [0.6, 0.75, 1.0, alpha];
-                let hint_text = format!("{} for help", &self.cached_help_hint);
-                self.render_status_text(vertices, &hint_text, cell_w, bar_y, viewport_w, hint_fg, no_bg);
+                let hint = self.cached_shortcuts_hint.clone();
+                self.render_status_text(vertices, &hint, cell_w, bar_y, viewport_w, hint_fg, no_bg);
             }
         }
 
@@ -1932,6 +1972,7 @@ impl Renderer {
                 ("Paste", &keys_config.paste),
                 ("Find", &keys_config.toggle_filter),
                 ("Global Search", &keys_config.open_search),
+                ("Switch Tab/Pane", &keys_config.open_pane_switcher),
                 ("Clear Scrollback", &keys_config.clear_scrollback),
                 ("Previous Tab", &keys_config.prev_tab),
                 ("Next Tab", &keys_config.next_tab),
@@ -2042,6 +2083,99 @@ impl Renderer {
             y += overlay_ch * 1.3;
         }
         self.cached_mem_report = report;
+    }
+
+    /// Vertical geometry of the scrolling list overlays (recent projects, pane
+    /// switcher). Kept as a method so mouse hit-testing maps clicks to the same
+    /// rows the renderer drew. The constants below MUST match the layout used in
+    /// `build_pane_switcher_overlay_vertices` / `build_recent_projects_overlay_vertices`.
+    pub fn overlay_list_geometry(&self, viewport_h: f32) -> OverlayListGeometry {
+        let cell_h = self.atlas.cell_height;
+        // title at y=3·cell_h, +title_scale(1.8)·2 lines, +body_scale(1.3)·2 lines.
+        let content_top = cell_h * (3.0 + 1.8 * 2.0 + 1.3 * 2.0);
+        let row_height = cell_h * 1.3 * 1.6;
+        let content_bottom = viewport_h - cell_h * 2.0;
+        let max_visible = (((content_bottom - content_top) / row_height).floor().max(0.0)) as usize;
+        OverlayListGeometry { content_top, row_height, max_visible }
+    }
+
+    fn build_pane_switcher_overlay_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        viewport_w: f32,
+        viewport_h: f32,
+        data: &PaneSwitcherRenderData<'_>,
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+
+        // Semi-transparent dark overlay
+        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let title_fg = [1.0, 0.85, 0.3, 1.0];
+        let header_fg = [0.55, 0.75, 1.0, 1.0];
+        let label_fg = [0.85, 0.85, 0.9, 1.0];
+        let current_fg = [0.5, 0.85, 0.5, 1.0];
+        let dim_fg = [0.45, 0.45, 0.5, 1.0];
+        let selected_bg = [0.25, 0.35, 0.55];
+
+        let title_scale = 1.8_f32;
+        let body_scale = 1.3_f32;
+        let scaled_cell_w = cell_w * body_scale;
+
+        // Title centered
+        let title = "Switch Tab / Pane";
+        let title_chars = title.chars().count() as f32;
+        let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
+        let mut y = cell_h * 3.0;
+        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        y += cell_h * title_scale * 2.0;
+
+        // Subtitle
+        let subtitle = "\u{2191}\u{2193} Navigate  \u{23ce} Focus  click to focus  esc Cancel";
+        let sub_chars = subtitle.chars().count() as f32;
+        let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
+        self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+
+        let geom = self.overlay_list_geometry(viewport_h);
+        let content_top = geom.content_top;
+        let row_height = geom.row_height;
+        let max_visible = geom.max_visible.max(1);
+        let scaled_cell_h = cell_h * body_scale;
+
+        let scroll = data.scroll.min(data.rows.len().saturating_sub(1));
+        let end = (scroll + max_visible).min(data.rows.len());
+
+        let left_margin = scaled_cell_w * 3.0;
+        let right_margin = viewport_w - scaled_cell_w * 3.0;
+
+        for (vis_i, i) in (scroll..end).enumerate() {
+            let row = &data.rows[i];
+            let row_y = content_top + vis_i as f32 * row_height;
+            let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
+
+            if i == data.selected && !row.is_header {
+                Self::push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+            }
+
+            if row.is_header {
+                self.render_text(vertices, row.text, left_margin - scaled_cell_w, text_y, right_margin, header_fg, no_bg, body_scale);
+            } else {
+                let fg = if row.is_current { current_fg } else { label_fg };
+                let marker = if row.is_current { "\u{25cf} " } else { "  " };
+                let text = format!("    {}{}", marker, row.text);
+                self.render_text(vertices, &text, left_margin, text_y, right_margin, fg, no_bg, body_scale);
+            }
+        }
+
+        // Scroll indicators
+        if scroll > 0 {
+            self.render_text(vertices, "\u{25b2}", viewport_w / 2.0, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
+        }
+        if end < data.rows.len() {
+            self.render_text(vertices, "\u{25bc}", viewport_w / 2.0, content_top + max_visible as f32 * row_height, viewport_w, dim_fg, no_bg, body_scale);
+        }
     }
 
     fn build_send_to_window_overlay_vertices(
