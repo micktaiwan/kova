@@ -2324,8 +2324,9 @@ impl TerminalState {
 
     /// Number of empty rows to push content down when screen isn't full.
     /// Used by both renderer and hit-test to keep visual and logical positions in sync.
-    /// Disabled in alt screen (TUI apps) and when content doesn't start at line 0
-    /// (explicit cursor positioning via escape sequences).
+    /// Disabled in alt screen (TUI apps) and when the cursor is parked above the
+    /// content (explicit cursor positioning via escape sequences). Leading blank
+    /// rows are fine — they're the common "clear screen + print a newline" flow.
     pub fn y_offset_rows(&self) -> usize {
         if self.in_alt_screen || self.scroll_offset != 0 {
             return 0;
@@ -2335,10 +2336,15 @@ impl TerminalState {
         // its char is a space (colored bands painted by TUIs).
         let default_bg = self.default_bg;
         let has_content = |row: &Row| row.cells.iter().any(|c| !c.is_blank() || c.bg != default_bg);
-        let first_used = self.grid.iter().position(has_content);
-        if first_used != Some(0) {
+        // Empty grid: nothing to anchor.
+        if self.grid.iter().position(has_content).is_none() {
             return 0;
         }
+        // Leading blank rows (content not starting at row 0) are NOT treated as
+        // absolute positioning: a program that clears the screen and prints a
+        // leading newline before its output (e.g. Vite's startup banner) is
+        // still shell flow. Whether to keep gravity is decided solely by where
+        // the cursor sits relative to the content — handled by the check below.
         let last_used = self.grid.iter().rposition(has_content)
             .map_or(0, |i| i + 1);
         // Shell-like flow only: the cursor sits on the last content row (the
@@ -2602,6 +2608,24 @@ mod tests {
         assert!(
             t.y_offset_rows() > 0,
             "wrapped suggestion below the cursor must NOT disable bottom-gravity"
+        );
+    }
+
+    #[test]
+    fn gravity_active_with_leading_blank_rows() {
+        // A program clears the screen and prints a leading newline before its
+        // output (e.g. Vite's startup banner): row 0 stays blank, content lands
+        // on rows 1..=2, and the cursor parks below it on row 3. This is shell
+        // flow — the leading blank row must NOT disable bottom-gravity.
+        let mut t = term(20, 10);
+        t.set_cursor_pos(1, 0);
+        put_str(&mut t, "VITE ready");
+        t.set_cursor_pos(2, 0);
+        put_str(&mut t, "Local: localhost");
+        t.set_cursor_pos(3, 0); // cursor below all content
+        assert!(
+            t.y_offset_rows() > 0,
+            "leading blank rows must NOT disable bottom-gravity"
         );
     }
 
