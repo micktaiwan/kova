@@ -1,7 +1,7 @@
 use parking_lot::RwLock;
 use rustix::termios::{self, Winsize};
 use rustix_openpty::openpty;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -177,6 +177,31 @@ impl Pty {
                 let mut buf = [0u8; 4096];
                 let mut eof = false;
 
+                // Raw PTY capture for offline replay through the `drive()` test
+                // harness (see notes/display-glitches.md). Gated by KOVA_PTY_CAPTURE
+                // so it costs nothing when off: enable it on a second Kova instance
+                // to capture a repro without touching live sessions. Bytes are the
+                // exact stream fed to the parser, so the file replays verbatim.
+                let mut capture: Option<std::fs::File> = if std::env::var_os("KOVA_PTY_CAPTURE").is_some() {
+                    let path = format!(
+                        "{}/Library/Logs/Kova/pty-capture-{}.raw",
+                        std::env::var("HOME").unwrap_or_default(),
+                        pane_id
+                    );
+                    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                        Ok(f) => {
+                            log::info!("PTY capture enabled: {}", path);
+                            Some(f)
+                        }
+                        Err(e) => {
+                            log::warn!("PTY capture open failed for {}: {}", path, e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 loop {
                     if reader_shutdown.load(Ordering::Relaxed) {
                         break;
@@ -207,6 +232,9 @@ impl Pty {
                         Ok(n) => {
                             if !shell_ready.load(Ordering::Relaxed) {
                                 shell_ready.store(true, Ordering::Relaxed);
+                            }
+                            if let Some(f) = capture.as_mut() {
+                                let _ = f.write_all(&buf[..n]);
                             }
                             parser.advance(&mut handler, &buf[..n]);
                             handler.apply_ops();
