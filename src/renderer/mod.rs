@@ -177,13 +177,21 @@ pub struct PaneSwitcherRowRender<'a> {
     pub is_current: bool,
 }
 
+/// One column of the pane-switcher overlay: a vertical run of rows holding
+/// whole tabs (a tab header followed by its panes), never split mid-tab.
+pub struct PaneSwitcherColumnRender<'a> {
+    pub rows: &'a [PaneSwitcherRowRender<'a>],
+    /// First visible row in this column (vertical scroll offset).
+    pub scroll: usize,
+}
+
 /// Data passed to the renderer for drawing the tab/pane switcher overlay.
 pub struct PaneSwitcherRenderData<'a> {
-    pub rows: &'a [PaneSwitcherRowRender<'a>],
-    /// Selected index into `rows` — always a pane row.
-    pub selected: usize,
-    /// First visible row (vertical scroll offset).
-    pub scroll: usize,
+    pub columns: &'a [PaneSwitcherColumnRender<'a>],
+    /// Selected column index.
+    pub selected_col: usize,
+    /// Selected row within `columns[selected_col]` — always a pane row.
+    pub selected_row: usize,
 }
 
 /// Vertical geometry of a list overlay (title + subtitle + scrolling rows),
@@ -2133,7 +2141,7 @@ impl Renderer {
         y += cell_h * title_scale * 2.0;
 
         // Subtitle
-        let subtitle = "\u{2191}\u{2193} Navigate  \u{23ce} Focus  click to focus  esc Cancel";
+        let subtitle = "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{23ce} Focus  click to focus  esc Cancel";
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
         self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
@@ -2144,37 +2152,47 @@ impl Renderer {
         let max_visible = geom.max_visible.max(1);
         let scaled_cell_h = cell_h * body_scale;
 
-        let scroll = data.scroll.min(data.rows.len().saturating_sub(1));
-        let end = (scroll + max_visible).min(data.rows.len());
+        let ncols = data.columns.len().max(1);
+        let col_w = viewport_w / ncols as f32;
+        // Padding inside each column; pane labels indent a bit more than headers.
+        let pad = scaled_cell_w * 1.5;
 
-        let left_margin = scaled_cell_w * 3.0;
-        let right_margin = viewport_w - scaled_cell_w * 3.0;
+        for (c, column) in data.columns.iter().enumerate() {
+            let col_x = c as f32 * col_w;
+            let left_margin = col_x + pad;
+            let right_margin = col_x + col_w - pad;
 
-        for (vis_i, i) in (scroll..end).enumerate() {
-            let row = &data.rows[i];
-            let row_y = content_top + vis_i as f32 * row_height;
-            let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
+            let scroll = column.scroll.min(column.rows.len().saturating_sub(1));
+            let end = (scroll + max_visible).min(column.rows.len());
 
-            if i == data.selected && !row.is_header {
-                Self::push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+            for (vis_i, i) in (scroll..end).enumerate() {
+                let row = &column.rows[i];
+                let row_y = content_top + vis_i as f32 * row_height;
+                let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
+
+                let is_selected = c == data.selected_col && i == data.selected_row && !row.is_header;
+                if is_selected {
+                    Self::push_bg_quad_alpha(vertices, left_margin - pad * 0.5, row_y, right_margin - left_margin + pad, row_height, selected_bg, 0.8);
+                }
+
+                if row.is_header {
+                    self.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
+                } else {
+                    let fg = if row.is_current { current_fg } else { label_fg };
+                    let marker = if row.is_current { "\u{25cf} " } else { "  " };
+                    let text = format!("  {}{}", marker, row.text);
+                    self.render_text(vertices, &text, left_margin, text_y, right_margin, fg, no_bg, body_scale);
+                }
             }
 
-            if row.is_header {
-                self.render_text(vertices, row.text, left_margin - scaled_cell_w, text_y, right_margin, header_fg, no_bg, body_scale);
-            } else {
-                let fg = if row.is_current { current_fg } else { label_fg };
-                let marker = if row.is_current { "\u{25cf} " } else { "  " };
-                let text = format!("    {}{}", marker, row.text);
-                self.render_text(vertices, &text, left_margin, text_y, right_margin, fg, no_bg, body_scale);
+            // Per-column scroll indicators (centered in the column)
+            let ind_x = col_x + col_w / 2.0;
+            if scroll > 0 {
+                self.render_text(vertices, "\u{25b2}", ind_x, content_top - scaled_cell_h, right_margin, dim_fg, no_bg, body_scale);
             }
-        }
-
-        // Scroll indicators
-        if scroll > 0 {
-            self.render_text(vertices, "\u{25b2}", viewport_w / 2.0, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
-        }
-        if end < data.rows.len() {
-            self.render_text(vertices, "\u{25bc}", viewport_w / 2.0, content_top + max_visible as f32 * row_height, viewport_w, dim_fg, no_bg, body_scale);
+            if end < column.rows.len() {
+                self.render_text(vertices, "\u{25bc}", ind_x, content_top + max_visible as f32 * row_height, right_margin, dim_fg, no_bg, body_scale);
+            }
         }
     }
 

@@ -111,7 +111,7 @@ pub struct KovaViewIvars {
     boundary_flash: Cell<Option<BoundaryFlash>>,
     /// Search palette overlay state (Cmd+Shift+F — global search across all panes).
     search_palette: RefCell<Option<SearchPaletteState>>,
-    /// Tab/pane switcher overlay state (Cmd+Shift+P — list tabs & panes, click to focus).
+    /// Tab/pane switcher overlay state (Cmd+P — list tabs & panes, click to focus).
     pane_switcher: RefCell<Option<PaneSwitcherState>>,
     /// Highlight a pane after a search-palette jump (decremented per tick).
     pane_flash: Cell<Option<PaneFlash>>,
@@ -290,12 +290,28 @@ impl SwitcherRow {
     }
 }
 
+/// Index of the pane row whose position is closest to `target` within `col`.
+/// Every column holds at least one pane (each tab has ≥1 pane), so this always
+/// returns a valid pane index; falls back to 0 only for a degenerate empty column.
+fn nearest_pane_row(col: &[SwitcherRow], target: usize) -> usize {
+    col.iter()
+        .enumerate()
+        .filter(|(_, r)| r.is_pane())
+        .min_by_key(|(i, _)| (*i as isize - target as isize).unsigned_abs())
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
 struct PaneSwitcherState {
-    rows: Vec<SwitcherRow>,
-    /// Index into `rows`; always points at a `Pane` row (or 0 if none exist).
-    selected: usize,
-    /// First visible row (vertical scroll offset).
-    scroll: usize,
+    /// Columns of rows. Each column holds whole tabs (a tab header followed by
+    /// its pane rows); a tab is never split across two columns.
+    columns: Vec<Vec<SwitcherRow>>,
+    /// Selected column index.
+    selected_col: usize,
+    /// Selected row within `columns[selected_col]`; always points at a `Pane` row.
+    selected_row: usize,
+    /// Per-column first-visible-row offset (vertical scroll), one entry per column.
+    scroll: Vec<usize>,
 }
 
 /// Outcome of `KovaView::ipc_close_tab`. Lets the caller distinguish "not in this window"
@@ -3002,6 +3018,11 @@ impl KovaView {
             if tab.id == tab_id {
                 drop(tabs);
                 self.ivars().active_tab.set(idx);
+                // Lazy resize: panes of an inactive tab may carry stale grid
+                // dimensions from a smaller window. Without this, the gravity
+                // offset centers content in the (larger) viewport. Match the
+                // other tab-switch paths which all resize after activation.
+                self.resize_all_panes();
                 self.mark_dirty();
                 return true;
             }
@@ -3198,40 +3219,87 @@ impl KovaView {
     /// Open the tab/pane switcher overlay: every tab with its panes, click or
     /// Enter to focus. Selection starts on the currently-focused pane.
     fn do_open_pane_switcher(&self) {
-        let mut rows: Vec<SwitcherRow> = Vec::new();
-        let mut selected = 0usize;
+        // Build one row group per tab (header followed by its pane rows).
+        let mut groups: Vec<Vec<SwitcherRow>> = Vec::new();
         {
             let tabs = self.ivars().tabs.borrow();
             let active = self.ivars().active_tab.get();
             for (ti, tab) in tabs.iter().enumerate() {
+                let mut rows: Vec<SwitcherRow> = Vec::new();
                 rows.push(SwitcherRow::TabHeader(format!("{}  {}", ti + 1, tab.title())));
                 let focused_pane = tab.focused_pane;
                 tab.for_each_pane(&mut |pane| {
                     let is_current = ti == active && pane.id == focused_pane;
-                    if is_current {
-                        selected = rows.len();
-                    }
                     rows.push(SwitcherRow::Pane {
                         pane_id: pane.id,
                         title: pane.display_title("shell"),
                         is_current,
                     });
                 });
+                groups.push(rows);
             }
         }
-        if rows.iter().all(|r| !r.is_pane()) {
+        if groups.iter().all(|g| g.iter().all(|r| !r.is_pane())) {
             return; // nothing to switch to
         }
-        // If the focused pane wasn't matched, land on the first pane row.
-        if !matches!(rows.get(selected), Some(SwitcherRow::Pane { .. })) {
-            selected = rows.iter().position(|r| r.is_pane()).unwrap_or(0);
+
+        // Partition the tab groups into ≤3 contiguous columns, balanced by row
+        // count. A group joins the current column unless closing the column now
+        // (without it) lands closer to the per-column target than including it.
+        let ncols = groups.len().min(3).max(1);
+        let total: usize = groups.iter().map(|g| g.len()).sum();
+        let mut columns: Vec<Vec<SwitcherRow>> = Vec::new();
+        let mut cur: Vec<SwitcherRow> = Vec::new();
+        let mut cur_w = 0usize;
+        let mut placed_w = 0usize;
+        for g in groups {
+            let w = g.len();
+            let cols_left = ncols - columns.len();
+            if cols_left > 1 && !cur.is_empty() {
+                let target = (total - placed_w) as f64 / cols_left as f64;
+                if (cur_w as f64 - target).abs() <= ((cur_w + w) as f64 - target).abs() {
+                    placed_w += cur_w;
+                    columns.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+            }
+            cur.extend(g);
+            cur_w += w;
         }
-        *self.ivars().pane_switcher.borrow_mut() = Some(PaneSwitcherState { rows, selected, scroll: 0 });
+        columns.push(cur);
+
+        // Land on the currently-focused pane; otherwise the first pane row.
+        let mut selected_col = 0usize;
+        let mut selected_row = 0usize;
+        let mut found = false;
+        'outer: for (c, col) in columns.iter().enumerate() {
+            for (r, row) in col.iter().enumerate() {
+                if matches!(row, SwitcherRow::Pane { is_current: true, .. }) {
+                    selected_col = c;
+                    selected_row = r;
+                    found = true;
+                    break 'outer;
+                }
+            }
+        }
+        if !found {
+            for (c, col) in columns.iter().enumerate() {
+                if let Some(r) = col.iter().position(|x| x.is_pane()) {
+                    selected_col = c;
+                    selected_row = r;
+                    break;
+                }
+            }
+        }
+
+        let scroll = vec![0usize; columns.len()];
+        *self.ivars().pane_switcher.borrow_mut() =
+            Some(PaneSwitcherState { columns, selected_col, selected_row, scroll });
         self.pane_switcher_clamp_scroll();
         self.mark_dirty();
     }
 
-    /// Adjust the switcher's scroll offset so the selected row stays visible.
+    /// Adjust the selected column's scroll offset so the selected row stays visible.
     fn pane_switcher_clamp_scroll(&self) {
         let max_visible = {
             let renderer = match self.ivars().renderer.get() { Some(r) => r, None => return };
@@ -3240,10 +3308,14 @@ impl KovaView {
         };
         let mut guard = self.ivars().pane_switcher.borrow_mut();
         if let Some(state) = guard.as_mut() {
-            if state.selected < state.scroll {
-                state.scroll = state.selected;
-            } else if state.selected >= state.scroll + max_visible {
-                state.scroll = state.selected + 1 - max_visible;
+            let col = state.selected_col;
+            let sel = state.selected_row;
+            if let Some(sc) = state.scroll.get_mut(col) {
+                if sel < *sc {
+                    *sc = sel;
+                } else if sel >= *sc + max_visible {
+                    *sc = sel + 1 - max_visible;
+                }
             }
         }
     }
@@ -3265,7 +3337,7 @@ impl KovaView {
             return;
         }
 
-        // Arrow keys move selection across pane rows (headers are skipped)
+        // Arrow keys: ↑↓ move within a column (headers skipped), ←→ between columns.
         {
             let mut guard = self.ivars().pane_switcher.borrow_mut();
             let state = match guard.as_mut() {
@@ -3274,15 +3346,31 @@ impl KovaView {
             };
             match keycode {
                 0x7E => { // Up
-                    if let Some(i) = state.rows[..state.selected].iter().rposition(|r| r.is_pane()) {
-                        state.selected = i;
+                    let col = &state.columns[state.selected_col];
+                    if let Some(i) = col[..state.selected_row].iter().rposition(|r| r.is_pane()) {
+                        state.selected_row = i;
                     }
                 }
                 0x7D => { // Down
-                    if let Some(off) = state.rows.get(state.selected + 1..)
+                    let col = &state.columns[state.selected_col];
+                    if let Some(off) = col.get(state.selected_row + 1..)
                         .and_then(|tail| tail.iter().position(|r| r.is_pane()))
                     {
-                        state.selected = state.selected + 1 + off;
+                        state.selected_row = state.selected_row + 1 + off;
+                    }
+                }
+                0x7B => { // Left
+                    if state.selected_col > 0 {
+                        state.selected_col -= 1;
+                        state.selected_row =
+                            nearest_pane_row(&state.columns[state.selected_col], state.selected_row);
+                    }
+                }
+                0x7C => { // Right
+                    if state.selected_col + 1 < state.columns.len() {
+                        state.selected_col += 1;
+                        state.selected_row =
+                            nearest_pane_row(&state.columns[state.selected_col], state.selected_row);
                     }
                 }
                 _ => return,
@@ -3296,9 +3384,11 @@ impl KovaView {
     fn pane_switcher_focus_selected(&self) {
         let pane_id = {
             let guard = self.ivars().pane_switcher.borrow();
-            guard.as_ref().and_then(|s| match s.rows.get(s.selected) {
-                Some(SwitcherRow::Pane { pane_id, .. }) => Some(*pane_id),
-                _ => None,
+            guard.as_ref().and_then(|s| {
+                match s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row)) {
+                    Some(SwitcherRow::Pane { pane_id, .. }) => Some(*pane_id),
+                    _ => None,
+                }
             })
         };
         *self.ivars().pane_switcher.borrow_mut() = None;
@@ -3310,11 +3400,18 @@ impl KovaView {
 
     /// Handle a click in the tab/pane switcher overlay. A click on a pane row
     /// focuses it; a click anywhere else dismisses the overlay.
-    fn handle_pane_switcher_click(&self, _px: f32, py: f32) {
-        let row_idx = {
+    fn handle_pane_switcher_click(&self, px: f32, py: f32) {
+        let pane_id = {
             let renderer = match self.ivars().renderer.get() { Some(r) => r, None => return };
-            let vh = self.drawable_viewport().height;
-            let geom = renderer.read().overlay_list_geometry(vh);
+            let vp = self.drawable_viewport();
+            let geom = renderer.read().overlay_list_geometry(vp.height);
+            let guard = self.ivars().pane_switcher.borrow();
+            let state = match guard.as_ref() {
+                Some(s) => s,
+                None => return,
+            };
+            let ncols = state.columns.len().max(1);
+            let col = ((px / (vp.width / ncols as f32)).floor() as usize).min(ncols - 1);
             if py < geom.content_top {
                 None
             } else {
@@ -3322,18 +3419,14 @@ impl KovaView {
                 if vis >= geom.max_visible {
                     None
                 } else {
-                    let guard = self.ivars().pane_switcher.borrow();
-                    guard.as_ref().map(|s| s.scroll + vis)
+                    let idx = state.scroll.get(col).copied().unwrap_or(0) + vis;
+                    match state.columns[col].get(idx) {
+                        Some(SwitcherRow::Pane { pane_id, .. }) => Some(*pane_id),
+                        _ => None,
+                    }
                 }
             }
         };
-        let pane_id = row_idx.and_then(|idx| {
-            let guard = self.ivars().pane_switcher.borrow();
-            guard.as_ref().and_then(|s| match s.rows.get(idx) {
-                Some(SwitcherRow::Pane { pane_id, .. }) => Some(*pane_id),
-                _ => None,
-            })
-        });
         *self.ivars().pane_switcher.borrow_mut() = None;
         if let Some(pid) = pane_id {
             self.ipc_focus_pane(pid);
@@ -5404,18 +5497,24 @@ impl KovaView {
             None
         };
 
-        // Build tab/pane switcher render data
+        // Build tab/pane switcher render data (one entry per column)
         let ps_guard = ivars.pane_switcher.borrow();
-        let ps_rows: Vec<crate::renderer::PaneSwitcherRowRender> = ps_guard.as_ref()
-            .map(|state| state.rows.iter().map(|r| match r {
+        let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
+            .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
                 SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, is_current: false },
                 SwitcherRow::Pane { title, is_current, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, is_current: *is_current },
+            }).collect()).collect())
+            .unwrap_or_default();
+        let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
+            .map(|state| ps_cols_rows.iter().enumerate().map(|(i, rows)| crate::renderer::PaneSwitcherColumnRender {
+                rows,
+                scroll: state.scroll.get(i).copied().unwrap_or(0),
             }).collect())
             .unwrap_or_default();
         let ps_data = ps_guard.as_ref().map(|state| crate::renderer::PaneSwitcherRenderData {
-            rows: &ps_rows,
-            selected: state.selected,
-            scroll: state.scroll,
+            columns: &ps_columns,
+            selected_col: state.selected_col,
+            selected_row: state.selected_row,
         });
 
         // Update resize feedback (decrement frames, build text)

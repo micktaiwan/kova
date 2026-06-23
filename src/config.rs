@@ -359,7 +359,7 @@ impl Default for KeysConfig {
             close_tab: "cmd+shift+w".into(),
             open_recent_project: "cmd+o".into(),
             open_search: "cmd+shift+f".into(),
-            open_pane_switcher: "cmd+shift+p".into(),
+            open_pane_switcher: "cmd+p".into(),
             equalize: "cmd+shift++".into(),
             repaint_pane: "cmd+r".into(),
             terminal: TerminalKeysConfig::default(),
