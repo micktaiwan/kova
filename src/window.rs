@@ -312,6 +312,8 @@ struct PaneSwitcherState {
     selected_row: usize,
     /// Per-column first-visible-row offset (vertical scroll), one entry per column.
     scroll: Vec<usize>,
+    /// Fractional accumulator for trackpad/wheel scroll (sub-row deltas).
+    scroll_acc: f64,
 }
 
 /// Outcome of `KovaView::ipc_close_tab`. Lets the caller distinguish "not in this window"
@@ -929,6 +931,12 @@ define_class!(
         fn scroll_wheel(&self, event: &NSEvent) {
             let ivars = self.ivars();
             let is_trackpad = event.hasPreciseScrollingDeltas();
+
+            // Pane switcher overlay handles its own scroll (scroll the column under the cursor).
+            if ivars.pane_switcher.borrow().is_some() {
+                self.handle_pane_switcher_scroll(event, is_trackpad);
+                return;
+            }
 
             // Phase-based axis lock (trackpad only)
             if is_trackpad {
@@ -2346,6 +2354,7 @@ impl KovaView {
             }
         };
         let new_id = new_pane.id;
+        let open_timer = new_pane.open_timer.clone();
 
         let mut tabs = self.ivars().tabs.borrow_mut();
         let idx = self.ivars().active_tab.get();
@@ -2366,6 +2375,7 @@ impl KovaView {
         }
         drop(tabs);
 
+        open_timer.mark_inserted(new_id);
         self.resize_all_panes();
     }
 
@@ -2415,6 +2425,7 @@ impl KovaView {
             }
         };
         let new_id = new_pane.id;
+        let open_timer = new_pane.open_timer.clone();
 
         let mut tabs = self.ivars().tabs.borrow_mut();
         let idx = self.ivars().active_tab.get();
@@ -2442,6 +2453,7 @@ impl KovaView {
         }
         drop(tabs);
 
+        open_timer.mark_inserted(new_id);
         self.resize_all_panes();
     }
 
@@ -3294,7 +3306,7 @@ impl KovaView {
 
         let scroll = vec![0usize; columns.len()];
         *self.ivars().pane_switcher.borrow_mut() =
-            Some(PaneSwitcherState { columns, selected_col, selected_row, scroll });
+            Some(PaneSwitcherState { columns, selected_col, selected_row, scroll, scroll_acc: 0.0 });
         self.pane_switcher_clamp_scroll();
         self.mark_dirty();
     }
@@ -3396,6 +3408,52 @@ impl KovaView {
             self.ipc_focus_pane(pid);
         }
         self.mark_dirty();
+    }
+
+    /// Scroll the switcher column under the cursor with the mouse wheel / trackpad.
+    /// Adjusts only the vertical row offset; selection is unchanged.
+    fn handle_pane_switcher_scroll(&self, event: &NSEvent, is_trackpad: bool) {
+        let (px, _py) = self.event_to_pixel(event);
+        let max_visible = {
+            let renderer = match self.ivars().renderer.get() { Some(r) => r, None => return };
+            let vh = self.drawable_viewport().height;
+            renderer.read().overlay_list_geometry(vh).max_visible.max(1)
+        };
+        let vw = self.drawable_viewport().width;
+
+        let mut guard = self.ivars().pane_switcher.borrow_mut();
+        let state = match guard.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        let ncols = state.columns.len().max(1);
+        let col = ((px / (vw / ncols as f32)).floor() as usize).min(ncols - 1);
+
+        // Natural scrolling: dragging content up (negative deltaY) moves the list down.
+        let dy = event.scrollingDeltaY();
+        let lines = if is_trackpad {
+            let acc = state.scroll_acc - dy / 8.0;
+            let discrete = acc.trunc();
+            state.scroll_acc = acc - discrete;
+            discrete as i32
+        } else {
+            state.scroll_acc = 0.0;
+            -dy as i32
+        };
+        if lines == 0 {
+            return;
+        }
+
+        let col_len = state.columns[col].len();
+        let max_scroll = col_len.saturating_sub(max_visible);
+        if let Some(sc) = state.scroll.get_mut(col) {
+            let next = (*sc as i64 + lines as i64).clamp(0, max_scroll as i64) as usize;
+            if next != *sc {
+                *sc = next;
+                drop(guard);
+                self.mark_dirty();
+            }
+        }
     }
 
     /// Handle a click in the tab/pane switcher overlay. A click on a pane row
@@ -3838,6 +3896,7 @@ impl KovaView {
         }
 
         let new_id = new_pane.id;
+        let open_timer = new_pane.open_timer.clone();
 
         let mut tabs = self.ivars().tabs.borrow_mut();
         let idx = self.ivars().active_tab.get();
@@ -3855,6 +3914,7 @@ impl KovaView {
         }
         drop(tabs);
 
+        open_timer.mark_inserted(new_id);
         self.resize_all_panes();
         log::info!("IPC: split created pane {}", new_id);
         Some(new_id)
@@ -5207,6 +5267,9 @@ impl KovaView {
                 height: drawable_size.height as f32 - tab_bar_h - global_bar_h,
             };
             tab.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
+                // First frame this pane is submitted to the renderer = it becomes
+                // visible (loading overlay or content). "time to rectangle".
+                pane.open_timer.mark_first_paint(pane.id);
                 let is_focused = pane.id == focused_id;
                 let term = pane.terminal.read();
                 // The focused pane is "seen": acknowledge its bell every frame

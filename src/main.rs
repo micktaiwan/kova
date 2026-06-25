@@ -118,6 +118,34 @@ fn rotate_log_if_needed(path: &std::path::Path) {
     // Current log file will be recreated by the logger (append mode)
 }
 
+/// Delete raw PTY capture files (`pty-capture-*.raw`) older than 24h to bound
+/// disk usage. Capture is on by default (see pty.rs); without pruning the files
+/// would accumulate across sessions forever.
+fn prune_old_captures() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let log_dir = PathBuf::from(home).join("Library/Logs/Kova");
+    let Ok(entries) = fs::read_dir(&log_dir) else { return };
+    let max_age = std::time::Duration::from_secs(24 * 60 * 60);
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("pty-capture-") && name.ends_with(".raw")) {
+            continue;
+        }
+        let too_old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .map(|age| age > max_age)
+            .unwrap_or(false);
+        if too_old {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn setup_logging() {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let log_dir = PathBuf::from(home).join("Library/Logs/Kova");
@@ -198,6 +226,7 @@ fn main() {
 
     setup_logging();
     log::info!("========== Kova starting ==========");
+    prune_old_captures();
     install_crash_signal_handlers();
     raise_fd_limit();
 

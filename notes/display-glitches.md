@@ -161,5 +161,23 @@ largeur**, ou une séquence région+repaint. Non prouvable par lecture seule
   bruts dans `pty.rs` (gated par env var), build via `build.sh`, lancé en 2ᵉ
   instance pour ne pas tuer les sessions en cours.
 
+### Capture ON par défaut (juin 2026)
+
+Le bug étant **non reproductible à la demande**, la capture doit déjà tourner
+quand le trou survient. Donc capture **activée par défaut** (`pty.rs`) :
+
+- Désactivable avec `KOVA_PTY_CAPTURE=0` (ou `off`/`false`/`no`).
+- Fichier `~/Library/Logs/Kova/pty-capture-{pane_id}.raw`, **tronqué à
+  l'ouverture** (les `pane_id` repartent à 1 à chaque lancement → append
+  splicerait des sessions sans rapport).
+- Plafond **256 MiB par pane** (stop + warn au-delà) pour borner le disque.
+- **Purge au démarrage** des captures de plus de 24 h (`prune_old_captures`
+  dans `main.rs`).
+
+Workflow quand le trou apparaît : noter le `pane_id` de la pane fautive (sans
+Cmd+R d'abord — ou peu importe, le `.raw` contient déjà les octets d'avant),
+récupérer le `.raw` correspondant, le rejouer dans `drive()` pour reproduire la
+bande hors-Kova, puis bissecter.
+
 Snapshots de cette session : `/tmp/kova_hole_194.json` (grille avec trou),
 `/tmp/kova_dump_194_visible.json`, `/tmp/kova_dump_194_all.json`.

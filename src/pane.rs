@@ -19,6 +19,72 @@ pub fn minimized_bar_px(cell_h: f32) -> f32 {
     if cell_h > 0.0 { MINIMIZED_BAR_PX.max(cell_h) } else { MINIMIZED_BAR_PX }
 }
 
+/// Per-pane open-latency instrumentation. Splits the new-pane critical path so
+/// "time to rectangle" (pane visible) and "time to prompt" (shell usable) can be
+/// attributed separately — see notes/pane-open-perf.md.
+///
+/// The reference instant `entry` is captured at the very start of `Pane::spawn`.
+/// The pre-spawn work in the split handlers (viewport float math, no syscalls)
+/// is sub-microsecond and folded in. `entry` is set once and only read after,
+/// so it is safe to share with the PTY reader thread, which records `shell-ready`.
+/// Each milestone logs at most once (atomic-guarded) under the `PANE-OPEN` prefix;
+/// grep the log for the full per-pane timeline.
+pub struct PaneOpenTimer {
+    entry: std::time::Instant,
+    inserted_logged: AtomicBool,
+    paint_logged: AtomicBool,
+    ready_logged: AtomicBool,
+}
+
+impl PaneOpenTimer {
+    pub fn new() -> Self {
+        PaneOpenTimer {
+            entry: std::time::Instant::now(),
+            inserted_logged: AtomicBool::new(false),
+            paint_logged: AtomicBool::new(false),
+            ready_logged: AtomicBool::new(false),
+        }
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        self.entry.elapsed().as_secs_f64() * 1e3
+    }
+
+    /// Tree mutation done: the new pane now exists in the layout (main thread).
+    /// Logged only for interactive splits (the split handlers call this);
+    /// restore/initial panes never reach it, so its absence flags a restore.
+    pub fn mark_inserted(&self, pane_id: PaneId) {
+        if self.inserted_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        log::info!("PANE-OPEN id={} tree-inserted +{:.1}ms", pane_id, self.elapsed_ms());
+    }
+
+    /// First frame the pane is submitted to the renderer = pane becomes visible
+    /// (its loading overlay paints). This is the "time to rectangle".
+    pub fn mark_first_paint(&self, pane_id: PaneId) {
+        if self.paint_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        log::info!("PANE-OPEN id={} first-paint +{:.1}ms (time-to-rectangle)", pane_id, self.elapsed_ms());
+    }
+
+    /// Shell emitted its first byte (first prompt) = shell is usable. This is
+    /// the "time to prompt". Called from the PTY reader thread.
+    pub fn mark_shell_ready(&self, pane_id: PaneId) {
+        if self.ready_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        log::info!("PANE-OPEN id={} shell-ready +{:.1}ms (time-to-prompt)", pane_id, self.elapsed_ms());
+    }
+}
+
+impl Default for PaneOpenTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SplitDirection {
     Horizontal, // side by side (left | right)
@@ -1116,10 +1182,15 @@ pub struct Pane {
     pub custom_title: Option<String>,
     /// Whether this pane is minimized (collapsed to a thin bar).
     pub minimized: bool,
+    /// Open-latency instrumentation (time-to-rectangle / time-to-prompt).
+    pub open_timer: Arc<PaneOpenTimer>,
 }
 
 impl Pane {
     pub fn spawn(cols: u16, rows: u16, config: &Config, working_dir: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
+        // Reference instant for open-latency instrumentation — captured first so
+        // it covers the whole spawn (TerminalState alloc + fork/exec + dups).
+        let open_timer = Arc::new(PaneOpenTimer::new());
         let id = alloc_pane_id();
         let terminal = Arc::new(RwLock::new(TerminalState::new(
             cols,
@@ -1138,6 +1209,7 @@ impl Pane {
             shell_ready.clone(),
             working_dir,
             id,
+            open_timer.clone(),
         )?;
         Ok(Pane {
             id,
@@ -1149,6 +1221,7 @@ impl Pane {
             pending_command: Cell::new(None),
             custom_title: None,
             minimized: false,
+            open_timer,
         })
     }
 
@@ -1175,6 +1248,7 @@ impl Pane {
             pending_command: Cell::new(None),
             custom_title: None,
             minimized: false,
+            open_timer: Arc::new(PaneOpenTimer::new()),
         })
     }
 

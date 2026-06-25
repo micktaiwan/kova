@@ -69,6 +69,7 @@ impl Pty {
         shell_ready: Arc<AtomicBool>,
         working_dir: Option<&str>,
         pane_id: u32,
+        open_timer: Arc<crate::pane::PaneOpenTimer>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_pair = openpty(None, None)?;
 
@@ -178,17 +179,29 @@ impl Pty {
                 let mut eof = false;
 
                 // Raw PTY capture for offline replay through the `drive()` test
-                // harness (see notes/display-glitches.md). Gated by KOVA_PTY_CAPTURE
-                // so it costs nothing when off: enable it on a second Kova instance
-                // to capture a repro without touching live sessions. Bytes are the
-                // exact stream fed to the parser, so the file replays verbatim.
-                let mut capture: Option<std::fs::File> = if std::env::var_os("KOVA_PTY_CAPTURE").is_some() {
+                // harness (see notes/display-glitches.md). ON by default so the
+                // alt-screen "hole" bug — which nobody can reproduce on demand —
+                // is already being recorded when it strikes. Bytes are the exact
+                // stream fed to the parser, so the file replays verbatim.
+                //
+                // Disabled with KOVA_PTY_CAPTURE=0 (or off/false/no). The file is
+                // truncated on open (pane_ids reset to 1 each launch, so append
+                // would splice unrelated sessions) and capped at CAPTURE_CAP bytes
+                // to bound disk; stale files are pruned at startup (see main.rs).
+                let capture_enabled = match std::env::var("KOVA_PTY_CAPTURE") {
+                    Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no" | ""),
+                    Err(_) => true,
+                };
+                const CAPTURE_CAP: u64 = 256 * 1024 * 1024; // 256 MiB per pane
+                let mut capture_written: u64 = 0;
+                let mut capture_full = false;
+                let mut capture: Option<std::fs::File> = if capture_enabled {
                     let path = format!(
                         "{}/Library/Logs/Kova/pty-capture-{}.raw",
                         std::env::var("HOME").unwrap_or_default(),
                         pane_id
                     );
-                    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path) {
                         Ok(f) => {
                             log::info!("PTY capture enabled: {}", path);
                             Some(f)
@@ -232,9 +245,19 @@ impl Pty {
                         Ok(n) => {
                             if !shell_ready.load(Ordering::Relaxed) {
                                 shell_ready.store(true, Ordering::Relaxed);
+                                // First byte from the shell = first prompt is ready.
+                                open_timer.mark_shell_ready(pane_id);
                             }
                             if let Some(f) = capture.as_mut() {
-                                let _ = f.write_all(&buf[..n]);
+                                if !capture_full {
+                                    if capture_written + n as u64 > CAPTURE_CAP {
+                                        log::warn!("PTY capture for pane {} hit {} MiB cap; stopping capture", pane_id, CAPTURE_CAP / (1024 * 1024));
+                                        capture_full = true;
+                                    } else {
+                                        let _ = f.write_all(&buf[..n]);
+                                        capture_written += n as u64;
+                                    }
+                                }
                             }
                             parser.advance(&mut handler, &buf[..n]);
                             handler.apply_ops();
