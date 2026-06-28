@@ -97,6 +97,20 @@ pub enum IpcCommand {
         pane_id: u32,
         title: Option<String>,
     },
+    /// Trigger any keyboard action by its stable name (see `action_from_ipc_name`).
+    /// `pane_id` optionally targets (and focuses) a specific pane's window first;
+    /// without it, the action runs against the key window.
+    DispatchAction {
+        action: String,
+        pane_id: Option<u32>,
+    },
+    /// Merge every tab of `source_window` into `target_window`, then close the
+    /// now-empty source window. Windows are addressed by the index reported in
+    /// `list-tabs` / `list-panes` (`"window"` field).
+    MergeWindow {
+        source_window: usize,
+        target_window: usize,
+    },
 }
 
 /// How long the IPC connection thread should wait for the main thread's response.
@@ -294,6 +308,37 @@ fn handle_connection(
     }
 }
 
+/// The set of accepted top-level fields for a command (besides `cmd`, which is
+/// always legitimate). Returns `None` for an unknown command, so the dispatcher's
+/// `unknown command` arm handles it instead of an `unknown field` error.
+///
+/// Must stay in sync with the per-command parsing in `parse_command` (and with
+/// `parse_pane_content_args` for the two pane-content commands).
+fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
+    Some(match cmd {
+        "split" => &["direction", "command", "cwd"],
+        "list-panes" => &[],
+        "close-pane" => &["pane_id"],
+        "send-keys" => &["pane_id", "text"],
+        "focus-pane" => &["pane_id"],
+        "new-tab" => &["cwd", "command"],
+        "set-tab-title" => &["pane_id", "title"],
+        "get-pane-content" | "count-pane-content" => {
+            &["panes", "mode", "trim_trailing_blank_lines"]
+        }
+        "wait-for-completion" => &["pane_id", "timeout_ms"],
+        "list-tabs" => &[],
+        "close-tab" => &["tab_id"],
+        "merge-tab" => &["source_tab_id", "target_tab_id"],
+        "swap-pane" => &["pane_id_a", "pane_id_b"],
+        "resize-pane" => &["pane_id", "axis", "direction", "amount_pct"],
+        "rename-pane" => &["pane_id", "title"],
+        "dispatch-action" => &["action", "pane_id"],
+        "merge-window" => &["source_window", "target_window"],
+        _ => return None,
+    })
+}
+
 /// Parse a JSON line into an IpcCommand.
 fn parse_command(line: &str) -> Result<IpcCommand, String> {
     let v: serde_json::Value =
@@ -303,6 +348,20 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
         .get("cmd")
         .and_then(|c| c.as_str())
         .ok_or_else(|| "missing \"cmd\" field".to_string())?;
+
+    // Reject unknown fields BEFORE the per-command parsing below. Without this,
+    // a stray key (e.g. `pane_id` on a command that expects `panes`) is silently
+    // ignored and the command does something other than asked — a muted failure.
+    // Unknown commands are left to the match's `unknown command` arm.
+    if let Some(allowed) = allowed_fields(cmd) {
+        if let Some(obj) = v.as_object() {
+            for key in obj.keys() {
+                if key != "cmd" && !allowed.contains(&key.as_str()) {
+                    return Err(format!("unknown field \"{}\" for command \"{}\"", key, cmd));
+                }
+            }
+        }
+    }
 
     match cmd {
         "split" => {
@@ -501,6 +560,38 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             };
             Ok(IpcCommand::RenamePane { pane_id, title })
         }
+        "dispatch-action" => {
+            let action = v
+                .get("action")
+                .and_then(|a| a.as_str())
+                .ok_or_else(|| "missing \"action\" field".to_string())?
+                .to_string();
+            let pane_id = match v.get("pane_id") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(p) => Some(
+                    p.as_u64()
+                        .ok_or_else(|| "\"pane_id\" must be a non-negative integer".to_string())?
+                        as u32,
+                ),
+            };
+            Ok(IpcCommand::DispatchAction { action, pane_id })
+        }
+        "merge-window" => {
+            let source_window = v
+                .get("source_window")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"source_window\" field".to_string())?
+                as usize;
+            let target_window = v
+                .get("target_window")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"target_window\" field".to_string())?
+                as usize;
+            if source_window == target_window {
+                return Err("source_window and target_window must differ".to_string());
+            }
+            Ok(IpcCommand::MergeWindow { source_window, target_window })
+        }
         other => Err(format!("unknown command: {}", other)),
     }
 }
@@ -571,5 +662,58 @@ pub fn cleanup() {
     if path.exists() {
         let _ = std::fs::remove_file(&path);
         log::debug!("IPC: socket cleaned up at {}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(line: &str) -> String {
+        parse_command(line).err().expect("expected an error")
+    }
+
+    #[test]
+    fn rejects_unknown_field() {
+        // The motivating bug: get-pane-content silently ignored pane_id and
+        // defaulted panes to "all". It must now fail loudly.
+        assert_eq!(
+            err(r#"{"cmd":"get-pane-content","pane_id":232}"#),
+            "unknown field \"pane_id\" for command \"get-pane-content\""
+        );
+        // count-pane-content shares the same allowed set.
+        assert_eq!(
+            err(r#"{"cmd":"count-pane-content","pane_id":1}"#),
+            "unknown field \"pane_id\" for command \"count-pane-content\""
+        );
+        // A typo on a normal command.
+        assert_eq!(
+            err(r#"{"cmd":"send-keys","pane_id":1,"text":"x","panes":"all"}"#),
+            "unknown field \"panes\" for command \"send-keys\""
+        );
+        // A command that takes no fields at all.
+        assert_eq!(
+            err(r#"{"cmd":"list-panes","pane_id":1}"#),
+            "unknown field \"pane_id\" for command \"list-panes\""
+        );
+    }
+
+    #[test]
+    fn accepts_documented_fields() {
+        assert!(parse_command(
+            r#"{"cmd":"get-pane-content","panes":[1,2],"mode":"all","trim_trailing_blank_lines":false}"#
+        )
+        .is_ok());
+        // `split`/`new-tab` use `command`, not `cmd`, for the shell command.
+        assert!(parse_command(
+            r#"{"cmd":"split","direction":"vertical","command":"ls"}"#
+        )
+        .is_ok());
+        assert!(parse_command(r#"{"cmd":"list-panes"}"#).is_ok());
+    }
+
+    #[test]
+    fn unknown_command_takes_precedence_over_field_check() {
+        assert_eq!(err(r#"{"cmd":"bogus","whatever":1}"#), "unknown command: bogus");
     }
 }

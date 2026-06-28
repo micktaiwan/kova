@@ -48,10 +48,16 @@ Every response uses the same wrapper:
 | `invalid JSON: ...` | malformed request |
 | `missing "<field>" field` | required field absent |
 | `unknown command: <x>` | typo in `cmd` |
+| `unknown field "<key>" for command "<cmd>"` | a field not accepted by that command (see below) |
 | `pane <N> not found` | unknown pane ID |
 | `tab <N> not found` | unknown tab ID |
 | `request too large` | line exceeded 64 KB |
 | `timeout waiting for response` | main thread didn't reply within the connection deadline |
+
+Field validation is **strict**: every command accepts only its documented fields
+(plus `cmd`). Any other top-level key is rejected with `unknown field "<key>" for
+command "<cmd>"` rather than silently ignored — so a typo or a field meant for a
+different command fails loudly instead of making the command do something else.
 
 ## Commands
 
@@ -170,6 +176,20 @@ Response: `{ "ok": true }`.
 
 ---
 
+### `merge-window` — merge a whole window into another
+
+```json
+{ "cmd": "merge-window", "source_window": 1, "target_window": 0 }
+```
+
+Moves **every tab** of `source_window` into `target_window` (preserving order), then closes the now-empty source window. Windows are addressed by the `window` index reported in `list-tabs` / `list-panes`. The two indices must differ; the target is validated before the source is drained, so an invalid target never loses tabs.
+
+This is the deterministic, scriptable counterpart of the `Cmd+Ctrl+Shift+M` keyboard shortcut (which instead opens an interactive window-picker overlay).
+
+Response: `{ "ok": true }`.
+
+---
+
 ### `swap-pane` — swap two panes
 
 ```json
@@ -215,6 +235,44 @@ Response: `{ "ok": true }`.
 Sets the pane's custom title — the same field that `Cmd+Option+R` and `OSC 1` write to. Sticky: survives OSC 0/2 (window title) sequences emitted by programs running in the pane. Pass `"title": null` to clear (pane falls back to its OSC 0/2 / auto-derived title).
 
 Response: `{ "ok": true }`.
+
+---
+
+### `dispatch-action` — trigger any keyboard action by name
+
+```json
+{ "cmd": "dispatch-action", "action": "next-tab", "pane_id": 42 }
+```
+
+Runs the exact same handler as the corresponding keyboard shortcut — this is the generic bridge that makes **every** keybinding scriptable, so Kova can be fully driven from Claude Code / shell. The typed commands above (`split`, `resize-pane`, `swap-pane`, `merge-tab`, `merge-window`, `rename-pane`, `close-tab`, `close-pane`) remain the preferred path when you want to address a specific pane/tab/window by ID; `dispatch-action` covers everything else and acts on the *focused* pane / active tab.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `action` | required | one of the action names below |
+| `pane_id` | omitted | if given, that pane's window is focused first and the action runs there; otherwise the action runs against the key window |
+
+Response: `{ "ok": true }`, or `{ "ok": false, "error": "unknown action: ..." }`.
+
+**Action names** (kebab-case, mirroring the config keys in `config.rs`):
+
+```
+new-tab  close-pane-or-tab  close-tab  close-window  kill-window  new-window
+vsplit  hsplit  vsplit-root  hsplit-root  equalize  repaint-pane
+prev-tab  next-tab  switch-tab-1 … switch-tab-9
+navigate-up|down|left|right        (move focus between panes)
+swap-up|down|left|right            (swap panes/columns)
+reparent-up|down|left|right        (move a pane across the tree)
+resize-left|right|up|down          (ratio resize, ±5%)
+edge-grow-left|right               (grow the focused pane's edge)
+minimize-pane  restore-minimized
+detach-tab  break-pane  merge-tab  merge-window
+rename-tab  rename-pane            (open the inline rename editor)
+open-recent-project  open-search  open-pane-switcher   (open an overlay)
+copy  copy-raw  paste  toggle-filter  clear-scrollback
+toggle-help  mem-report
+```
+
+Note: a few actions open an **interactive overlay** that then expects keyboard input — `merge-tab`, `merge-window`, `detach-tab` (when several windows exist), `rename-tab`, `rename-pane`, `open-recent-project`, `open-search`, `open-pane-switcher`. For headless automation, prefer the deterministic typed commands where one exists (e.g. `merge-window` with explicit indices, `rename-pane` with a title).
 
 ---
 

@@ -274,6 +274,10 @@ struct MergeTabState {
 struct SendToWindowState {
     entries: Vec<SendToWindowEntry>,
     selected: usize,
+    /// When true, confirming the overlay merges *all* of this window's tabs into
+    /// the chosen window and closes this one (whole-window merge). When false,
+    /// only the active tab is sent (detach-tab flow).
+    merge_all: bool,
 }
 
 /// One row of the tab/pane switcher overlay.
@@ -704,195 +708,12 @@ define_class!(
 
             if let Some(action) = keybindings.window_map.get(&combo) {
                 log::debug!("performKeyEquivalent: combo={:?} action={:?}", combo, action);
-                match action {
-                    Action::ToggleHelp => {
-                        self.ivars().show_help.set(true);
-                        self.mark_dirty();
-                    }
-                    Action::ToggleFilter => self.toggle_filter(),
-                    Action::MemReport => {
-                        let showing = self.ivars().show_mem_report.get();
-                        if showing {
-                            self.ivars().show_mem_report.set(false);
-                            self.mark_dirty();
-                        } else {
-                            self.show_mem_report_overlay();
-                        }
-                    }
-                    Action::ClearScrollback => {
-                        if let Some(pane) = self.focused_pane() {
-                            pane.terminal.write().clear_scrollback_and_screen();
-                            pane.pty.write(b"\x0c");
-                        }
-                    }
-                    Action::NewWindow => {
-                        let mtm = unsafe { MainThreadMarker::new_unchecked() };
-                        crate::app::create_new_window(mtm);
-                    }
-                    Action::NewTab => self.do_new_tab(),
-                    Action::VSplit => self.do_split(SplitDirection::Horizontal),
-                    Action::HSplit => self.do_split(SplitDirection::Vertical),
-                    Action::VSplitRoot => self.do_split_root(SplitDirection::Horizontal),
-                    Action::HSplitRoot => self.do_split_root(SplitDirection::Vertical),
-                    Action::CloseWindow => self.do_close_window(),
-                    Action::KillWindow => self.do_kill_window(),
-                    Action::ClosePaneOrTab => self.do_close_pane_or_tab(),
-                    Action::CloseTab => self.do_close_tab(),
-                    Action::OpenRecentProject => self.do_open_recent_projects(),
-                    Action::OpenSearchPalette => self.do_open_search_palette(),
-                    Action::OpenPaneSwitcher => self.do_open_pane_switcher(),
-                    Action::Equalize => {
-                        let mut tabs = self.ivars().tabs.borrow_mut();
-                        let idx = self.ivars().active_tab.get();
-                        if let Some(tab) = tabs.get_mut(idx) {
-                            tab.equalize();
-                            drop(tabs);
-                            self.resize_all_panes();
-                        }
-                    }
-                    Action::RepaintPane => self.do_repaint_pane(),
-                    Action::PrevTab => self.do_switch_tab_relative(-1),
-                    Action::NextTab => self.do_switch_tab_relative(1),
-                    Action::RenameTab => self.start_rename_tab(),
-                    Action::RenamePane => self.start_rename_pane(),
-                    Action::DetachTab => self.do_detach_tab(),
-                    Action::BreakPane => self.do_break_pane(),
-                    Action::MergeTab => self.do_merge_tab(),
-
-                    Action::SwitchTab(idx) => self.do_switch_tab(*idx),
-                    Action::MinimizePane => self.do_minimize_pane(),
-                    Action::RestoreLastMinimized => self.do_restore_last_minimized(),
-                    Action::Navigate(dir) => self.do_navigate(*dir),
-                    Action::SwapPane(dir) => self.do_swap_pane(*dir),
-                    Action::ReparentPane(dir) => self.do_reparent_pane(*dir),
-                    Action::Resize(axis, delta) => {
-                        // Mode 1: ratio resize — move nearest separator, virtual width unchanged
-                        let mut tabs = self.ivars().tabs.borrow_mut();
-                        let idx = self.ivars().active_tab.get();
-                        if let Some(tab) = tabs.get_mut(idx) {
-                            let focused_id = tab.focused_pane;
-                            if tab.adjust_ratio_directional(focused_id, *delta, *axis)
-                                || tab.adjust_ratio_nearest(focused_id, *delta, *axis) {
-                                let full = self.drawable_viewport();
-                                let min_w = self.min_split_width_px();
-                                self.cap_virtual_width(tab, full.width, min_w);
-                                tab.clamp_scroll(full.width, min_w);
-                                self.scroll_to_reveal_pane(tab, focused_id, full.width);
-                                self.set_resize_feedback("Ratio", tab, full.width, min_w);
-                                drop(tabs);
-                                self.resize_all_panes();
-                            }
-                        }
-                    }
-                    Action::EdgeGrow(delta) => {
-                        // Mode 3: edge grow — only focused pane changes size, virtual width adjusts
-                        let mut tabs = self.ivars().tabs.borrow_mut();
-                        let idx = self.ivars().active_tab.get();
-                        if let Some(tab) = tabs.get_mut(idx) {
-                            let focused_id = tab.focused_pane;
-                            let full = self.drawable_viewport();
-                            let min_w = self.min_split_width_px();
-                            let screen_w = full.width;
-                            // Don't grow if focused pane is already at screen width
-                            let pane_vp = tab.viewport_for_pane(focused_id, self.panes_viewport_for_tab(tab));
-                            let pane_w = pane_vp.map(|vp| vp.width).unwrap_or(0.0);
-                            let blocked = *delta > 0.0 && pane_w >= screen_w - 1.0;
-                            let old_vw = tab.virtual_width(screen_w, min_w);
-                            let step = (0.05 * screen_w).max(20.0);
-                            let new_vw = if *delta > 0.0 {
-                                old_vw + step
-                            } else {
-                                (old_vw - step).max(screen_w)
-                            };
-                            if !blocked && (new_vw - old_vw).abs() > 0.5 {
-                                tab.scale_ratios_for_edge_grow(focused_id, old_vw, new_vw);
-                                tab.virtual_width_override = if new_vw > screen_w { new_vw } else { 0.0 };
-                                self.enforce_max_pane_width(tab, screen_w, min_w);
-                                tab.clamp_scroll(screen_w, min_w);
-                                self.scroll_to_reveal_pane(tab, focused_id, screen_w);
-                                self.set_resize_feedback("Right Edge", tab, screen_w, min_w);
-                                drop(tabs);
-                                self.resize_all_panes();
-                            }
-                        }
-                    }
-                    Action::Copy | Action::CopyRaw => {
-                        let raw = matches!(action, Action::CopyRaw);
-                        // If filter is active, copy all filtered lines
-                        let filter = self.ivars().filter.borrow();
-                        if let Some(state) = filter.as_ref() {
-                            if !state.matches.is_empty() {
-                                let mut text = String::new();
-                                for (i, m) in state.matches.iter().enumerate() {
-                                    if i > 0 { text.push('\n'); }
-                                    text.push_str(&m.text);
-                                }
-                                drop(filter);
-                                copy_to_pasteboard(&text);
-                                // Close filter after copying
-                                *self.ivars().filter.borrow_mut() = None;
-                                self.mark_dirty();
-                            } else {
-                                drop(filter);
-                            }
-                        } else {
-                            drop(filter);
-                            if let Some(pane) = self.focused_pane() {
-                                let text = if raw {
-                                    pane.terminal.read().selected_text()
-                                } else {
-                                    pane.terminal.read().selected_text_joined()
-                                };
-                                if !text.is_empty() {
-                                    copy_to_pasteboard(&text);
-                                    pane.terminal.write().clear_selection();
-                                } else {
-                                    return objc2::runtime::Bool::NO;
-                                }
-                            }
-                        }
-                    }
-                    Action::Paste => {
-                        if let Some(pane) = self.focused_pane() {
-                            let pasteboard = NSPasteboard::generalPasteboard();
-                            let pasted_image = unsafe { pasteboard.dataForType(objc2_app_kit::NSPasteboardTypePNG) }
-                                .and_then(|data| {
-                                    if data.is_empty() { return None; }
-                                    let bytes = data.to_vec();
-                                    let timestamp = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis();
-                                    let path = format!("/tmp/kova-paste-{timestamp}.png");
-                                    std::fs::write(&path, bytes).ok().map(|_| path)
-                                });
-
-                            if let Some(path) = pasted_image {
-                                let bracketed = pane.terminal.read().bracketed_paste;
-                                if bracketed { pane.pty.write(b"\x1b[200~"); }
-                                pane.pty.write(path.as_bytes());
-                                if bracketed { pane.pty.write(b"\x1b[201~"); }
-                            } else if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
-                                let mut text = text.to_string();
-                                let bracketed = pane.terminal.read().bracketed_paste;
-                                if bracketed {
-                                    // A paste containing the bracketed-paste
-                                    // terminator would break out of the paste
-                                    // and inject keystrokes into the app.
-                                    // Loop to a fixpoint: a single replace can
-                                    // re-form the terminator from its halves.
-                                    while text.contains("\x1b[201~") {
-                                        text = text.replace("\x1b[201~", "");
-                                    }
-                                    pane.pty.write(b"\x1b[200~");
-                                }
-                                pane.pty.write(text.as_bytes());
-                                if bracketed { pane.pty.write(b"\x1b[201~"); }
-                            }
-                        }
-                    }
-                }
-                return objc2::runtime::Bool::YES;
+                let action = action.clone();
+                return if self.dispatch_action(&action) {
+                    objc2::runtime::Bool::YES
+                } else {
+                    objc2::runtime::Bool::NO
+                };
             }
 
             if combo.cmd {
@@ -3193,13 +3014,21 @@ impl KovaView {
 
         // Enter → confirm selection
         if keycode == 0x24 {
-            let target = {
+            let selection = {
                 let state = self.ivars().send_to_window.borrow();
-                state.as_ref().map(|s| s.entries[s.selected].window_index)
+                state.as_ref().map(|s| (s.entries[s.selected].window_index, s.merge_all))
             };
-            if let Some(window_index) = target {
+            if let Some((window_index, merge_all)) = selection {
                 *self.ivars().send_to_window.borrow_mut() = None;
-                self.send_active_tab_to(window_index);
+                if merge_all {
+                    // Whole-window merge only targets existing windows, so
+                    // window_index is always Some here.
+                    if let Some(idx) = window_index {
+                        self.merge_window_into(idx);
+                    }
+                } else {
+                    self.send_active_tab_to(window_index);
+                }
             }
             return;
         }
@@ -3522,6 +3351,205 @@ impl KovaView {
         self.ivars().skip_session_save.get()
     }
 
+    /// Execute a window-level [`Action`] against this view. Shared by the
+    /// keyboard path (`performKeyEquivalent`) and the IPC `dispatch-action`
+    /// command so both go through a single implementation. Returns `true` when
+    /// the action was consumed, `false` for a no-op the keyboard caller may want
+    /// to propagate up the responder chain (currently only Copy with an empty
+    /// selection).
+    pub fn dispatch_action(&self, action: &Action) -> bool {
+        match action {
+            Action::ToggleHelp => {
+                self.ivars().show_help.set(true);
+                self.mark_dirty();
+            }
+            Action::ToggleFilter => self.toggle_filter(),
+            Action::MemReport => {
+                let showing = self.ivars().show_mem_report.get();
+                if showing {
+                    self.ivars().show_mem_report.set(false);
+                    self.mark_dirty();
+                } else {
+                    self.show_mem_report_overlay();
+                }
+            }
+            Action::ClearScrollback => {
+                if let Some(pane) = self.focused_pane() {
+                    pane.terminal.write().clear_scrollback_and_screen();
+                    pane.pty.write(b"\x0c");
+                }
+            }
+            Action::NewWindow => {
+                let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                crate::app::create_new_window(mtm);
+            }
+            Action::NewTab => self.do_new_tab(),
+            Action::VSplit => self.do_split(SplitDirection::Horizontal),
+            Action::HSplit => self.do_split(SplitDirection::Vertical),
+            Action::VSplitRoot => self.do_split_root(SplitDirection::Horizontal),
+            Action::HSplitRoot => self.do_split_root(SplitDirection::Vertical),
+            Action::CloseWindow => self.do_close_window(),
+            Action::KillWindow => self.do_kill_window(),
+            Action::ClosePaneOrTab => self.do_close_pane_or_tab(),
+            Action::CloseTab => self.do_close_tab(),
+            Action::OpenRecentProject => self.do_open_recent_projects(),
+            Action::OpenSearchPalette => self.do_open_search_palette(),
+            Action::OpenPaneSwitcher => self.do_open_pane_switcher(),
+            Action::Equalize => {
+                let mut tabs = self.ivars().tabs.borrow_mut();
+                let idx = self.ivars().active_tab.get();
+                if let Some(tab) = tabs.get_mut(idx) {
+                    tab.equalize();
+                    drop(tabs);
+                    self.resize_all_panes();
+                }
+            }
+            Action::RepaintPane => self.do_repaint_pane(),
+            Action::PrevTab => self.do_switch_tab_relative(-1),
+            Action::NextTab => self.do_switch_tab_relative(1),
+            Action::RenameTab => self.start_rename_tab(),
+            Action::RenamePane => self.start_rename_pane(),
+            Action::DetachTab => self.do_detach_tab(),
+            Action::BreakPane => self.do_break_pane(),
+            Action::MergeTab => self.do_merge_tab(),
+            Action::MergeWindow => self.do_merge_window(),
+
+            Action::SwitchTab(idx) => self.do_switch_tab(*idx),
+            Action::MinimizePane => self.do_minimize_pane(),
+            Action::RestoreLastMinimized => self.do_restore_last_minimized(),
+            Action::Navigate(dir) => self.do_navigate(*dir),
+            Action::SwapPane(dir) => self.do_swap_pane(*dir),
+            Action::ReparentPane(dir) => self.do_reparent_pane(*dir),
+            Action::Resize(axis, delta) => {
+                // Mode 1: ratio resize — move nearest separator, virtual width unchanged
+                let mut tabs = self.ivars().tabs.borrow_mut();
+                let idx = self.ivars().active_tab.get();
+                if let Some(tab) = tabs.get_mut(idx) {
+                    let focused_id = tab.focused_pane;
+                    if tab.adjust_ratio_directional(focused_id, *delta, *axis)
+                        || tab.adjust_ratio_nearest(focused_id, *delta, *axis) {
+                        let full = self.drawable_viewport();
+                        let min_w = self.min_split_width_px();
+                        self.cap_virtual_width(tab, full.width, min_w);
+                        tab.clamp_scroll(full.width, min_w);
+                        self.scroll_to_reveal_pane(tab, focused_id, full.width);
+                        self.set_resize_feedback("Ratio", tab, full.width, min_w);
+                        drop(tabs);
+                        self.resize_all_panes();
+                    }
+                }
+            }
+            Action::EdgeGrow(delta) => {
+                // Mode 3: edge grow — only focused pane changes size, virtual width adjusts
+                let mut tabs = self.ivars().tabs.borrow_mut();
+                let idx = self.ivars().active_tab.get();
+                if let Some(tab) = tabs.get_mut(idx) {
+                    let focused_id = tab.focused_pane;
+                    let full = self.drawable_viewport();
+                    let min_w = self.min_split_width_px();
+                    let screen_w = full.width;
+                    // Don't grow if focused pane is already at screen width
+                    let pane_vp = tab.viewport_for_pane(focused_id, self.panes_viewport_for_tab(tab));
+                    let pane_w = pane_vp.map(|vp| vp.width).unwrap_or(0.0);
+                    let blocked = *delta > 0.0 && pane_w >= screen_w - 1.0;
+                    let old_vw = tab.virtual_width(screen_w, min_w);
+                    let step = (0.05 * screen_w).max(20.0);
+                    let new_vw = if *delta > 0.0 {
+                        old_vw + step
+                    } else {
+                        (old_vw - step).max(screen_w)
+                    };
+                    if !blocked && (new_vw - old_vw).abs() > 0.5 {
+                        tab.scale_ratios_for_edge_grow(focused_id, old_vw, new_vw);
+                        tab.virtual_width_override = if new_vw > screen_w { new_vw } else { 0.0 };
+                        self.enforce_max_pane_width(tab, screen_w, min_w);
+                        tab.clamp_scroll(screen_w, min_w);
+                        self.scroll_to_reveal_pane(tab, focused_id, screen_w);
+                        self.set_resize_feedback("Right Edge", tab, screen_w, min_w);
+                        drop(tabs);
+                        self.resize_all_panes();
+                    }
+                }
+            }
+            Action::Copy | Action::CopyRaw => {
+                let raw = matches!(action, Action::CopyRaw);
+                // If filter is active, copy all filtered lines
+                let filter = self.ivars().filter.borrow();
+                if let Some(state) = filter.as_ref() {
+                    if !state.matches.is_empty() {
+                        let mut text = String::new();
+                        for (i, m) in state.matches.iter().enumerate() {
+                            if i > 0 { text.push('\n'); }
+                            text.push_str(&m.text);
+                        }
+                        drop(filter);
+                        copy_to_pasteboard(&text);
+                        // Close filter after copying
+                        *self.ivars().filter.borrow_mut() = None;
+                        self.mark_dirty();
+                    } else {
+                        drop(filter);
+                    }
+                } else {
+                    drop(filter);
+                    if let Some(pane) = self.focused_pane() {
+                        let text = if raw {
+                            pane.terminal.read().selected_text()
+                        } else {
+                            pane.terminal.read().selected_text_joined()
+                        };
+                        if !text.is_empty() {
+                            copy_to_pasteboard(&text);
+                            pane.terminal.write().clear_selection();
+                        } else {
+                            return false;
+                        }
+                    }
+                }
+            }
+            Action::Paste => {
+                if let Some(pane) = self.focused_pane() {
+                    let pasteboard = NSPasteboard::generalPasteboard();
+                    let pasted_image = unsafe { pasteboard.dataForType(objc2_app_kit::NSPasteboardTypePNG) }
+                        .and_then(|data| {
+                            if data.is_empty() { return None; }
+                            let bytes = data.to_vec();
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis();
+                            let path = format!("/tmp/kova-paste-{timestamp}.png");
+                            std::fs::write(&path, bytes).ok().map(|_| path)
+                        });
+
+                    if let Some(path) = pasted_image {
+                        let bracketed = pane.terminal.read().bracketed_paste;
+                        if bracketed { pane.pty.write(b"\x1b[200~"); }
+                        pane.pty.write(path.as_bytes());
+                        if bracketed { pane.pty.write(b"\x1b[201~"); }
+                    } else if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+                        let mut text = text.to_string();
+                        let bracketed = pane.terminal.read().bracketed_paste;
+                        if bracketed {
+                            // A paste containing the bracketed-paste
+                            // terminator would break out of the paste
+                            // and inject keystrokes into the app.
+                            // Loop to a fixpoint: a single replace can
+                            // re-form the terminator from its halves.
+                            while text.contains("\x1b[201~") {
+                                text = text.replace("\x1b[201~", "");
+                            }
+                            pane.pty.write(b"\x1b[200~");
+                        }
+                        pane.pty.write(text.as_bytes());
+                        if bracketed { pane.pty.write(b"\x1b[201~"); }
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Send the active tab to another window.
     /// - 1 tab + no other window → no-op (would leave nothing)
     /// - 1 tab + other windows → overlay (no "New Window" option)
@@ -3563,9 +3591,58 @@ impl KovaView {
             *self.ivars().send_to_window.borrow_mut() = Some(SendToWindowState {
                 entries,
                 selected: 0,
+                merge_all: false,
             });
             self.mark_dirty();
         }
+    }
+
+    /// Merge this whole window (all its tabs) into another window.
+    /// - no other window → no-op (nothing to merge into)
+    /// - exactly one other window → merge directly
+    /// - several other windows → overlay picker (no "New Window" option)
+    fn do_merge_window(&self) {
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let source = self.window().unwrap();
+        let others = crate::app::list_other_windows(mtm, &source);
+
+        if others.is_empty() {
+            log::debug!("do_merge_window: no other window to merge into, ignoring");
+            return;
+        }
+
+        if others.len() == 1 {
+            self.merge_window_into(others[0].index);
+        } else {
+            let entries: Vec<SendToWindowEntry> = others.into_iter()
+                .map(|info| SendToWindowEntry {
+                    label: info.label,
+                    window_index: Some(info.index),
+                })
+                .collect();
+            *self.ivars().send_to_window.borrow_mut() = Some(SendToWindowState {
+                entries,
+                selected: 0,
+                merge_all: true,
+            });
+            self.mark_dirty();
+        }
+    }
+
+    /// Move every tab of this window into the window at `target_index`
+    /// (app-delegate window-list index), then close this now-empty window.
+    /// Shared by the merge-window overlay and the IPC `merge-window` command.
+    pub fn merge_window_into(&self, target_index: usize) {
+        let tabs: Vec<crate::pane::Tab> = self.ivars().tabs.borrow_mut().drain(..).collect();
+        if tabs.is_empty() {
+            return;
+        }
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        crate::app::send_tabs_to_window(mtm, tabs, target_index);
+        // This window is now empty — close it without re-saving (the tabs live
+        // on in the target window's session).
+        self.ivars().skip_session_save.set(true);
+        self.ivars().closing.set(true);
     }
 
     /// Detach the active tab to a new window (no overlay).

@@ -48,6 +48,7 @@ pub enum Action {
     DetachTab,
     BreakPane,
     MergeTab,
+    MergeWindow,
 
     SwitchTab(usize),
     Navigate(NavDirection),
@@ -218,6 +219,7 @@ impl Keybindings {
         bind(&keys.detach_tab, Action::DetachTab);
         bind(&keys.break_pane, Action::BreakPane);
         bind(&keys.merge_tab, Action::MergeTab);
+        bind(&keys.merge_window, Action::MergeWindow);
 
 
         for (i, s) in [
@@ -277,4 +279,85 @@ impl Keybindings {
 
         Keybindings { window_map, terminal_map }
     }
+}
+
+/// Map a stable kebab-case action name (used by the IPC `dispatch-action`
+/// command) to an [`Action`]. This is the single canonical name → action table
+/// so external scripts can trigger any keyboard action. Returns `None` for an
+/// unknown name.
+///
+/// Resize/edge-grow deltas mirror the keyboard bindings in
+/// [`Keybindings::from_config`] so a dispatched action behaves identically to
+/// its keystroke.
+pub fn action_from_ipc_name(name: &str) -> Option<Action> {
+    let action = match name {
+        "new-tab" => Action::NewTab,
+        "close-pane-or-tab" => Action::ClosePaneOrTab,
+        "vsplit" => Action::VSplit,
+        "hsplit" => Action::HSplit,
+        "vsplit-root" => Action::VSplitRoot,
+        "hsplit-root" => Action::HSplitRoot,
+        "new-window" => Action::NewWindow,
+        "close-window" => Action::CloseWindow,
+        "kill-window" => Action::KillWindow,
+        "copy" => Action::Copy,
+        "copy-raw" => Action::CopyRaw,
+        "paste" => Action::Paste,
+        "toggle-filter" => Action::ToggleFilter,
+        "clear-scrollback" => Action::ClearScrollback,
+        "prev-tab" => Action::PrevTab,
+        "next-tab" => Action::NextTab,
+        "rename-tab" => Action::RenameTab,
+        "rename-pane" => Action::RenamePane,
+        "detach-tab" => Action::DetachTab,
+        "break-pane" => Action::BreakPane,
+        "merge-tab" => Action::MergeTab,
+        "merge-window" => Action::MergeWindow,
+
+        "switch-tab-1" => Action::SwitchTab(0),
+        "switch-tab-2" => Action::SwitchTab(1),
+        "switch-tab-3" => Action::SwitchTab(2),
+        "switch-tab-4" => Action::SwitchTab(3),
+        "switch-tab-5" => Action::SwitchTab(4),
+        "switch-tab-6" => Action::SwitchTab(5),
+        "switch-tab-7" => Action::SwitchTab(6),
+        "switch-tab-8" => Action::SwitchTab(7),
+        "switch-tab-9" => Action::SwitchTab(8),
+
+        "navigate-up" => Action::Navigate(NavDirection::Up),
+        "navigate-down" => Action::Navigate(NavDirection::Down),
+        "navigate-left" => Action::Navigate(NavDirection::Left),
+        "navigate-right" => Action::Navigate(NavDirection::Right),
+
+        "swap-up" => Action::SwapPane(NavDirection::Up),
+        "swap-down" => Action::SwapPane(NavDirection::Down),
+        "swap-left" => Action::SwapPane(NavDirection::Left),
+        "swap-right" => Action::SwapPane(NavDirection::Right),
+
+        "reparent-up" => Action::ReparentPane(NavDirection::Up),
+        "reparent-down" => Action::ReparentPane(NavDirection::Down),
+        "reparent-left" => Action::ReparentPane(NavDirection::Left),
+        "reparent-right" => Action::ReparentPane(NavDirection::Right),
+
+        "resize-left" => Action::Resize(SplitAxis::Horizontal, -0.05),
+        "resize-right" => Action::Resize(SplitAxis::Horizontal, 0.05),
+        "resize-up" => Action::Resize(SplitAxis::Vertical, -0.05),
+        "resize-down" => Action::Resize(SplitAxis::Vertical, 0.05),
+        "edge-grow-right" => Action::EdgeGrow(1.0),
+        "edge-grow-left" => Action::EdgeGrow(-1.0),
+
+        "minimize-pane" => Action::MinimizePane,
+        "restore-minimized" => Action::RestoreLastMinimized,
+        "toggle-help" => Action::ToggleHelp,
+        "mem-report" => Action::MemReport,
+        "close-tab" => Action::CloseTab,
+        "open-recent-project" => Action::OpenRecentProject,
+        "open-search" => Action::OpenSearchPalette,
+        "open-pane-switcher" => Action::OpenPaneSwitcher,
+        "equalize" => Action::Equalize,
+        "repaint-pane" => Action::RepaintPane,
+
+        _ => return None,
+    };
+    Some(action)
 }

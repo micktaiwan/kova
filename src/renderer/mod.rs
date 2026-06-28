@@ -81,7 +81,7 @@ use crate::config::{Config, KeysConfig};
 use crate::pane::PaneId;
 
 /// Attention state for a non-focused pane (bell > completion > none).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum PaneAttention {
     None,
     Completion,
@@ -1989,6 +1989,7 @@ impl Renderer {
                 ("Detach Tab", &keys_config.detach_tab),
                 ("Break Pane", &keys_config.break_pane),
                 ("Merge Tab", &keys_config.merge_tab),
+                ("Merge Window", &keys_config.merge_window),
 
                 ("Navigate", &keys_config.navigate_up),
                 ("Swap Pane", &keys_config.swap_up),
@@ -2626,4 +2627,100 @@ fn format_key_combo(s: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_count_below_thousand_is_verbatim() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(7), "7");
+        assert_eq!(format_count(999), "999");
+    }
+
+    #[test]
+    fn format_count_scales_with_suffixes() {
+        assert_eq!(format_count(1_000), "1.0K");
+        assert_eq!(format_count(1_234), "1.2K");
+        assert_eq!(format_count(1_000_000), "1.0M");
+        assert_eq!(format_count(3_400_000), "3.4M");
+        assert_eq!(format_count(1_000_000_000), "1.0G");
+    }
+
+    #[test]
+    fn format_last_activity_has_expected_shape() {
+        // Timezone-dependent value, so assert the "DD/MMM HH:mm" shape, not the value.
+        let s = format_last_activity(1_700_000_000);
+        let bytes = s.as_bytes();
+        assert_eq!(s.len(), 12, "got {s:?}");
+        assert_eq!(bytes[2], b'/');
+        assert_eq!(bytes[6], b' ');
+        assert_eq!(bytes[9], b':');
+        // Month is one of the known abbreviations.
+        let mon = &s[3..6];
+        assert!(MONTHS.contains(&mon), "unexpected month {mon:?}");
+    }
+
+    #[test]
+    fn format_key_combo_renders_modifier_glyphs() {
+        assert_eq!(format_key_combo("cmd+shift+d"), "\u{2318}\u{21E7}D");
+        assert_eq!(format_key_combo("ctrl+a"), "\u{2303}A");
+        assert_eq!(format_key_combo("option+left"), "\u{2325}\u{2190}");
+        assert_eq!(format_key_combo("cmd+p"), "\u{2318}P");
+    }
+
+    #[test]
+    fn format_key_combo_special_keys() {
+        assert_eq!(format_key_combo("enter"), "\u{21A9}");
+        assert_eq!(format_key_combo("backspace"), "\u{232B}");
+        assert_eq!(format_key_combo("cmd+["), "\u{2318}[");
+    }
+
+    #[test]
+    fn format_key_combo_arrows_collapses_directions() {
+        // A trailing arrow direction is replaced with the word "Arrows".
+        assert_eq!(format_key_combo_arrows("cmd+up"), "\u{2318}ARROWS");
+        assert_eq!(format_key_combo_arrows("up"), "ARROWS");
+        // Non-arrow keys fall through to the normal formatter.
+        assert_eq!(format_key_combo_arrows("cmd+d"), "\u{2318}D");
+    }
+
+    #[test]
+    fn tooltip_zone_contains_is_half_open() {
+        let z = TooltipZone { x: 10.0, y: 20.0, width: 30.0, height: 8.0, text: "x" };
+        // Inside.
+        assert!(z.contains(10.0, 20.0)); // top-left corner is inclusive
+        assert!(z.contains(25.0, 24.0));
+        assert!(z.contains(39.9, 27.9));
+        // Outside: right/bottom edges are exclusive.
+        assert!(!z.contains(40.0, 24.0));
+        assert!(!z.contains(25.0, 28.0));
+        assert!(!z.contains(9.9, 24.0));
+        assert!(!z.contains(25.0, 19.9));
+    }
+
+    #[test]
+    fn pane_attention_bell_wins_over_completion() {
+        assert_eq!(PaneAttention::from_flags(true, true), PaneAttention::Bell);
+        assert_eq!(PaneAttention::from_flags(true, false), PaneAttention::Bell);
+        assert_eq!(PaneAttention::from_flags(false, true), PaneAttention::Completion);
+        assert_eq!(PaneAttention::from_flags(false, false), PaneAttention::None);
+    }
+
+    #[test]
+    fn pane_attention_dot_color_only_when_attention() {
+        assert!(PaneAttention::Bell.dot_color().is_some());
+        assert!(PaneAttention::Completion.dot_color().is_some());
+        assert!(PaneAttention::None.dot_color().is_none());
+    }
+
+    #[test]
+    fn pane_attention_bar_bg_falls_back_to_default() {
+        let default = [0.1, 0.2, 0.3];
+        assert_eq!(PaneAttention::None.bar_bg(default), default);
+        assert_ne!(PaneAttention::Bell.bar_bg(default), default);
+        assert_ne!(PaneAttention::Completion.bar_bg(default), default);
+    }
 }

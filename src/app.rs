@@ -373,6 +373,19 @@ pub fn send_tab_to_window(mtm: MainThreadMarker, tab: crate::pane::Tab, window_i
     }
 }
 
+/// Append several tabs to an existing window (by index in the app delegate's
+/// window list), preserving their order. Used by the whole-window merge.
+pub fn send_tabs_to_window(mtm: MainThreadMarker, tabs: Vec<crate::pane::Tab>, window_index: usize) {
+    let ad = app_delegate(mtm);
+    let windows = ad.ivars().windows.borrow();
+    if let Some(target) = windows.get(window_index) {
+        if let Some(view) = kova_view(target) {
+            view.append_tabs(tabs);
+        }
+        target.makeKeyAndOrderFront(None);
+    }
+}
+
 /// Cast the window's contentView to our KovaView.
 /// SAFETY: contentView is always a KovaView (set in `create_window`).
 pub fn kova_view(window: &NSWindow) -> Option<&crate::window::KovaView> {
@@ -468,6 +481,12 @@ fn handle_ipc_command_sync(
         }
         IpcCommand::RenamePane { pane_id, title } => {
             handle_ipc_rename_pane(windows, pane_id, title)
+        }
+        IpcCommand::DispatchAction { action, pane_id } => {
+            handle_ipc_dispatch_action(windows, &action, pane_id)
+        }
+        IpcCommand::MergeWindow { source_window, target_window } => {
+            handle_ipc_merge_window(windows, source_window, target_window)
         }
     }
 }
@@ -1061,6 +1080,91 @@ fn handle_ipc_rename_pane(
     }
 
     IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: trigger any keyboard action by its stable name. With `pane_id`, the
+/// owning window is focused first and the action runs there; without it, the
+/// action runs against the key window.
+fn handle_ipc_dispatch_action(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    action_name: &str,
+    pane_id: Option<u32>,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let action = match crate::keybindings::action_from_ipc_name(action_name) {
+        Some(a) => a,
+        None => return IpcResponse::Error { message: format!("unknown action: {}", action_name) },
+    };
+
+    // Resolve the target window, then drop the window-list borrow before
+    // dispatching — some actions (new-window, detach-tab) mutate the list.
+    let target_win = {
+        let wins = windows.borrow();
+        match pane_id {
+            Some(pid) => {
+                let mut found = None;
+                for win in wins.iter() {
+                    if let Some(view) = kova_view(win) {
+                        if view.ipc_focus_pane(pid) {
+                            win.makeKeyAndOrderFront(None);
+                            found = Some(win.clone());
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some(w) => w,
+                    None => return IpcResponse::Error { message: format!("pane {} not found", pid) },
+                }
+            }
+            None => {
+                let win = wins.iter().find(|w| w.isKeyWindow()).or_else(|| wins.first());
+                match win {
+                    Some(w) => w.clone(),
+                    None => return IpcResponse::Error { message: "no window".to_string() },
+                }
+            }
+        }
+    };
+
+    let view = match kova_view(&target_win) {
+        Some(v) => v,
+        None => return IpcResponse::Error { message: "no view".to_string() },
+    };
+    view.dispatch_action(&action);
+    IpcResponse::Ok { data: None }
+}
+
+/// IPC: merge every tab of `source_window` into `target_window` (by window-list
+/// index), then close the now-empty source window.
+fn handle_ipc_merge_window(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    source_window: usize,
+    target_window: usize,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    // Validate the target exists *before* draining the source, otherwise an
+    // invalid target would lose the source's tabs. Clone the source handle and
+    // drop the borrow — merge_window_into re-borrows the list internally.
+    let source_win = {
+        let wins = windows.borrow();
+        if wins.get(target_window).is_none() {
+            return IpcResponse::Error { message: format!("target window {} not found", target_window) };
+        }
+        match wins.get(source_window) {
+            Some(w) => w.clone(),
+            None => return IpcResponse::Error { message: format!("source window {} not found", source_window) },
+        }
+    };
+
+    let view = match kova_view(&source_win) {
+        Some(v) => v,
+        None => return IpcResponse::Error { message: "no view for source window".to_string() },
+    };
+    view.merge_window_into(target_window);
+    IpcResponse::Ok { data: None }
 }
 
 fn setup_menu(mtm: MainThreadMarker) {

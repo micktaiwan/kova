@@ -261,6 +261,7 @@ pub struct KeysConfig {
     pub detach_tab: String,
     pub break_pane: String,
     pub merge_tab: String,
+    pub merge_window: String,
 
     pub switch_tab_1: String,
     pub switch_tab_2: String,
@@ -325,6 +326,7 @@ impl Default for KeysConfig {
             detach_tab: "cmd+shift+t".into(),
             break_pane: "cmd+ctrl+t".into(),
             merge_tab: "cmd+ctrl+m".into(),
+            merge_window: "cmd+ctrl+shift+m".into(),
 
             switch_tab_1: "cmd+1".into(),
             switch_tab_2: "cmd+2".into(),
