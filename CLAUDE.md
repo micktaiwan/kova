@@ -54,7 +54,9 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 
 ## Tests
 
-Ne jamais lancer l'application (open, Kova.app, etc.) — laisser l'utilisateur tester manuellement.
+- **Lancer les tests automatisés après chaque modification de code.** Dès qu'une modif touche le code Rust, exécuter `cargo test` (le target est global, pas besoin de `build.sh` pour ça) et vérifier que tout est vert avant de considérer la modif terminée. Un test rouge fait partie du diff : le corriger, ne pas le laisser de côté.
+- **Écrire un TU quand on ajoute/modifie de la logique pure et testable** (formatage, calcul de layout/géométrie, hit-test, parsing, machine à états). Ajouter un `#[test]` inline qui la couvre, dans un `#[cfg(test)] mod tests` du même fichier. Ne pas chercher à tester le rendu Metal ni l'UI AppKit (effets de bord GPU/fenêtre) : isoler la logique pure et la tester elle.
+- Ne jamais lancer l'application (open, Kova.app, etc.) — laisser l'utilisateur tester manuellement.
 
 ## Principes
 
