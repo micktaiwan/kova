@@ -918,10 +918,10 @@ impl TerminalState {
         row.trim_trailing_blanks(self.default_fg, self.default_bg);
         self.scrollback.push_back(row);
         if self.scrollback.len() > self.scrollback_limit {
-            // Buffer full: 1 in, 1 out — net zero, viewport stays put.
+            // Buffer at its limit: drop the oldest line. All absolute line
+            // indices shift up by one — move the selection with its content,
+            // or drop it once it reaches the trimmed edge.
             self.scrollback.pop_front();
-            // All absolute line indices shift up by one — move the selection
-            // with its content, or drop it once it reaches the trimmed edge.
             if let Some(sel) = &mut self.selection {
                 if sel.anchor.line == 0 || sel.end.line == 0 {
                     self.selection = None;
@@ -930,9 +930,17 @@ impl TerminalState {
                     sel.end.line -= 1;
                 }
             }
-        } else if self.scroll_offset > 0 {
-            // Buffer still growing: shift viewport to keep the same content visible.
-            self.scroll_offset += 1;
+        }
+        // Keep a scrolled-up viewport anchored to the SAME content as new lines
+        // arrive. The bottom advances by one line on every push (whether the
+        // buffer grew or did 1-in/1-out), which would otherwise slide the view
+        // one line toward the bottom; bumping the offset cancels that drift.
+        // Clamp to the (possibly trimmed) buffer length: once the viewed line
+        // reaches the discarded front it can no longer be pinned, and the view
+        // settles at the top. scroll_offset == 0 (following the bottom) is left
+        // untouched so live output still streams normally.
+        if self.scroll_offset > 0 {
+            self.scroll_offset = (self.scroll_offset + 1).min(self.scrollback.len() as i32);
         }
     }
 
@@ -2657,6 +2665,53 @@ mod tests {
         assert_eq!(row_text(&t, 1), "line4");
         assert_eq!(row_text(&t, 2), "line5");
         assert_eq!(t.scrollback_len(), 3);
+    }
+
+    // --- Scrolled-up viewport stays anchored while output streams in ---
+
+    #[test]
+    fn scrolled_view_stays_put_when_scrollback_full() {
+        // Regression: while the user is scrolled up reading old output, new
+        // lines streaming in (e.g. Claude Code running) must NOT drag the
+        // viewport back toward the bottom. This held while the scrollback was
+        // still growing, but broke once it reached its limit (1-in/1-out): the
+        // offset was frozen while content slid underneath it, so the view crept
+        // line by line back to the bottom.
+        let mut t = TerminalState::new(20, 3, 8, FG, BG); // small scrollback limit
+        let write_line = |t: &mut TerminalState, s: &str| {
+            for c in s.chars() {
+                t.put_char(c);
+            }
+            t.newline();
+            t.carriage_return();
+        };
+        // Overfill the scrollback so we are firmly in the 1-in/1-out regime.
+        for i in 0..30 {
+            write_line(&mut t, &format!("L{i}"));
+        }
+        assert_eq!(t.scrollback_len(), 8, "scrollback must be at its limit");
+
+        // Scroll up and note the line now sitting at the top of the viewport.
+        t.scroll(3);
+        assert_eq!(t.scroll_offset(), 3);
+        let top_before = row_text(&t, 0);
+        assert!(!top_before.is_empty(), "viewport top should show real content");
+
+        // More output streams in. The viewed line is still within the buffer,
+        // so it must remain exactly where it was — not drift toward the bottom.
+        for i in 30..34 {
+            write_line(&mut t, &format!("L{i}"));
+        }
+
+        assert_eq!(
+            row_text(&t, 0),
+            top_before,
+            "scrolled-up viewport drifted toward the bottom while output streamed in"
+        );
+        assert!(
+            t.scroll_offset() > 0,
+            "viewport must still be scrolled up, not snapped back to the bottom"
+        );
     }
 
     // --- Scroll regions (regression net) ---
