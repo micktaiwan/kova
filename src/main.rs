@@ -118,9 +118,15 @@ fn rotate_log_if_needed(path: &std::path::Path) {
     // Current log file will be recreated by the logger (append mode)
 }
 
-/// Delete raw PTY capture files (`pty-capture-*.raw`) older than 24h to bound
-/// disk usage. Capture is on by default (see pty.rs); without pruning the files
-/// would accumulate across sessions forever.
+/// True for PTY capture artifacts: `pty-capture-<pid>-<pane>.raw`, its rotated
+/// `.raw.1` chunk, and legacy `pty-capture-<pane>.raw` files.
+fn is_capture_file(name: &str) -> bool {
+    name.starts_with("pty-capture-") && (name.ends_with(".raw") || name.ends_with(".raw.1"))
+}
+
+/// Delete raw PTY capture files older than 24h to bound disk usage. Capture is
+/// on by default (see pty.rs); without pruning the files would accumulate
+/// across sessions forever.
 fn prune_old_captures() {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let log_dir = PathBuf::from(home).join("Library/Logs/Kova");
@@ -130,7 +136,7 @@ fn prune_old_captures() {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !(name.starts_with("pty-capture-") && name.ends_with(".raw")) {
+        if !is_capture_file(&name) {
             continue;
         }
         let too_old = entry
@@ -214,6 +220,24 @@ fn raise_fd_limit() {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // Informational flags must exit BEFORE any app machinery runs: launching
+    // the full app here restores (and deletes) session.json and truncates the
+    // PTY capture files of a concurrently running instance.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("kova {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("kova {} — macOS terminal (Rust + Metal)", env!("CARGO_PKG_VERSION"));
+        println!();
+        println!("USAGE: kova [OPTIONS]");
+        println!("  --version, -V      print version and exit");
+        println!("  --help, -h         print this help and exit");
+        println!("  --list-sessions    list session backups and exit");
+        println!("  --session N        restore session.N.json instead of session.json");
+        return;
+    }
+
     if args.iter().any(|a| a == "--list-sessions") {
         session::list_session_backups();
         return;
@@ -275,4 +299,20 @@ fn main() {
     app.setDelegate(Some(delegate_proto));
 
     app.run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_capture_file;
+
+    #[test]
+    fn capture_file_matching() {
+        assert!(is_capture_file("pty-capture-12345-7.raw"));
+        assert!(is_capture_file("pty-capture-12345-7.raw.1"));
+        assert!(is_capture_file("pty-capture-7.raw")); // legacy naming
+        assert!(!is_capture_file("kova.log"));
+        assert!(!is_capture_file("kova.log.1"));
+        assert!(!is_capture_file("pty-capture-7.txt"));
+        assert!(!is_capture_file("capture-7.raw"));
+    }
 }

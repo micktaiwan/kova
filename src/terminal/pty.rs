@@ -184,30 +184,34 @@ impl Pty {
                 // is already being recorded when it strikes. Bytes are the exact
                 // stream fed to the parser, so the file replays verbatim.
                 //
-                // Disabled with KOVA_PTY_CAPTURE=0 (or off/false/no). The file is
-                // truncated on open (pane_ids reset to 1 each launch, so append
-                // would splice unrelated sessions) and capped at CAPTURE_CAP bytes
-                // to bound disk; stale files are pruned at startup (see main.rs).
+                // Disabled with KOVA_PTY_CAPTURE=0 (or off/false/no). The path
+                // embeds the app process id: pane_ids restart at 1 each launch,
+                // so two concurrent instances would otherwise truncate each
+                // other's live captures. When a chunk reaches CAPTURE_CHUNK_CAP
+                // it is rotated to "<path>.1" and a fresh chunk starts, so
+                // capture never stops on long-lived panes while disk stays
+                // bounded at 2 chunks per pane; replay = ".1" then current.
+                // Stale files are pruned at startup (see main.rs).
                 let capture_enabled = match std::env::var("KOVA_PTY_CAPTURE") {
                     Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no" | ""),
                     Err(_) => true,
                 };
-                const CAPTURE_CAP: u64 = 256 * 1024 * 1024; // 256 MiB per pane
+                const CAPTURE_CHUNK_CAP: u64 = 128 * 1024 * 1024; // 2 chunks kept => <=256 MiB per pane
+                let capture_path = format!(
+                    "{}/Library/Logs/Kova/pty-capture-{}-{}.raw",
+                    std::env::var("HOME").unwrap_or_default(),
+                    std::process::id(),
+                    pane_id
+                );
                 let mut capture_written: u64 = 0;
-                let mut capture_full = false;
                 let mut capture: Option<std::fs::File> = if capture_enabled {
-                    let path = format!(
-                        "{}/Library/Logs/Kova/pty-capture-{}.raw",
-                        std::env::var("HOME").unwrap_or_default(),
-                        pane_id
-                    );
-                    match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path) {
+                    match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&capture_path) {
                         Ok(f) => {
-                            log::info!("PTY capture enabled: {}", path);
+                            log::info!("PTY capture enabled: {}", capture_path);
                             Some(f)
                         }
                         Err(e) => {
-                            log::warn!("PTY capture open failed for {}: {}", path, e);
+                            log::warn!("PTY capture open failed for {}: {}", capture_path, e);
                             None
                         }
                     }
@@ -248,15 +252,23 @@ impl Pty {
                                 // First byte from the shell = first prompt is ready.
                                 open_timer.mark_shell_ready(pane_id);
                             }
-                            if let Some(f) = capture.as_mut() {
-                                if !capture_full {
-                                    if capture_written + n as u64 > CAPTURE_CAP {
-                                        log::warn!("PTY capture for pane {} hit {} MiB cap; stopping capture", pane_id, CAPTURE_CAP / (1024 * 1024));
-                                        capture_full = true;
-                                    } else {
-                                        let _ = f.write_all(&buf[..n]);
-                                        capture_written += n as u64;
+                            if capture.is_some() {
+                                if capture_written + n as u64 > CAPTURE_CHUNK_CAP {
+                                    capture = None; // close current chunk before rename
+                                    let rotated = format!("{}.1", capture_path);
+                                    let _ = std::fs::rename(&capture_path, &rotated);
+                                    match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&capture_path) {
+                                        Ok(f) => {
+                                            log::info!("PTY capture rotated for pane {} at {} MiB", pane_id, CAPTURE_CHUNK_CAP / (1024 * 1024));
+                                            capture = Some(f);
+                                        }
+                                        Err(e) => log::warn!("PTY capture rotation reopen failed for {}: {}", capture_path, e),
                                     }
+                                    capture_written = 0;
+                                }
+                                if let Some(f) = capture.as_mut() {
+                                    let _ = f.write_all(&buf[..n]);
+                                    capture_written += n as u64;
                                 }
                             }
                             parser.advance(&mut handler, &buf[..n]);
