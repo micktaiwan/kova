@@ -181,3 +181,78 @@ bande hors-Kova, puis bissecter.
 
 Snapshots de cette session : `/tmp/kova_hole_194.json` (grille avec trou),
 `/tmp/kova_dump_194_visible.json`, `/tmp/kova_dump_194_all.json`.
+
+---
+
+# Round 3 (juillet 2026) : le trou est MULTI-CAUSAL — séquences VT ignorées + pending-wrap
+
+Méthode : scan IPC des 54 panes live → **4 panes avec le trou en cours** (13, 45,
+97, 100 ; scrollback 0 = alt-screen confirmé). Signature reconfirmée : bande vide
+juste après un **listing numéroté soft-wrappé** (souvent avec glyphes spéciaux
+`⏺ ⎿ ⚠️`), juste avant un bloc `⏺`. Puis étude multi-agents (7 cartographes →
+9 hypothèses → 11 sondes de repro en worktrees avec vrais `cargo test` →
+vérification adversariale, chaque divergence rejouée + validée contre les sources
+xterm). **Le trou a été reproduit hors-app par plusieurs chemins indépendants** —
+d'où l'échec des rounds précédents à le « corriger » d'un coup.
+
+## Causes racines corrigées (chacune avec test de régression dans `parser.rs`)
+
+1. **ESC D (IND) et ESC E (NEL) silencieusement ignorés** (`esc_dispatch`,
+   `parser.rs`). Aucun arm `(b'D',[])`/`(b'E',[])` → un scroll perdu par usage.
+   Émis par de vrais terminfo (tmux-256color `nel=\EE`). Un seul décale tout le
+   rendu différentiel en dessous → bande jamais repeinte. Reproduit à 85×65 alt.
+   Fix : IND → `Newline` ; NEL → `CarriageReturn` + `Newline`.
+2. **Aplatissement des sous-paramètres `:` corrompt les CSI non-SGR**
+   (`csi_dispatch`, `parser.rs:~609`). Le `flat_map` fusionnait les subparams ITU
+   dans la liste positionnelle → `CSI 3:99;5H` mettait la colonne à 99, et
+   `CSI ?7:25l` togglait un mode 25 fantôme (curseur caché). Fix : une valeur par
+   groupe (`first`), `raw_groups` inchangé pour l'arm `'m'`. (Cousin du bug SGR
+   `4:0` du round 1, mais côté positions.)
+3. **VPR (CSI e), HPR (CSI a), HPA (CSI \`) ignorés** → repaints positionnés qui
+   s'empilent sur une seule ligne, laissant des rangées jamais peintes. Fix :
+   fusionnés dans les arms équivalents (VPR→CursorDown, HPR→CUF, HPA→CHA).
+4. **ICH (CSI @) / DCH (CSI P) n'annulaient pas `pending_wrap`** (`insert_chars`/
+   `delete_chars`, `mod.rs`), alors que `erase_chars` le fait. Une édition de fin
+   sur une ligne pile pleine → wrap parasite ; **en bas d'écran ça scrolle toute
+   la grille alt d'un cran**, non modélisé par l'app → bande persistante. Fix :
+   `self.pending_wrap = false;` en tête des deux fonctions (conforme xterm
+   `ResetWrap`). C'est la cause « hole-capable » la plus directe.
+
+Suite : 80 tests verts (71 + 9 régressions). Les 9 nouveaux tests ont été
+vérifiés rouges sur le code d'avant-fix (revert temporaire ciblé).
+
+## Outillage durci (même session)
+
+- **Capture PTY qui ne meurt plus** : le cap 256 MiB arrêtait la capture
+  définitivement, or les panes vivent des jours → au moment du trou la capture
+  était éteinte. Remplacé par une **rotation 2×128 MiB** (`pty.rs`) : capture
+  continue, disque borné. Replay = `.raw.1` puis `.raw`.
+- **Chemins scopés par PID d'instance** : `pty-capture-{pid}-{pane}.raw`. Avant,
+  le nom ne dépendait que du `pane_id` (repart à 1 par lancement) → une 2ᵉ
+  instance Kova tronquait les captures de l'instance vivante. `prune_old_captures`
+  et `is_capture_file` (`main.rs`) reconnaissent les nouveaux noms + le legacy.
+- **Outil de replay** : `parser.rs`, test `#[ignore]` `replay_capture_file`.
+  `KOVA_REPLAY_FILE=<.raw> KOVA_REPLAY_COLS=85 KOVA_REPLAY_ROWS=65 cargo test
+  replay_capture_file -- --ignored --nocapture` → grille finale + curseur +
+  détection auto des bandes vides intérieures. C'est le bisecteur du plan ci-dessus.
+- **`kova --version`/`--help`** (`main.rs`) affichent et sortent au lieu de lancer
+  l'app complète (qui restaurait/supprimait `session.json` et tronquait les
+  captures d'une instance concurrente — incident rencontré pendant la session).
+
+## Reste ouvert (non prouvé cause du trou observé, mais suspects hole-capable)
+
+- **DECSTBM param 0 / région invalide** : `CSI 5;0r` traité comme plein écran au
+  lieu de « défaut = dernière ligne » ; région `top>=bottom` reset + home curseur.
+  Reproduit en test mais fix non appliqué (plus invasif — à faire avec sa géométrie
+  de repro dédiée).
+- **Frontière de chunk PTY au milieu d'un graphème** (émoji ZWJ / skin-tone) :
+  largeur gonflée → overflow en bas d'écran. Reproduit ; recouvre en partie le
+  holdback combining-mark du round 1 mais pas les clusters ZWJ/skin-tone.
+- **Divergence de table de largeur** app vs Kova sur `⏺`/VS16 (`⚠️`) : Node
+  string-width compte 2 colonnes là où Kova en compte 1 → ligne pré-wrappée par
+  l'app déborde. Piste prioritaire pour la prochaine occurrence : rejouer une
+  capture réelle avec `replay_capture_file` et bissecter autour du glyphe.
+
+Snapshots round 3 : `holes_report.json` + `hole_pane_{13,45,97,100}.json`
+(scratchpad de session). Journal du workflow (code des tests de repro, verdicts) :
+`subagents/workflows/wf_13ff246f-482/journal.jsonl`.
