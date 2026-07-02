@@ -603,10 +603,14 @@ impl Perform for VteHandler {
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         self.flush_print_buf();
-        // Parameter groups: colon subparameters (ITU SGR forms) arrive as one
-        // group — only the 'm' arm needs them; everything else uses the flat list.
+        // Parameter groups: colon subparameters (ITU forms) arrive as one
+        // group — only the 'm' arm reads them (via raw_groups). Every other arm
+        // is positional, so we keep exactly one value per group (the first).
+        // Flattening the subparameters into the list instead would shift the
+        // positional params — e.g. `CSI 10;5:40 H` would feed col=5, and
+        // `CSI ?7:25 l` would toggle a phantom mode 25.
         let raw_groups: Vec<Vec<u16>> = params.iter().map(|p| p.to_vec()).collect();
-        let params: Vec<u16> = params.iter().flat_map(|p| p.iter().map(|&v| v)).collect();
+        let params: Vec<u16> = params.iter().map(|p| p.first().copied().unwrap_or(0)).collect();
 
         match (action, intermediates) {
             ('A', []) => {
@@ -617,7 +621,9 @@ impl Perform for VteHandler {
                 let n = params.first().copied().unwrap_or(1).max(1);
                 self.ops.push(TermOp::CursorDown(n));
             }
-            ('C', []) => {
+            // 'C' = CUF (cursor forward); 'a' = HPR (horizontal position
+            // relative) — same net motion, both same-row, no scroll.
+            ('C', []) | ('a', []) => {
                 let n = params.first().copied().unwrap_or(1).max(1);
                 self.ops.push(TermOp::CursorForward(n));
             }
@@ -633,7 +639,9 @@ impl Perform for VteHandler {
                 let n = params.first().copied().unwrap_or(1).max(1);
                 self.ops.push(TermOp::CursorPrevLine(n));
             }
-            ('G', []) => {
+            // 'G' = CHA (cursor horizontal absolute); '`' = HPA (horizontal
+            // position absolute) — identical: 1-based column, same row.
+            ('G', []) | ('`', []) => {
                 let col = params.first().copied().unwrap_or(1).max(1) - 1;
                 self.ops.push(TermOp::SetCursorCol(col));
             }
@@ -677,6 +685,13 @@ impl Perform for VteHandler {
             ('d', []) => {
                 let row = params.first().copied().unwrap_or(1).max(1) - 1;
                 self.ops.push(TermOp::SetCursorRow(row));
+            }
+            // VPR (line position relative): move down Pn rows, same column, no
+            // scroll. Dropping it piles VPR-positioned repaints onto one row and
+            // leaves the rows it should have advanced past blank.
+            ('e', []) => {
+                let n = params.first().copied().unwrap_or(1).max(1);
+                self.ops.push(TermOp::CursorDown(n));
             }
             ('m', []) => {
                 // Normalize parameter groups. Colon subparameters (ITU forms
@@ -799,6 +814,15 @@ impl Perform for VteHandler {
         self.flush_print_buf();
         match (byte, intermediates) {
             (b'M', []) => self.ops.push(TermOp::ReverseIndex),
+            // IND (index): move down one row, scrolling at the bottom margin —
+            // identical to LF. NEL (next line): CR + index. Both are emitted by
+            // real terminfo entries (tmux-256color: nel=\EE); dropping them
+            // loses a scroll per use and desyncs every subsequently painted row.
+            (b'D', []) => self.ops.push(TermOp::Newline),
+            (b'E', []) => {
+                self.ops.push(TermOp::CarriageReturn);
+                self.ops.push(TermOp::Newline);
+            }
             (b'H', []) => self.ops.push(TermOp::SetTabStop),
             (b'7', []) => self.ops.push(TermOp::SaveCursor),
             (b'8', []) => self.ops.push(TermOp::RestoreCursor),
@@ -1033,6 +1057,83 @@ mod tests {
         assert_eq!(cell(&t, 1, 0).c, 'X');
     }
 
+    #[test]
+    fn ind_esc_d_scrolls_at_bottom_margin() {
+        // ESC D (IND) at the bottom row must scroll like LF, not be dropped.
+        let t = drive(10, 3, &[b"\x1b[1;1Hr0\x1b[2;1Hr1\x1b[3;1Hr2\x1bD"]);
+        assert_eq!(cell(&t, 0, 0).c, 'r');
+        assert_eq!(cell(&t, 0, 1).c, '1', "IND must scroll: r1 rises to the top row");
+        assert_eq!(cell(&t, 1, 1).c, '2');
+    }
+
+    #[test]
+    fn nel_esc_e_is_cr_plus_index() {
+        // ESC E (NEL) = CR + LF: the next text starts at column 0 of the next row.
+        let t = drive(10, 3, &[b"\x1b[1;1HAB\x1bECD"]);
+        assert_eq!(cell(&t, 0, 0).c, 'A');
+        assert_eq!(cell(&t, 0, 2).c, ' ', "NEL must not keep printing on the same row");
+        assert_eq!(cell(&t, 1, 0).c, 'C');
+        assert_eq!(cell(&t, 1, 1).c, 'D');
+    }
+
+    #[test]
+    fn cup_colon_subparam_does_not_shift_column() {
+        // CSI 3:99 ; 5 H — the colon subparam (99) on the row group must not
+        // shift the column: cursor lands at row 3, col 5 (1-based).
+        let t = drive(10, 5, &[b"\x1b[3:99;5HX"]);
+        assert_eq!(cell(&t, 2, 4).c, 'X');
+    }
+
+    #[test]
+    fn dec_private_mode_colon_subparam_is_not_a_second_mode() {
+        // CSI ?7:25 l — the colon subparam 25 must NOT be read as mode 25
+        // (DECTCEM); the cursor stays visible, only mode 7 is affected.
+        let t = drive(10, 3, &[b"\x1b[?7:25l"]);
+        assert!(t.read().cursor_visible, "mode 25 must not be toggled by a subparam");
+    }
+
+    #[test]
+    fn vpr_csi_e_moves_cursor_down_same_column() {
+        // CSI 2 e (VPR): down 2 rows, same column, no scroll.
+        let t = drive(10, 5, &[b"\x1b[1;1HX\x1b[2eY"]);
+        assert_eq!(cell(&t, 0, 0).c, 'X');
+        assert_eq!(cell(&t, 2, 1).c, 'Y', "VPR must advance the row");
+    }
+
+    #[test]
+    fn hpr_csi_a_moves_cursor_right() {
+        // CSI 3 a (HPR): forward 3 columns.
+        let t = drive(10, 3, &[b"\x1b[1;1Habc\x1b[3aX"]);
+        assert_eq!(cell(&t, 0, 6).c, 'X');
+    }
+
+    #[test]
+    fn hpa_csi_backtick_sets_absolute_column() {
+        // CSI 8 ` (HPA): absolute column 8 (1-based) => index 7.
+        let t = drive(10, 3, &[b"\x1b[8`X"]);
+        assert_eq!(cell(&t, 0, 7).c, 'X');
+    }
+
+    #[test]
+    fn ich_cancels_pending_wrap() {
+        // Fill the row so pending-wrap is armed, then ICH (a tail edit), then
+        // print: the char must land in-row, not wrap to the next row.
+        let t = drive(10, 3, &[b"0123456789\x1b[@X"]);
+        assert_eq!(cell(&t, 0, 9).c, 'X', "ICH must cancel pending wrap");
+        assert_eq!(cell(&t, 1, 0).c, ' ', "nothing should have wrapped down");
+    }
+
+    #[test]
+    fn dch_at_bottom_row_must_not_scroll_alt_grid() {
+        // A DCH tail edit on an exactly-full BOTTOM row must not leave the
+        // Last Column Flag armed — otherwise the next print wraps and scrolls
+        // the whole grid up by one (the alt-screen "hole" mechanism).
+        let t = drive(10, 3, &[b"r0\r\nr1\r\n0123456789\x1b[PX"]);
+        assert_eq!(cell(&t, 0, 0).c, 'r');
+        assert_eq!(cell(&t, 0, 1).c, '0', "the grid must not have scrolled");
+        assert_eq!(cell(&t, 2, 9).c, 'X');
+    }
+
     /// Deterministic fuzz: pseudo-random byte streams (biased toward VT
     /// introducers) plus mid-stream resizes must never panic, and the
     /// terminal invariants must hold after every chunk.
@@ -1099,6 +1200,70 @@ mod tests {
                 }
                 assert!(t.scroll_offset >= 0 && t.scroll_offset as usize <= t.scrollback.len(),
                     "round {}: scroll_offset {} out of [0, {}]", round, t.scroll_offset, t.scrollback.len());
+            }
+        }
+    }
+
+    /// Offline replay of a raw PTY capture (see pty.rs) through the real
+    /// parser — the bisection tool from notes/display-glitches.md. Ignored so
+    /// `cargo test` never depends on local capture files. Usage:
+    ///
+    ///   KOVA_REPLAY_FILE=~/Library/Logs/Kova/pty-capture-<pid>-<pane>.raw \
+    ///   KOVA_REPLAY_COLS=85 KOVA_REPLAY_ROWS=65 \
+    ///   cargo test replay_capture_file -- --ignored --nocapture
+    ///
+    /// Prints the final grid with row numbers, the cursor position, and any
+    /// interior blank band (the "hole" signature). Bytes are fed in 4096-byte
+    /// chunks, like the live PTY reader. For a rotated capture, replay the
+    /// ".raw.1" chunk and the ".raw" file concatenated (cat a.1 a > full.raw).
+    #[test]
+    #[ignore]
+    fn replay_capture_file() {
+        let path = std::env::var("KOVA_REPLAY_FILE")
+            .expect("set KOVA_REPLAY_FILE to a pty-capture .raw path");
+        let path = match path.strip_prefix("~/") {
+            Some(rest) => format!("{}/{}", std::env::var("HOME").unwrap_or_default(), rest),
+            None => path,
+        };
+        let cols: u16 = std::env::var("KOVA_REPLAY_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(85);
+        let rows: u16 = std::env::var("KOVA_REPLAY_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(65);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
+        let chunks: Vec<&[u8]> = bytes.chunks(4096).collect();
+        let t = drive(cols, rows, &chunks);
+        let term = t.read();
+        let texts: Vec<String> = term
+            .visible_lines()
+            .iter()
+            .map(|l| l.iter().map(|c| c.c).collect::<String>().trim_end().to_string())
+            .collect();
+        println!("replayed {} bytes at {}x{} from {}", bytes.len(), cols, rows, path);
+        println!(
+            "cursor: row={} col={} alt_screen={} scrollback={}",
+            term.cursor_y, term.cursor_x, term.in_alt_screen, term.scrollback_len()
+        );
+        for (i, l) in texts.iter().enumerate() {
+            println!("{:>3} |{}", i, l);
+        }
+        let nonblank: Vec<usize> = texts
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !l.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        if let (Some(&first), Some(&last)) = (nonblank.first(), nonblank.last()) {
+            let mut i = first;
+            while i <= last {
+                if texts[i].is_empty() {
+                    let start = i;
+                    while i <= last && texts[i].is_empty() {
+                        i += 1;
+                    }
+                    if i - start >= 3 {
+                        println!("INTERIOR BLANK BAND: rows {}..{} ({} rows)", start, i - 1, i - start);
+                    }
+                } else {
+                    i += 1;
+                }
             }
         }
     }

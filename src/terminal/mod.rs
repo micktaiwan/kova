@@ -1336,6 +1336,11 @@ impl TerminalState {
     }
 
     pub fn delete_chars(&mut self, n: u16) {
+        // Per xterm/DEC STD 070, DCH resets the Last Column Flag (pending wrap),
+        // like erase_chars. Otherwise a tail edit on an exactly-full row makes
+        // the next print wrap spuriously — at the bottom row it scrolls the
+        // whole alt grid up by one, unmodeled by the app.
+        self.pending_wrap = false;
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         let fill = self.bce_blank();
@@ -1351,6 +1356,9 @@ impl TerminalState {
     }
 
     pub fn insert_chars(&mut self, n: u16) {
+        // Per xterm/DEC STD 070, ICH resets the Last Column Flag (pending wrap),
+        // like erase_chars — see delete_chars for the spurious-scroll failure.
+        self.pending_wrap = false;
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         let fill = self.bce_blank();
