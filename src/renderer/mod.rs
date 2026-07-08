@@ -1109,12 +1109,21 @@ impl Renderer {
                 let fg = [fg_f[0], fg_f[1], fg_f[2], alpha];
                 let no_bg = [0.0, 0.0, 0.0, 0.0];
 
-                vertices.push(Vertex { position: [gx, gy], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [gx + gw, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [gx, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [gx + gw, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [gx + gw, gy + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [gx, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+                // Faux-bold: draw the glyph a second time shifted +1px in x. A
+                // real bold font would need a (char, bold)-keyed atlas; the
+                // synthetic double-draw is cheap and reads clearly as bold.
+                // Color emoji are already color glyphs — don't embolden them.
+                let bold = cell.bold && !glyph.is_color;
+                let x_offsets: &[f32] = if bold { &[0.0, 1.0] } else { &[0.0] };
+                for &dx in x_offsets {
+                    let gx = gx + dx;
+                    vertices.push(Vertex { position: [gx, gy], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [gx + gw, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [gx, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [gx + gw, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [gx + gw, gy + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [gx, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+                }
             }
         }
 

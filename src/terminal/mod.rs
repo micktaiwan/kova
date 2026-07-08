@@ -111,6 +111,10 @@ pub struct Cell {
     pub bg: [u8; 3],
     /// OSC 8 hyperlink index into TerminalState::hyperlinks (0 = no link).
     pub hyperlink_id: u16,
+    /// SGR bold (ESC[1m). Rendered as synthetic faux-bold (the glyph drawn a
+    /// second time offset +1px in x). Fits in the struct's existing padding, so
+    /// it costs no extra bytes per cell — keep it that way (see size_of test).
+    pub bold: bool,
 }
 
 impl Cell {
@@ -127,6 +131,7 @@ impl Default for Cell {
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
             hyperlink_id: 0,
+            bold: false,
         }
     }
 }
@@ -289,7 +294,7 @@ pub struct FilterMatch {
 
 impl TerminalState {
     pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [u8; 3], bg: [u8; 3]) -> Self {
-        let blank = Cell { c: ' ', cluster: None, fg, bg, hyperlink_id: 0 };
+        let blank = Cell { c: ' ', cluster: None, fg, bg, hyperlink_id: 0, bold: false };
         let grid = (0..rows as usize).map(|_| Row::new(cols as usize, &blank)).collect();
         let terminal_id = TERMINAL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         log::info!("TerminalState::new id={} cols={} rows={}", terminal_id, cols, rows);
@@ -649,6 +654,7 @@ impl TerminalState {
                 fg,
                 bg,
                 hyperlink_id: self.current_hyperlink,
+                bold: self.bold,
             };
 
             // Wide char: write placeholder '\0' in the next column
@@ -659,6 +665,7 @@ impl TerminalState {
                     fg,
                     bg,
                     hyperlink_id: self.current_hyperlink,
+                    bold: self.bold,
                 };
             }
         }
@@ -747,6 +754,7 @@ impl TerminalState {
                 fg,
                 bg,
                 hyperlink_id: self.current_hyperlink,
+                bold: self.bold,
             };
 
             // Write '\0' sentinel for remaining columns
@@ -758,6 +766,7 @@ impl TerminalState {
                         fg,
                         bg,
                         hyperlink_id: self.current_hyperlink,
+                        bold: self.bold,
                     };
                 }
             }
@@ -823,9 +832,9 @@ impl TerminalState {
             UnicodeWidthStr::width(merged.as_str()).max(1)
         };
         if new_w > old_w && col + 1 < self.grid[row].cells.len() {
-            let (fg, bg, link) = {
+            let (fg, bg, link, bold) = {
                 let c = &self.grid[row].cells[col];
-                (c.fg, c.bg, c.hyperlink_id)
+                (c.fg, c.bg, c.hyperlink_id, c.bold)
             };
             self.grid[row].cells[col + 1] = Cell {
                 c: '\0',
@@ -833,6 +842,7 @@ impl TerminalState {
                 fg,
                 bg,
                 hyperlink_id: link,
+                bold,
             };
             if !self.pending_wrap {
                 let end = (col as u16) + new_w as u16;
@@ -1476,7 +1486,7 @@ impl TerminalState {
         if bg == self.blank.bg {
             self.blank.clone()
         } else {
-            Cell { c: ' ', cluster: None, fg: self.blank.fg, bg, hyperlink_id: 0 }
+            Cell { c: ' ', cluster: None, fg: self.blank.fg, bg, hyperlink_id: 0, bold: false }
         }
     }
 
@@ -2417,6 +2427,35 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    // --- Cell layout / bold ---
+
+    #[test]
+    fn cell_stays_32_bytes() {
+        // The bold flag must fit in the struct's existing padding. Growing Cell
+        // multiplies across scrollback × panes (see the doc comment on Cell).
+        assert_eq!(std::mem::size_of::<Cell>(), 32);
+    }
+
+    #[test]
+    fn sgr_bold_marks_cells_then_resets() {
+        let mut t = term(10, 5);
+        t.set_sgr(&[1]); // bold on
+        put_str(&mut t, "AB");
+        t.set_sgr(&[22]); // bold off (SGR 22)
+        put_str(&mut t, "C");
+        t.set_sgr(&[1]);
+        put_str(&mut t, "D");
+        t.set_sgr(&[0]); // full reset
+        put_str(&mut t, "E");
+
+        let row = &t.visible_lines()[0];
+        assert!(row[0].bold, "A must be bold");
+        assert!(row[1].bold, "B must be bold");
+        assert!(!row[2].bold, "C must not be bold (SGR 22)");
+        assert!(row[3].bold, "D must be bold again");
+        assert!(!row[4].bold, "E must not be bold (SGR 0 reset)");
     }
 
     // --- Deferred autowrap (xterm "last column flag") ---
