@@ -95,6 +95,22 @@
 
 **Prochaine action** : repro déterministe — `script -q /tmp/kova_cap.raw claude` dans une pane neuve, faire apparaître le trou, puis rejouer le fichier dans `drive(cols, rows, chunks)` (`parser.rs:913`) à 85×65, bissecter → séquence fautive → test de régression + fix. Snapshots de la session : `/tmp/kova_hole_194.json`, `/tmp/kova_dump_194_{visible,all}.json`.
 
+### Bug: le nombre de colonnes/lignes change au switch d'écran (scale 2x ↔ 1x)
+
+**Statut** : En cours — diagnostiqué (2026-07-03), aucun fix. Analyse par trace complète + relecture des lignes clés.
+
+**Symptôme** : en passant d'un écran externe au retina (ou l'inverse), la grille du terminal change de dimensions → une table affichée par un programme reflow avec une largeur différente. Pénible et récurrent.
+
+**Cause racine** : tout le calcul de grille se fait en **pixels physiques**, et la cellule est arrondie *après* multiplication par le scale, ce qui rend la taille de cellule ramenée au point logique dépendante de l'écran.
+- L'atlas est construit à `font.size * scale` (`src/renderer/mod.rs:342`, rebuild `:1883`).
+- Les métriques sont `ceil()` en physique : `cell_height` (`src/renderer/glyph_atlas.rs:88`), `cell_width` (`:109`).
+- `cols`/`rows` = viewport physique / cellule physique (`src/window.rs:4636-4638`, idem `viewport_to_grid` `:2004`). `cell_size()` renvoie du physique (`src/renderer/mod.rs:2485`).
+- Exemple police 14, avance 'M' ≈ 8,42 pt : 2x → `ceil(16.84)=17` phys = 8,5 px logiques/col ; 1x → `ceil(8.42)=9` phys = 9,0 px logiques/col. Même largeur logique → **plus de colonnes en retina** qu'en externe.
+- Chaîne au switch : `viewDidChangeBackingProperties` (`src/window.rs:748`) → `handle_resize` (rebuild atlas au nouveau scale) → `resize_all_panes` → `term.resize` + `pty.resize` → SIGWINCH → reflow.
+- Contributeur secondaire : `PANE_H_PADDING = 10.0` (`src/renderer/mod.rs:5`) est en px physiques, non scalé (5 px logiques à 2x, 10 à 1x).
+
+**Prochaine action** : choisir la direction de fix (calcul de grille en espace logique vs cellule arrondie en logique puis scalée pour l'atlas ; + scaler le padding), montrer le diff, builder.
+
 ## En attente
 
 ### Bug: resultats de recherche perimes si du texte arrive overlay ouvert
