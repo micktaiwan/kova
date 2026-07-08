@@ -5,6 +5,10 @@ pub mod vertex;
 pub const PANE_H_PADDING: f32 = 10.0;
 const TOOLTIP_ANIM_FRAMES: u8 = 10; // ~166ms at 60fps
 
+/// Synthetic italic slant: tan(~12°). The glyph quad's top edge is shifted this
+/// fraction of the baseline height to the right, the descender edge to the left.
+const ITALIC_SHEAR: f32 = 0.213;
+
 /// A hoverable zone in a status bar, with associated tooltip text.
 struct TooltipZone {
     x: f32,
@@ -109,7 +113,7 @@ impl PaneAttention {
         }
     }
 }
-use crate::terminal::{CursorShape, FilterMatch, TerminalState};
+use crate::terminal::{CellAttrs, CursorShape, FilterMatch, TerminalState};
 
 /// Data passed to the renderer for drawing filter overlay.
 pub struct FilterRenderData {
@@ -1019,6 +1023,7 @@ impl Renderer {
         // Pass 3: build vertices
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
+        let baseline_from_top = self.atlas.baseline_from_top();
         let atlas_w = self.atlas.atlas_width as f32;
         let atlas_h = self.atlas.atlas_height as f32;
         let ox = vp.x + PANE_H_PADDING;
@@ -1068,6 +1073,24 @@ impl Renderer {
                     continue;
                 };
 
+                // Underline / strikethrough: horizontal rules in the cell's fg
+                // color. Drawn before the blank skip so runs of underlined
+                // spaces (and wide-char continuation cells) stay continuous.
+                if cell.attrs.intersects(CellAttrs::UNDERLINE | CellAttrs::STRIKETHROUGH) {
+                    let lx = (ox + col_idx as f32 * cell_w).round();
+                    let ly = (oy + y_offset + row_idx as f32 * cell_h).round();
+                    let rule_fg = crate::terminal::color_to_f32(cell.fg);
+                    let thickness = (cell_h * 0.07).max(1.0).round();
+                    if cell.attrs.contains(CellAttrs::UNDERLINE) {
+                        let uy = (ly + cell_h - thickness).round();
+                        Self::push_bg_quad(&mut vertices, lx, uy, cell_w, thickness, rule_fg);
+                    }
+                    if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
+                        let sy = (ly + cell_h * 0.5 - thickness * 0.5).round();
+                        Self::push_bg_quad(&mut vertices, lx, sy, cell_w, thickness, rule_fg);
+                    }
+                }
+
                 if cell.is_blank() {
                     continue;
                 }
@@ -1109,20 +1132,34 @@ impl Renderer {
                 let fg = [fg_f[0], fg_f[1], fg_f[2], alpha];
                 let no_bg = [0.0, 0.0, 0.0, 0.0];
 
+                // Synthetic italic: shear the glyph quad around the baseline —
+                // the top edge leans right, the descender edge leans left. Emoji
+                // and box-drawing keep their shape only insofar as the quad is
+                // slanted; color glyphs are left as-is to avoid smearing.
+                let italic = cell.attrs.contains(CellAttrs::ITALIC) && !glyph.is_color;
+                let (shear_top, shear_bot) = if italic {
+                    (ITALIC_SHEAR * baseline_from_top, ITALIC_SHEAR * (baseline_from_top - gh))
+                } else {
+                    (0.0, 0.0)
+                };
+
                 // Faux-bold: draw the glyph a second time shifted +1px in x. A
                 // real bold font would need a (char, bold)-keyed atlas; the
                 // synthetic double-draw is cheap and reads clearly as bold.
                 // Color emoji are already color glyphs — don't embolden them.
-                let bold = cell.bold && !glyph.is_color;
+                let bold = cell.attrs.contains(CellAttrs::BOLD) && !glyph.is_color;
                 let x_offsets: &[f32] = if bold { &[0.0, 1.0] } else { &[0.0] };
                 for &dx in x_offsets {
-                    let gx = gx + dx;
-                    vertices.push(Vertex { position: [gx, gy], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
-                    vertices.push(Vertex { position: [gx + gw, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-                    vertices.push(Vertex { position: [gx, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-                    vertices.push(Vertex { position: [gx + gw, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-                    vertices.push(Vertex { position: [gx + gw, gy + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
-                    vertices.push(Vertex { position: [gx, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+                    let xtl = gx + dx + shear_top;
+                    let xtr = gx + gw + dx + shear_top;
+                    let xbl = gx + dx + shear_bot;
+                    let xbr = gx + gw + dx + shear_bot;
+                    vertices.push(Vertex { position: [xtl, gy], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [xtr, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [xbl, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [xtr, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [xbr, gy + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [xbl, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
                 }
             }
         }

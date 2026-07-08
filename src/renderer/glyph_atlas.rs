@@ -332,6 +332,14 @@ impl GlyphAtlas {
         self.glyphs.get(&c)
     }
 
+    /// Distance from the top of a cell down to the text baseline, in physical
+    /// pixels. Glyphs are rasterized at baseline y=descent from the cell bottom,
+    /// so the baseline sits `cell_height - descent` below the cell top. Used to
+    /// shear synthetic italic around the baseline.
+    pub fn baseline_from_top(&self) -> f32 {
+        self.cell_height - self.descent as f32
+    }
+
     pub fn overlay_glyph(&self, c: char) -> Option<&GlyphInfo> {
         self.overlay_glyphs.get(&c)
     }

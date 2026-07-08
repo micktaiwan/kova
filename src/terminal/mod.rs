@@ -86,6 +86,9 @@ struct SavedCursor {
     bg: [u8; 3],
     bold: bool,
     dim: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
     reversed: bool,
     pending_wrap: bool,
     origin_mode: bool,
@@ -94,6 +97,23 @@ struct SavedCursor {
     g0_dec_graphics: bool,
     g1_dec_graphics: bool,
     active_charset_g1: bool,
+}
+
+bitflags::bitflags! {
+    /// Per-cell text attributes that affect rendering geometry (as opposed to
+    /// color, which is baked into fg/bg at write time). Packed into a single
+    /// byte so it fits in the struct's existing padding — no extra RAM/cell.
+    ///
+    /// - BOLD: synthetic faux-bold (glyph drawn a second time offset +1px in x)
+    /// - ITALIC: synthetic slant (glyph quad sheared ~12° around the baseline)
+    /// - UNDERLINE / STRIKETHROUGH: a horizontal rule under / through the cell
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+    pub struct CellAttrs: u8 {
+        const BOLD          = 1 << 0;
+        const ITALIC        = 1 << 1;
+        const UNDERLINE     = 1 << 2;
+        const STRIKETHROUGH = 1 << 3;
+    }
 }
 
 /// Terminal cell — kept compact to minimize scrollback RAM usage.
@@ -111,10 +131,10 @@ pub struct Cell {
     pub bg: [u8; 3],
     /// OSC 8 hyperlink index into TerminalState::hyperlinks (0 = no link).
     pub hyperlink_id: u16,
-    /// SGR bold (ESC[1m). Rendered as synthetic faux-bold (the glyph drawn a
-    /// second time offset +1px in x). Fits in the struct's existing padding, so
-    /// it costs no extra bytes per cell — keep it that way (see size_of test).
-    pub bold: bool,
+    /// SGR text attributes (bold/italic/underline/strikethrough). Fits in the
+    /// struct's existing padding, so it costs no extra bytes per cell — keep it
+    /// that way (see size_of test).
+    pub attrs: CellAttrs,
 }
 
 impl Cell {
@@ -131,7 +151,7 @@ impl Default for Cell {
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
             hyperlink_id: 0,
-            bold: false,
+            attrs: CellAttrs::empty(),
         }
     }
 }
@@ -203,6 +223,9 @@ pub struct TerminalState {
     reversed: bool,
     bold: bool,
     dim: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
     // Saved cursor
     saved_cursor: Option<SavedCursor>,
     // Scroll region
@@ -294,7 +317,7 @@ pub struct FilterMatch {
 
 impl TerminalState {
     pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [u8; 3], bg: [u8; 3]) -> Self {
-        let blank = Cell { c: ' ', cluster: None, fg, bg, hyperlink_id: 0, bold: false };
+        let blank = Cell { c: ' ', cluster: None, fg, bg, hyperlink_id: 0, attrs: CellAttrs::empty() };
         let grid = (0..rows as usize).map(|_| Row::new(cols as usize, &blank)).collect();
         let terminal_id = TERMINAL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         log::info!("TerminalState::new id={} cols={} rows={}", terminal_id, cols, rows);
@@ -318,6 +341,9 @@ impl TerminalState {
             reversed: false,
             bold: false,
             dim: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
             saved_cursor: None,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
@@ -592,6 +618,18 @@ impl TerminalState {
         }
     }
 
+    /// Geometry-affecting text attributes currently active, to stamp onto cells
+    /// as they are written. Color effects (dim/bold-brighten/reverse) live in
+    /// effective_colors instead — those are baked into fg/bg.
+    fn current_attrs(&self) -> CellAttrs {
+        let mut a = CellAttrs::empty();
+        a.set(CellAttrs::BOLD, self.bold);
+        a.set(CellAttrs::ITALIC, self.italic);
+        a.set(CellAttrs::UNDERLINE, self.underline);
+        a.set(CellAttrs::STRIKETHROUGH, self.strikethrough);
+        a
+    }
+
     pub fn put_char(&mut self, c: char) {
         let c = self.map_charset(c);
         if c >= '\u{2500}' && c <= '\u{257F}' {
@@ -648,13 +686,14 @@ impl TerminalState {
                 cells.insert(col, self.blank.clone());
             }
             let (fg, bg) = self.effective_colors();
+            let attrs = self.current_attrs();
             self.grid[row].cells[col] = Cell {
                 c,
                 cluster: None,
                 fg,
                 bg,
                 hyperlink_id: self.current_hyperlink,
-                bold: self.bold,
+                attrs,
             };
 
             // Wide char: write placeholder '\0' in the next column
@@ -665,7 +704,7 @@ impl TerminalState {
                     fg,
                     bg,
                     hyperlink_id: self.current_hyperlink,
-                    bold: self.bold,
+                    attrs,
                 };
             }
         }
@@ -747,6 +786,7 @@ impl TerminalState {
         let col = self.cursor_x as usize;
         if row < self.grid.len() && col < self.grid[row].cells.len() {
             let (fg, bg) = self.effective_colors();
+            let attrs = self.current_attrs();
 
             self.grid[row].cells[col] = Cell {
                 c: first,
@@ -754,7 +794,7 @@ impl TerminalState {
                 fg,
                 bg,
                 hyperlink_id: self.current_hyperlink,
-                bold: self.bold,
+                attrs,
             };
 
             // Write '\0' sentinel for remaining columns
@@ -766,7 +806,7 @@ impl TerminalState {
                         fg,
                         bg,
                         hyperlink_id: self.current_hyperlink,
-                        bold: self.bold,
+                        attrs,
                     };
                 }
             }
@@ -832,9 +872,9 @@ impl TerminalState {
             UnicodeWidthStr::width(merged.as_str()).max(1)
         };
         if new_w > old_w && col + 1 < self.grid[row].cells.len() {
-            let (fg, bg, link, bold) = {
+            let (fg, bg, link, attrs) = {
                 let c = &self.grid[row].cells[col];
-                (c.fg, c.bg, c.hyperlink_id, c.bold)
+                (c.fg, c.bg, c.hyperlink_id, c.attrs)
             };
             self.grid[row].cells[col + 1] = Cell {
                 c: '\0',
@@ -842,7 +882,7 @@ impl TerminalState {
                 fg,
                 bg,
                 hyperlink_id: link,
-                bold,
+                attrs,
             };
             if !self.pending_wrap {
                 let end = (col as u16) + new_w as u16;
@@ -1003,13 +1043,22 @@ impl TerminalState {
                     self.reversed = false;
                     self.bold = false;
                     self.dim = false;
+                    self.italic = false;
+                    self.underline = false;
+                    self.strikethrough = false;
                 }
                 1 => self.bold = true,
                 2 => self.dim = true,
+                3 => self.italic = true,
+                4 => self.underline = true,
+                9 => self.strikethrough = true,
                 22 => {
                     self.bold = false;
                     self.dim = false;
                 }
+                23 => self.italic = false,
+                24 => self.underline = false,
+                29 => self.strikethrough = false,
                 // Reverse video is a flag applied at write time (effective_colors),
                 // not a physical swap — a swap corrupts colors set while reversed.
                 7 => self.reversed = true,
@@ -1263,6 +1312,9 @@ impl TerminalState {
             bg: self.current_bg,
             bold: self.bold,
             dim: self.dim,
+            italic: self.italic,
+            underline: self.underline,
+            strikethrough: self.strikethrough,
             reversed: self.reversed,
             pending_wrap: self.pending_wrap,
             origin_mode: self.origin_mode,
@@ -1283,6 +1335,9 @@ impl TerminalState {
             self.current_bg = sc.bg;
             self.bold = sc.bold;
             self.dim = sc.dim;
+            self.italic = sc.italic;
+            self.underline = sc.underline;
+            self.strikethrough = sc.strikethrough;
             self.reversed = sc.reversed;
             self.pending_wrap = sc.pending_wrap && self.cursor_x == self.cols.saturating_sub(1);
             self.origin_mode = sc.origin_mode;
@@ -1486,7 +1541,7 @@ impl TerminalState {
         if bg == self.blank.bg {
             self.blank.clone()
         } else {
-            Cell { c: ' ', cluster: None, fg: self.blank.fg, bg, hyperlink_id: 0, bold: false }
+            Cell { c: ' ', cluster: None, fg: self.blank.fg, bg, hyperlink_id: 0, attrs: CellAttrs::empty() }
         }
     }
 
@@ -1509,6 +1564,9 @@ impl TerminalState {
         self.reversed = false;
         self.bold = false;
         self.dim = false;
+        self.italic = false;
+        self.underline = false;
+        self.strikethrough = false;
         self.synchronized_output = false;
         self.sync_output_since = None;
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2451,11 +2509,43 @@ mod tests {
         put_str(&mut t, "E");
 
         let row = &t.visible_lines()[0];
-        assert!(row[0].bold, "A must be bold");
-        assert!(row[1].bold, "B must be bold");
-        assert!(!row[2].bold, "C must not be bold (SGR 22)");
-        assert!(row[3].bold, "D must be bold again");
-        assert!(!row[4].bold, "E must not be bold (SGR 0 reset)");
+        let bold = |i: usize| row[i].attrs.contains(CellAttrs::BOLD);
+        assert!(bold(0), "A must be bold");
+        assert!(bold(1), "B must be bold");
+        assert!(!bold(2), "C must not be bold (SGR 22)");
+        assert!(bold(3), "D must be bold again");
+        assert!(!bold(4), "E must not be bold (SGR 0 reset)");
+    }
+
+    #[test]
+    fn sgr_italic_underline_strike_mark_and_reset() {
+        let mut t = term(10, 5);
+        t.set_sgr(&[3]); // italic on
+        put_str(&mut t, "A");
+        t.set_sgr(&[23]); // italic off
+        t.set_sgr(&[4]); // underline on
+        put_str(&mut t, "B");
+        t.set_sgr(&[24]); // underline off
+        t.set_sgr(&[9]); // strike on
+        put_str(&mut t, "C");
+        t.set_sgr(&[0]); // full reset
+        put_str(&mut t, "D");
+
+        let row = &t.visible_lines()[0];
+        assert_eq!(row[0].attrs, CellAttrs::ITALIC, "A: italic only");
+        assert_eq!(row[1].attrs, CellAttrs::UNDERLINE, "B: underline only");
+        assert_eq!(row[2].attrs, CellAttrs::STRIKETHROUGH, "C: strike only");
+        assert_eq!(row[3].attrs, CellAttrs::empty(), "D: reset clears all");
+    }
+
+    #[test]
+    fn sgr_attributes_combine() {
+        let mut t = term(10, 5);
+        t.set_sgr(&[1, 3, 4]); // bold + italic + underline in one SGR
+        put_str(&mut t, "X");
+        let cell = &t.visible_lines()[0][0];
+        assert!(cell.attrs.contains(CellAttrs::BOLD | CellAttrs::ITALIC | CellAttrs::UNDERLINE));
+        assert!(!cell.attrs.contains(CellAttrs::STRIKETHROUGH));
     }
 
     // --- Deferred autowrap (xterm "last column flag") ---

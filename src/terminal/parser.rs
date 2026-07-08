@@ -713,8 +713,14 @@ impl Perform for VteHandler {
                         [head @ (38 | 48), 5, idx, ..] => {
                             flat.extend_from_slice(&[*head, 5, *idx]);
                         }
-                        // Unsupported attribute with subparams (4:x underline
-                        // styles, 58/59 underline color): drop the whole group
+                        // Underline styles (4:0 off, 4:1..4:5 single/double/
+                        // curly/dotted/dashed): we render one underline style,
+                        // so collapse to plain 4 (on) / 24 (off).
+                        [4, sub @ ..] => {
+                            flat.push(if sub == [0] { 24 } else { 4 });
+                        }
+                        // Unsupported attribute with subparams (58/59 underline
+                        // color): drop the whole group
                         _ => {}
                     }
                 }
@@ -963,6 +969,17 @@ mod tests {
         let red = AnsiColor::from_index(1).to_rgb();
         assert_eq!(cell(&t, 0, 0).fg, red);
         assert_eq!(cell(&t, 0, 1).fg, red, "4:0 must not reset the red foreground");
+    }
+
+    #[test]
+    fn sgr_colon_underline_style_collapses_to_plain_underline() {
+        use crate::terminal::CellAttrs;
+        // 4:3 (curly) and 4:0 (off) ITU forms map to plain underline on/off;
+        // plain 4 also underlines.
+        let t = drive(20, 5, &[b"\x1b[4:3mA\x1b[4:0mB\x1b[4mC"]);
+        assert!(cell(&t, 0, 0).attrs.contains(CellAttrs::UNDERLINE), "4:3 underlines A");
+        assert!(!cell(&t, 0, 1).attrs.contains(CellAttrs::UNDERLINE), "4:0 turns it off for B");
+        assert!(cell(&t, 0, 2).attrs.contains(CellAttrs::UNDERLINE), "plain 4 underlines C");
     }
 
     #[test]
