@@ -1186,6 +1186,30 @@ pub struct Pane {
     pub open_timer: Arc<PaneOpenTimer>,
 }
 
+/// Resolve the label to show for a pane, in priority order:
+/// user-set custom title → non-empty OSC title → cwd basename → `fallback`.
+/// An empty or whitespace-only OSC title is treated as absent so we never
+/// render a blank row (the "invisible white line" bug in the pane switcher).
+fn derive_display_title(
+    custom_title: Option<&str>,
+    osc_title: Option<&str>,
+    cwd: Option<&str>,
+    fallback: &str,
+) -> String {
+    if let Some(custom) = custom_title {
+        return custom.to_string();
+    }
+    if let Some(title) = osc_title.filter(|t| !t.trim().is_empty()) {
+        return title.to_string();
+    }
+    if let Some(cwd) = cwd {
+        if let Some(base) = std::path::Path::new(cwd).file_name() {
+            return base.to_string_lossy().to_string();
+        }
+    }
+    fallback.to_string()
+}
+
 impl Pane {
     pub fn spawn(cols: u16, rows: u16, config: &Config, working_dir: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
         // Reference instant for open-latency instrumentation — captured first so
@@ -1274,19 +1298,13 @@ impl Pane {
 
     /// Display title for this pane: custom title > OSC title > CWD basename > fallback.
     pub fn display_title(&self, fallback: &str) -> String {
-        if let Some(ref custom) = self.custom_title {
-            return custom.clone();
-        }
         let term = self.terminal.read();
-        if let Some(ref title) = term.title {
-            return title.clone();
-        }
-        if let Some(ref cwd) = term.cwd {
-            if let Some(base) = std::path::Path::new(cwd).file_name() {
-                return base.to_string_lossy().to_string();
-            }
-        }
-        fallback.to_string()
+        derive_display_title(
+            self.custom_title.as_deref(),
+            term.title.as_deref(),
+            term.cwd.as_deref(),
+            fallback,
+        )
     }
 
     /// If the shell is ready and there's a pending command, write it to the PTY
@@ -1679,5 +1697,41 @@ impl Column {
                 weights[i] += share;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_display_title;
+
+    #[test]
+    fn custom_title_wins_over_everything() {
+        let t = derive_display_title(Some("my pane"), Some("osc"), Some("/home/x/proj"), "shell");
+        assert_eq!(t, "my pane");
+    }
+
+    #[test]
+    fn non_empty_osc_title_used() {
+        let t = derive_display_title(None, Some("vim"), Some("/home/x/proj"), "shell");
+        assert_eq!(t, "vim");
+    }
+
+    #[test]
+    fn empty_osc_title_falls_back_to_cwd_basename() {
+        let t = derive_display_title(None, Some(""), Some("/home/x/proj"), "shell");
+        assert_eq!(t, "proj");
+    }
+
+    #[test]
+    fn whitespace_osc_title_falls_back_to_cwd_basename() {
+        let t = derive_display_title(None, Some("   "), Some("/home/x/proj"), "shell");
+        assert_eq!(t, "proj");
+    }
+
+    #[test]
+    fn no_title_no_cwd_uses_fallback() {
+        assert_eq!(derive_display_title(None, None, None, "shell"), "shell");
+        // Empty OSC title with no cwd must also reach the fallback, never blank.
+        assert_eq!(derive_display_title(None, Some(""), None, "shell"), "shell");
     }
 }
