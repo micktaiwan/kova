@@ -24,5 +24,7 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Kova needs microphone access so that terminal commands like ffmpeg, sox, or recording tools can capture audio.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Kova needs camera access so that apps launched from the terminal (e.g. an Electron app in dev mode) can use the webcam.</string>
 </dict>
 </plist>

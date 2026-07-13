@@ -2189,8 +2189,22 @@ impl KovaView {
         if let Some(tab) = tabs.get_mut(idx) {
             match direction {
                 SplitDirection::Horizontal => {
-                    // Insert new column after the focused pane's column
+                    // Insert new column after the focused pane's column. If we
+                    // are already scrolling (virtual width > screen), grow the
+                    // virtual space by the new column's width instead of
+                    // shrinking the existing panes.
+                    let screen = self.drawable_viewport().width;
+                    let min_w = self.min_split_width_px();
+                    let old_virtual = tab.virtual_width(screen, min_w);
                     tab.insert_column_after_focused(new_pane);
+                    if old_virtual > screen {
+                        if let Some(new_col_idx) = tab.column_index_of(new_id) {
+                            // New pane is born at the same width as the pane it
+                            // was split from, so it doesn't look shrunk.
+                            let new_col_px = current_vp.width.max(min_w);
+                            tab.grow_virtual_for_scrolled_split(new_col_idx, old_virtual, new_col_px, screen);
+                        }
+                    }
                 }
                 SplitDirection::Vertical => {
                     // Split focused pane vertically within its column
@@ -2258,10 +2272,25 @@ impl KovaView {
         let mut tabs = self.ivars().tabs.borrow_mut();
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get_mut(idx) {
+            let screen = self.drawable_viewport().width;
+            let min_w = self.min_split_width_px();
+            let old_virtual = tab.virtual_width(screen, min_w);
+            // Width of the pane we split from, to size the new column like a sibling.
+            let focused_w = tab.viewport_for_pane(tab.focused_pane, self.panes_viewport_for_tab(tab))
+                .map(|vp| vp.width)
+                .unwrap_or(min_w);
             match direction {
                 SplitDirection::Horizontal => {
                     // Append new column at the end
                     tab.append_column(new_pane);
+                    // Already scrolling → grow the virtual space by the new
+                    // column's width instead of shrinking the existing panes.
+                    if old_virtual > screen {
+                        if let Some(new_col_idx) = tab.column_index_of(new_id) {
+                            let new_col_px = focused_w.max(min_w);
+                            tab.grow_virtual_for_scrolled_split(new_col_idx, old_virtual, new_col_px, screen);
+                        }
+                    }
                 }
                 SplitDirection::Vertical => {
                     // Wrap column at bottom
@@ -2271,11 +2300,9 @@ impl KovaView {
             tab.focused_pane = new_id;
             if direction == SplitDirection::Horizontal {
                 // Auto-scroll to reveal the new pane (rightmost)
-                let full = self.drawable_viewport();
-                let min_w = self.min_split_width_px();
-                let vw = tab.virtual_width(full.width, min_w);
-                if vw > full.width {
-                    tab.scroll_offset_x = (vw - full.width).max(0.0);
+                let vw = tab.virtual_width(screen, min_w);
+                if vw > screen {
+                    tab.scroll_offset_x = (vw - screen).max(0.0);
                 }
             }
         }
@@ -3987,7 +4014,16 @@ impl KovaView {
         if let Some(tab) = tabs.get_mut(idx) {
             match direction {
                 SplitDirection::Horizontal => {
+                    let screen = self.drawable_viewport().width;
+                    let min_w = self.min_split_width_px();
+                    let old_virtual = tab.virtual_width(screen, min_w);
                     tab.insert_column_after_focused(new_pane);
+                    if old_virtual > screen {
+                        if let Some(new_col_idx) = tab.column_index_of(new_id) {
+                            let new_col_px = current_vp.width.max(min_w);
+                            tab.grow_virtual_for_scrolled_split(new_col_idx, old_virtual, new_col_px, screen);
+                        }
+                    }
                 }
                 SplitDirection::Vertical => {
                     tab.vsplit_at_pane(focused_id, new_pane);

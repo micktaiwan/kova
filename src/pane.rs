@@ -173,6 +173,35 @@ pub struct Tab {
     pub cell_h: Cell<f32>,
 }
 
+/// Rewrite column weights so that, after a horizontal split performed while
+/// already scrolling, every existing column keeps its pre-split pixel width and
+/// the just-inserted column (at `new_col_idx`) gets `new_col_px`. Weights are
+/// stored in pixel units (Tab::column_widths normalizes by their sum), so the
+/// returned value — the new virtual width, equal to the sum of the desired pixel
+/// widths — reproduces those widths exactly when used as the override.
+///
+/// Returns `None` (no change) if the index is out of range or the pre-split
+/// weight sum is non-positive.
+fn reweight_for_scrolled_split(
+    weights: &mut [f32],
+    new_col_idx: usize,
+    old_virtual: f32,
+    new_col_px: f32,
+) -> Option<f32> {
+    if new_col_idx >= weights.len() { return None; }
+    // Old weight sum excludes the just-inserted column, so dividing by it
+    // reproduces each existing column's pre-split pixel width.
+    let old_sum: f32 = weights.iter().enumerate()
+        .filter(|&(i, _)| i != new_col_idx)
+        .map(|(_, w)| *w)
+        .sum();
+    if old_sum <= 0.0 { return None; }
+    for (i, w) in weights.iter_mut().enumerate() {
+        *w = if i == new_col_idx { new_col_px } else { *w / old_sum * old_virtual };
+    }
+    Some(old_virtual + new_col_px)
+}
+
 impl Tab {
     /// Create a new tab with a single pane.
     pub fn new(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
@@ -1022,6 +1051,31 @@ impl Tab {
         }
     }
 
+    /// After a horizontal split that happens while already scrolling (virtual
+    /// width > screen), grow the virtual width by the new column's width instead
+    /// of stealing space from the existing columns. Every existing column keeps
+    /// the pixel width it had before the split; the just-inserted column (at
+    /// `new_col_idx`) gets `new_col_px`.
+    ///
+    /// `old_virtual` is the virtual width before the split. Weights are stored in
+    /// pixel units here (column_widths normalizes by their sum), so after this
+    /// the new override equals the sum of the desired pixel widths and the layout
+    /// reproduces them exactly.
+    pub fn grow_virtual_for_scrolled_split(
+        &mut self,
+        new_col_idx: usize,
+        old_virtual: f32,
+        new_col_px: f32,
+        screen: f32,
+    ) {
+        if new_col_idx >= self.columns.len() { return; }
+        if let Some(new_virtual) = reweight_for_scrolled_split(
+            &mut self.column_weights, new_col_idx, old_virtual, new_col_px,
+        ) {
+            self.virtual_width_override = if new_virtual > screen { new_virtual } else { 0.0 };
+        }
+    }
+
     /// Set column weights by dragging a column separator.
     /// `col_idx` is the index such that the separator is between columns[col_idx] and columns[col_idx+1].
     ///
@@ -1702,7 +1756,52 @@ impl Column {
 
 #[cfg(test)]
 mod tests {
-    use super::derive_display_title;
+    use super::{derive_display_title, reweight_for_scrolled_split};
+
+    // Emulate Tab::column_widths for the no-minimized fast path.
+    fn col_widths(weights: &[f32], total: f32) -> Vec<f32> {
+        let sum: f32 = weights.iter().sum();
+        weights.iter().map(|w| total * w / sum).collect()
+    }
+
+    #[test]
+    fn scrolled_split_keeps_existing_pixel_widths() {
+        // 3 columns at 900px each, scrolling (virtual 2700 > screen 1512).
+        // A 4th column was just inserted at the end with the average weight;
+        // it should be born at the focused pane's width (900), like a sibling.
+        let old_virtual = 2700.0;
+        let new_col_px = 900.0; // focused pane width
+        let mut weights = vec![900.0, 900.0, 900.0, 900.0]; // last = just-inserted (avg)
+        let new_virtual = reweight_for_scrolled_split(&mut weights, 3, old_virtual, new_col_px).unwrap();
+        assert_eq!(new_virtual, 3600.0);
+        let widths = col_widths(&weights, new_virtual);
+        // All four columns end up at the same width, nothing shrunk.
+        assert!((widths[0] - 900.0).abs() < 0.01);
+        assert!((widths[1] - 900.0).abs() < 0.01);
+        assert!((widths[2] - 900.0).abs() < 0.01);
+        assert!((widths[3] - 900.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn scrolled_split_insert_in_middle_preserves_others() {
+        // Unequal columns: 1200, 600, scrolling; insert a new column at idx 1.
+        let old_virtual = 1800.0;
+        let new_col_px = 600.0;
+        let mut weights = vec![1200.0, 900.0, 600.0]; // idx 1 = just-inserted (avg of 1200+600)
+        let new_virtual = reweight_for_scrolled_split(&mut weights, 1, old_virtual, new_col_px).unwrap();
+        assert_eq!(new_virtual, 2400.0);
+        let widths = col_widths(&weights, new_virtual);
+        assert!((widths[0] - 1200.0).abs() < 0.01);
+        assert!((widths[1] - 600.0).abs() < 0.01); // new column
+        assert!((widths[2] - 600.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn scrolled_split_bad_index_is_noop() {
+        let mut weights = vec![1.0, 1.0];
+        assert!(reweight_for_scrolled_split(&mut weights, 5, 1000.0, 300.0).is_none());
+        assert_eq!(weights, vec![1.0, 1.0]);
+    }
 
     #[test]
     fn custom_title_wins_over_everything() {
