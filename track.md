@@ -82,18 +82,15 @@
 
 ### Bug: bande blanche (« trou ») dans Claude Code — repaint différentiel alt-screen
 
-**Statut** : En cours — cause non élucidée, repro déterministe à faire. Détail complet : `notes/display-glitches.md` § Round 2.
+**Statut** : En test — fix débouncé posé (auto-repaint après resize), à valider en live. Détail complet : `notes/display-glitches.md` § Round 4 (rounds 1-3 = historique).
 
-**Contexte** : Trou (bande de rangées vides) au milieu du texte d'une pane Claude Code ; Cmd+R répare ; re-scroller (haut puis bas) le ramène au même endroit. Rapporté 2026-06-17 sur Kova v1.8.0. Bug récurrent (déjà ~50 fixes en v1.8.0 sans le tuer).
+**Contexte** : Trou (bande de rangées vides) au milieu du texte d'une pane Claude Code ; Cmd+R répare. Récurrent depuis v1.8.0 malgré ~50 fixes de parsing (rounds 1-3).
 
-**Faits établis (vérité-terrain par dump IPC, 2026-06-17)** :
-- Claude Code est en **alt-screen** (`count-pane-content mode=scrollback` = 0 octet sur 6 panes) → le bug n'a RIEN à voir avec le scrollback / la gravité / le cross-tab (tous innocentés).
-- Le trou = bande de N rangées vides dans la **grille alt** (pane 194 : 9 rangées vides, lignes 33-41, juste après un bloc `Update()` soft-wrappé, avant `⏺ Capitalisé`). Kova ne met pas à jour ces cellules pendant le repaint différentiel que Claude émet au scroll (molette → SGR mouse mode 1000+1006 → redraw, `window.rs:919`).
-- **Pas déjà corrigé** : process qui tourne lancé le 11/06 07:18 = binaire v1.8.0 ; seul commit terminal depuis (`48625d1`) sans rapport (search/URL/SGR/sélection). Bug présent dans HEAD (`0e30761`) aussi → rebuild ne corrige pas.
-- `reverse_index` (1930) / `scroll_down` (961) / IL (1281) / DL (1307) / régions (1376) corrects à la lecture ; renderer innocenté ; `y_offset_rows` renvoie 0 en alt-screen.
-- Une autre session a laissé des sondes `probe_*` **non-commitées** dans `src/terminal/mod.rs` (hypothèse scrollback, écartée par la vérité-terrain) — ne pas y toucher.
+**Bascule du round 4 (juillet 2026)** : trou capturé en direct (pane 229) avec sa capture PTY. Rejoué à froid à 118×65, il est **déterministe** — et **tmux reproduit exactement le même trou** à partir des mêmes octets. Donc ce n'est pas un bug de parsing Kova isolable au flux figé. La cause est le **resize** : le log Kova confirme des rafales de resize (dont un round-trip vertical shrink→grow), et rejouer une session resizée à taille fixe désynchronise par construction. La table de largeur (suspect du round 3) est écartée pour ce cas (Kova et ink comptent pareil). Cause racine exacte **non isolée** (chemin de resize Kova vs reconciler d'ink) — voir Round 4.
 
-**Prochaine action** : repro déterministe — `script -q /tmp/kova_cap.raw claude` dans une pane neuve, faire apparaître le trou, puis rejouer le fichier dans `drive(cols, rows, chunks)` (`parser.rs:913`) à 85×65, bissecter → séquence fautive → test de régression + fix. Snapshots de la session : `/tmp/kova_hole_194.json`, `/tmp/kova_dump_194_{visible,all}.json`.
+**Fix (en test)** : au lieu de parier sur la cause, on automatise le remède fiable = Cmd+R. Après qu'une rafale de resize se calme (~150 ms), Kova déclenche seul un repaint robuste (soft_reset + nudge double-SIGWINCH) sur chaque pane redimensionné → Claude repeint tout contre une grille propre. `window.rs` : `resize_settle` + `step_resize_settle` (pur, 3 tests) + `fire_resize_settle_repaints`. Buildé (v1.8.1), 93 tests verts, **pas encore validé en live**.
+
+**Prochaine action** : redémarrer Kova, resizer pendant une session Claude, vérifier que le trou ne survit plus. Si il revient : passer au test isolant (rejouer AVEC resizes injectés dans Kova vs tmux) → instrumenter la capture PTY (`pty.rs`) pour logger les winsize + offsets. Snapshots : scratchpad `kova_hole_229.json`, `cap_229.raw`.
 
 ### Bug: le nombre de colonnes/lignes change au switch d'écran (scale 2x ↔ 1x)
 

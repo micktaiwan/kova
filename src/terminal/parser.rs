@@ -1244,7 +1244,12 @@ mod tests {
         };
         let cols: u16 = std::env::var("KOVA_REPLAY_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(85);
         let rows: u16 = std::env::var("KOVA_REPLAY_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(65);
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
+        let mut bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
+        // Bisection knob: truncate the stream to the first N bytes.
+        if let Some(n) = std::env::var("KOVA_REPLAY_BYTES").ok().and_then(|v| v.parse::<usize>().ok()) {
+            bytes.truncate(n);
+        }
+        let quiet = std::env::var("KOVA_REPLAY_QUIET").is_ok();
         let chunks: Vec<&[u8]> = bytes.chunks(4096).collect();
         let t = drive(cols, rows, &chunks);
         let term = t.read();
@@ -1258,8 +1263,10 @@ mod tests {
             "cursor: row={} col={} alt_screen={} scrollback={}",
             term.cursor_y, term.cursor_x, term.in_alt_screen, term.scrollback_len()
         );
-        for (i, l) in texts.iter().enumerate() {
-            println!("{:>3} |{}", i, l);
+        if !quiet {
+            for (i, l) in texts.iter().enumerate() {
+                println!("{:>3} |{}", i, l);
+            }
         }
         let nonblank: Vec<usize> = texts
             .iter()

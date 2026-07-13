@@ -122,6 +122,12 @@ pub struct KovaViewIvars {
     /// SIGWINCHs — the child reads an unchanged winsize and skips its
     /// repaint while our grid went through a lossy reflow round-trip.
     recent_resizes: RefCell<std::collections::HashMap<PaneId, Vec<((u16, u16), std::time::Instant)>>>,
+    /// Debounce countdown (frames) per pane until a post-resize robust repaint
+    /// fires. Reset on every resize; when it hits 0 (the resize burst has
+    /// settled) Kova runs the Cmd+R repaint (soft_reset + winsize nudge) once,
+    /// so a differential TUI (Claude Code) fully repaints against a clean
+    /// state instead of leaving stale blank bands after a resize.
+    resize_settle: RefCell<std::collections::HashMap<PaneId, u32>>,
     /// Original `SavedTab` for tabs that are still placeholders or whose
     /// deferred restoration failed. Looked up by `TabId` at save time so we
     /// snapshot the placeholder's *original* data rather than its empty live
@@ -1344,6 +1350,7 @@ impl KovaView {
             pane_flash: Cell::new(None),
             pty_restore: RefCell::new(Vec::new()),
             recent_resizes: RefCell::new(std::collections::HashMap::new()),
+            resize_settle: RefCell::new(std::collections::HashMap::new()),
             tab_backup: RefCell::new(std::collections::HashMap::new()),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -4665,9 +4672,68 @@ impl KovaView {
                             history.remove(0);
                         }
                     }
+
+                    // Debounce a single robust repaint to run once the resize
+                    // burst settles: rapid CTRL+OPTION+arrow resizes produce a
+                    // storm of SIGWINCHs the child coalesces, and a differential
+                    // TUI (Claude Code) can then skip rows and leave a stale
+                    // blank band. Re-arming on every resize collapses the burst
+                    // into one Cmd+R-style repaint (soft_reset + nudge) at the
+                    // end. See `resize_settle` and `fire_resize_settle_repaints`.
+                    let fps = self.ivars().config.get().map(|c| c.terminal.fps).unwrap_or(60) as u32;
+                    let settle = (fps / 6).max(4); // ~150ms after the last resize
+                    self.ivars().resize_settle.borrow_mut().insert(pane.id, settle);
                 }
             });
         }
+    }
+
+    /// Tick the per-pane resize-settle debounce. When a pane's countdown
+    /// reaches 0 (no resize for ~150ms), run the same robust repaint as Cmd+R
+    /// so the foreground program fully repaints against a clean grid. Returns
+    /// nothing; safe to call every frame.
+    fn fire_resize_settle_repaints(&self) {
+        let fire = {
+            let mut settle = self.ivars().resize_settle.borrow_mut();
+            step_resize_settle(&mut settle)
+        };
+        for pane_id in fire {
+            self.repaint_pane_settle(pane_id);
+        }
+    }
+
+    /// Robust repaint for a specific pane (by id), mirroring `do_repaint_pane`
+    /// but without the border flash — used by the automatic post-resize settle.
+    fn repaint_pane_settle(&self, pane_id: PaneId) {
+        let pane = {
+            let tabs = self.ivars().tabs.borrow();
+            let mut found: Option<*const Pane> = None;
+            for tab in tabs.iter() {
+                if let Some(p) = tab.pane(pane_id) {
+                    found = Some(p as *const Pane);
+                    break;
+                }
+            }
+            // SAFETY: same invariant as `focused_pane` — Tab mutations happen
+            // only in the render tick, and this runs from the render tick.
+            match found {
+                Some(ptr) => unsafe { &*ptr },
+                None => return,
+            }
+        };
+        if pane.minimized {
+            return;
+        }
+        let (cols, rows) = {
+            let t = pane.terminal.read();
+            (t.cols, t.rows)
+        };
+        pane.terminal.write().soft_reset();
+        let nudged = if rows > 1 { rows - 1 } else { rows + 1 };
+        pane.pty.resize(cols, nudged);
+        let mut restores = self.ivars().pty_restore.borrow_mut();
+        restores.retain(|r| r.pane_id != pane_id);
+        restores.push(PtyRestore { pane_id, remaining_frames: 3 });
     }
 
     fn mark_dirty(&self) {
@@ -5243,6 +5309,9 @@ impl KovaView {
                 }
             }
         }
+
+        // --- Debounced robust repaint after a resize burst settles ---
+        self.fire_resize_settle_repaints();
 
         // --- Poll git branch for all panes with a CWD ---
         let git_poll_interval = ivars.git_poll_interval.get();
@@ -5832,4 +5901,61 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, act
     window.setAcceptsMouseMovedEvents(true);
 
     window
+}
+
+/// One debounce step for the per-pane resize-settle countdowns: decrement
+/// every entry and return the pane ids whose countdown reached 0 (removing
+/// them from the map). A fresh resize re-arms a pane by re-inserting its
+/// countdown, so the burst only fires once, after it stops.
+fn step_resize_settle(map: &mut std::collections::HashMap<PaneId, u32>) -> Vec<PaneId> {
+    let mut fire: Vec<PaneId> = Vec::new();
+    map.retain(|&pane_id, frames| {
+        *frames = frames.saturating_sub(1);
+        if *frames == 0 {
+            fire.push(pane_id);
+            false
+        } else {
+            true
+        }
+    });
+    fire
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn resize_settle_fires_once_when_burst_ends() {
+        let mut m: HashMap<PaneId, u32> = HashMap::new();
+        m.insert(7, 3);
+        assert!(step_resize_settle(&mut m).is_empty()); // 3 -> 2
+        assert!(step_resize_settle(&mut m).is_empty()); // 2 -> 1
+        assert_eq!(step_resize_settle(&mut m), vec![7]); // 1 -> 0, fires
+        assert!(m.is_empty(), "fired pane is removed");
+        assert!(step_resize_settle(&mut m).is_empty(), "no re-fire");
+    }
+
+    #[test]
+    fn resize_settle_rearms_and_defers_fire() {
+        let mut m: HashMap<PaneId, u32> = HashMap::new();
+        m.insert(1, 2);
+        assert!(step_resize_settle(&mut m).is_empty()); // 2 -> 1
+        // A new resize re-arms the same pane before it could fire.
+        m.insert(1, 2);
+        assert!(step_resize_settle(&mut m).is_empty()); // 2 -> 1 (not 0)
+        assert_eq!(step_resize_settle(&mut m), vec![1]); // 1 -> 0, fires now
+    }
+
+    #[test]
+    fn resize_settle_handles_multiple_panes_independently() {
+        let mut m: HashMap<PaneId, u32> = HashMap::new();
+        m.insert(1, 1);
+        m.insert(2, 3);
+        assert_eq!(step_resize_settle(&mut m), vec![1]); // pane 1 fires; pane 2: 3 -> 2
+        assert!(m.contains_key(&2) && !m.contains_key(&1));
+        assert!(step_resize_settle(&mut m).is_empty()); // pane 2: 2 -> 1
+        assert_eq!(step_resize_settle(&mut m), vec![2]); // pane 2: 1 -> 0, fires
+    }
 }

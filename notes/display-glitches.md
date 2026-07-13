@@ -256,3 +256,91 @@ vérifiés rouges sur le code d'avant-fix (revert temporaire ciblé).
 Snapshots round 3 : `holes_report.json` + `hole_pane_{13,45,97,100}.json`
 (scratchpad de session). Journal du workflow (code des tests de repro, verdicts) :
 `subagents/workflows/wf_13ff246f-482/journal.jsonl`.
+
+---
+
+# Round 4 (juillet 2026) : le trou survit à une capture rejouée hors-app → piste RESIZE, fix débouncé (EN TEST)
+
+Point de départ : trou capturé **en direct** dans une pane Claude Code (tab mira,
+pane 229, 118×65) avec sa capture PTY fraîche encore vivante
+(`pty-capture-53097-229.raw`). Pour la première fois sur ce bug, on avait les
+octets exacts + le repro immédiat.
+
+## Faits établis (VÉRIFIÉS)
+
+1. **Le trou est déterministe à partir du flux d'octets.** Rejoué à froid via
+   `replay_capture_file` à 118×65 : même grille, même bande **rows 27..46 (20
+   lignes vides)**, curseur row 61. Ce n'est pas une race de rendu live.
+2. **La bande = un `CSI 20 B` (CUD) littéral** dans le flux. Séquence : fin du
+   bloc tableau → `\r` → `CSI 20 B` → `⏺ C'est fait`. Claude saute 20 rangées
+   par-dessus des cellules que rien ne remplit. Le trou est **hérité** de frames
+   antérieures (la dernière frame ne redessine que la ligne 1) — signature du
+   repaint différentiel.
+3. **tmux 3.6a reproduit le trou à l'identique** (mêmes octets, 118×65, `cat` du
+   `.raw` dans un pane 118×65) : bande vide lignes 28–47 avant `⏺ C'est fait`.
+   Deux émulateurs indépendants d'accord à partir du même flux.
+4. **Ce n'est PAS la table de largeur** (contrairement au suspect prioritaire du
+   round 3). Pour tous les glyphes de cet écran (⏺ ⎿ 🔧 ✅ ★ ❯ →), Kova
+   (`unicode-width` niveau cluster) et ink (`string-width` npm) donnent la MÊME
+   largeur. Et ink positionne l'horizontal en colonne absolue (`CSI n G`), donc
+   toute dérive horizontale se resynchronise — seule la dérive verticale compte.
+5. **Des resizes ont bien eu lieu** (log Kova de l'instance vivante) : rafales de
+   `Resize(*)`, dont un **round-trip vertical shrink→grow** (touche Up puis Down)
+   à 22:44 — exactement ce qui change le nombre de lignes. 38 events resize au
+   total. (Réserve : le log ne dit pas quel pane était focus, donc pas cloué sur
+   229 spécifiquement — mais le comportement est établi.)
+6. Positionnement absolu : **ligne max référencée = 65, jamais au-delà** → si la
+   pane a été resizée, elle n'est allée que ≤ 65 puis retour à 65 (round-trips
+   bornés à 65), cohérent avec l'habitude CTRL+OPTION+flèches de Mickael.
+
+## Piège méthodologique (une conclusion prématurée, retirée)
+
+« tmux reproduit le trou → donc pas un bug Kova » est **faux comme exonération** :
+le replay ET le test tmux tournaient à **taille FIXE 118×65**, alors que la vraie
+session était **redimensionnée**. Rejouer la sortie d'une session resizée dans un
+terminal de taille figée désynchronise par construction — ça ne distingue pas un
+bug du renderer de Claude d'un bug du chemin de resize de Kova. La capture PTY ne
+contient que la sortie, **pas** les resizes (ioctl hors-bande), donc on ne peut
+pas rejouer les resizes aux bons offsets depuis ce `.raw`.
+
+Donc **cause racine non isolée** : soit le chemin de resize alt-screen de Kova
+laisse un état non-standard que Claude ne rattrape pas en différentiel, soit le
+reconciler d'ink ne récupère pas d'un resize (et Kova le rend fidèlement, comme
+tmux). Les deux restent ouverts.
+
+## Fix posé (EN TEST, pas confirmé)
+
+Plutôt que de parier sur la cause non prouvée, on automatise le remède **fiable
+connu** : Cmd+R (`do_repaint_pane`) répare toujours le trou (soft_reset + nudge
+double-SIGWINCH → Claude repeint tout). On le déclenche désormais **tout seul
+après resize**, débouncé.
+
+- `resize_settle: HashMap<PaneId, u32>` (`window.rs`) : compteur de frames par
+  pane, (ré)armé à chaque resize (~150 ms). Constaté : chaque frappe
+  CTRL+OPTION+flèche appelait `resize_all_panes` immédiatement, sans debounce →
+  rafale de SIGWINCH que Claude coalesce → repaint partiel → bande.
+- Quand la rafale se calme (compteur à 0), `fire_resize_settle_repaints` →
+  `repaint_pane_settle(pane_id)` fait le même travail que Cmd+R (soft_reset +
+  `pty.resize(rows-1)` + restore différé), **sans** le flash de bordure.
+- Logique de debounce extraite en fonction pure `step_resize_settle` + **3 tests
+  de régression** (`window.rs` mod tests). Suite complète : 93 tests verts.
+- Nature du fix : **mitigation par repaint forcé**, pas un fix de parsing. Sûr
+  (soft_reset = DECSTR, ne touche pas au contenu ; s'applique à toutes les apps).
+
+## À valider (prochaine action)
+
+Redémarrer Kova (l'instance qui tournait pendant l'investigation = ancien
+binaire) puis resizer comme d'habitude pendant une session Claude et vérifier que
+le trou ne survit plus / se répare seul ~150 ms après la rafale. **Si le trou
+revient malgré le fix**, la cause est en amont du repaint (état post-resize de la
+grille Kova non-standard, OU renderer d'ink) et il faudra le test isolant :
+rejouer un flux AVEC les resizes injectés aux bons offsets dans Kova vs tmux et
+diffé les grilles — ce qui suppose d'instrumenter la capture PTY (`pty.rs`) pour
+logger les changements de winsize + offset.
+
+## Outillage (test-only)
+
+- `KOVA_REPLAY_BYTES=<n>` (tronque le flux) et `KOVA_REPLAY_QUIET` ajoutés à
+  `replay_capture_file` (`parser.rs`) pour la bissection par préfixes.
+- Snapshot du trou : scratchpad de session `kova_hole_229.json` ; capture
+  copiée `cap_229.raw`.
