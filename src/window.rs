@@ -291,7 +291,7 @@ enum SwitcherRow {
     /// A tab name — not selectable.
     TabHeader(String),
     /// A pane entry — selectable, focuses the pane on Enter/click.
-    Pane { pane_id: PaneId, title: String, is_current: bool },
+    Pane { pane_id: PaneId, title: String, is_current: bool, has_bell: bool, has_completion: bool },
 }
 
 impl SwitcherRow {
@@ -3105,10 +3105,23 @@ impl KovaView {
                 let focused_pane = tab.focused_pane;
                 tab.for_each_pane(&mut |pane| {
                     let is_current = ti == active && pane.id == focused_pane;
+                    // Attention (unread) mirrors the per-pane status-bar dot: bell
+                    // or a completed command, but never on the currently-focused pane.
+                    let (has_bell, has_completion) = if is_current {
+                        (false, false)
+                    } else {
+                        let term = pane.terminal.read();
+                        (
+                            term.bell.load(std::sync::atomic::Ordering::Relaxed),
+                            term.command_completed.load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                    };
                     rows.push(SwitcherRow::Pane {
                         pane_id: pane.id,
                         title: pane.display_title("shell"),
                         is_current,
+                        has_bell,
+                        has_completion,
                     });
                 });
                 groups.push(rows);
@@ -5746,8 +5759,8 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, is_current: false },
-                SwitcherRow::Pane { title, is_current, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, is_current: *is_current },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, is_current: false, has_bell: false, has_completion: false },
+                SwitcherRow::Pane { title, is_current, has_bell, has_completion, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, is_current: *is_current, has_bell: *has_bell, has_completion: *has_completion },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()

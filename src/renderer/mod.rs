@@ -179,6 +179,10 @@ pub struct PaneSwitcherRowRender<'a> {
     pub is_header: bool,
     /// True for the row of the currently-focused pane (gets a marker).
     pub is_current: bool,
+    /// Pending bell on this pane (unread) — drives an attention dot.
+    pub has_bell: bool,
+    /// A command completed on this pane (unread) — drives an attention dot.
+    pub has_completion: bool,
 }
 
 /// One column of the pane-switcher overlay: a vertical run of rows holding
@@ -2226,9 +2230,19 @@ impl Renderer {
                     self.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
                 } else {
                     let fg = if row.is_current { current_fg } else { label_fg };
+                    // Attention (unread) dot in the marker slot for non-current panes,
+                    // mirroring the per-pane status-bar dot (bell > completion).
+                    let attention = PaneAttention::from_flags(row.has_bell, row.has_completion);
                     let marker = if row.is_current { "\u{25cf} " } else { "  " };
                     let text = format!("  {}{}", marker, row.text);
                     self.render_text(vertices, &text, left_margin, text_y, right_margin, fg, no_bg, body_scale);
+                    if !row.is_current {
+                        if let Some(color) = attention.dot_color() {
+                            // Marker occupies the 3rd char slot (after the "  " lead-in).
+                            let dot_x = left_margin + 2.0 * scaled_cell_w;
+                            self.render_text(vertices, "\u{25cf}", dot_x, text_y, right_margin, color, no_bg, body_scale);
+                        }
+                    }
                 }
             }
 
