@@ -316,8 +316,8 @@ pub struct Renderer {
     /// Cached permanent shortcuts reminder for the global status bar
     /// (help + overlay combos), built once from the key config.
     cached_shortcuts_hint: String,
-    /// Cached formatted shortcuts for help overlay (label, formatted key combo).
-    cached_help_shortcuts: Vec<(String, String)>,
+    /// Cached help overlay rows, pre-split into two display columns.
+    cached_help_columns: [Vec<HelpRow>; 2],
     /// Hoverable zones in status bars (rebuilt each frame).
     tooltip_zones: Vec<TooltipZone>,
     /// Last built vertices per pane. While a pane defers rendering inside a
@@ -426,7 +426,7 @@ impl Renderer {
             hovered_url_pane_id: None,
             cached_help_hint: String::new(),
             cached_shortcuts_hint: String::new(),
-            cached_help_shortcuts: Vec::new(),
+            cached_help_columns: [Vec::new(), Vec::new()],
             tooltip_zones: Vec::new(),
             pane_vertex_cache: std::collections::HashMap::new(),
             active_tooltip: None,
@@ -666,7 +666,8 @@ impl Renderer {
         let tooltip_animating = self.tooltip_anim > 0 && self.tooltip_anim < TOOLTIP_ANIM_FRAMES;
         let has_loading = self.loading_progress.is_some();
         let has_pane_flash = self.pane_flash.is_some();
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && help_hint_remaining == 0 && !tooltip_animating && !has_loading {
+        let has_status_text = self.resize_feedback_text.is_some();
+        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && !has_status_text && help_hint_remaining == 0 && !tooltip_animating && !has_loading {
             return;
         }
 
@@ -2012,81 +2013,129 @@ impl Renderer {
         drop(font_line);
         y += och * 2.2;
 
-        // Build shortcut list (cached to avoid per-frame allocation)
-        if self.cached_help_shortcuts.is_empty() {
-            let raw: Vec<(&str, &str)> = vec![
-                ("New Tab", &keys_config.new_tab),
-                ("Close Pane/Tab", &keys_config.close_pane_or_tab),
-                ("Close Tab", &keys_config.close_tab),
-                ("Open Recent", &keys_config.open_recent_project),
-                ("Vertical Split", &keys_config.vsplit),
-                ("Horizontal Split", &keys_config.hsplit),
-                ("V Split (Root)", &keys_config.vsplit_root),
-                ("H Split (Root)", &keys_config.hsplit_root),
-                ("New Window", &keys_config.new_window),
-                ("Close Window", &keys_config.close_window),
-                ("Copy", &keys_config.copy),
-                ("Copy Raw", &keys_config.copy_raw),
-                ("Paste", &keys_config.paste),
-                ("Find", &keys_config.toggle_filter),
-                ("Global Search", &keys_config.open_search),
-                ("Switch Tab/Pane", &keys_config.open_pane_switcher),
-                ("Clear Scrollback", &keys_config.clear_scrollback),
-                ("Previous Tab", &keys_config.prev_tab),
-                ("Next Tab", &keys_config.next_tab),
-                ("Rename Tab", &keys_config.rename_tab),
-                ("Rename Pane", &keys_config.rename_pane),
-                ("Detach Tab", &keys_config.detach_tab),
-                ("Break Pane", &keys_config.break_pane),
-                ("Merge Tab", &keys_config.merge_tab),
-                ("Merge Window", &keys_config.merge_window),
-
-                ("Navigate", &keys_config.navigate_up),
-                ("Swap Pane", &keys_config.swap_up),
-                ("Reparent Pane", &keys_config.reparent_up),
-                ("Resize Pane", &keys_config.resize_up),
-                ("Edge Grow", &keys_config.edge_grow_right),
-                ("Minimize Pane", &keys_config.minimize_pane),
-                ("Restore Minimized", &keys_config.restore_minimized),
-                ("Equalize", &keys_config.equalize),
-                ("Repaint Pane", &keys_config.repaint_pane),
-                ("Kill Window", &keys_config.kill_window),
-                ("Memory Report", "cmd+shift+i"),
-                ("Help", &keys_config.toggle_help),
+        // Build the sectioned shortcut list (cached to avoid per-frame allocation).
+        // Each entry is (label, key combo, one-line "what it does / when it works").
+        // The two column groups are laid out left / right, sections kept intact.
+        if self.cached_help_columns[0].is_empty() && self.cached_help_columns[1].is_empty() {
+            let kc = keys_config;
+            type Section<'a> = (&'a str, Vec<(&'a str, &'a str, &'a str)>);
+            let left: Vec<Section> = vec![
+                ("TABS & WINDOWS", vec![
+                    ("New Tab", kc.new_tab.as_str(), ""),
+                    ("Close Pane/Tab", kc.close_pane_or_tab.as_str(), "pane, or tab if last one"),
+                    ("Close Tab", kc.close_tab.as_str(), "whole tab at once"),
+                    ("Previous Tab", kc.prev_tab.as_str(), ""),
+                    ("Next Tab", kc.next_tab.as_str(), ""),
+                    ("Rename Tab", kc.rename_tab.as_str(), ""),
+                    ("New Window", kc.new_window.as_str(), ""),
+                    ("Close Window", kc.close_window.as_str(), ""),
+                    ("Kill Window", kc.kill_window.as_str(), "force, no prompt"),
+                    ("Open Recent", kc.open_recent_project.as_str(), "recent projects"),
+                ]),
+                ("SPLITS", vec![
+                    ("Vertical Split", kc.vsplit.as_str(), "side by side"),
+                    ("Horizontal Split", kc.hsplit.as_str(), "stacked"),
+                    ("V Split (Root)", kc.vsplit_root.as_str(), "full column height"),
+                    ("H Split (Root)", kc.hsplit_root.as_str(), "full row width"),
+                    ("Equalize", kc.equalize.as_str(), "even out sizes"),
+                ]),
+                ("MOVE PANES & TABS", vec![
+                    ("Break Pane", kc.break_pane.as_str(), "pane → new tab (needs 2+ panes)"),
+                    ("Merge Tab", kc.merge_tab.as_str(), "fold this tab into another"),
+                    ("Detach Tab", kc.detach_tab.as_str(), "tab → new window"),
+                    ("Merge Window", kc.merge_window.as_str(), "fold window into another"),
+                    ("Swap Pane", kc.swap_up.as_str(), "trade two panes"),
+                    ("Reparent Pane", kc.reparent_up.as_str(), "move across the split tree"),
+                ]),
             ];
-            self.cached_help_shortcuts = raw.into_iter()
-                .map(|(label, key)| (label.to_string(), format_key_combo_arrows(key)))
-                .collect();
+            let right: Vec<Section> = vec![
+                ("PANES", vec![
+                    ("Navigate", kc.navigate_up.as_str(), "move focus"),
+                    ("Resize Pane", kc.resize_up.as_str(), "adjust split ratio"),
+                    ("Edge Grow", kc.edge_grow_right.as_str(), "grow one edge"),
+                    ("Minimize Pane", kc.minimize_pane.as_str(), ""),
+                    ("Restore Minimized", kc.restore_minimized.as_str(), ""),
+                    ("Rename Pane", kc.rename_pane.as_str(), "sticky title"),
+                    ("Repaint Pane", kc.repaint_pane.as_str(), "redraw / fix winsize"),
+                ]),
+                ("EDIT & SEARCH", vec![
+                    ("Copy", kc.copy.as_str(), ""),
+                    ("Copy Raw", kc.copy_raw.as_str(), ""),
+                    ("Paste", kc.paste.as_str(), ""),
+                    ("Find", kc.toggle_filter.as_str(), "search in this pane"),
+                    ("Global Search", kc.open_search.as_str(), "across all panes"),
+                    ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "quick switcher"),
+                    ("Clear Scrollback", kc.clear_scrollback.as_str(), ""),
+                ]),
+                ("MISC", vec![
+                    ("Memory Report", "cmd+shift+i", ""),
+                    ("Help", kc.toggle_help.as_str(), "this screen"),
+                ]),
+            ];
+            let build = |sections: Vec<Section>| -> Vec<HelpRow> {
+                let mut rows = Vec::new();
+                for (header, items) in sections {
+                    rows.push(HelpRow::Header(header.to_string()));
+                    for (label, key, desc) in items {
+                        rows.push(HelpRow::Item {
+                            label: label.to_string(),
+                            key: format_key_combo_arrows(key),
+                            desc: desc.to_string(),
+                        });
+                    }
+                }
+                rows
+            };
+            self.cached_help_columns = [build(left), build(right)];
         }
-        // Take shortcuts out of self to avoid borrow conflict with render_text
-        let shortcuts = std::mem::take(&mut self.cached_help_shortcuts);
 
-        // Render in 2 columns
-        let col_width = viewport_w / 2.0;
-        let label_offset = ocw * 2.0;
-        let max_label_len = shortcuts.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as f32;
-        let key_offset = label_offset + (max_label_len + 2.0) * ocw;
+        // Take columns out of self to avoid borrow conflict with render_overlay_text.
+        let columns = std::mem::replace(&mut self.cached_help_columns, [Vec::new(), Vec::new()]);
 
-        let rows_per_col = (shortcuts.len() + 1) / 2;
-        for (i, (label, formatted)) in shortcuts.iter().enumerate() {
-            let col = if i < rows_per_col { 0 } else { 1 };
-            let row = if i < rows_per_col { i } else { i - rows_per_col };
-            let base_x = col as f32 * col_width;
-            let row_y = y + row as f32 * (och * 1.4);
-
-            if row_y + och > viewport_h - base_ch {
-                break; // Don't overflow past global status bar
+        // Global column alignment: line up the key combo and description across all rows.
+        let mut max_label = 0usize;
+        let mut max_key = 0usize;
+        for col in &columns {
+            for row in col {
+                if let HelpRow::Item { label, key, .. } = row {
+                    max_label = max_label.max(label.chars().count());
+                    max_key = max_key.max(key.chars().count());
+                }
             }
+        }
+        let col_width = viewport_w / 2.0;
+        let label_off = ocw * 2.0;
+        let key_off = label_off + (max_label as f32 + 1.0) * ocw;
+        let desc_off = key_off + (max_key as f32 + 2.0) * ocw;
+        let row_h = och * 1.4;
 
-            // Label
-            self.render_overlay_text(vertices, label, base_x + label_offset, row_y, base_x + key_offset - ocw, label_fg, no_bg, 1.0);
-
-            // Key combo
-            self.render_overlay_text(vertices, formatted, base_x + key_offset, row_y, base_x + col_width - ocw, key_fg, no_bg, 1.0);
+        for (ci, col) in columns.iter().enumerate() {
+            let base_x = ci as f32 * col_width;
+            let mut row_y = y;
+            for row in col {
+                if row_y + och > viewport_h - base_ch {
+                    break; // Don't overflow past global status bar
+                }
+                match row {
+                    HelpRow::Header(h) => {
+                        row_y += och * 0.5; // breathing room above each section
+                        self.render_overlay_text(vertices, h, base_x + label_off, row_y, base_x + col_width - ocw, title_fg, no_bg, 1.0);
+                        row_y += row_h;
+                    }
+                    HelpRow::Item { label, key, desc } => {
+                        self.render_overlay_text(vertices, label, base_x + label_off, row_y, base_x + key_off - ocw, label_fg, no_bg, 1.0);
+                        self.render_overlay_text(vertices, key, base_x + key_off, row_y, base_x + desc_off - ocw, key_fg, no_bg, 1.0);
+                        if !desc.is_empty() {
+                            self.render_overlay_text(vertices, desc, base_x + desc_off, row_y, base_x + col_width - ocw, dim_fg, no_bg, 1.0);
+                        }
+                        row_y += row_h;
+                    }
+                }
+            }
         }
 
-        // Put shortcuts back
-        self.cached_help_shortcuts = shortcuts;
+        // Put columns back.
+        self.cached_help_columns = columns;
     }
 
     fn build_mem_report_overlay_vertices(
@@ -2633,6 +2682,12 @@ impl Renderer {
         vertices.push(Vertex { position: [x + w, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
         vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
     }
+}
+
+/// One row of the help overlay: either a section header or a shortcut entry.
+enum HelpRow {
+    Header(String),
+    Item { label: String, key: String, desc: String },
 }
 
 /// Format a key combo string like "cmd+shift+d" into "⌘⇧D" for display.

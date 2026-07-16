@@ -98,6 +98,9 @@ pub struct KovaViewIvars {
     merge_tab: RefCell<Option<MergeTabState>>,
     /// Resize feedback: (mode_name, screen_w, virtual_w, remaining_frames).
     resize_feedback: Cell<Option<ResizeFeedback>>,
+    /// Transient status-bar message (text, remaining frames) — used for one-off
+    /// hints like "no-op" feedback when an action can't apply in the current layout.
+    transient_status: RefCell<Option<(String, u32)>>,
     /// Deferred tabs to restore progressively (tab_index, saved_tab_data).
     /// Deferred tabs keyed by their placeholder's TabId (not by index: the
     /// window is interactive during progressive restore, so indices shift
@@ -1341,6 +1344,7 @@ impl KovaView {
             help_hint_frames: Cell::new(180), // updated in setup_metal
             scroll_axis_lock: Cell::new(ScrollAxisLock::None),
             resize_feedback: Cell::new(None),
+            transient_status: RefCell::new(None),
             deferred_tabs: RefCell::new(Vec::new()),
             loading_total_panes: Cell::new(0),
             boundary_hit: Cell::new(None),
@@ -2878,6 +2882,14 @@ impl KovaView {
         self.mark_dirty();
     }
 
+    /// Show a transient status-bar message for ~2 seconds. Used to explain why an
+    /// action did nothing (e.g. Break Pane on a tab that has a single pane).
+    fn set_transient_status(&self, msg: &str) {
+        let fps = self.ivars().config.get().map(|c| c.terminal.fps).unwrap_or(60) as u32;
+        *self.ivars().transient_status.borrow_mut() = Some((msg.to_string(), fps * 2));
+        self.mark_dirty();
+    }
+
     /// Activate the tab containing `tab_id`. Returns true if found.
     fn activate_tab(&self, tab_id: TabId) -> bool {
         let tabs = self.ivars().tabs.borrow();
@@ -3755,6 +3767,8 @@ impl KovaView {
         // No-op if already a single pane
         if tabs[idx].is_single_pane() {
             log::debug!("do_break_pane: pane is already alone, ignoring");
+            drop(tabs);
+            self.set_transient_status("Break Pane needs 2+ panes in this tab");
             return;
         }
 
@@ -5792,6 +5806,20 @@ impl KovaView {
             }
         } else {
             r.resize_feedback_text = None;
+        }
+
+        // Transient status message (e.g. Break Pane no-op) — takes priority over
+        // the resize feedback slot in the global status bar while it lasts.
+        {
+            let mut ts = ivars.transient_status.borrow_mut();
+            if let Some((msg, frames)) = ts.as_mut() {
+                if *frames > 0 {
+                    *frames -= 1;
+                    r.resize_feedback_text = Some(msg.clone());
+                } else {
+                    *ts = None;
+                }
+            }
         }
 
         // Update boundary flash (decrement frames, compute edge position)
