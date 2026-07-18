@@ -1244,6 +1244,21 @@ pub struct Pane {
 /// user-set custom title → non-empty OSC title → cwd basename → `fallback`.
 /// An empty or whitespace-only OSC title is treated as absent so we never
 /// render a blank row (the "invisible white line" bug in the pane switcher).
+/// Strip a leading activity marker that some apps (e.g. Claude Code) prepend to
+/// the terminal title: an asterisk-like glyph followed by a space. Only trims a
+/// single such prefix from the front; leaves the rest untouched.
+fn strip_activity_prefix(title: &str) -> &str {
+    let mut chars = title.chars();
+    match chars.next() {
+        // '*' ASCII, '✳' U+2733 eight-spoked asterisk, '∗' U+2217 asterisk operator
+        Some('*') | Some('\u{2733}') | Some('\u{2217}') => {
+            let rest = chars.as_str();
+            rest.strip_prefix(' ').unwrap_or(title)
+        }
+        _ => title,
+    }
+}
+
 fn derive_display_title(
     custom_title: Option<&str>,
     osc_title: Option<&str>,
@@ -1254,7 +1269,7 @@ fn derive_display_title(
         return custom.to_string();
     }
     if let Some(title) = osc_title.filter(|t| !t.trim().is_empty()) {
-        return title.to_string();
+        return strip_activity_prefix(title).to_string();
     }
     if let Some(cwd) = cwd {
         if let Some(base) = std::path::Path::new(cwd).file_name() {
@@ -1756,7 +1771,23 @@ impl Column {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_display_title, reweight_for_scrolled_split};
+    use super::{derive_display_title, reweight_for_scrolled_split, strip_activity_prefix};
+
+    #[test]
+    fn strip_activity_prefix_trims_marker_and_space() {
+        assert_eq!(strip_activity_prefix("* Add TimeComet.swift"), "Add TimeComet.swift");
+        assert_eq!(strip_activity_prefix("\u{2733} Comprendre"), "Comprendre");
+        assert_eq!(strip_activity_prefix("\u{2217} foo"), "foo");
+        // No marker, or marker without a following space: left untouched.
+        assert_eq!(strip_activity_prefix("plain title"), "plain title");
+        assert_eq!(strip_activity_prefix("*already glued"), "*already glued");
+        // Only one prefix stripped; an inner asterisk stays.
+        assert_eq!(strip_activity_prefix("* a * b"), "a * b");
+        // Empty and marker-only edge cases don't panic.
+        assert_eq!(strip_activity_prefix(""), "");
+        assert_eq!(strip_activity_prefix("*"), "*");
+        assert_eq!(strip_activity_prefix("* "), "");
+    }
 
     // Emulate Tab::column_widths for the no-minimized fast path.
     fn col_widths(weights: &[f32], total: f32) -> Vec<f32> {

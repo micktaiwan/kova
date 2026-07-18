@@ -177,8 +177,6 @@ pub struct SendToWindowRenderData<'a> {
 pub struct PaneSwitcherRowRender<'a> {
     pub text: &'a str,
     pub is_header: bool,
-    /// True for the row of the currently-focused pane (gets a marker).
-    pub is_current: bool,
     /// Pending bell on this pane (unread) — drives an attention dot.
     pub has_bell: bool,
     /// A command completed on this pane (unread) — drives an attention dot.
@@ -2224,7 +2222,6 @@ impl Renderer {
         let title_fg = [1.0, 0.85, 0.3, 1.0];
         let header_fg = [0.55, 0.75, 1.0, 1.0];
         let label_fg = [0.85, 0.85, 0.9, 1.0];
-        let current_fg = [0.5, 0.85, 0.5, 1.0];
         let dim_fg = [0.45, 0.45, 0.5, 1.0];
         let selected_bg = [0.25, 0.35, 0.55];
 
@@ -2278,19 +2275,18 @@ impl Renderer {
                 if row.is_header {
                     self.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
                 } else {
-                    let fg = if row.is_current { current_fg } else { label_fg };
-                    // Attention (unread) dot in the marker slot for non-current panes,
-                    // mirroring the per-pane status-bar dot (bell > completion).
+                    // No current-pane marker: the focused pane renders like any
+                    // other row (the blue selection highlight is the only cursor).
+                    // Attention (unread) dot for non-current panes, mirroring the
+                    // per-pane status-bar dot (bell > completion). is_current panes
+                    // are already suppressed upstream (has_bell/has_completion = false).
                     let attention = PaneAttention::from_flags(row.has_bell, row.has_completion);
-                    let marker = if row.is_current { "\u{25cf} " } else { "  " };
-                    let text = format!("  {}{}", marker, row.text);
-                    self.render_text(vertices, &text, left_margin, text_y, right_margin, fg, no_bg, body_scale);
-                    if !row.is_current {
-                        if let Some(color) = attention.dot_color() {
-                            // Marker occupies the 3rd char slot (after the "  " lead-in).
-                            let dot_x = left_margin + 2.0 * scaled_cell_w;
-                            self.render_text(vertices, "\u{25cf}", dot_x, text_y, right_margin, color, no_bg, body_scale);
-                        }
+                    let text = format!("    {}", row.text);
+                    self.render_text(vertices, &text, left_margin, text_y, right_margin, label_fg, no_bg, body_scale);
+                    if let Some(color) = attention.dot_color() {
+                        // Dot occupies the 3rd char slot (after the "    " lead-in).
+                        let dot_x = left_margin + 2.0 * scaled_cell_w;
+                        self.render_text(vertices, "\u{25cf}", dot_x, text_y, right_margin, color, no_bg, body_scale);
                     }
                 }
             }

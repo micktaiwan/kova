@@ -5773,8 +5773,8 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, is_current: false, has_bell: false, has_completion: false },
-                SwitcherRow::Pane { title, is_current, has_bell, has_completion, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, is_current: *is_current, has_bell: *has_bell, has_completion: *has_completion },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false },
+                SwitcherRow::Pane { title, has_bell, has_completion, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
