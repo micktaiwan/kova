@@ -4173,6 +4173,7 @@ impl KovaView {
                     "pid": pid,
                     "child_processes": child_json,
                     "is_idle": is_idle,
+                    "working": pane.is_working(),
                 }));
             });
         }
@@ -5458,7 +5459,7 @@ impl KovaView {
             .map(|c| c.splits.min_width)
             .unwrap_or(300.0)
             * ivars.last_scale.get().max(1.0) as f32;
-        let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width, total_columns, focused_column, active_tab, total_tabs, active_tab_name) = {
+        let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width, total_columns, focused_column, active_tab, total_tabs, active_tab_name, working_claudes) = {
             let mut tabs = ivars.tabs.borrow_mut();
             if tabs.is_empty() {
                 return false;
@@ -5582,7 +5583,13 @@ impl KovaView {
             let active_tab_1based = active_idx + 1;
             let total_tabs = tabs.len();
             let active_tab_name = tabs[active_idx].title();
-            (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width, total_columns, focused_column, active_tab_1based, total_tabs, active_tab_name)
+            // Count panes across every tab of this window whose app is signalling
+            // activity via the OSC-title marker (Claude Code busy).
+            let mut working_claudes = 0usize;
+            for t in tabs.iter() {
+                t.for_each_pane(&mut |p| if p.is_working() { working_claudes += 1; });
+            }
+            (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width, total_columns, focused_column, active_tab_1based, total_tabs, active_tab_name, working_claudes)
         };
 
         // Focus reporting (DEC mode 1004) — send to focused pane only
@@ -5873,7 +5880,7 @@ impl KovaView {
             }
         }
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_claudes, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 

@@ -1244,18 +1244,41 @@ pub struct Pane {
 /// user-set custom title → non-empty OSC title → cwd basename → `fallback`.
 /// An empty or whitespace-only OSC title is treated as absent so we never
 /// render a blank row (the "invisible white line" bug in the pane switcher).
-/// Strip a leading activity marker that some apps (e.g. Claude Code) prepend to
-/// the terminal title: an asterisk-like glyph followed by a space. Only trims a
-/// single such prefix from the front; leaves the rest untouched.
-fn strip_activity_prefix(title: &str) -> &str {
+/// True if `title` begins with a Claude Code *working* marker: an animated
+/// Braille spinner glyph (U+2800–U+28FF) immediately followed by a space.
+/// Claude Code prepends this spinner ONLY while it is actively generating or
+/// running a tool; at the prompt it shows an asterisk-like idle marker
+/// (`✳ Claude Code`) or a plain title instead. So this — and NOT the asterisk —
+/// is the reliable "the app is busy" signal.
+fn is_working_marker(title: &str) -> bool {
     let mut chars = title.chars();
-    match chars.next() {
-        // '*' ASCII, '✳' U+2733 eight-spoked asterisk, '∗' U+2217 asterisk operator
-        Some('*') | Some('\u{2733}') | Some('\u{2217}') => {
-            let rest = chars.as_str();
-            rest.strip_prefix(' ').unwrap_or(title)
-        }
-        _ => title,
+    matches!(chars.next(), Some(c) if ('\u{2800}'..='\u{28FF}').contains(&c))
+        && chars.next() == Some(' ')
+}
+
+/// True if `title` begins with any Claude Code status marker followed by a
+/// space: the Braille working spinner OR an asterisk-like idle marker
+/// (`*`, `✳ ` U+2733, `∗` U+2217). Used to strip the prefix for display so the
+/// title neither jitters with the spinner nor carries a bare idle marker.
+fn has_leading_marker(title: &str) -> bool {
+    let mut chars = title.chars();
+    matches!(
+        chars.next(),
+        Some(c) if ('\u{2800}'..='\u{28FF}').contains(&c)
+            || matches!(c, '*' | '\u{2733}' | '\u{2217}')
+    ) && chars.next() == Some(' ')
+}
+
+/// Strip a leading status marker that Claude Code prepends to the terminal
+/// title (Braille working spinner or asterisk-like idle marker), plus its
+/// trailing space. Only trims a single such prefix; leaves the rest untouched.
+fn strip_activity_prefix(title: &str) -> &str {
+    if has_leading_marker(title) {
+        // Marker glyph (1–3 bytes) + one ASCII space (1 byte).
+        let marker_len = title.chars().next().map_or(0, char::len_utf8);
+        &title[marker_len + 1..]
+    } else {
+        title
     }
 }
 
@@ -1374,6 +1397,18 @@ impl Pane {
             term.cwd.as_deref(),
             fallback,
         )
+    }
+
+    /// True if the app in this pane is actively working: its live OSC 0/2 title
+    /// leads with Claude Code's animated Braille spinner (see `is_working_marker`).
+    /// The asterisk idle marker (`✳ Claude Code`) does NOT count. Reads the live
+    /// OSC 0/2 title even when a sticky custom title shadows it in the display.
+    pub fn is_working(&self) -> bool {
+        self.terminal
+            .read()
+            .title
+            .as_deref()
+            .map_or(false, is_working_marker)
     }
 
     /// If the shell is ready and there's a pending command, write it to the PTY
@@ -1771,16 +1806,39 @@ impl Column {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_display_title, reweight_for_scrolled_split, strip_activity_prefix};
+    use super::{derive_display_title, is_working_marker, reweight_for_scrolled_split, strip_activity_prefix};
 
     #[test]
-    fn strip_activity_prefix_trims_marker_and_space() {
+    fn is_working_marker_only_on_braille_spinner() {
+        // Working: an animated Braille spinner glyph (U+2800–U+28FF) + space.
+        assert!(is_working_marker("\u{2802} Revue de code")); // ⠂
+        assert!(is_working_marker("\u{2810} Comprendre"));    // ⠐
+        assert!(is_working_marker("\u{28FF} x"));             // last frame of range
+        assert!(is_working_marker("\u{2800} ")); // spinner + trailing space only
+        // NOT working: the asterisk idle marker (this was the earlier bug).
+        assert!(!is_working_marker("* Claude Code"));
+        assert!(!is_working_marker("\u{2733} Claude Code"));
+        assert!(!is_working_marker("\u{2217} foo"));
+        // NOT working: plain titles, spinner without a space, empty.
+        assert!(!is_working_marker("plain title"));
+        assert!(!is_working_marker("\u{2802}glued"));
+        assert!(!is_working_marker("\u{2802}"));
+        assert!(!is_working_marker(""));
+    }
+
+    #[test]
+    fn strip_activity_prefix_trims_spinner_and_idle_marker() {
+        // Braille working spinner stripped for a stable, non-jittering title.
+        assert_eq!(strip_activity_prefix("\u{2802} Revue de code"), "Revue de code");
+        assert_eq!(strip_activity_prefix("\u{2810} Comprendre"), "Comprendre");
+        // Asterisk-like idle markers still stripped too.
         assert_eq!(strip_activity_prefix("* Add TimeComet.swift"), "Add TimeComet.swift");
-        assert_eq!(strip_activity_prefix("\u{2733} Comprendre"), "Comprendre");
+        assert_eq!(strip_activity_prefix("\u{2733} Claude Code"), "Claude Code");
         assert_eq!(strip_activity_prefix("\u{2217} foo"), "foo");
         // No marker, or marker without a following space: left untouched.
         assert_eq!(strip_activity_prefix("plain title"), "plain title");
         assert_eq!(strip_activity_prefix("*already glued"), "*already glued");
+        assert_eq!(strip_activity_prefix("\u{2802}glued"), "\u{2802}glued");
         // Only one prefix stripped; an inner asterisk stays.
         assert_eq!(strip_activity_prefix("* a * b"), "a * b");
         // Empty and marker-only edge cases don't panic.
