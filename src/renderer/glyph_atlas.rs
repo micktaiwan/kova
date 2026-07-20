@@ -51,6 +51,14 @@ pub struct GlyphAtlas {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     color_space: Retained<CGColorSpace>,
     fallback_fonts: HashMap<char, CFRetained<CTFont>>,
+    /// Real italic face of the main font, when the family ships one. `None`
+    /// means no italic face exists and the renderer falls back to a synthetic
+    /// GPU shear of the upright glyph.
+    italic_font: Option<CFRetained<CTFont>>,
+    /// Glyph cache for the italic face, keyed like `glyphs` (single chars).
+    italic_glyphs: HashMap<char, GlyphInfo>,
+    /// Per-char CoreText fallback fonts for the italic face.
+    italic_fallback_fonts: HashMap<char, CFRetained<CTFont>>,
     // Overlay font (larger, for overlays like Memory Report)
     overlay_font: Retained<CTFont>,
     // Per-char fallback fonts for the overlay font (Apple symbols ⌘⌥⌃ etc. absent from the main font)
@@ -288,10 +296,31 @@ impl GlyphAtlas {
         }
         let overlay_cell_width = overlay_advance.width.ceil() as f32;
 
+        // Build the real italic face by adding the italic symbolic trait. If the
+        // family has no italic face, CoreText returns None (or a copy without the
+        // italic trait) — either way we treat it as "no italic" and the renderer
+        // falls back to the synthetic shear.
+        let italic_font: Option<CFRetained<CTFont>> = unsafe {
+            font.copy_with_symbolic_traits(
+                font_size,
+                ptr::null(),
+                CTFontSymbolicTraits::ItalicTrait,
+                CTFontSymbolicTraits::ItalicTrait,
+            )
+        }
+        .filter(|f| unsafe { f.symbolic_traits() }.0 & CTFontSymbolicTraits::TraitItalic.0 != 0);
+        match &italic_font {
+            Some(f) => log::info!("Italic face: {}", unsafe { f.display_name() }),
+            None => log::info!("No italic face for '{}', using synthetic shear", actual_font_name),
+        }
+
         let mut atlas = GlyphAtlas {
             texture,
             glyphs,
             cluster_glyphs: HashMap::new(),
+            italic_font,
+            italic_glyphs: HashMap::new(),
+            italic_fallback_fonts: HashMap::new(),
             cell_width,
             cell_height,
             atlas_width,
@@ -330,6 +359,15 @@ impl GlyphAtlas {
 
     pub fn glyph(&self, c: char) -> Option<&GlyphInfo> {
         self.glyphs.get(&c)
+    }
+
+    /// Whether a real italic face is available (else the renderer shears).
+    pub fn has_italic(&self) -> bool {
+        self.italic_font.is_some()
+    }
+
+    pub fn italic_glyph(&self, c: char) -> Option<&GlyphInfo> {
+        self.italic_glyphs.get(&c)
     }
 
     /// Distance from the top of a cell down to the text baseline, in physical
@@ -889,6 +927,102 @@ impl GlyphAtlas {
         self.insert_bitmap(c, &bmp_buf, bmp_w, bmp_h, is_color)
     }
 
+    /// Rasterize a character from the real italic face into the italic cache.
+    /// Returns `None` when no italic face exists or the char resolves to a color
+    /// (emoji) font — in both cases the renderer falls back to the regular glyph.
+    /// Box-drawing/block builtins are intentionally not handled here: they have
+    /// no italic form, so they too fall back to the regular (upright) glyph.
+    pub fn rasterize_italic_char(&mut self, c: char) -> Option<GlyphInfo> {
+        if let Some(g) = self.italic_glyphs.get(&c) {
+            return Some(*g);
+        }
+        self.italic_font.as_ref()?;
+
+        let width_cells = UnicodeWidthChar::width(c).unwrap_or(1).max(1);
+        let bmp_w = self.cell_width as usize * width_cells;
+        let bmp_h = self.cell_height as usize;
+        let bmp_bpr = bmp_w * 4;
+
+        // Resolve glyph id + draw font (italic face, then CoreText fallback).
+        let mut uni_buf = [0u16; 2];
+        let encoded = c.encode_utf16(&mut uni_buf);
+        let count = encoded.len();
+        let italic = self.italic_font.as_ref().unwrap();
+        let mut glyph_buf = [0u16; 2];
+        let ok = unsafe {
+            italic.glyphs_for_characters(
+                NonNull::new(uni_buf.as_mut_ptr()).unwrap(),
+                NonNull::new(glyph_buf.as_mut_ptr()).unwrap(),
+                count as isize,
+            )
+        };
+        let (mut glyph_id, draw_font): (CGGlyph, *const CTFont) = if ok && glyph_buf[0] != 0 {
+            (glyph_buf[0], &**italic as *const CTFont)
+        } else {
+            if !self.italic_fallback_fonts.contains_key(&c) {
+                let s = c.to_string();
+                let cf_str = CFString::from_str(&s);
+                let fallback = unsafe {
+                    italic.for_string(&cf_str, CFRange { location: 0, length: cf_str.length() })
+                };
+                self.italic_fallback_fonts.insert(c, fallback);
+            }
+            let fallback = self.italic_fallback_fonts.get(&c)?;
+            let mut glyph_buf2 = [0u16; 2];
+            let ok2 = unsafe {
+                fallback.glyphs_for_characters(
+                    NonNull::new(uni_buf.as_mut_ptr()).unwrap(),
+                    NonNull::new(glyph_buf2.as_mut_ptr()).unwrap(),
+                    count as isize,
+                )
+            };
+            if ok2 && glyph_buf2[0] != 0 {
+                (glyph_buf2[0], &**fallback as *const CTFont)
+            } else {
+                return None;
+            }
+        };
+
+        // Color (emoji) fonts have no italic sense — skip so the renderer uses
+        // the regular color glyph.
+        let is_color = unsafe { (&*draw_font).symbolic_traits().0 & (1 << 13) != 0 };
+        if is_color {
+            return None;
+        }
+
+        let mut bmp_buf = vec![0u8; bmp_bpr * bmp_h];
+        let bmp_ctx = unsafe {
+            CGBitmapContextCreate(
+                bmp_buf.as_mut_ptr() as *mut c_void,
+                bmp_w,
+                bmp_h,
+                8,
+                bmp_bpr,
+                Some(&self.color_space),
+                1u32,
+            )
+        };
+        let bmp_ctx = match bmp_ctx {
+            Some(ctx) => ctx,
+            None => return None,
+        };
+        CGContext::set_rgb_fill_color(Some(&bmp_ctx), 1.0, 1.0, 1.0, 1.0);
+
+        let mut pos = CGPoint { x: 0.0, y: self.descent };
+        unsafe {
+            (&*draw_font).draw_glyphs(
+                NonNull::new(&mut glyph_id).unwrap(),
+                NonNull::new(&mut pos).unwrap(),
+                1,
+                &bmp_ctx,
+            );
+        }
+
+        let info = self.insert_bitmap_raw(&bmp_buf, bmp_w, bmp_h, false)?;
+        self.italic_glyphs.insert(c, info);
+        Some(info)
+    }
+
     pub fn cluster_glyph(&self, cluster: &str) -> Option<&GlyphInfo> {
         self.cluster_glyphs.get(cluster)
     }
@@ -1146,6 +1280,7 @@ impl GlyphAtlas {
         );
         self.glyphs.clear();
         self.cluster_glyphs.clear();
+        self.italic_glyphs.clear();
         self.overlay_glyphs.clear();
         self.atlas_buf.fill(0);
         self.next_x = 0;

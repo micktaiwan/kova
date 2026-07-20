@@ -1860,8 +1860,13 @@ impl KovaView {
                 dragging: false,
             }));
         } else if let Some(win) = self.window() {
-            // Click in titlebar but not on a tab — initiate window drag
-            win.performWindowDragWithEvent(event);
+            if event.clickCount() == 2 {
+                // Double-click in titlebar (not on a tab) → zoom, like native titlebars
+                win.zoom(None);
+            } else {
+                // Click in titlebar but not on a tab — initiate window drag
+                win.performWindowDragWithEvent(event);
+            }
         }
         true
     }

@@ -7,6 +7,9 @@ const TOOLTIP_ANIM_FRAMES: u8 = 10; // ~166ms at 60fps
 
 /// Synthetic italic slant: tan(~12°). The glyph quad's top edge is shifted this
 /// fraction of the baseline height to the right, the descender edge to the left.
+/// Fallback only — used when the font has no real italic face, or for a char
+/// (box-drawing, etc.) with no italic form. Real italic glyphs are rasterized
+/// from the font's italic face; see `GlyphAtlas::rasterize_italic_char`.
 const ITALIC_SHEAR: f32 = 0.213;
 
 /// A hoverable zone in a status bar, with associated tooltip text.
@@ -995,9 +998,12 @@ impl Renderer {
         // Pass 1: collect unknown chars/clusters for dynamic rasterization
         let display = term.visible_lines();
         let mut unknown_chars: Vec<char> = Vec::new();
+        let mut unknown_italic_chars: Vec<char> = Vec::new();
         let mut unknown_clusters: Vec<Box<str>> = Vec::new();
+        let has_italic = self.atlas.has_italic();
         {
             let mut seen_chars = std::collections::HashSet::new();
+            let mut seen_italic = std::collections::HashSet::new();
             let mut seen_clusters = std::collections::HashSet::new();
             for line in display.iter() {
                 for cell in line.iter() {
@@ -1007,8 +1013,20 @@ impl Renderer {
                         }
                     } else {
                         let c = cell.c;
-                        if c != ' ' && c != '\0' && self.atlas.glyph(c).is_none() && seen_chars.insert(c) {
+                        if c == ' ' || c == '\0' {
+                            continue;
+                        }
+                        // Regular glyph is always needed (non-italic cells, and the
+                        // synthetic-shear fallback for chars with no italic form).
+                        if self.atlas.glyph(c).is_none() && seen_chars.insert(c) {
                             unknown_chars.push(c);
+                        }
+                        if has_italic
+                            && cell.attrs.contains(CellAttrs::ITALIC)
+                            && self.atlas.italic_glyph(c).is_none()
+                            && seen_italic.insert(c)
+                        {
+                            unknown_italic_chars.push(c);
                         }
                     }
                 }
@@ -1018,6 +1036,9 @@ impl Renderer {
         // Pass 2: rasterize unknowns
         for c in unknown_chars {
             self.atlas.rasterize_char(c);
+        }
+        for c in unknown_italic_chars {
+            self.atlas.rasterize_italic_char(c);
         }
         for cluster in unknown_clusters {
             self.atlas.rasterize_cluster(&cluster);
@@ -1103,11 +1124,26 @@ impl Renderer {
                     log::trace!("render ─ at col={} row={} fg={:?} bg={:?}", col_idx, row_idx, cell.fg, cell.bg);
                 }
 
-                // Look up glyph: cluster first, then single char
+                // Look up glyph: cluster first, then single char. Italic cells
+                // prefer the real italic glyph; when there is none (no italic
+                // face, or a char with no italic form like box-drawing) we fall
+                // back to the upright glyph and shear it synthetically below.
+                let mut real_italic = false;
                 let glyph = if let Some(ref cluster) = cell.cluster {
                     match self.atlas.cluster_glyph(cluster) {
                         Some(g) => *g,
                         None => continue,
+                    }
+                } else if cell.attrs.contains(CellAttrs::ITALIC) {
+                    match self.atlas.italic_glyph(c) {
+                        Some(g) => {
+                            real_italic = true;
+                            *g
+                        }
+                        None => match self.atlas.glyph(c) {
+                            Some(g) => *g,
+                            None => continue,
+                        },
                     }
                 } else {
                     match self.atlas.glyph(c) {
@@ -1139,7 +1175,7 @@ impl Renderer {
                 // the top edge leans right, the descender edge leans left. Emoji
                 // and box-drawing keep their shape only insofar as the quad is
                 // slanted; color glyphs are left as-is to avoid smearing.
-                let italic = cell.attrs.contains(CellAttrs::ITALIC) && !glyph.is_color;
+                let italic = cell.attrs.contains(CellAttrs::ITALIC) && !glyph.is_color && !real_italic;
                 let (shear_top, shear_bot) = if italic {
                     (ITALIC_SHEAR * baseline_from_top, ITALIC_SHEAR * (baseline_from_top - gh))
                 } else {
