@@ -87,6 +87,10 @@ use vertex::Vertex;
 use crate::config::{Config, KeysConfig};
 use crate::pane::PaneId;
 
+/// Color of the minimized-pane marker (status-bar counter and switcher ⊟ icon).
+/// Violet: distinct from the bell (orange) and completion (green) dots.
+const MINIMIZED_FG: [f32; 4] = [0.75, 0.55, 0.95, 1.0];
+
 /// Attention state for a non-focused pane (bell > completion > none).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PaneAttention {
@@ -184,6 +188,8 @@ pub struct PaneSwitcherRowRender<'a> {
     pub has_bell: bool,
     /// A command completed on this pane (unread) — drives an attention dot.
     pub has_completion: bool,
+    /// Pane is minimized (hidden from the layout) — drives a colored ⊟ icon.
+    pub minimized: bool,
 }
 
 /// One column of the pane-switcher overlay: a vertical run of rows holding
@@ -220,8 +226,6 @@ pub struct PaneRenderData {
     pub is_focused: bool,
     pub pane_id: PaneId,
     pub custom_title: Option<String>,
-    /// Pre-computed display title (custom > OSC > CWD basename > "shell").
-    pub display_title: String,
     pub has_completion: bool,
     pub has_bell: bool,
     pub minimized: bool,
@@ -321,6 +325,9 @@ pub struct Renderer {
     cached_help_columns: [Vec<HelpRow>; 2],
     /// Hoverable zones in status bars (rebuilt each frame).
     tooltip_zones: Vec<TooltipZone>,
+    /// Clickable rect of the minimized-panes counter in the global status bar
+    /// (x, y, w, h); None when the counter is hidden. Click opens the switcher.
+    pub minimized_counter_zone: Option<(f32, f32, f32, f32)>,
     /// Last built vertices per pane. While a pane defers rendering inside a
     /// synchronized-output burst (DEC 2026), its previous frame is drawn from
     /// this cache instead of rebuilding from the mid-update grid — rebuilding
@@ -429,6 +436,7 @@ impl Renderer {
             cached_shortcuts_hint: String::new(),
             cached_help_columns: [Vec::new(), Vec::new()],
             tooltip_zones: Vec::new(),
+            minimized_counter_zone: None,
             pane_vertex_cache: std::collections::HashMap::new(),
             active_tooltip: None,
             tooltip_visible: None,
@@ -475,11 +483,17 @@ impl Renderer {
                 let is_hover_pane = self.hovered_url_pane_id == Some(pane.pane_id);
                 self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
                 self.hovered_url = if is_hover_pane { saved_hover_segments.clone() } else { None };
+                // Minimized panes take no layout space and are never drawn;
+                // they surface via the status-bar counter and the pane switcher.
+                if pane.minimized {
+                    self.pane_vertex_cache.remove(&pane.pane_id);
+                    continue;
+                }
                 // Skip panes entirely off-screen (hidden by horizontal scroll)
                 if vp.x + vp.width <= 0.0 || vp.x >= viewport_w {
                     continue;
                 }
-                if pane.is_focused && has_filter && !pane.minimized {
+                if pane.is_focused && has_filter {
                     continue; // Skip: filter overlay covers focused pane
                 }
                 let in_sync = Self::in_sync_window(pane);
@@ -488,8 +502,7 @@ impl Renderer {
                 // Only valid while the viewport is unchanged (vertices are
                 // absolute pixels), the cached build itself wasn't torn
                 // (mid_sync) and it isn't the loading placeholder (ready).
-                let reuse_cached = !pane.minimized
-                    && pane.shell_ready
+                let reuse_cached = pane.shell_ready
                     && in_sync
                     && self.pane_vertex_cache.get(&pane.pane_id).is_some_and(|e| {
                         e.ready
@@ -500,10 +513,7 @@ impl Renderer {
                             && e.vp.height == vp.height
                     });
                 if !reuse_cached {
-                    // Build pane vertices (minimized bar or full content)
-                    let pane_verts = if pane.minimized {
-                        self.build_minimized_bar_vertices(vp, &pane.display_title, pane.has_bell, pane.has_completion)
-                    } else {
+                    let pane_verts = {
                         let pane_attention = PaneAttention::from_flags(pane.has_bell, pane.has_completion);
                         let mut verts = if pane.shell_ready {
                             let t = pane.terminal.read();
@@ -575,6 +585,7 @@ impl Renderer {
         total_tabs: usize,
         active_tab_name: &str,
         working_claudes: usize,
+        minimized_counts: (usize, usize),
         show_help: bool,
         show_mem_report: bool,
         recent_projects: Option<&RecentProjectsRenderData<'_>>,
@@ -757,7 +768,7 @@ impl Renderer {
         }
 
         // Draw global status bar
-        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, working_claudes, help_hint_remaining, keys_config);
+        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, working_claudes, minimized_counts.0, minimized_counts.1, help_hint_remaining, keys_config);
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
@@ -1390,12 +1401,15 @@ impl Renderer {
         total_tabs: usize,
         active_tab_name: &str,
         working_claudes: usize,
+        minimized_current: usize,
+        minimized_total: usize,
         help_hint_remaining: u32,
         keys_config: Option<&KeysConfig>,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
         let bar_y = viewport_h - cell_h;
+        self.minimized_counter_zone = None;
 
         // Background quad
         Self::push_bg_quad(vertices, 0.0, bar_y, viewport_w, cell_h, self.global_bar_bg);
@@ -1518,6 +1532,23 @@ impl Renderer {
                 left_edge = left_edge - claude_w - gap;
                 self.render_status_text(vertices, &claude_str, left_edge, bar_y, viewport_w, claude_fg, no_bg);
                 self.push_tooltip_zone(left_edge, bar_y, claude_w, cell_h, "Claude Code panes currently working");
+            }
+
+            // Minimized panes: "⊟ current/total" (current tab / all windows).
+            // Hidden when there are none anywhere; dimmed when none in this tab.
+            // Clickable — opens the pane switcher (zone stored for hit-testing).
+            if minimized_total > 0 {
+                let min_str = format!("\u{229f} {}/{}", minimized_current, minimized_total);
+                let min_fg = if minimized_current > 0 {
+                    MINIMIZED_FG
+                } else {
+                    [MINIMIZED_FG[0], MINIMIZED_FG[1], MINIMIZED_FG[2], 0.4]
+                };
+                let min_w = min_str.chars().count() as f32 * cell_w;
+                left_edge = left_edge - min_w - gap;
+                self.render_status_text(vertices, &min_str, left_edge, bar_y, viewport_w, min_fg, no_bg);
+                self.push_tooltip_zone(left_edge, bar_y, min_w, cell_h, "Minimized panes — this tab / all windows (click: switcher)");
+                self.minimized_counter_zone = Some((left_edge, bar_y, min_w, cell_h));
             }
         }
     }
@@ -1874,64 +1905,6 @@ impl Renderer {
                 }
             }
         }
-    }
-
-    /// Build vertices for a minimized pane bar (24px thin dimension).
-    /// Detects orientation from viewport aspect ratio:
-    /// - narrow & tall (HSplit minimized) → vertical bar, text rotated 90°
-    /// - wide & short (VSplit minimized) → horizontal bar, text horizontal
-    fn build_minimized_bar_vertices(
-        &mut self,
-        vp: &PaneViewport,
-        label: &str,
-        has_bell: bool,
-        has_completion: bool,
-    ) -> Vec<Vertex> {
-        let mut vertices = Vec::new();
-        let attention = PaneAttention::from_flags(has_bell, has_completion);
-        let bar_bg = attention.bar_bg(self.status_bar_bg);
-
-        // Background quad
-        Self::push_bg_quad_alpha(&mut vertices, vp.x, vp.y, vp.width, vp.height, bar_bg, 1.0);
-
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
-        let fg = [0.6, 0.6, 0.65, 1.0];
-        let no_bg = [0.0, 0.0, 0.0, 0.0];
-        let is_vertical_bar = vp.width < vp.height;
-
-        if is_vertical_bar {
-            // Vertical bar: render each character top-to-bottom
-            let char_x = vp.x + (vp.width - cell_w) / 2.0;
-            let start_y = vp.y + cell_h * 0.5;
-            let max_chars = ((vp.height - cell_h) / cell_h).floor() as usize;
-            let dot = attention.dot_color();
-            let text_slots = if dot.is_some() { max_chars.saturating_sub(1) } else { max_chars };
-            let mut buf = [0u8; 4];
-
-            for (i, c) in label.chars().take(text_slots).enumerate() {
-                let cy = start_y + i as f32 * cell_h;
-                let s = c.encode_utf8(&mut buf);
-                self.render_status_text(&mut vertices, s, char_x, cy, char_x + cell_w, fg, no_bg);
-            }
-
-            if let Some(color) = dot {
-                let dot_y = start_y + text_slots as f32 * cell_h;
-                self.render_status_text(&mut vertices, "●", char_x, dot_y, char_x + cell_w, color, no_bg);
-            }
-        } else {
-            // Horizontal bar: render text left-to-right
-            let padding = PANE_H_PADDING;
-            let text_y = vp.y + (vp.height - cell_h) / 2.0;
-            self.render_status_text(&mut vertices, &label, vp.x + padding, text_y, vp.x + vp.width - padding, fg, no_bg);
-
-            if let Some(color) = attention.dot_color() {
-                let dot_x = vp.x + vp.width - cell_w * 2.0;
-                self.render_status_text(&mut vertices, "●", dot_x, text_y, vp.x + vp.width, color, no_bg);
-            }
-        }
-
-        vertices
     }
 
     fn build_loading_vertices(&mut self, vp: &PaneViewport) -> Vec<Vertex> {
@@ -2331,7 +2304,13 @@ impl Renderer {
                     // are already suppressed upstream (has_bell/has_completion = false).
                     let attention = PaneAttention::from_flags(row.has_bell, row.has_completion);
                     let text = format!("    {}", row.text);
-                    self.render_text(vertices, &text, left_margin, text_y, right_margin, label_fg, no_bg, body_scale);
+                    let row_fg = if row.minimized { dim_fg } else { label_fg };
+                    self.render_text(vertices, &text, left_margin, text_y, right_margin, row_fg, no_bg, body_scale);
+                    if row.minimized {
+                        // Minimized marker in the 1st char slot, in a color of
+                        // its own so hidden panes stand out in the list.
+                        self.render_text(vertices, "\u{229f}", left_margin, text_y, right_margin, MINIMIZED_FG, no_bg, body_scale);
+                    }
                     if let Some(color) = attention.dot_color() {
                         // Dot occupies the 3rd char slot (after the "    " lead-in).
                         let dot_x = left_margin + 2.0 * scaled_cell_w;

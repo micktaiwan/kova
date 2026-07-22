@@ -10,13 +10,30 @@ use crate::terminal::TerminalState;
 
 pub type PaneId = u32;
 
-/// Minimum height of a minimized pane bar (in pixels). The effective height
-/// is at least one cell row so the label isn't vertically clipped on retina.
-pub const MINIMIZED_BAR_PX: f32 = 24.0;
-
-/// Effective minimized-bar height for a given cell height.
-pub fn minimized_bar_px(cell_h: f32) -> f32 {
-    if cell_h > 0.0 { MINIMIZED_BAR_PX.max(cell_h) } else { MINIMIZED_BAR_PX }
+/// Distribute `total` among entries by weight, giving minimized entries zero.
+/// Minimized panes take no layout space at all — they are reachable through
+/// the pane switcher and the status-bar minimized counter instead.
+pub fn distribute_visible(weights: &[f32], minimized: &[bool], total: f32) -> Vec<f32> {
+    let visible_sum: f32 = weights
+        .iter()
+        .zip(minimized.iter())
+        .filter(|&(_, &m)| !m)
+        .map(|(w, _)| w)
+        .sum();
+    let visible_count = minimized.iter().filter(|&&m| !m).count();
+    weights
+        .iter()
+        .zip(minimized.iter())
+        .map(|(w, &m)| {
+            if m {
+                0.0
+            } else if visible_sum > 0.0 {
+                total * w / visible_sum
+            } else {
+                total / visible_count.max(1) as f32
+            }
+        })
+        .collect()
 }
 
 /// Per-pane open-latency instrumentation. Splits the new-pane critical path so
@@ -274,12 +291,13 @@ impl Tab {
     }
 
     /// Compute the virtual width for this tab's split layout.
-    /// If a manual override is set, use it. Otherwise: max(screen_width, columns * min_split_width).
+    /// If a manual override is set, use it. Otherwise: max(screen_width, visible columns * min_split_width).
+    /// Fully-minimized columns take no space, so they don't extend the virtual width.
     pub fn virtual_width(&self, screen_width: f32, min_split_width: f32) -> f32 {
         if self.virtual_width_override > 0.0 {
             self.virtual_width_override.max(screen_width)
         } else {
-            let n = self.columns.len() as f32;
+            let n = self.num_visible_columns() as f32;
             (n * min_split_width).max(screen_width)
         }
     }
@@ -543,56 +561,41 @@ impl Tab {
         self.columns.len()
     }
 
-    /// Return the 1-based column index of the pane (for status bar display).
-    pub fn column_index(&self, id: PaneId) -> Option<usize> {
-        self.column_index_of(id).map(|i| i + 1)
-    }
-
     // ---------------------------------------------------------------
     // Viewport computation
     // ---------------------------------------------------------------
 
     /// Compute column widths from weights and total width.
-    /// Fully-minimized columns collapse to MINIMIZED_BAR_PX (like split_sizes for VSplits).
+    /// Fully-minimized columns take zero width (no layout footprint).
     fn column_widths(&self, total_width: f32) -> Vec<f32> {
         let minimized: Vec<bool> = self.columns.iter()
             .map(|col| col.is_fully_minimized())
             .collect();
-        let min_count = minimized.iter().filter(|&&m| m).count();
+        distribute_visible(&self.column_weights, &minimized, total_width)
+    }
 
-        if min_count == 0 {
-            // Fast path: no minimized columns
-            let sum: f32 = self.column_weights.iter().sum();
-            if sum <= 0.0 {
-                return vec![total_width / self.columns.len() as f32; self.columns.len()];
-            }
-            return self.column_weights.iter().map(|w| total_width * w / sum).collect();
-        }
+    /// Number of columns that occupy layout space (not fully minimized).
+    pub fn num_visible_columns(&self) -> usize {
+        self.columns.iter().filter(|c| !c.is_fully_minimized()).count()
+    }
 
-        // Reserve the minimized-bar size for each minimized column
-        let bar_px = minimized_bar_px(self.cell_h.get());
-        let minimized_total = min_count as f32 * bar_px;
-        let remaining = (total_width - minimized_total).max(0.0);
+    /// 1-based index of the pane's column among visible columns (for status bar).
+    pub fn visible_column_index(&self, id: PaneId) -> Option<usize> {
+        let idx = self.column_index_of(id)?;
+        Some(
+            self.columns[..idx]
+                .iter()
+                .filter(|c| !c.is_fully_minimized())
+                .count()
+                + 1,
+        )
+    }
 
-        // Distribute remaining width among non-minimized columns by weight
-        let non_min_sum: f32 = self.column_weights.iter()
-            .zip(minimized.iter())
-            .filter(|&(_, &m)| !m)
-            .map(|(w, _)| w)
-            .sum();
-
-        self.column_weights.iter()
-            .zip(minimized.iter())
-            .map(|(w, &m)| {
-                if m {
-                    bar_px
-                } else if non_min_sum > 0.0 {
-                    remaining * w / non_min_sum
-                } else {
-                    remaining / (self.columns.len() - min_count).max(1) as f32
-                }
-            })
-            .collect()
+    /// Count minimized panes across all columns.
+    pub fn count_minimized(&self) -> usize {
+        let mut n = 0;
+        self.for_each_pane(&mut |p| if p.minimized { n += 1 });
+        n
     }
 
     /// Walk columns, computing viewports for each pane.
@@ -642,18 +645,24 @@ impl Tab {
     // ---------------------------------------------------------------
 
     /// Collect separator lines between splits as (x1, y1, x2, y2) segments.
+    /// Fully-minimized columns are zero-width: no separator is drawn for them
+    /// (a visible column draws one only when a visible column precedes it).
     pub fn collect_separators(&self, vp: PaneViewport, out: &mut Vec<(f32, f32, f32, f32)>) {
         let widths = self.column_widths(vp.width);
         let ch = self.cell_h.get();
         let mut x = vp.x;
-        for (i, (col, &w)) in self.columns.iter().zip(widths.iter()).enumerate() {
+        let mut seen_visible = false;
+        for (col, &w) in self.columns.iter().zip(widths.iter()) {
             let col_vp = PaneViewport { x, y: vp.y, width: w, height: vp.height };
-            // Vertical separator between columns
-            if i > 0 {
-                out.push((x, vp.y, x, vp.y + vp.height));
+            if !col.is_fully_minimized() {
+                // Vertical separator between this visible column and the previous one
+                if seen_visible {
+                    out.push((x, vp.y, x, vp.y + vp.height));
+                }
+                seen_visible = true;
+                // Horizontal separators within column
+                col.collect_separators(col_vp, ch, out);
             }
-            // Horizontal separators within column
-            col.collect_separators(col_vp, ch, out);
             x += w;
         }
     }
@@ -1473,37 +1482,20 @@ impl Column {
         self.panes.iter().position(|p| p.id == id)
     }
 
-    /// Compute pixel heights for each pane from row_weights, accounting for minimized panes.
+    /// Compute pixel heights for each pane from row_weights. Minimized panes
+    /// get zero height (no layout footprint).
     /// When cell_h > 0, snap non-minimized heights to multiples of cell_h so that
     /// pane y-offsets always land on cell boundaries (prevents prompt drift during resize).
     pub fn row_heights(&self, total_height: f32, cell_h: f32) -> Vec<f32> {
         let n = self.panes.len();
-        let mut heights = vec![0.0f32; n];
-        let mut minimized_total = 0.0f32;
-        let mut weight_sum = 0.0f32;
-        let bar_px = minimized_bar_px(cell_h);
-        for i in 0..n {
-            if self.panes[i].minimized {
-                heights[i] = bar_px;
-                minimized_total += bar_px;
-            } else {
-                weight_sum += self.row_weights[i];
-            }
-        }
-        let remaining = (total_height - minimized_total).max(0.0);
-        if weight_sum > 0.0 {
-            for i in 0..n {
-                if !self.panes[i].minimized {
-                    heights[i] = remaining * (self.row_weights[i] / weight_sum);
-                }
-            }
-        }
+        let minimized: Vec<bool> = self.panes.iter().map(|p| p.minimized).collect();
+        let mut heights = distribute_visible(&self.row_weights, &minimized, total_height);
         // Snap non-minimized heights to multiples of cell_h
         if cell_h > 0.0 {
-            let mut snapped_total = minimized_total;
+            let mut snapped_total = 0.0f32;
             let mut last_non_min = None;
             for i in 0..n {
-                if !self.panes[i].minimized {
+                if !minimized[i] {
                     heights[i] = (heights[i] / cell_h).floor() * cell_h;
                     snapped_total += heights[i];
                     last_non_min = Some(i);
@@ -1554,11 +1546,16 @@ impl Column {
             }
             cur_y += heights[i];
         }
-        // Fallback: last pane
-        self.panes.last().map(|p| {
-            let last_y = vp.y + vp.height - heights.last().unwrap_or(&0.0);
-            (p, PaneViewport { x: vp.x, y: last_y, width: vp.width, height: *heights.last().unwrap_or(&0.0) })
-        })
+        // Fallback: last visible pane (minimized panes are zero-height and unhittable)
+        self.panes
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, p)| !p.minimized)
+            .map(|(i, p)| {
+                let last_y = vp.y + vp.height - heights[i];
+                (p, PaneViewport { x: vp.x, y: last_y, width: vp.width, height: heights[i] })
+            })
     }
 
     pub fn collect_separators(&self, vp: PaneViewport, cell_h: f32, out: &mut Vec<(f32, f32, f32, f32)>) {
@@ -1566,7 +1563,13 @@ impl Column {
         let mut y = vp.y;
         for i in 0..self.panes.len().saturating_sub(1) {
             y += heights[i];
-            out.push((vp.x, y, vp.x + vp.width, y));
+            // Minimized panes are zero-height: draw one separator per visible
+            // boundary only (skip when either side is minimized, and only if a
+            // visible pane follows below).
+            let below_visible = self.panes[i + 1..].iter().any(|p| !p.minimized);
+            if !self.panes[i].minimized && below_visible {
+                out.push((vp.x, y, vp.x + vp.width, y));
+            }
         }
     }
 
@@ -1806,7 +1809,34 @@ impl Column {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_display_title, is_working_marker, reweight_for_scrolled_split, strip_activity_prefix};
+    use super::{derive_display_title, distribute_visible, is_working_marker, reweight_for_scrolled_split, strip_activity_prefix};
+
+    #[test]
+    fn distribute_visible_gives_minimized_zero_space() {
+        // One minimized entry: it gets 0, the others share the full total by weight.
+        let w = distribute_visible(&[1.0, 1.0, 2.0], &[false, true, false], 900.0);
+        assert_eq!(w[1], 0.0);
+        assert!((w[0] - 300.0).abs() < 0.01);
+        assert!((w[2] - 600.0).abs() < 0.01);
+        // Total is fully used by visible entries.
+        assert!((w.iter().sum::<f32>() - 900.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn distribute_visible_no_minimized_is_plain_weights() {
+        let w = distribute_visible(&[1.0, 3.0], &[false, false], 800.0);
+        assert!((w[0] - 200.0).abs() < 0.01);
+        assert!((w[1] - 600.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn distribute_visible_zero_weights_split_evenly() {
+        // Degenerate zero weights: visible entries share evenly, minimized stays 0.
+        let w = distribute_visible(&[0.0, 0.0, 0.0], &[false, true, false], 600.0);
+        assert_eq!(w[1], 0.0);
+        assert!((w[0] - 300.0).abs() < 0.01);
+        assert!((w[2] - 300.0).abs() < 0.01);
+    }
 
     #[test]
     fn is_working_marker_only_on_braille_spinner() {

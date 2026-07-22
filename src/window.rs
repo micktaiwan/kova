@@ -294,7 +294,8 @@ enum SwitcherRow {
     /// A tab name — not selectable.
     TabHeader(String),
     /// A pane entry — selectable, focuses the pane on Enter/click.
-    Pane { pane_id: PaneId, title: String, is_current: bool, has_bell: bool, has_completion: bool },
+    /// `minimized` panes are restored (unhidden) when selected.
+    Pane { pane_id: PaneId, title: String, is_current: bool, has_bell: bool, has_completion: bool, minimized: bool },
 }
 
 impl SwitcherRow {
@@ -884,6 +885,16 @@ define_class!(
             // Check tab bar click
             if self.hit_test_tab_bar(px, py, event) {
                 return;
+            }
+
+            // Click on the minimized-panes counter (global status bar) → open switcher
+            if let Some(renderer) = self.ivars().renderer.get() {
+                if let Some((zx, zy, zw, zh)) = renderer.read().minimized_counter_zone {
+                    if px >= zx && px < zx + zw && py >= zy && py < zy + zh {
+                        self.do_open_pane_switcher();
+                        return;
+                    }
+                }
             }
 
             // Check separator hit
@@ -3139,6 +3150,7 @@ impl KovaView {
                         is_current,
                         has_bell,
                         has_completion,
+                        minimized: pane.minimized,
                     });
                 });
                 groups.push(rows);
@@ -4199,6 +4211,12 @@ impl KovaView {
             None => return false,
         };
 
+        // Focusing a minimized (hidden) pane restores it first — it has no
+        // layout footprint, so focus alone would land on an invisible pane.
+        if tabs[tab_idx].pane(pane_id).is_some_and(|p| p.minimized) {
+            tabs[tab_idx].restore_pane(pane_id);
+            tabs[tab_idx].mark_all_dirty();
+        }
         tabs[tab_idx].focused_pane = pane_id;
         let full = self.drawable_viewport();
         let min_w = self.min_split_width_px();
@@ -5505,7 +5523,6 @@ impl KovaView {
                     shell_ready: pane.is_ready(),
                     is_focused,
                     pane_id: pane.id,
-                    display_title: pane.display_title("shell"),
                     custom_title: pane.custom_title.clone(),
                     has_completion: completed,
                     has_bell,
@@ -5578,8 +5595,10 @@ impl KovaView {
                 })
                 .collect();
             drop(rename);
-            let total_columns = tabs[active_idx].num_columns();
-            let focused_column = tabs[active_idx].column_index(tabs[active_idx].focused_pane).unwrap_or(1);
+            // Status-bar column indicator: count only columns that occupy
+            // layout space (fully-minimized columns are zero-width, invisible).
+            let total_columns = tabs[active_idx].num_visible_columns();
+            let focused_column = tabs[active_idx].visible_column_index(tabs[active_idx].focused_pane).unwrap_or(1);
             let active_tab_1based = active_idx + 1;
             let total_tabs = tabs.len();
             let active_tab_name = tabs[active_idx].title();
@@ -5639,6 +5658,23 @@ impl KovaView {
             }
         };
 
+        // Minimized-pane counters for the global status bar:
+        // current = active tab of this window; total = every tab of every window.
+        let minimized_counts = {
+            let current = ivars.tabs.borrow()[active_idx].count_minimized();
+            let mut total = 0usize;
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            let ad = crate::app::app_delegate(mtm);
+            for win in ad.ivars().windows.borrow().iter() {
+                if let Some(view) = crate::app::kova_view(win) {
+                    for tab in view.ivars().tabs.borrow().iter() {
+                        total += tab.count_minimized();
+                    }
+                }
+            }
+            (current, total)
+        };
+
         // Decrement help hint countdown
         let help_hint_remaining = ivars.help_hint_frames.get();
         if help_hint_remaining > 0 {
@@ -5684,10 +5720,14 @@ impl KovaView {
         r.hovered_url = hover_segments;
         r.hovered_url_text = hover_text;
         r.hovered_url_pane_id = hover_pane_id;
-        // Count hidden panes (fully off-screen)
+        // Count hidden panes (fully off-screen). Minimized panes are excluded:
+        // they are zero-sized by design, not hidden by horizontal scroll.
         let mut hidden_left = 0usize;
         let mut hidden_right = 0usize;
         for p in &pane_data {
+            if p.minimized {
+                continue;
+            }
             if p.viewport.x + p.viewport.width <= 0.0 {
                 hidden_left += 1;
             } else if p.viewport.x >= screen_width {
@@ -5785,8 +5825,8 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false },
-                SwitcherRow::Pane { title, has_bell, has_completion, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false },
+                SwitcherRow::Pane { title, has_bell, has_completion, minimized, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -5880,7 +5920,7 @@ impl KovaView {
             }
         }
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_claudes, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_claudes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 
