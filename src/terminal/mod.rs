@@ -306,6 +306,12 @@ pub struct TerminalState {
     current_hyperlink: u16,
     /// Hyperlink URL table, indexed by hyperlink_id (slot 0 unused).
     hyperlinks: Vec<String>,
+    /// Rows the app explicitly addressed (print/erase-line/ICH/DCH/ECH/IL/DL)
+    /// since the last winsize change. Bulk clears (ED) do NOT count: a
+    /// differential renderer that clears the screen then skips rows leaves
+    /// them blank — exactly the desync this tracks. Used to decide whether
+    /// the post-resize settle nudge is needed (see window.rs).
+    rows_touched: Vec<bool>,
 }
 
 /// A single line matching a filter query.
@@ -384,6 +390,7 @@ impl TerminalState {
             last_activity_secs: std::sync::Arc::new(AtomicU64::new(0)),
             current_hyperlink: 0,
             hyperlinks: vec![String::new()], // slot 0 = no hyperlink
+            rows_touched: vec![false; rows as usize],
         }
     }
 
@@ -676,6 +683,7 @@ impl TerminalState {
             self.advance_line();
         }
 
+        self.touch_row();
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         if row < self.grid.len() && col < self.grid[row].cells.len() {
@@ -1205,6 +1213,7 @@ impl TerminalState {
     pub fn erase_in_line(&mut self, mode: u16) {
         self.pending_wrap = false;
         self.dirty.store(true, Ordering::Relaxed);
+        self.touch_row();
         let row = self.cursor_y as usize;
         if row >= self.grid.len() {
             return;
@@ -1356,6 +1365,7 @@ impl TerminalState {
         if row < self.scroll_top || row > self.scroll_bottom {
             return;
         }
+        self.touch_row();
         let max_n = self.scroll_bottom - row + 1;
         let n = n.min(max_n);
         let row_u = row as usize;
@@ -1382,6 +1392,7 @@ impl TerminalState {
         if row < self.scroll_top || row > self.scroll_bottom {
             return;
         }
+        self.touch_row();
         let max_n = self.scroll_bottom - row + 1;
         let n = n.min(max_n);
         let row_u = row as usize;
@@ -1406,6 +1417,7 @@ impl TerminalState {
         // the next print wrap spuriously — at the bottom row it scrolls the
         // whole alt grid up by one, unmodeled by the app.
         self.pending_wrap = false;
+        self.touch_row();
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         let fill = self.bce_blank();
@@ -1424,6 +1436,7 @@ impl TerminalState {
         // Per xterm/DEC STD 070, ICH resets the Last Column Flag (pending wrap),
         // like erase_chars — see delete_chars for the spurious-scroll failure.
         self.pending_wrap = false;
+        self.touch_row();
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         let fill = self.bce_blank();
@@ -1441,6 +1454,7 @@ impl TerminalState {
 
     pub fn erase_chars(&mut self, n: u16) {
         self.pending_wrap = false;
+        self.touch_row();
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         let fill = self.bce_blank();
@@ -1572,6 +1586,60 @@ impl TerminalState {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Mark the cursor row as addressed by the app (see `rows_touched`).
+    #[inline]
+    fn touch_row(&mut self) {
+        if let Some(t) = self.rows_touched.get_mut(self.cursor_y as usize) {
+            *t = true;
+        }
+    }
+
+    /// Restart row-coverage tracking. Called whenever the PTY winsize changes
+    /// (real resize, repaint nudge, nudge restore) so `row_coverage` measures
+    /// how much of the screen the app repainted since that event.
+    pub fn reset_rows_touched(&mut self) {
+        self.rows_touched.iter_mut().for_each(|t| *t = false);
+    }
+
+    /// Fraction of screen rows the app addressed since the last winsize change.
+    pub fn row_coverage(&self) -> f32 {
+        if self.rows_touched.is_empty() {
+            return 0.0;
+        }
+        let touched = self.rows_touched.iter().filter(|&&t| t).count();
+        touched as f32 / self.rows_touched.len() as f32
+    }
+
+    /// Largest run of fully-blank rows strictly between the first and last
+    /// rows with content, if it spans at least `min_rows`. This is the "hole"
+    /// signature: a differential TUI cleared the screen then skipped rows it
+    /// wrongly believed unchanged. A row counts as content if any cell has a
+    /// glyph, a cluster, a non-default background (BCE), or text attributes
+    /// (an underlined space renders a rule).
+    pub fn interior_blank_band(&self, min_rows: usize) -> Option<(usize, usize)> {
+        let blank_row = |row: &Row| {
+            row.cells.iter().all(|c| {
+                c.c == ' ' && c.cluster.is_none() && c.bg == self.default_bg && c.attrs.is_empty()
+            })
+        };
+        let blanks: Vec<bool> = self.grid.iter().map(|r| blank_row(r)).collect();
+        let first = blanks.iter().position(|&b| !b)?;
+        let last = blanks.iter().rposition(|&b| !b)?;
+        let mut best: Option<(usize, usize)> = None;
+        let mut run_start: Option<usize> = None;
+        for i in first..=last {
+            if blanks[i] {
+                run_start.get_or_insert(i);
+            } else if let Some(start) = run_start.take() {
+                let len = i - start;
+                if len >= min_rows && best.map_or(true, |(s, e)| e - s + 1 < len) {
+                    best = Some((start, i - 1));
+                }
+            }
+        }
+        best
+    }
+
     pub fn resize(&mut self, new_cols: u16, new_rows: u16) {
         if new_cols == self.cols && new_rows == self.rows {
             return;
@@ -1579,6 +1647,7 @@ impl TerminalState {
         // Reflow rebuilds the scrollback/grid — absolute line indices held by
         // the selection no longer point at the same content.
         self.selection = None;
+        self.rows_touched = vec![false; new_rows as usize];
 
         let old_cols = self.cols;
         self.cols = new_cols;
@@ -2485,6 +2554,77 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    // --- Row coverage / interior blank band (hole detection) ---
+
+    fn put_line_at(t: &mut TerminalState, row: u16, s: &str) {
+        t.cursor_y = row;
+        t.cursor_x = 0;
+        put_str(t, s);
+    }
+
+    #[test]
+    fn interior_blank_band_detects_middle_hole() {
+        let mut t = term(10, 12);
+        for r in 0..3 {
+            put_line_at(&mut t, r, "top");
+        }
+        for r in 9..12 {
+            put_line_at(&mut t, r, "bottom");
+        }
+        // Rows 3..8 blank (6 rows) between content.
+        assert_eq!(t.interior_blank_band(3), Some((3, 8)));
+        assert_eq!(t.interior_blank_band(6), Some((3, 8)));
+        assert_eq!(t.interior_blank_band(7), None);
+    }
+
+    #[test]
+    fn interior_blank_band_ignores_leading_and_trailing_blanks() {
+        let mut t = term(10, 12);
+        put_line_at(&mut t, 5, "only");
+        put_line_at(&mut t, 6, "content");
+        // Blanks above and below are margins, not holes.
+        assert_eq!(t.interior_blank_band(3), None);
+    }
+
+    #[test]
+    fn interior_blank_band_counts_bce_background_as_content() {
+        let mut t = term(10, 12);
+        put_line_at(&mut t, 0, "top");
+        put_line_at(&mut t, 11, "bottom");
+        assert!(t.interior_blank_band(3).is_some());
+        // A BCE-colored row in the middle splits the 10-row band into
+        // rows 1..4 and 6..10 — proof the colored row counts as content.
+        t.current_bg = [10, 20, 30];
+        t.cursor_y = 5;
+        t.cursor_x = 0;
+        t.erase_in_line(2);
+        t.current_bg = t.default_bg;
+        assert_eq!(t.interior_blank_band(5), Some((6, 10)));
+        assert_eq!(t.interior_blank_band(6), None);
+    }
+
+    #[test]
+    fn row_coverage_tracks_addressed_rows_and_resets() {
+        let mut t = term(10, 10);
+        assert_eq!(t.row_coverage(), 0.0);
+        for r in 0..5 {
+            put_line_at(&mut t, r, "x");
+        }
+        assert!((t.row_coverage() - 0.5).abs() < 1e-6);
+        // Erase-line addresses a row too (differential renderers clear
+        // shortened lines without printing).
+        t.cursor_y = 7;
+        t.erase_in_line(2);
+        assert!((t.row_coverage() - 0.6).abs() < 1e-6);
+        t.reset_rows_touched();
+        assert_eq!(t.row_coverage(), 0.0);
+        // A grid resize restarts tracking at the new height.
+        t.resize(10, 20);
+        assert_eq!(t.row_coverage(), 0.0);
+        put_line_at(&mut t, 0, "x");
+        assert!((t.row_coverage() - 0.05).abs() < 1e-6);
     }
 
     // --- Cell layout / bold ---

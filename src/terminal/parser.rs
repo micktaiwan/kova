@@ -1229,6 +1229,38 @@ mod tests {
     ///   KOVA_REPLAY_COLS=85 KOVA_REPLAY_ROWS=65 \
     ///   cargo test replay_capture_file -- --ignored --nocapture
     ///
+    /// The hole signature, distilled from cap_19.raw (round 5, 2026-07-24):
+    /// when the winsize flaps A→B→A quickly (Kova's repaint nudge), Claude
+    /// Code can answer with `CSI 2J` (full clear) followed by a PARTIAL
+    /// differential frame that jumps over the middle rows (`CSI 44 B`),
+    /// believing they still hold the previous content. Any terminal renders a
+    /// permanent blank band. This test pins the detector both ways: full
+    /// repaint → no band; clear + partial repaint → band, exactly where the
+    /// skipped rows are.
+    #[test]
+    fn cleared_screen_plus_partial_repaint_leaves_interior_band() {
+        let mut full = String::from("\x1b[?1049h\x1b[2J\x1b[H");
+        for i in 0..65 {
+            full.push_str(&format!("\x1b[{};1Hline {}", i + 1, i));
+        }
+        let t = drive(89, 65, &[full.as_bytes()]);
+        assert_eq!(t.read().interior_blank_band(3), None);
+
+        // The broken frame: clear all, repaint only rows 0..6 and 55..64.
+        let mut broken = String::from("\x1b[2J\x1b[H");
+        for i in 0..6 {
+            broken.push_str(&format!("\x1b[{};1Htop {}", i + 1, i));
+        }
+        broken.push_str("\r\x1b[49B");
+        for i in 55..65 {
+            broken.push_str(&format!("\x1b[{};1Hbottom {}", i + 1, i));
+        }
+        let t = drive(89, 65, &[full.as_bytes(), broken.as_bytes()]);
+        let term = t.read();
+        assert!(term.in_alt_screen);
+        assert_eq!(term.interior_blank_band(8), Some((6, 54)));
+    }
+
     /// Prints the final grid with row numbers, the cursor position, and any
     /// interior blank band (the "hole" signature). Bytes are fed in 4096-byte
     /// chunks, like the live PTY reader. For a rotated capture, replay the

@@ -344,3 +344,88 @@ logger les changements de winsize + offset.
   `replay_capture_file` (`parser.rs`) pour la bissection par préfixes.
 - Snapshot du trou : scratchpad de session `kova_hole_229.json` ; capture
   copiée `cap_229.raw`.
+
+---
+
+# Round 5 (2026-07-24) : CAUSE TROUVÉE — Claude Code émet `2J` + repaint PARTIEL quand la winsize flappe, et c'est notre nudge qui fait flapper
+
+Repro : pane 19 (everping, tab CTO), trou de 47 lignes (rangées 7..53) sur
+grille 89×65, capturé live avec sa capture PTY fraîche
+(`pty-capture-84103-19.raw`, copiée en scratchpad `cap_19.raw` +
+`kova_hole_19_visible.json`).
+
+## Faits établis (VÉRIFIÉS, offsets dans cap_19.raw)
+
+1. **Le trou est déterministe depuis les octets** : `replay_capture_file` à
+   89×65 reproduit exactement la grille live (bande 7..53, curseur row 61).
+   Kova rend fidèlement ce que l'app a émis — cohérent avec le test tmux du
+   round 4.
+2. **La frame fautive est dans le flux** : l'app émet `CSI 2J` (clear complet)
+   PUIS un repaint **partiel** (~2 Ko au lieu de ~4,3 Ko pour une frame
+   pleine) qui saute le milieu d'un `CSI 34/44 B`. Après un 2J tout est vide :
+   les rangées sautées restent vides. Offsets des frames `2J+partiel` :
+   956947 (64 lignes, CUD 34), 964702 (65 l., CUD 44), **972442** (65 l.,
+   CUD 44 — la dernière, celle qui laisse le trou définitif). Les frames
+   suivantes (différentielles, `[H` + ~6 lignes en haut + `CR`+`[46/47B` +
+   bloc du bas) ne repeignent jamais le milieu : l'app croit que ces rangées
+   contiennent encore le texte du transcript.
+3. **Le contexte déclencheur est un flapping 65↔64 de la winsize** : resize
+   réel 93×84 → 89×65 à l'offset ~939214 (dernier `[84;1H`) / 943484 (premier
+   `[65;1H`). Juste après, l'app fait DEUX repaints complets sains (2J pleins,
+   4,2 Ko, offsets 939288 et 943558) — le resize réel était déjà bien géré.
+   Puis les nudges rows±1 de NOTRE mitigation round 4 (`repaint_pane_settle`
+   + `PtyRestore`) font flapper 65→64→65 plusieurs fois (3 frames `[64;1H`,
+   947743..972368) : c'est sur ces allers-retours que l'app sort ses frames
+   `2J+partiel`. Le dernier nudge s'est terminé sur une frame cassée, plus
+   rien ne force de repaint ensuite → trou permanent.
+4. Bilan de responsabilité : **bug de renderer côté Claude Code/ink**
+   (différentiel calculé contre son cache alors qu'il vient d'effacer l'écran
+   physique avec 2J, quand la taille revient vite sur une valeur déjà vue) ;
+   **Kova est complice** parce que sa mitigation nudge crée exactement ce
+   pattern A→B→A, y compris quand elle était inutile (l'app avait déjà
+   full-repaint le resize réel).
+
+## Pourquoi les rounds 1-4 n'ont pas suffi
+
+Le round 4 avait la bonne piste (resize) mais la mauvaise arme : le repaint
+forcé par nudge répare le cas « app a coalescé les SIGWINCH et n'a rien
+redessiné », et EN MÊME TEMPS provoque le cas « 2J+partiel » chez ink. La
+mitigation guérit et réinfecte.
+
+## Fix posé (2026-07-24, EN TEST — build fait, redémarrage Kova requis)
+
+Deux volets défensifs, implémentés :
+
+1. **Nudge seulement si nécessaire** (`should_skip_settle_nudge`,
+   `window.rs`) : `repaint_pane_settle` saute le nudge quand l'app a déjà
+   adressé ≥ 80 % des rangées depuis le dernier changement de winsize
+   (`TerminalState::rows_touched`, remis à zéro à chaque `term.resize` /
+   nudge / restore ; alimenté par print, EL, ICH/DCH/ECH, IL/DL — PAS par
+   ED, un clear bulk n'est pas une peinture) ET que la grille n'a pas de
+   bande vide intérieure ≥ 8 rangées (`interior_blank_band`, une rangée
+   BCE-colorée ou attribuée compte comme contenu). Ce matin, c'est un nudge
+   inutile (l'app avait déjà full-repaint le resize réel) qui a déclenché
+   le trou.
+2. **Auto-guérison bornée** (`fire_post_restore_band_checks`, `window.rs`) :
+   ~0,5 s (30 frames) après chaque restore de winsize, scan de la grille ;
+   si bande vide intérieure ≥ 8 rangées en alt-screen → re-repaint forcé,
+   max 2 tentatives par pane entre deux resizes réels (log INFO à chaque
+   tentative, WARN à l'abandon). Dans cap_19.raw, 4 cycles nudge sur 6 se
+   terminent en repaint complet sain → une retentative converge presque
+   toujours.
+
+Tests : 111 verts, dont `cleared_screen_plus_partial_repaint_leaves_interior_band`
+(parser.rs — la signature distillée de cap_19.raw : full paint → `2J` +
+repaint partiel → bande détectée aux rangées exactes), les tests de
+`interior_blank_band` / `row_coverage` (mod.rs) et de
+`should_skip_settle_nudge` (window.rs).
+
+Validation : redémarrer Kova (l'instance en cours = binaire du 22/07 sans le
+fix), puis vivre normalement (resizes, minimize/restore, scroll dans des
+panes Claude Code). Si un trou apparaît et reste > 1 s, chercher dans le log
+`post-restore check:` — s'il dit « giving up », l'app a répondu 3 frames
+cassées d'affilée ; récupérer la capture PTY du pane et bissecter comme ici.
+
+Upstream : le pattern exact (flap 65→64→65 rapide → `2J` + frame
+différentielle partielle) est reportable à Anthropic avec `cap_19.raw` comme
+repro byte-for-byte (rejouable via `replay_capture_file` à 89×65).

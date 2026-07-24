@@ -131,6 +131,15 @@ pub struct KovaViewIvars {
     /// so a differential TUI (Claude Code) fully repaints against a clean
     /// state instead of leaving stale blank bands after a resize.
     resize_settle: RefCell<std::collections::HashMap<PaneId, u32>>,
+    /// Countdown (frames) per pane until a post-nudge-restore hole check runs:
+    /// the app may answer the restore SIGWINCH with a clear-screen followed by
+    /// a PARTIAL differential repaint (skipping rows it wrongly believes
+    /// unchanged), leaving a permanent blank band. ~0.5s after each restore we
+    /// scan the grid and force another repaint if a band is found.
+    post_restore_checks: RefCell<Vec<PtyRestore>>,
+    /// Band-repair repaints already fired per pane since its last real resize,
+    /// bounding the nudge → broken frame → re-nudge loop (see MAX_BAND_REPAIRS).
+    band_repair_attempts: RefCell<std::collections::HashMap<PaneId, u32>>,
     /// Original `SavedTab` for tabs that are still placeholders or whose
     /// deferred restoration failed. Looked up by `TabId` at save time so we
     /// snapshot the placeholder's *original* data rather than its empty live
@@ -922,11 +931,11 @@ define_class!(
                     let mut tabs = self.ivars().tabs.borrow_mut();
                     let idx = self.ivars().active_tab.get();
                     if let Some(tab) = tabs.get_mut(idx) {
-                        tab.restore_pane(pane_id);
-                        tab.focused_pane = pane_id;
-                        tab.mark_all_dirty();
                         let full = self.drawable_viewport();
                         let min_w = self.min_split_width_px();
+                        tab.restore_pane_adjust_virtual(pane_id, full.width, min_w);
+                        tab.focused_pane = pane_id;
+                        tab.mark_all_dirty();
                         tab.clamp_scroll(full.width, min_w);
                         self.scroll_to_reveal_pane(tab, pane_id, full.width);
                     }
@@ -1366,6 +1375,8 @@ impl KovaView {
             pty_restore: RefCell::new(Vec::new()),
             recent_resizes: RefCell::new(std::collections::HashMap::new()),
             resize_settle: RefCell::new(std::collections::HashMap::new()),
+            post_restore_checks: RefCell::new(Vec::new()),
+            band_repair_attempts: RefCell::new(std::collections::HashMap::new()),
             tab_backup: RefCell::new(std::collections::HashMap::new()),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -1504,7 +1515,11 @@ impl KovaView {
             let term = pane.terminal.read();
             (term.cols, term.rows)
         };
-        pane.terminal.write().soft_reset();
+        {
+            let mut term = pane.terminal.write();
+            term.soft_reset();
+            term.reset_rows_touched();
+        }
         let nudged = if rows > 1 { rows - 1 } else { rows + 1 };
         pane.pty.resize(cols, nudged);
         // ~50ms @60fps before restoring the real winsize, so the foreground
@@ -2384,14 +2399,17 @@ impl KovaView {
             self.remove_tab(idx);
             return;
         }
-        let new_focus = next_focus
-            .filter(|id| tabs[idx].contains(*id))
+        // Clean up minimized_stack (closed pane may have been minimized)
+        tabs[idx].minimized_stack.retain(|&pid| pid != focused_id);
+        // If only minimized panes remain, restore the last minimized one
+        let restored = tabs[idx].ensure_visible_pane();
+        let new_focus = restored
+            .or(next_focus.filter(|id| tabs[idx].contains(*id)))
+            .or_else(|| tabs[idx].first_visible_pane())
             .unwrap_or_else(|| tabs[idx].first_pane().id);
         tabs[idx].focused_pane = new_focus;
         let new_columns = tabs[idx].num_columns();
         tabs[idx].scale_virtual_width(old_columns, new_columns);
-        // Clean up minimized_stack (closed pane may have been minimized)
-        tabs[idx].minimized_stack.retain(|&pid| pid != focused_id);
         // Clamp scroll and auto-scroll to reveal focused pane
         let full = self.drawable_viewport();
         let min_w = self.min_split_width_px();
@@ -4132,13 +4150,16 @@ impl KovaView {
             drop(tabs);
             return Some(false);
         }
-        let new_focus = next_focus
-            .filter(|id| tabs[tab_idx].contains(*id))
+        tabs[tab_idx].minimized_stack.retain(|&pid| pid != pane_id);
+        // If only minimized panes remain, restore the last minimized one
+        let restored = tabs[tab_idx].ensure_visible_pane();
+        let new_focus = restored
+            .or(next_focus.filter(|id| tabs[tab_idx].contains(*id)))
+            .or_else(|| tabs[tab_idx].first_visible_pane())
             .unwrap_or_else(|| tabs[tab_idx].first_pane().id);
         tabs[tab_idx].focused_pane = new_focus;
         let new_columns = tabs[tab_idx].num_columns();
         tabs[tab_idx].scale_virtual_width(old_columns, new_columns);
-        tabs[tab_idx].minimized_stack.retain(|&pid| pid != pane_id);
         let full = self.drawable_viewport();
         let min_w = self.min_split_width_px();
         tabs[tab_idx].clamp_scroll(full.width, min_w);
@@ -4213,13 +4234,13 @@ impl KovaView {
 
         // Focusing a minimized (hidden) pane restores it first — it has no
         // layout footprint, so focus alone would land on an invisible pane.
+        let full = self.drawable_viewport();
+        let min_w = self.min_split_width_px();
         if tabs[tab_idx].pane(pane_id).is_some_and(|p| p.minimized) {
-            tabs[tab_idx].restore_pane(pane_id);
+            tabs[tab_idx].restore_pane_adjust_virtual(pane_id, full.width, min_w);
             tabs[tab_idx].mark_all_dirty();
         }
         tabs[tab_idx].focused_pane = pane_id;
-        let full = self.drawable_viewport();
-        let min_w = self.min_split_width_px();
         tabs[tab_idx].clamp_scroll(full.width, min_w);
         let tab = &mut tabs[tab_idx];
         self.scroll_to_reveal_pane(tab, pane_id, full.width);
@@ -4547,10 +4568,10 @@ impl KovaView {
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get_mut(idx) {
             let focused_id = tab.focused_pane;
-            if tab.minimize_pane(focused_id) {
+            let full = self.drawable_viewport();
+            let min_w = self.min_split_width_px();
+            if tab.minimize_pane_adjust_virtual(focused_id, full.width, min_w) {
                 tab.mark_all_dirty();
-                let full = self.drawable_viewport();
-                let min_w = self.min_split_width_px();
                 tab.clamp_scroll(full.width, min_w);
                 let new_focus = tab.focused_pane;
                 self.scroll_to_reveal_pane(tab, new_focus, full.width);
@@ -4565,10 +4586,10 @@ impl KovaView {
         let mut tabs = self.ivars().tabs.borrow_mut();
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get_mut(idx) {
-            if tab.restore_last_minimized() {
+            let full = self.drawable_viewport();
+            let min_w = self.min_split_width_px();
+            if tab.restore_last_minimized(full.width, min_w) {
                 tab.mark_all_dirty();
-                let full = self.drawable_viewport();
-                let min_w = self.min_split_width_px();
                 tab.clamp_scroll(full.width, min_w);
                 let focused = tab.focused_pane;
                 self.scroll_to_reveal_pane(tab, focused, full.width);
@@ -4736,6 +4757,10 @@ impl KovaView {
                     term.resize(cols, rows);
                     drop(term);
                     pane.pty.resize(cols, rows);
+                    // A real resize opens a fresh band-repair budget (see
+                    // MAX_BAND_REPAIRS) and coverage window (reset by
+                    // term.resize above).
+                    self.ivars().band_repair_attempts.borrow_mut().remove(&pane.id);
 
                     // Round-trip detection: returning within 500ms to ANY
                     // recently-seen size means the child may coalesce the
@@ -4789,6 +4814,71 @@ impl KovaView {
         }
     }
 
+    /// Tick the post-restore hole checks. ~0.5s after each winsize restore,
+    /// scan the pane's grid: if the app answered the restore with a
+    /// clear-screen + partial repaint (interior blank band in alt-screen),
+    /// force another robust repaint — bounded by MAX_BAND_REPAIRS per pane
+    /// between real resizes so a misbehaving app can't loop us.
+    fn fire_post_restore_band_checks(&self) {
+        let due: Vec<PaneId> = {
+            let mut checks = self.ivars().post_restore_checks.borrow_mut();
+            let mut due = Vec::new();
+            for c in checks.iter_mut() {
+                c.remaining_frames = c.remaining_frames.saturating_sub(1);
+                if c.remaining_frames == 0 {
+                    due.push(c.pane_id);
+                }
+            }
+            checks.retain(|c| c.remaining_frames > 0);
+            due
+        };
+        for pane_id in due {
+            // None = pane gone; Some(band) = pane found, band presence known.
+            let holed: Option<Option<(usize, usize)>> = {
+                let tabs = self.ivars().tabs.borrow();
+                let mut found = None;
+                for tab in tabs.iter() {
+                    if let Some(p) = tab.pane(pane_id) {
+                        let t = p.terminal.read();
+                        let band = if !p.minimized && t.in_alt_screen {
+                            t.interior_blank_band(BAND_MIN_ROWS)
+                        } else {
+                            None
+                        };
+                        found = Some(band);
+                        break;
+                    }
+                }
+                found
+            };
+            match holed {
+                Some(Some((start, end))) => {
+                    let mut attempts = self.ivars().band_repair_attempts.borrow_mut();
+                    let n = attempts.entry(pane_id).or_insert(0);
+                    if *n < MAX_BAND_REPAIRS {
+                        *n += 1;
+                        let attempt = *n;
+                        drop(attempts);
+                        log::info!(
+                            "post-restore check: pane {} has a {}-row blank band (rows {}..{}) — forcing repaint (attempt {}/{})",
+                            pane_id, end - start + 1, start, end, attempt, MAX_BAND_REPAIRS
+                        );
+                        self.repaint_pane_settle(pane_id);
+                    } else {
+                        log::warn!(
+                            "post-restore check: pane {} still holed after {} repaints — giving up until next resize",
+                            pane_id, MAX_BAND_REPAIRS
+                        );
+                    }
+                }
+                _ => {
+                    // Clean grid or pane closed: reset the repair budget.
+                    self.ivars().band_repair_attempts.borrow_mut().remove(&pane_id);
+                }
+            }
+        }
+    }
+
     /// Robust repaint for a specific pane (by id), mirroring `do_repaint_pane`
     /// but without the border flash — used by the automatic post-resize settle.
     fn repaint_pane_settle(&self, pane_id: PaneId) {
@@ -4813,9 +4903,23 @@ impl KovaView {
         }
         let (cols, rows) = {
             let t = pane.terminal.read();
+            if should_skip_settle_nudge(t.row_coverage(), t.interior_blank_band(BAND_MIN_ROWS).is_some()) {
+                log::debug!(
+                    "settle repaint skipped for pane {}: app repainted {:.0}% of rows since resize, no hole",
+                    pane_id,
+                    t.row_coverage() * 100.0
+                );
+                return;
+            }
             (t.cols, t.rows)
         };
-        pane.terminal.write().soft_reset();
+        {
+            let mut t = pane.terminal.write();
+            t.soft_reset();
+            // Fresh coverage window: measure what the app repaints in
+            // response to this nudge, not what came before it.
+            t.reset_rows_touched();
+        }
         let nudged = if rows > 1 { rows - 1 } else { rows + 1 };
         pane.pty.resize(cols, nudged);
         let mut restores = self.ivars().pty_restore.borrow_mut();
@@ -5391,14 +5495,29 @@ impl KovaView {
                                 (t.cols, t.rows)
                             };
                             pane.pty.resize(cols, rows);
+                            // Measure the app's response to this restore
+                            // SIGWINCH from a clean slate.
+                            pane.terminal.write().reset_rows_touched();
                         }
                     });
+                }
+                drop(tabs);
+                // The app's answer to a winsize restore is the frame that can
+                // carry the hole (clear + partial repaint). Schedule a grid
+                // scan once that frame has certainly landed.
+                let mut checks = ivars.post_restore_checks.borrow_mut();
+                for &pane_id in &due {
+                    checks.retain(|c| c.pane_id != pane_id);
+                    checks.push(PtyRestore { pane_id, remaining_frames: POST_RESTORE_CHECK_FRAMES });
                 }
             }
         }
 
         // --- Debounced robust repaint after a resize burst settles ---
         self.fire_resize_settle_repaints();
+
+        // --- Post-restore hole check: repair clear+partial-repaint frames ---
+        self.fire_post_restore_band_checks();
 
         // --- Poll git branch for all panes with a CWD ---
         let git_poll_interval = ivars.git_poll_interval.get();
@@ -5447,9 +5566,14 @@ impl KovaView {
                     tab.scale_virtual_width(old_cols, new_cols);
                     tab.minimized_stack.retain(|&pid| pid != *id);
                 }
-                if exited.contains(&tab.focused_pane) {
-                    if !tabs_to_remove.contains(&tab_idx) {
-                        tab.focused_pane = tab.first_pane().id;
+                if !tabs_to_remove.contains(&tab_idx) {
+                    // If only minimized panes remain, restore the last minimized one
+                    if let Some(restored) = tab.ensure_visible_pane() {
+                        tab.focused_pane = restored;
+                    } else if exited.contains(&tab.focused_pane) {
+                        tab.focused_pane = tab
+                            .first_visible_pane()
+                            .unwrap_or_else(|| tab.first_pane().id);
                     }
                 }
             }
@@ -6050,6 +6174,31 @@ fn step_resize_settle(map: &mut std::collections::HashMap<PaneId, u32>) -> Vec<P
     fire
 }
 
+/// Minimum height (rows) of an interior blank band before it is treated as a
+/// hole worth repairing. Real holes span dozens of rows; small gaps are
+/// normal UI spacing.
+const BAND_MIN_ROWS: usize = 8;
+/// Row-coverage fraction above which the settle nudge is skipped: the app
+/// demonstrably repainted (almost) the whole screen since the last winsize
+/// change, so nudging again is pure risk — the winsize flap it causes can
+/// make Claude Code emit a clear-screen followed by a partial repaint (the
+/// hole, see notes/display-glitches.md round 5).
+const SETTLE_SKIP_COVERAGE: f32 = 0.8;
+/// Frames (~0.5s at 60fps) after a winsize restore before scanning the grid
+/// for a leftover hole.
+const POST_RESTORE_CHECK_FRAMES: u32 = 30;
+/// Max automatic band-repair repaints per pane between real resizes, so a
+/// program that keeps answering nudges with broken frames can't loop us.
+const MAX_BAND_REPAIRS: u32 = 2;
+
+/// Whether the post-resize settle repaint (winsize nudge) can be skipped.
+/// Skip only when the app already repainted broadly AND the grid shows no
+/// hole — both conditions observable, so this is strictly safer than always
+/// nudging (the round-4 behavior) which can itself re-trigger the hole.
+fn should_skip_settle_nudge(row_coverage: f32, has_interior_band: bool) -> bool {
+    !has_interior_band && row_coverage >= SETTLE_SKIP_COVERAGE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6086,5 +6235,19 @@ mod tests {
         assert!(m.contains_key(&2) && !m.contains_key(&1));
         assert!(step_resize_settle(&mut m).is_empty()); // pane 2: 2 -> 1
         assert_eq!(step_resize_settle(&mut m), vec![2]); // pane 2: 1 -> 0, fires
+    }
+
+    #[test]
+    fn settle_nudge_skipped_only_on_broad_repaint_without_hole() {
+        // App fully repainted after the real resize: nudging again is the
+        // exact trigger of the clear+partial-repaint hole — skip.
+        assert!(should_skip_settle_nudge(1.0, false));
+        assert!(should_skip_settle_nudge(SETTLE_SKIP_COVERAGE, false));
+        // App barely repainted (possibly coalesced the SIGWINCH): nudge.
+        assert!(!should_skip_settle_nudge(0.1, false));
+        // A hole is visible: always nudge, whatever the coverage says
+        // (scroll frames can accumulate coverage while the band persists).
+        assert!(!should_skip_settle_nudge(1.0, true));
+        assert!(!should_skip_settle_nudge(0.1, true));
     }
 }

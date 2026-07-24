@@ -219,6 +219,25 @@ fn reweight_for_scrolled_split(
     Some(old_virtual + new_col_px)
 }
 
+/// New virtual-width override after a column of `col_px` pixels became fully
+/// hidden: the virtual space shrinks by exactly that width so the remaining
+/// columns keep their pixel sizes, floored at the screen width (`0.0` means
+/// "no override": the layout is screen-sized again).
+fn shrink_virtual_for_hidden_column(old_virtual: f32, col_px: f32, screen: f32) -> f32 {
+    let new_vw = old_virtual - col_px;
+    if new_vw > screen { new_vw } else { 0.0 }
+}
+
+/// New virtual-width override after a fully-hidden column becomes visible
+/// again: the virtual space grows by the pixel share the column takes
+/// (`w_col` vs the `w_others` weight sum of the other visible columns), so
+/// those columns keep their exact pixel sizes. Inverse of
+/// `shrink_virtual_for_hidden_column` when weights are unchanged.
+fn grow_virtual_for_restored_column(w_col: f32, w_others: f32, old_virtual: f32, screen: f32) -> f32 {
+    let new_vw = old_virtual * (w_others + w_col) / w_others;
+    if new_vw > screen { new_vw } else { 0.0 }
+}
+
 impl Tab {
     /// Create a new tab with a single pane.
     pub fn new(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
@@ -452,16 +471,99 @@ impl Tab {
         self.minimized_stack.retain(|&pid| pid != id);
     }
 
-    /// Restore the last minimized pane (FILO).
-    pub fn restore_last_minimized(&mut self) -> bool {
-        if let Some(id) = self.minimized_stack.pop() {
-            if let Some(pane) = self.pane_mut(id) {
-                pane.minimized = false;
-            }
+    /// Restore the last minimized pane (FILO), adjusting the virtual space.
+    pub fn restore_last_minimized(&mut self, screen_width: f32, min_split_width: f32) -> bool {
+        if let Some(id) = self.minimized_stack.last().copied() {
+            self.restore_pane_adjust_virtual(id, screen_width, min_split_width);
             true
         } else {
             false
         }
+    }
+
+    /// Minimize pane `id` and adjust the virtual space: while the tab is
+    /// scrolling (virtual width > screen), a column that becomes fully hidden
+    /// gives its pixel width back to the virtual space, so the remaining
+    /// panes keep their exact sizes — never shrinking below the screen width.
+    /// When not scrolling, the visible panes simply reshare the screen.
+    pub fn minimize_pane_adjust_virtual(&mut self, id: PaneId, screen_width: f32, min_split_width: f32) -> bool {
+        let old_vw = self.virtual_width(screen_width, min_split_width);
+        let col_px = self
+            .column_index_of(id)
+            .and_then(|ci| self.column_widths(old_vw).get(ci).copied());
+        if !self.minimize_pane(id) {
+            return false;
+        }
+        if old_vw > screen_width {
+            if let (Some(ci), Some(px)) = (self.column_index_of(id), col_px) {
+                if self.columns[ci].is_fully_minimized() && px > 0.0 {
+                    self.virtual_width_override =
+                        shrink_virtual_for_hidden_column(old_vw, px, screen_width);
+                }
+            }
+        }
+        true
+    }
+
+    /// Restore pane `id` and adjust the virtual space: while the tab is
+    /// scrolling, a fully-hidden column coming back grows the virtual width
+    /// by the share it takes, so the already-visible panes keep their sizes.
+    pub fn restore_pane_adjust_virtual(&mut self, id: PaneId, screen_width: f32, min_split_width: f32) {
+        let old_vw = self.virtual_width(screen_width, min_split_width);
+        let hidden_col = self
+            .column_index_of(id)
+            .filter(|&ci| self.columns[ci].is_fully_minimized());
+        self.restore_pane(id);
+        if let Some(ci) = hidden_col {
+            if old_vw > screen_width {
+                let mut w_col = self.column_weights.get(ci).copied().unwrap_or(0.0);
+                let mut w_others: f32 = self
+                    .column_weights
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != ci && !self.columns[i].is_fully_minimized())
+                    .map(|(_, &w)| w)
+                    .sum();
+                if w_col <= 0.0 || w_others <= 0.0 {
+                    // Degenerate weights: fall back to equal shares.
+                    let others = self.num_visible_columns().saturating_sub(1);
+                    if others == 0 {
+                        return;
+                    }
+                    w_col = 1.0;
+                    w_others = others as f32;
+                }
+                self.virtual_width_override =
+                    grow_virtual_for_restored_column(w_col, w_others, old_vw, screen_width);
+            }
+        }
+    }
+
+    /// First non-minimized pane id, if any.
+    pub fn first_visible_pane(&self) -> Option<PaneId> {
+        let mut found = None;
+        self.for_each_pane(&mut |p| {
+            if !p.minimized && found.is_none() {
+                found = Some(p.id);
+            }
+        });
+        found
+    }
+
+    /// If no visible (non-minimized) pane remains, restore the most recently
+    /// minimized one (FILO) and return its id. Used after closing the last
+    /// visible pane so the tab never ends up showing nothing.
+    pub fn ensure_visible_pane(&mut self) -> Option<PaneId> {
+        if self.first_visible_pane().is_some() {
+            return None;
+        }
+        let id = self
+            .minimized_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.first_pane().id);
+        self.restore_pane(id);
+        Some(id)
     }
 
     /// Rebuild minimized_stack from the columns (depth-first order). Used after session restore.
@@ -1809,7 +1911,41 @@ impl Column {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_display_title, distribute_visible, is_working_marker, reweight_for_scrolled_split, strip_activity_prefix};
+    use super::{derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
+
+    #[test]
+    fn shrink_virtual_gives_back_hidden_column_width() {
+        // Scrolling at 2×screen, a half-screen column hides → virtual shrinks by it.
+        assert!((shrink_virtual_for_hidden_column(2000.0, 500.0, 1000.0) - 1500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn shrink_virtual_floors_at_screen_width() {
+        // Shrinking to (or below) the screen clears the override entirely.
+        assert_eq!(shrink_virtual_for_hidden_column(1200.0, 400.0, 1000.0), 0.0);
+        assert_eq!(shrink_virtual_for_hidden_column(1200.0, 200.0, 1000.0), 0.0);
+    }
+
+    #[test]
+    fn grow_virtual_adds_restored_column_share() {
+        // 3 visible columns (weight 3) at 1500px, restoring a weight-1 column:
+        // grows by 500px so the restored column gets its 1/4 share of 2000px.
+        assert!((grow_virtual_for_restored_column(1.0, 3.0, 1500.0, 1000.0) - 2000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn grow_virtual_inverts_shrink_with_unchanged_weights() {
+        // Round trip: minimize a column then restore it → original virtual width.
+        // Weights [1, 1, 2], virtual 2000px, screen 1000px; hide the weight-2
+        // column (1000px wide), then restore it.
+        let after_min = shrink_virtual_for_hidden_column(2000.0, 1000.0, 1000.0);
+        assert!((after_min - 1000.0).abs() < 0.01 || after_min == 0.0);
+        // Still-scrolling variant: weights [1, 1, 1, 1], virtual 2000px, hide
+        // one 500px column (→ 1500px), restore it (w_col=1 vs w_others=3).
+        let after_min = shrink_virtual_for_hidden_column(2000.0, 500.0, 1000.0);
+        let restored = grow_virtual_for_restored_column(1.0, 3.0, after_min, 1000.0);
+        assert!((restored - 2000.0).abs() < 0.01);
+    }
 
     #[test]
     fn distribute_visible_gives_minimized_zero_space() {
