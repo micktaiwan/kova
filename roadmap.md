@@ -129,6 +129,7 @@ puis refacto multi-pane, puis splits, puis tabs par-dessus.
 ## V3 — Avancé
 
 - [x] **IPC / pilotage externe** _(priorité 3 — stratégique)_ — socket Unix (`/tmp/kova-{pid}.sock`) acceptant des commandes JSON : `split --cmd "..."`, `list-panes`, `close-pane`, `send-keys`. Permet à Claude Code Teams de spawner des agents dans des panes séparés (aujourd'hui seul tmux le peut). Transforme Kova de "terminal avec splits" en "plateforme de développement scriptable". Voir `track.md` section IPC.
+- [x] **Restauration des sessions Claude Code** — un pane qui tournait une conversation Claude Code revient avec `claude --resume <id>` pré-tapé au lieu de sa dernière commande shell. Rend le redémarrage de Kova indolore quand une douzaine de conversations sont ouvertes. Voir `track.md`.
 - [ ] Support images inline (Kitty Graphics Protocol) — affichage d'images dans le terminal (`icat`, `yazi`, etc.). Parser APC, image store, texture manager Metal, draw calls séparés. Voir [`docs/image-support.md`](docs/image-support.md)
 - [ ] Shell integration (marks, navigation prompt à prompt)
 - [ ] Complétion inline / suggestions

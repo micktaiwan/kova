@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::pane::{alloc_tab_id, Column, Pane, PaneId, Tab};
 
-const SESSION_VERSION: u32 = 4;
+const SESSION_VERSION: u32 = 5;
 
 /// Multi-window session format (v3 — flat columns).
 #[derive(Serialize, Deserialize)]
@@ -77,6 +77,18 @@ pub struct SavedPane {
     pub custom_title: Option<String>,
     #[serde(default)]
     pub minimized: bool,
+    /// Title the running app had set (OSC 0/2) — for Claude Code, the name of
+    /// the conversation. Restored so a pane that has not been resumed yet still
+    /// says what it was, instead of falling back to its directory name. The
+    /// first title the app emits once relaunched replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Claude Code session running in this pane when the snapshot was taken
+    /// (v5). On restore the pane gets a `claude --resume <id>` line instead of
+    /// the last typed command, so the conversation can be picked up where it
+    /// stopped. `None` for a pane that was at a shell prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session: Option<String>,
 }
 
 /// Legacy column format (v3) — kept for backward compat reading.
@@ -134,6 +146,11 @@ fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
             last_command: p.last_command(),
             custom_title: p.custom_title.clone(),
             minimized: p.minimized,
+            title: p.osc_title(),
+            // Must run while the pane's children are alive: Claude Code deletes
+            // its session file on exit, so this is unreadable once the PTYs are
+            // reaped. `will_terminate` saves before `shutdown_all` for this.
+            claude_session: crate::claude_session::for_shell(p.pty.pid()),
         }).collect(),
         row_weights: col.row_weights.clone(),
         custom_row_weights: if col.custom_row_weights.iter().any(|&cw| cw) {
@@ -306,8 +323,8 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
     let data = std::fs::read_to_string(&path).ok()?;
 
     // Try v4/v3 first, then v2, then v1
-    let session: Session = if let Ok(s) = serde_json::from_str::<Session>(&data) {
-        if s.version == SESSION_VERSION || s.version == 3 || s.version == 2 {
+    let mut session: Session = if let Ok(s) = serde_json::from_str::<Session>(&data) {
+        if s.version == SESSION_VERSION || s.version == 4 || s.version == 3 || s.version == 2 {
             s
         } else if s.version == 1 {
             log::warn!("Session v1 with windows field, ignoring");
@@ -336,11 +353,131 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
         return None;
     };
 
+    // Sessions captured out-of-band (upgrade from a build that did not record
+    // them) are folded in before restore. No-op once the file is gone.
+    apply_claude_bootstrap(&mut session.windows, crate::claude_session::take_bootstrap());
+
     // Destructive: the loaded file is consumed. Leave a trace so a lost
     // session (e.g. a --session N backup) can be diagnosed from the log.
     log::info!("Session file {} deleted after load", path.display());
     let _ = std::fs::remove_file(&path);
     Some(session)
+}
+
+/// Fill in `claude_session` on saved panes from an out-of-band capture.
+///
+/// Matching is deliberately lenient. The capture is taken while Kova runs and
+/// the session file is written later, at quit, so positions can shift in
+/// between (a window closed meanwhile is even re-ordered to the front of the
+/// file). Panes are therefore matched on their exact position first, then on
+/// cwd alone, in capture order — a session id is never handed to a pane whose
+/// directory differs, because `claude --resume` only works from the directory
+/// the conversation started in.
+fn apply_claude_bootstrap(
+    windows: &mut [WindowSession],
+    captured: Vec<crate::claude_session::BootstrapPane>,
+) -> usize {
+    if captured.is_empty() {
+        return 0;
+    }
+    let mut used = vec![false; captured.len()];
+    let mut applied = 0;
+
+    // Pass 0: the pane's own command line already names a conversation. That
+    // beats any position guess, and it is the common case when upgrading — the
+    // previous restore left a `claude --resume <id>` line in every pane.
+    for_each_saved_pane(windows, &mut |_, _, _, pane| {
+        let Some(id) = pane
+            .last_command
+            .as_deref()
+            .and_then(crate::claude_session::session_in_command)
+        else {
+            return;
+        };
+        let hit = captured.iter().enumerate().position(|(n, c)| !used[n] && c.session_id == id);
+        if let Some(n) = hit {
+            used[n] = true;
+            applied += fill_from_capture(pane, &captured[n]);
+        }
+    });
+
+    // Pass 1: same position and same directory. A capture is consumed even when
+    // the pane already knows its session (Kova recorded it on its own), so a
+    // leftover cannot drift onto another pane in pass 2.
+    for_each_saved_pane(windows, &mut |w, t, i, pane| {
+        let hit = captured.iter().enumerate().position(|(n, c)| {
+            !used[n] && c.window == w && c.tab == t && c.index == i && Some(&c.cwd) == pane.cwd.as_ref()
+        });
+        if let Some(n) = hit {
+            used[n] = true;
+            applied += fill_from_capture(pane, &captured[n]);
+        }
+    });
+
+    // Pass 2: same directory, in capture order.
+    for_each_saved_pane(windows, &mut |_, _, _, pane| {
+        if pane.claude_session.is_some() {
+            return;
+        }
+        let hit = captured
+            .iter()
+            .enumerate()
+            .position(|(n, c)| !used[n] && Some(&c.cwd) == pane.cwd.as_ref());
+        if let Some(n) = hit {
+            used[n] = true;
+            applied += fill_from_capture(pane, &captured[n]);
+        }
+    });
+
+    let dropped = used.iter().filter(|u| !**u).count();
+    if dropped > 0 {
+        log::warn!("Claude session bootstrap: {} capture(s) matched no pane", dropped);
+    }
+    log::info!("Claude session bootstrap: {} pane(s) restored with a resume line", applied);
+    applied
+}
+
+/// Copy what the pane is missing out of a matched capture. Returns 1 if the
+/// pane gained a session id, so the caller can report what was recovered.
+fn fill_from_capture(pane: &mut SavedPane, capture: &crate::claude_session::BootstrapPane) -> usize {
+    if pane.title.is_none() {
+        pane.title = capture.title.clone().filter(|t| !t.trim().is_empty());
+    }
+    if pane.claude_session.is_some() {
+        return 0;
+    }
+    // A capture can be stale — panes move, panes get opened. When the pane's
+    // own command line already names a conversation, that wins: overwriting it
+    // with a mismatched capture would hand the pane someone else's session.
+    let own = pane
+        .last_command
+        .as_deref()
+        .and_then(crate::claude_session::session_in_command);
+    if own.is_some_and(|id| id != capture.session_id) {
+        return 0;
+    }
+    pane.claude_session = Some(capture.session_id.clone());
+    1
+}
+
+/// Walk every saved pane of the current format, in session-file order,
+/// yielding (window index, tab index, flat pane index).
+fn for_each_saved_pane(
+    windows: &mut [WindowSession],
+    f: &mut impl FnMut(usize, usize, usize, &mut SavedPane),
+) {
+    for (w, window) in windows.iter_mut().enumerate() {
+        for (t, tab) in window.tabs.iter_mut().enumerate() {
+            let Some(ref mut cols) = tab.flat_columns else { continue };
+            let mut index = 0;
+            for col in cols.iter_mut() {
+                for pane in col.panes.iter_mut() {
+                    f(w, t, index, pane);
+                    index += 1;
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------
@@ -360,9 +497,23 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
             }
         };
         let id = pane.id;
-        if let Some(ref cmd) = sp.last_command {
-            pane.pending_command.set(Some(cmd.clone()));
-            pane.terminal.write().last_command = Some(cmd.clone());
+        // A pane that was running Claude Code gets its resume line pre-typed
+        // instead of the last shell command. Nothing is executed: the command
+        // is written without a newline, so it waits for the user to press Enter.
+        let command = match sp.claude_session {
+            Some(ref session_id) => Some(crate::claude_session::resume_command(
+                sp.last_command.as_deref(),
+                session_id,
+            )),
+            None => sp.last_command.clone(),
+        };
+        {
+            let mut term = pane.terminal.write();
+            if let Some(cmd) = command {
+                pane.pending_command.set(Some(cmd.clone()));
+                term.last_command = Some(cmd);
+            }
+            term.title = sp.title.clone();
         }
         pane.custom_title = sp.custom_title.clone();
         pane.minimized = sp.minimized;
@@ -683,4 +834,207 @@ pub fn restore_session(session: Session, config: &Config) -> Option<Vec<Restored
     }
 
     Some(windows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude_session::BootstrapPane;
+
+    fn pane(cwd: &str) -> SavedPane {
+        SavedPane {
+            cwd: Some(cwd.to_string()),
+            last_command: Some("claude".to_string()),
+            custom_title: None,
+            minimized: false,
+            title: None,
+            claude_session: None,
+        }
+    }
+
+    #[test]
+    fn a_pane_saved_before_v5_still_loads() {
+        let saved: SavedPane = serde_json::from_str(
+            r#"{"cwd":"/a","last_command":"ls","custom_title":null,"minimized":false}"#,
+        )
+        .expect("a v4 pane must still parse");
+        assert_eq!(saved.cwd.as_deref(), Some("/a"));
+        assert_eq!(saved.title, None);
+        assert_eq!(saved.claude_session, None);
+    }
+
+    #[test]
+    fn a_pane_with_nothing_to_add_serializes_like_before() {
+        let json: serde_json::Value = serde_json::to_value(pane("/a")).unwrap();
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert!(!keys.contains(&&"title".to_string()), "unexpected keys: {keys:?}");
+        assert!(!keys.contains(&&"claude_session".to_string()), "unexpected keys: {keys:?}");
+    }
+
+    /// One window, one tab per slice of cwds, each tab a single column.
+    fn window(tabs: &[&[&str]]) -> WindowSession {
+        WindowSession {
+            tabs: tabs
+                .iter()
+                .map(|cwds| SavedTab {
+                    flat_columns: Some(vec![SavedFlatColumn {
+                        panes: cwds.iter().map(|c| pane(c)).collect(),
+                        row_weights: vec![1.0; cwds.len()],
+                        custom_row_weights: None,
+                    }]),
+                    columns: None,
+                    column_weights: None,
+                    custom_weights: None,
+                    tree: None,
+                    focused_leaf_index: 0,
+                    custom_title: None,
+                    color: None,
+                    virtual_width_override: None,
+                    scroll_offset_x: None,
+                })
+                .collect(),
+            active_tab: 0,
+            frame: None,
+        }
+    }
+
+    fn captured(window: usize, tab: usize, index: usize, cwd: &str, id: &str) -> BootstrapPane {
+        BootstrapPane {
+            window,
+            tab,
+            index,
+            cwd: cwd.to_string(),
+            session_id: id.to_string(),
+            title: Some(format!("titre de {id}")),
+        }
+    }
+
+    fn sessions_of(ws: &WindowSession) -> Vec<Option<String>> {
+        ws.tabs
+            .iter()
+            .flat_map(|t| t.flat_columns.as_ref().unwrap())
+            .flat_map(|c| &c.panes)
+            .map(|p| p.claude_session.clone())
+            .collect()
+    }
+
+    #[test]
+    fn bootstrap_matches_panes_on_their_exact_position() {
+        let mut windows = vec![window(&[&["/a", "/b"]])];
+        let applied = apply_claude_bootstrap(
+            &mut windows,
+            vec![captured(0, 0, 1, "/b", "id-b"), captured(0, 0, 0, "/a", "id-a")],
+        );
+        assert_eq!(applied, 2);
+        assert_eq!(
+            sessions_of(&windows[0]),
+            vec![Some("id-a".into()), Some("id-b".into())]
+        );
+    }
+
+    #[test]
+    fn bootstrap_falls_back_to_cwd_when_positions_moved() {
+        // The pane moved to another tab between the capture and the quit.
+        let mut windows = vec![window(&[&["/x"], &["/a"]])];
+        let applied = apply_claude_bootstrap(&mut windows, vec![captured(0, 0, 0, "/a", "id-a")]);
+        assert_eq!(applied, 1);
+        assert_eq!(sessions_of(&windows[0]), vec![None, Some("id-a".into())]);
+    }
+
+    #[test]
+    fn bootstrap_keeps_capture_order_among_panes_sharing_a_directory() {
+        let mut windows = vec![window(&[&["/a"], &["/a"]])];
+        let applied = apply_claude_bootstrap(
+            &mut windows,
+            // Neither capture matches a position (tab 3 does not exist), so both
+            // fall through to the cwd pass and must land in capture order.
+            vec![captured(0, 3, 0, "/a", "first"), captured(0, 3, 1, "/a", "second")],
+        );
+        assert_eq!(applied, 2);
+        assert_eq!(
+            sessions_of(&windows[0]),
+            vec![Some("first".into()), Some("second".into())]
+        );
+    }
+
+    #[test]
+    fn bootstrap_never_hands_a_session_to_a_pane_in_another_directory() {
+        let mut windows = vec![window(&[&["/elsewhere"]])];
+        let applied = apply_claude_bootstrap(&mut windows, vec![captured(0, 0, 0, "/a", "id-a")]);
+        assert_eq!(applied, 0);
+        assert_eq!(sessions_of(&windows[0]), vec![None]);
+    }
+
+    #[test]
+    fn bootstrap_leaves_panes_that_already_know_their_session() {
+        let mut windows = vec![window(&[&["/a"]])];
+        windows[0].tabs[0].flat_columns.as_mut().unwrap()[0].panes[0].claude_session =
+            Some("already-there".into());
+        let applied = apply_claude_bootstrap(&mut windows, vec![captured(0, 0, 0, "/a", "id-a")]);
+        assert_eq!(applied, 0);
+        assert_eq!(sessions_of(&windows[0]), vec![Some("already-there".into())]);
+    }
+
+    #[test]
+    fn bootstrap_matches_on_the_session_the_pane_already_names() {
+        // The pane moved and its directory now holds another capture too. The
+        // resume line it carries is what decides.
+        let mut windows = vec![window(&[&["/a", "/a"]])];
+        let panes = windows[0].tabs[0].flat_columns.as_mut().unwrap();
+        panes[0].panes[0].last_command = Some("claude --resume id-second".into());
+        panes[0].panes[1].last_command = Some("claude --resume id-first".into());
+        apply_claude_bootstrap(
+            &mut windows,
+            vec![captured(0, 0, 0, "/a", "id-first"), captured(0, 0, 1, "/a", "id-second")],
+        );
+        let panes = &windows[0].tabs[0].flat_columns.as_ref().unwrap()[0].panes;
+        assert_eq!(panes[0].title.as_deref(), Some("titre de id-second"));
+        assert_eq!(panes[1].title.as_deref(), Some("titre de id-first"));
+    }
+
+    #[test]
+    fn a_stale_capture_never_overrides_the_session_the_pane_names_itself() {
+        let mut windows = vec![window(&[&["/a"]])];
+        windows[0].tabs[0].flat_columns.as_mut().unwrap()[0].panes[0].last_command =
+            Some("claude --resume the-right-one".into());
+        apply_claude_bootstrap(&mut windows, vec![captured(0, 0, 0, "/a", "someone-else")]);
+        let pane = &windows[0].tabs[0].flat_columns.as_ref().unwrap()[0].panes[0];
+        assert_eq!(pane.claude_session, None, "the resume line already carries the truth");
+    }
+
+    #[test]
+    fn bootstrap_restores_the_conversation_title_too() {
+        let mut windows = vec![window(&[&["/a"]])];
+        apply_claude_bootstrap(&mut windows, vec![captured(0, 0, 0, "/a", "id-a")]);
+        let pane = &windows[0].tabs[0].flat_columns.as_ref().unwrap()[0].panes[0];
+        assert_eq!(pane.title.as_deref(), Some("titre de id-a"));
+    }
+
+    #[test]
+    fn bootstrap_gives_a_title_back_to_a_pane_that_already_knows_its_session() {
+        // Kova recorded the session itself, but the title was lost when the
+        // pane came back without its Claude Code running.
+        let mut windows = vec![window(&[&["/a"]])];
+        windows[0].tabs[0].flat_columns.as_mut().unwrap()[0].panes[0].claude_session =
+            Some("already-there".into());
+        apply_claude_bootstrap(&mut windows, vec![captured(0, 0, 0, "/a", "id-a")]);
+        let pane = &windows[0].tabs[0].flat_columns.as_ref().unwrap()[0].panes[0];
+        assert_eq!(pane.claude_session.as_deref(), Some("already-there"));
+        assert_eq!(pane.title.as_deref(), Some("titre de id-a"));
+    }
+
+    #[test]
+    fn bootstrap_never_overwrites_a_title_the_pane_already_had() {
+        let mut windows = vec![window(&[&["/a"]])];
+        windows[0].tabs[0].flat_columns.as_mut().unwrap()[0].panes[0].title = Some("à moi".into());
+        apply_claude_bootstrap(&mut windows, vec![captured(0, 0, 0, "/a", "id-a")]);
+        let pane = &windows[0].tabs[0].flat_columns.as_ref().unwrap()[0].panes[0];
+        assert_eq!(pane.title.as_deref(), Some("à moi"));
+    }
+
+    #[test]
+    fn bootstrap_without_capture_is_a_no_op() {
+        let mut windows = vec![window(&[&["/a"]])];
+        assert_eq!(apply_claude_bootstrap(&mut windows, Vec::new()), 0);
+    }
 }

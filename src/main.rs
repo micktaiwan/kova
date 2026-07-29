@@ -1,4 +1,5 @@
 mod app;
+mod claude_session;
 mod config;
 mod input;
 mod ipc;

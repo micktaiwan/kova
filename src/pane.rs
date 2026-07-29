@@ -1499,6 +1499,18 @@ impl Pane {
         self.terminal.read().last_command.clone()
     }
 
+    /// Title set by the running app (OSC 0/2), without the activity marker
+    /// Claude Code prepends — so a saved title does not freeze a spinner frame.
+    pub fn osc_title(&self) -> Option<String> {
+        self.terminal
+            .read()
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| strip_activity_prefix(t).to_string())
+    }
+
     /// Display title for this pane: custom title > OSC title > CWD basename > fallback.
     pub fn display_title(&self, fallback: &str) -> String {
         let term = self.terminal.read();

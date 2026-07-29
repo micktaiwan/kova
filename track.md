@@ -2,6 +2,30 @@
 
 ## En cours
 
+### Restauration des sessions Claude Code au redémarrage
+
+**Statut** : Codé, testé (unitaires verts), buildé dans `/Applications/Kova.app` le 2026-07-29. Reste le test réel, qui ne peut se faire qu'en quittant Kova.
+
+**Ce que ça fait** : au snapshot de session, Kova repère le Claude Code qui tourne dans chaque pane et mémorise son identifiant de conversation. À la restauration, ce pane reçoit `claude --resume <id>` pré-tapé au lieu de la dernière commande shell — sans retour chariot, donc rien ne part sans un Entrée. Un pane qui était à l'invite du shell garde le comportement d'avant.
+
+**Comment le pane est relié à sa session** : Claude Code écrit `~/.claude/sessions/<pid>.json` (contient `sessionId`) tant que le process vit, et le supprime en sortant. Kova lit ce répertoire et remonte la filiation de chaque process `claude` jusqu'au shell du pane. La lecture doit donc précéder `pty::shutdown_all()` — c'est déjà l'ordre de `applicationWillTerminate`.
+
+**Contrainte vérifiée le 2026-07-29** : `claude --resume <uuid>` ne retrouve la conversation que depuis le répertoire où elle a démarré (les transcripts sont rangés par cwd dans `~/.claude/projects/<slug>/`). Testé dans les deux sens : même répertoire → la conversation revient ; autre répertoire → `No conversation found`. Kova restaure déjà le cwd du pane, donc l'injection tombe juste.
+
+**Bootstrap du premier redémarrage** : le Kova qui tourne aujourd'hui ne sait pas enregistrer ces identifiants, donc le premier passage les perdrait quand même. `scripts/capture-claude-sessions.py` capture la carte pane → session depuis le Kova vivant (via l'IPC) et l'écrit dans `~/.config/kova/claude-sessions.json` ; le nouveau build la fusionne au premier démarrage puis la renomme en `.used.json`. Capture faite le 2026-07-29 : 23 sessions sur 26 panes. **À relancer juste avant de quitter** si des panes ont bougé depuis. Le script et le code de fusion sont jetables une fois le premier cycle passé.
+
+**Premier cycle réel, 2026-07-29 13:40** : le bootstrap a marché, 23 panes sur 23 sont revenus avec leur ligne de resume (log Kova, `Claude session bootstrap: 23 pane(s) restored`). Mais la détection native, elle, ne remontait rien : le fichier de session sauvé juste après contenait `claude_session: null` partout.
+
+**Cause** : le garde-fou anti-fichier-périmé comparait le nom du process à `claude`. Or l'exécutable est `~/.local/share/claude/versions/2.1.220`, donc `proc_name` renvoie `2.1.220`, un numéro de version. Tous les process étaient rejetés. L'identité se vérifie maintenant sur l'heure de démarrage du process comparée au champ `startedAt` du fichier de session (dérive mesurée : moins d'une seconde). Corrigé et buildé le 2026-07-29 13:44, vérifié par le test `claude_sessions_are_detected_on_this_machine` (ignoré par défaut, à lancer avec `cargo test -- --ignored --nocapture`).
+
+**Effet de bord du même bug, non corrigé** : `foreground_process_name()` renvoie aussi `2.1.220`, donc le dialogue de confirmation à la fermeture liste des numéros de version au lieu de `claude`. Retrouver le vrai nom demanderait de lire `argv[0]` via `sysctl KERN_PROCARGS2`.
+
+**Titres de conversation (ajouté le 2026-07-29 13:50)** : un pane dont la session n'a pas été relancée retombait sur le nom de son répertoire dans le switcher, alors que le titre de la conversation était connu avant la fermeture. Le titre OSC 0/2 est donc sauvé lui aussi (`SavedPane.title`, marqueur d'activité retiré) et réinjecté dans l'état du terminal à la restauration ; le premier titre émis par l'app relancée le remplace. La capture de bootstrap transporte le titre elle aussi, et le fichier du 2026-07-29 12:54 a été remis en place pour récupérer les titres déjà perdus lors du premier cycle.
+
+**Capture périmée (durci le 2026-07-29 14:27)** : entre la capture de 12:54 et maintenant, le nombre de panes est passé de 26 à 29, donc les positions enregistrées ne valent plus. Le rapprochement commence désormais par l'identifiant de conversation que le pane porte déjà dans sa ligne `claude --resume <id>` — un repère exact, indépendant des positions. Et une capture ne peut plus écraser une session que le pane nomme lui-même : au pire elle donne un titre faux, jamais une mauvaise conversation.
+
+**Prochaine action** : au prochain redémarrage de Kova, vérifier que `~/.config/kova/session.json` contient bien des `claude_session` non nuls dans les 30 secondes (autosave) — c'est la preuve que le mécanisme permanent tourne sans le bootstrap — et que les panes non relancés affichent leur titre de conversation dans le switcher (Cmd+P).
+
 ### Pane switcher — rebind Cmd+P + layout 3 colonnes
 
 **Statut** : Rebind fait + layout 3 colonnes implémenté et buildé (2026-06-23) ; reste le test manuel.

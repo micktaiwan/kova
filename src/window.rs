@@ -4207,6 +4207,7 @@ impl KovaView {
                     "child_processes": child_json,
                     "is_idle": is_idle,
                     "working": pane.is_working(),
+                    "minimized": pane.minimized,
                 }));
             });
         }
@@ -6151,7 +6152,12 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, act
     window.setContentView(Some(&view));
     window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*view)));
     window.makeFirstResponder(Some(&view));
-    window.setAcceptsMouseMovedEvents(true);
+    // NOT setAcceptsMouseMovedEvents(true): the view already installs an
+    // NSTrackingArea with MouseMoved (see updateTrackingAreas). Both paths
+    // together deliver mouseMoved: twice per physical move, so mode-1003 apps
+    // receive every motion report twice. Measured against Terminal.app on the
+    // same gesture: 37% duplicate reports vs 0%. The tracking area is the more
+    // precise source (view bounds, key window only), so it is the one we keep.
 
     window
 }

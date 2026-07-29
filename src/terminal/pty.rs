@@ -390,8 +390,10 @@ impl Pty {
         if actual <= 0 {
             return Vec::new();
         }
-        let n = (actual as usize) / std::mem::size_of::<i32>();
-        pids.truncate(n);
+        // proc_listchildpids returns a *count* of PIDs written, not a byte
+        // length — dividing by size_of::<i32>() truncated every shell with
+        // fewer than four children down to zero.
+        pids.truncate(actual as usize);
         pids.iter()
             .map(|&cpid| {
                 let mut name_buf = [0u8; 256];
