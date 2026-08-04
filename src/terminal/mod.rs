@@ -270,8 +270,14 @@ pub struct TerminalState {
     pub insert_mode: bool,
     // Bell received (BEL 0x07) — used for tab attention indicator
     pub bell: AtomicBool,
-    // Command completed (OSC 133;D) — used for pane/tab completion indicator
+    // Command completed (OSC 133;D) — sticky until the next OSC 133;C, because
+    // the IPC `wait-for-completion` contract reads it. Never clear it for UI
+    // purposes: acknowledge with `completion_seen` instead.
     pub command_completed: AtomicBool,
+    // The user has looked at this pane since the completion fired. Reset on
+    // every OSC 133;D, set on every frame the pane is focused. Gates the
+    // attention dot without disturbing `command_completed`.
+    pub completion_seen: AtomicBool,
     // Command running (between OSC 133;C and 133;D) — tab running indicator
     pub command_running: AtomicBool,
     // The first OSC 133;D after spawn comes from the shell's startup precmd
@@ -375,6 +381,7 @@ impl TerminalState {
             insert_mode: false,
             bell: AtomicBool::new(false),
             command_completed: AtomicBool::new(false),
+            completion_seen: AtomicBool::new(false),
             command_running: AtomicBool::new(false),
             osc133_primed: false,
             last_command: None,
@@ -396,6 +403,19 @@ impl TerminalState {
 
     pub fn kitty_flags(&self) -> u8 {
         self.kitty_keyboard_flags.last().copied().unwrap_or(0)
+    }
+
+    /// True if a command completed here and the user hasn't looked at the pane
+    /// since. This — not `command_completed` — drives every completion dot.
+    pub fn unread_completion(&self) -> bool {
+        self.command_completed.load(std::sync::atomic::Ordering::Relaxed)
+            && !self.completion_seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Mark the completion as seen (call while the pane is focused). Leaves
+    /// `command_completed` alone so IPC `wait-for-completion` still sees it.
+    pub fn ack_completion(&self) {
+        self.completion_seen.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Set or clear the active OSC 8 hyperlink.

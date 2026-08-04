@@ -429,3 +429,90 @@ cassées d'affilée ; récupérer la capture PTY du pane et bissecter comme ici.
 Upstream : le pattern exact (flap 65→64→65 rapide → `2J` + frame
 différentielle partielle) est reportable à Anthropic avec `cap_19.raw` comme
 repro byte-for-byte (rejouable via `replay_capture_file` à 89×65).
+
+# Round 6 (2026-07-29) : le trou arrive AUSSI sans resize — déclencheur = le scroll, et Kova doublait les rapports de souris
+
+Repro live : pane 11 (session self/), grille 98×65, bande vide rangées 9..49
+(41 rangées), curseur row=61 col=2, alt-screen. Capture
+`pty-capture-63758-11.raw`, 1 652 462 octets.
+
+Mécanisme DIFFÉRENT du round 5 : ici l'app n'efface jamais l'écran (aucun `2J`)
+et aucun resize n'est en jeu. Le round 5 reste valable pour son cas (flap de
+winsize provoqué par nos nudges) ; il ne couvre pas celui-ci.
+
+## Faits établis (VÉRIFIÉS)
+
+1. **Le trou est dans la grille, pas au rendu** : `get-pane-content` mode
+   `visible` lit `self.grid` (`terminal/mod.rs:465`) et montre les 41 rangées
+   vides. Ce n'est donc pas un problème de framebuffer Metal.
+2. **Il suit la position de scroll de l'app** : scrollé vers le haut → trou ;
+   redescendu en bas → grille propre. Vérifié sur trois dumps successifs du
+   même pane. Claude Code est en alt-screen et a le mouse tracking actif, donc
+   la molette lui est transmise et c'est LUI qui repeint
+   (`window.rs:820-832`) — le scrollback Kova n'est pas impliqué.
+3. **Déterministe hors app** : `replay_capture_file` à 98×65 reproduit
+   exactement la grille live (bande 9..49, curseur row=61 col=2).
+4. **tmux 3.6a donne la même chose** : mêmes octets, même taille, bande 9..49
+   et mêmes longueurs de ligne. Kova rend fidèlement ce que l'app a émis.
+5. **Aucun resize** : dernier événement du pane 11 dans `kova.log` =
+   `settle repaint skipped for pane 11 … no hole` à 13:42:59 ; le trou est
+   apparu vers 15:00 sans resize entre les deux.
+6. **Aucun effacement dans le flux du scroll** (208 956 octets) : 0 `CSI J`,
+   0 `IL`/`DL`, 0 `SU`/`SD`, 0 `LF`. Uniquement 9 164 `CHA`, 2 207 `CUD`,
+   2 207 `CR`, 998 `EL`, 189 `CUP`, encadrés par `?2026h`/`?2026l`.
+7. **Naissance datée à la frame près** (en rejouant à chaque `?2026l`) :
+   dernière frame propre à l'offset 1 564 755 ; la suivante (1 569 555) a déjà
+   6 rangées vides ; la bande grandit de 2 à 4 rangées par frame — 6, 10, 11,
+   15, 16, 20, 21, 25, 27, 31, 33, 37, 39 — puis sature à 41.
+8. **Mécanisme** : à chaque cran, l'app redessine son bloc 4 rangées plus bas
+   que la frame précédente et n'écrit jamais les rangées libérées en haut. La
+   trace de curseur de la frame de bascule n'écrit rien sur les rangées
+   0, 1, 2, 4, 6.
+9. **Différence Kova / Terminal.app sur l'ENTRÉE** (mouchard, même geste) :
+   Kova 676 rapports en 17,8 s dont 250 doublons exacts (même bouton, même
+   colonne, même ligne) à moins de 2 ms, soit 37 % ; Terminal.app 147 rapports,
+   0 doublon, une écriture de 12 octets par rapport. Débit ~38/s contre ~19/s.
+10. **Cause du doublement** : `setAcceptsMouseMovedEvents(true)` sur la fenêtre
+    ET une `NSTrackingArea` avec `MouseMoved` sur la vue → `mouseMoved:` livré
+    deux fois par mouvement physique. Corrigé en retirant le flag fenêtre
+    (`window.rs:6154`) ; la tracking area est la source la plus précise (bornée
+    à la vue, key window seulement). Les ~35 doublons de molette restants
+    viennent de la boucle un-événement-par-ligne (`window.rs:826-831`), non
+    touchée.
+
+## Non élucidé
+
+- **Lien de causalité doublement → trou : NON prouvé.** Ce qui est établi, c'est
+  une différence de comportement mesurée entre Kova et un terminal où le bug
+  n'a jamais été observé, dans le sens attendu (l'app reçoit deux fois plus
+  d'ordres). La validation est le test ci-dessous.
+- **7,2 s sans aucun événement au lancement du mouchard**, alors que le pointeur
+  était bien dans le pane. Le log Kova ne journalise le scroll que dans la
+  branche scrollback (`window.rs:840-846`), donc la branche souris est muette et
+  on ne peut pas distinguer « macOS n'a rien délivré » de « Kova a filtré ».
+  Suspect lisible mais non prouvé : `scroll_axis_lock` est global à la fenêtre
+  et n'est réinitialisé qu'aux phases trackpad (`window.rs:782-801`) — une
+  souris à molette ne le remet jamais à `None`, et le vertical est ignoré tant
+  qu'il vaut `Horizontal`. Pour trancher il faudrait un log dans la branche
+  souris.
+
+## Angle mort des garde-fous du round 5
+
+`resize_settle` et `post_restore_checks` ne sont armés que dans le chemin de
+resize (`window.rs:4797` et le restore de winsize). Un trou né d'un scroll n'est
+donc jamais détecté ni réparé — cohérent avec l'observation qu'il reste à
+l'écran jusqu'à ce qu'on redescende.
+
+## Outillage
+
+`scripts/mouse-probe.py` : active les modes 1000/1002/1003/1006, passe le tty en
+brut, décode les rapports SGR et trace pour chacun l'écart en millisecondes et
+la taille de l'écriture. Trace dans `~/Downloads/mouse-probe-<label>.log`. Sert
+à comparer deux terminaux sur le même geste — c'est lui qui a produit les 37 %.
+
+## À valider (prochaine action)
+
+Redémarrer Kova (le binaire en cours est d'avant le fix), relancer le mouchard →
+zéro doublon de motion attendu, puis rescroller vers le haut dans une session
+Claude Code bien remplie. Si le trou revient malgré tout, suspect suivant : la
+rafale d'un événement par ligne de molette.

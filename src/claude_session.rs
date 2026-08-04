@@ -136,21 +136,6 @@ pub fn resume_command(last_command: Option<&str>, session_id: &str) -> String {
     format!("{} --resume {}", base.join(" "), session_id)
 }
 
-/// The session id a command line already selects, if it carries one.
-///
-/// A pane restored with `claude --resume <id>` still names its conversation
-/// even when nothing is running in it, which is a stronger clue than any
-/// position-based guess.
-pub fn session_in_command(cmd: &str) -> Option<&str> {
-    let mut tokens = cmd.split_whitespace();
-    while let Some(token) = tokens.next() {
-        if token == "--resume" || token == "-r" {
-            return tokens.next().filter(|next| !next.starts_with('-'));
-        }
-    }
-    None
-}
-
 /// True if `cmd` starts with a plain `claude` invocation (no alias, no env
 /// prefix, no pipeline) — the only shape we can safely rewrite.
 fn is_claude_invocation(cmd: &str) -> bool {
@@ -187,73 +172,6 @@ fn strip_session_flags(cmd: &str) -> Vec<String> {
     out
 }
 
-// ---------------------------------------------------------------
-// Bootstrap file
-// ---------------------------------------------------------------
-//
-// A Kova build that predates this feature saves panes without any session id,
-// so the very first quit after upgrading would still lose every conversation —
-// the one cycle the feature exists to protect. The bootstrap file bridges it:
-// an external capture (see `scripts/capture-claude-sessions.py`) records the
-// live pane→session mapping through the IPC socket, and the next Kova start
-// folds it into the restored session. It is consumed once, then renamed.
-//
-// Once every machine has quit at least once from a build that knows about
-// `claude_session`, this whole section can go.
-
-/// One captured pane. `window`/`tab`/`index` locate it the way the session file
-/// orders panes (windows, then tabs, then columns top-to-bottom, left-to-right).
-#[derive(serde::Deserialize, Clone, Debug)]
-pub struct BootstrapPane {
-    pub window: usize,
-    pub tab: usize,
-    pub index: usize,
-    pub cwd: String,
-    pub session_id: String,
-    /// Conversation title the pane displayed at capture time.
-    #[serde(default)]
-    pub title: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct BootstrapFile {
-    version: u32,
-    panes: Vec<BootstrapPane>,
-}
-
-const BOOTSTRAP_VERSION: u32 = 1;
-
-fn bootstrap_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/kova/claude-sessions.json")
-}
-
-/// Read the bootstrap capture and rename it out of the way, so a later restore
-/// cannot re-apply session ids that have since been claimed.
-pub fn take_bootstrap() -> Vec<BootstrapPane> {
-    let path = bootstrap_path();
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let parsed = match serde_json::from_str::<BootstrapFile>(&data) {
-        Ok(f) if f.version == BOOTSTRAP_VERSION => f.panes,
-        Ok(f) => {
-            log::warn!("Unknown claude-sessions.json version {}, ignoring", f.version);
-            Vec::new()
-        }
-        Err(e) => {
-            log::warn!("Failed to parse claude-sessions.json: {}", e);
-            Vec::new()
-        }
-    };
-    let used = path.with_file_name("claude-sessions.used.json");
-    if let Err(e) = std::fs::rename(&path, &used) {
-        log::warn!("Failed to retire claude-sessions.json: {}", e);
-    }
-    log::info!("Claude session bootstrap: {} pane(s) captured", parsed.len());
-    parsed
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,17 +188,6 @@ mod tests {
             println!("  pid {} → {}", pid, session);
         }
         assert!(!map.is_empty(), "no live Claude Code session found");
-    }
-
-    #[test]
-    fn a_command_line_reveals_the_session_it_selects() {
-        assert_eq!(session_in_command("claude --resume abc"), Some("abc"));
-        assert_eq!(session_in_command("claude -r abc --debug"), Some("abc"));
-        assert_eq!(session_in_command("claude"), None);
-        assert_eq!(session_in_command("claude --resume"), None);
-        // The picker form takes no id.
-        assert_eq!(session_in_command("claude --resume --debug"), None);
-        assert_eq!(session_in_command(""), None);
     }
 
     #[test]

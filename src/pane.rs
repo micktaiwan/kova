@@ -387,9 +387,7 @@ impl Tab {
         let focused = self.focused_pane;
         let mut any = false;
         self.for_each_pane(&mut |pane| {
-            if pane.id != focused
-                && pane.terminal.read().command_completed.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if pane.id != focused && pane.terminal.read().unread_completion() {
                 any = true;
             }
         });
@@ -580,12 +578,14 @@ impl Tab {
         self.minimized_stack = ids;
     }
 
-    /// Clear the completion flag (call when switching to this tab).
+    /// Acknowledge the completion indicator (call when switching to this tab):
+    /// every pane of the tab becomes visible at once, so all of them are "seen".
+    /// Only the attention state is acked — `command_completed` itself stays set
+    /// for IPC `wait-for-completion`.
     pub fn clear_completion(&mut self) {
         self.has_completion = false;
-        // Also clear all pane-level flags
         self.for_each_pane(&mut |pane| {
-            pane.terminal.read().command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+            pane.terminal.read().ack_completion();
         });
     }
 

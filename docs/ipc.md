@@ -383,6 +383,7 @@ Response:
 
 - If the wait arrives **after** the command already finished, it returns `completed: true` immediately.
 - Calling `wait-for-completion` twice in a row without sending a new command in between returns `completed: true` both times. The flag isn't consumed by observation. The intended pattern is `send-keys` → `wait-for-completion`, never two waits without a send in between.
+- Focusing the pane doesn't consume it either. The completion *dot* is acknowledged when you look at the pane, but that ack is a separate flag — a user switching panes can't make a pending `wait-for-completion` miss its event.
 
 **Long timeouts.** The connection-thread timeout is automatically extended to `timeout_ms + 2s`, so you can ask for a long wait without the connection dying first.
 

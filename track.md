@@ -4,27 +4,21 @@
 
 ### Restauration des sessions Claude Code au redémarrage
 
-**Statut** : Codé, testé (unitaires verts), buildé dans `/Applications/Kova.app` le 2026-07-29. Reste le test réel, qui ne peut se faire qu'en quittant Kova.
+**Statut** : mécanisme permanent en place et vérifié le 2026-08-04. Le bootstrap jetable qui l'accompagnait est retiré, c'est lui qui a causé la panne du 2026-08-04.
 
-**Ce que ça fait** : au snapshot de session, Kova repère le Claude Code qui tourne dans chaque pane et mémorise son identifiant de conversation. À la restauration, ce pane reçoit `claude --resume <id>` pré-tapé au lieu de la dernière commande shell — sans retour chariot, donc rien ne part sans un Entrée. Un pane qui était à l'invite du shell garde le comportement d'avant.
+**Ce que ça fait** : au snapshot de session, Kova repère le Claude Code qui tourne dans chaque pane et mémorise son identifiant de conversation. À la restauration, ce pane reçoit `claude --resume <id>` pré-tapé au lieu de la dernière commande shell, sans retour chariot, donc rien ne part sans un Entrée. Un pane qui était à l'invite du shell garde le comportement d'avant. Le titre de conversation est sauvé et réinjecté lui aussi, pour qu'un pane non relancé ne retombe pas sur le nom de son répertoire dans le switcher.
 
-**Comment le pane est relié à sa session** : Claude Code écrit `~/.claude/sessions/<pid>.json` (contient `sessionId`) tant que le process vit, et le supprime en sortant. Kova lit ce répertoire et remonte la filiation de chaque process `claude` jusqu'au shell du pane. La lecture doit donc précéder `pty::shutdown_all()` — c'est déjà l'ordre de `applicationWillTerminate`.
+**Comment le pane est relié à sa session** : Claude Code écrit `~/.claude/sessions/<pid>.json` (contient `sessionId`) tant que le process vit, et le supprime en sortant. Kova lit ce répertoire et remonte la filiation de chaque process `claude` jusqu'au shell du pane. La lecture doit donc précéder `pty::shutdown_all()`, c'est déjà l'ordre de `applicationWillTerminate`.
 
 **Contrainte vérifiée le 2026-07-29** : `claude --resume <uuid>` ne retrouve la conversation que depuis le répertoire où elle a démarré (les transcripts sont rangés par cwd dans `~/.claude/projects/<slug>/`). Testé dans les deux sens : même répertoire → la conversation revient ; autre répertoire → `No conversation found`. Kova restaure déjà le cwd du pane, donc l'injection tombe juste.
 
-**Bootstrap du premier redémarrage** : le Kova qui tourne aujourd'hui ne sait pas enregistrer ces identifiants, donc le premier passage les perdrait quand même. `scripts/capture-claude-sessions.py` capture la carte pane → session depuis le Kova vivant (via l'IPC) et l'écrit dans `~/.config/kova/claude-sessions.json` ; le nouveau build la fusionne au premier démarrage puis la renomme en `.used.json`. Capture faite le 2026-07-29 : 23 sessions sur 26 panes. **À relancer juste avant de quitter** si des panes ont bougé depuis. Le script et le code de fusion sont jetables une fois le premier cycle passé.
+**Piège de l'identité du process** : l'exécutable de Claude Code est un fichier au nom de version (`~/.local/share/claude/versions/2.1.220`), donc `proc_name` renvoie `2.1.220`, jamais `claude`. Un garde-fou anti-fichier-périmé basé sur le nom rejetait toutes les sessions. Il compare maintenant l'heure de démarrage du process au champ `startedAt` du fichier de session (dérive mesurée : moins d'une seconde). Même cause pour `foreground_process_name()`, non corrigé : le dialogue de confirmation à la fermeture liste des numéros de version au lieu de `claude`. Retrouver le vrai nom demanderait de lire `argv[0]` via `sysctl KERN_PROCARGS2`.
 
-**Premier cycle réel, 2026-07-29 13:40** : le bootstrap a marché, 23 panes sur 23 sont revenus avec leur ligne de resume (log Kova, `Claude session bootstrap: 23 pane(s) restored`). Mais la détection native, elle, ne remontait rien : le fichier de session sauvé juste après contenait `claude_session: null` partout.
+**Post-mortem du 2026-08-04 : le bootstrap a tiré 5 jours trop tard.** Un fichier jetable, `~/.config/kova/claude-sessions.json`, écrit hors de Kova le 2026-07-29 à 14:55 avec 26 sessions, servait à couvrir le tout premier redémarrage depuis un build qui ne savait pas encore enregistrer les identifiants. Il n'a été consommé que le 2026-08-04 à 14:16, sur une disposition de panes qui n'avait plus rien à voir : 19 captures sans pane correspondant, 7 panes pré-remplis avec des conversations vieilles de 5 jours. **Décision : le bootstrap est supprimé** (code de fusion, script de capture, format de fichier). Un fichier de reprise sans date de péremption ni lien avec l'état courant est un piège, et le mécanisme permanent n'en a plus besoin.
 
-**Cause** : le garde-fou anti-fichier-périmé comparait le nom du process à `claude`. Or l'exécutable est `~/.local/share/claude/versions/2.1.220`, donc `proc_name` renvoie `2.1.220`, un numéro de version. Tous les process étaient rejetés. L'identité se vérifie maintenant sur l'heure de démarrage du process comparée au champ `startedAt` du fichier de session (dérive mesurée : moins d'une seconde). Corrigé et buildé le 2026-07-29 13:44, vérifié par le test `claude_sessions_are_detected_on_this_machine` (ignoré par défaut, à lancer avec `cargo test -- --ignored --nocapture`).
+**Vérifié le 2026-08-04** : la détection native marche, `~/.config/kova/session.json` porte l'identifiant réel des 4 sessions Claude vivantes ainsi que leur titre. Reste le fichier mort `~/.config/kova/claude-sessions.used.json`, supprimable.
 
-**Effet de bord du même bug, non corrigé** : `foreground_process_name()` renvoie aussi `2.1.220`, donc le dialogue de confirmation à la fermeture liste des numéros de version au lieu de `claude`. Retrouver le vrai nom demanderait de lire `argv[0]` via `sysctl KERN_PROCARGS2`.
-
-**Titres de conversation (ajouté le 2026-07-29 13:50)** : un pane dont la session n'a pas été relancée retombait sur le nom de son répertoire dans le switcher, alors que le titre de la conversation était connu avant la fermeture. Le titre OSC 0/2 est donc sauvé lui aussi (`SavedPane.title`, marqueur d'activité retiré) et réinjecté dans l'état du terminal à la restauration ; le premier titre émis par l'app relancée le remplace. La capture de bootstrap transporte le titre elle aussi, et le fichier du 2026-07-29 12:54 a été remis en place pour récupérer les titres déjà perdus lors du premier cycle.
-
-**Capture périmée (durci le 2026-07-29 14:27)** : entre la capture de 12:54 et maintenant, le nombre de panes est passé de 26 à 29, donc les positions enregistrées ne valent plus. Le rapprochement commence désormais par l'identifiant de conversation que le pane porte déjà dans sa ligne `claude --resume <id>` — un repère exact, indépendant des positions. Et une capture ne peut plus écraser une session que le pane nomme lui-même : au pire elle donne un titre faux, jamais une mauvaise conversation.
-
-**Prochaine action** : au prochain redémarrage de Kova, vérifier que `~/.config/kova/session.json` contient bien des `claude_session` non nuls dans les 30 secondes (autosave) — c'est la preuve que le mécanisme permanent tourne sans le bootstrap — et que les panes non relancés affichent leur titre de conversation dans le switcher (Cmd+P).
+**Séquelle à connaître** : les 6 panes pré-remplis le 2026-08-04 portent une ligne `claude --resume` vers une conversation du 2026-07-29. Tant qu'aucune commande n'y est lancée, cette ligne se recopie de redémarrage en redémarrage. Effacer la ligne dans le pane suffit à s'en débarrasser.
 
 ### Pane switcher — rebind Cmd+P + layout 3 colonnes
 
@@ -104,17 +98,21 @@
 
 **Prochaine action** : a la prochaine repro, checker `~/Library/Logs/Kova/kova.log` : si le `term_id` de `SCROLL-BEGIN` (tab/pane ou on scrolle) ≠ le `term_id` de `SCROLL-START` (terminal qui scrolle reellement), le routage event→terminal est en cause ; si egaux mais contenu faux, c'est le scrollback lui-meme (reflow/corruption).
 
-### Bug: bande blanche (« trou ») dans Claude Code — repaint différentiel alt-screen
+### Bug: bande blanche (« trou ») dans Claude Code
 
-**Statut** : En test — fix débouncé posé (auto-repaint après resize), à valider en live. Détail complet : `notes/display-glitches.md` § Round 4 (rounds 1-3 = historique).
+**Statut** : Round 6 — nouveau déclencheur identifié (le scroll, pas le resize). Fix côté entrée souris posé et buildé, à valider après redémarrage de Kova. Détail : `notes/display-glitches.md` § Round 6 (rounds 1-5 = historique).
 
-**Contexte** : Trou (bande de rangées vides) au milieu du texte d'une pane Claude Code ; Cmd+R répare. Récurrent depuis v1.8.0 malgré ~50 fixes de parsing (rounds 1-3).
+**Contexte** : Trou (bande de rangées vides) au milieu du texte d'une pane Claude Code ; Cmd+R répare. Récurrent depuis v1.8.0.
 
-**Bascule du round 4 (juillet 2026)** : trou capturé en direct (pane 229) avec sa capture PTY. Rejoué à froid à 118×65, il est **déterministe** — et **tmux reproduit exactement le même trou** à partir des mêmes octets. Donc ce n'est pas un bug de parsing Kova isolable au flux figé. La cause est le **resize** : le log Kova confirme des rafales de resize (dont un round-trip vertical shrink→grow), et rejouer une session resizée à taille fixe désynchronise par construction. La table de largeur (suspect du round 3) est écartée pour ce cas (Kova et ink comptent pareil). Cause racine exacte **non isolée** (chemin de resize Kova vs reconciler d'ink) — voir Round 4.
+**Ce qu'on sait maintenant** : le trou apparaît sans aucun resize, en scrollant vers le haut dans une session Claude Code. Le flux émis ne contient aucun effacement d'écran ; l'app redessine son bloc 4 rangées plus bas à chaque cran et laisse vides les rangées libérées. Rejoué hors app, tmux produit exactement la même grille que Kova : le rendu est fidèle, le trou est déjà dans les octets reçus.
 
-**Fix (en test)** : au lieu de parier sur la cause, on automatise le remède fiable = Cmd+R. Après qu'une rafale de resize se calme (~150 ms), Kova déclenche seul un repaint robuste (soft_reset + nudge double-SIGWINCH) sur chaque pane redimensionné → Claude repeint tout contre une grille propre. `window.rs` : `resize_settle` + `step_resize_settle` (pur, 3 tests) + `fire_resize_settle_repaints`. Buildé (v1.8.1), 93 tests verts, **pas encore validé en live**.
+**Différence Kova vs Terminal.app** : sur le même geste, Kova envoyait 37 % de rapports souris en double, Terminal.app aucun. Deux chemins de livraison de `mouseMoved:` étaient actifs en même temps. Corrigé.
 
-**Prochaine action** : redémarrer Kova, resizer pendant une session Claude, vérifier que le trou ne survit plus. Si il revient : passer au test isolant (rejouer AVEC resizes injectés dans Kova vs tmux) → instrumenter la capture PTY (`pty.rs`) pour logger les winsize + offsets. Snapshots : scratchpad `kova_hole_229.json`, `cap_229.raw`.
+**Angle mort connu** : les garde-fous du round 5 ne s'arment qu'après un resize, donc ils ne verront jamais un trou né d'un scroll.
+
+**Prochaine action** : redémarrer Kova, relancer `scripts/mouse-probe.py` (zéro doublon de motion attendu), puis rescroller dans une session Claude Code chargée. Si le trou revient, suspect suivant : la rafale d'un événement par ligne de molette.
+
+**Question ouverte** : 7 s sans aucun événement au lancement du mouchard, cause non établie. Suspect : le verrou d'axe de scroll, global à la fenêtre et jamais réinitialisé pour une souris à molette.
 
 ### Bug: le nombre de colonnes/lignes change au switch d'écran (scale 2x ↔ 1x)
 

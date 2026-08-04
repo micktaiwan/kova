@@ -961,9 +961,9 @@ define_class!(
                 }
                 // Mark old focused pane dirty so its dim overlay updates
                 if old_focused != pane.id {
-                    // Clear completion and bell flags on newly focused pane
+                    // Acknowledge completion and bell on the newly focused pane
                     let t = pane.terminal.read();
-                    t.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+                    t.ack_completion();
                     t.bell.store(false, std::sync::atomic::Ordering::Relaxed);
                     drop(t);
                     let tabs = self.ivars().tabs.borrow();
@@ -3159,7 +3159,7 @@ impl KovaView {
                         let term = pane.terminal.read();
                         (
                             term.bell.load(std::sync::atomic::Ordering::Relaxed),
-                            term.command_completed.load(std::sync::atomic::Ordering::Relaxed),
+                            term.unread_completion(),
                         )
                     };
                     rows.push(SwitcherRow::Pane {
@@ -4616,9 +4616,9 @@ impl KovaView {
                 old.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             if let Some(new) = tab.pane(neighbor_id) {
-                // Clear completion and bell flags on the newly focused pane
+                // Acknowledge completion and bell on the newly focused pane
                 let t = new.terminal.read();
-                t.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+                t.ack_completion();
                 t.bell.store(false, std::sync::atomic::Ordering::Relaxed);
                 t.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -5630,15 +5630,16 @@ impl KovaView {
                 pane.open_timer.mark_first_paint(pane.id);
                 let is_focused = pane.id == focused_id;
                 let term = pane.terminal.read();
-                // The focused pane is "seen": acknowledge its bell every frame
-                // so it doesn't reappear stale once focus moves away. Do NOT
-                // touch command_completed here — the IPC wait-for-completion
-                // contract needs it sticky until the next OSC 133;C.
+                // The focused pane is "seen": acknowledge its bell and its
+                // completion every frame so neither reappears stale once focus
+                // moves away. The ack is a separate flag — command_completed
+                // stays sticky until the next OSC 133;C for the IPC
+                // wait-for-completion contract.
                 if is_focused {
                     term.bell.store(false, std::sync::atomic::Ordering::Relaxed);
+                    term.ack_completion();
                 }
-                let completed = !is_focused
-                    && term.command_completed.load(std::sync::atomic::Ordering::Relaxed);
+                let completed = !is_focused && term.unread_completion();
                 let has_bell = !is_focused
                     && term.bell.load(std::sync::atomic::Ordering::Relaxed);
                 drop(term);

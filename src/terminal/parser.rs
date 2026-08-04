@@ -415,6 +415,8 @@ impl VteHandler {
                         // must still fire: the startup D already primed us.
                         if term.osc133_primed {
                             term.command_completed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Fresh completion — unread until the pane is looked at.
+                            term.completion_seen.store(false, std::sync::atomic::Ordering::Relaxed);
                             term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                         } else {
                             term.osc133_primed = true;
@@ -958,6 +960,20 @@ mod tests {
         term
     }
 
+    /// Feed more bytes into an existing terminal (all parser state that matters
+    /// across chunks lives on `TerminalState`, so a fresh handler is fine).
+    fn feed(term: &Arc<RwLock<TerminalState>>, bytes: &[u8]) {
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let writer: Arc<OwnedFd> = Arc::new(devnull.into());
+        let mut parser = vte::Parser::new();
+        let mut handler = VteHandler::new(term.clone(), writer);
+        parser.advance(&mut handler, bytes);
+        handler.apply_ops();
+    }
+
     fn cell(term: &Arc<RwLock<TerminalState>>, row: usize, col: usize) -> crate::terminal::Cell {
         term.read().visible_lines()[row][col].clone()
     }
@@ -1056,6 +1072,28 @@ mod tests {
         let t = drive(20, 5, &[b"\x1b]133;C\x07\x1b]133;D\x07"]);
         assert!(t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!t.read().command_running.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn ack_hides_the_dot_but_keeps_the_ipc_flag() {
+        // A completed command is unread until the pane is looked at.
+        let t = drive(20, 5, &[b"\x1b]133;C\x07\x1b]133;D\x07"]);
+        assert!(t.read().unread_completion(), "fresh completion must be unread");
+
+        // Looking at the pane acks it: no more dot, but wait-for-completion
+        // still sees the sticky flag.
+        t.read().ack_completion();
+        assert!(!t.read().unread_completion(), "acked completion must not light a dot");
+        assert!(
+            t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed),
+            "ack must not consume the IPC flag"
+        );
+
+        // The next completion re-arms the dot.
+        feed(&t, b"\x1b]133;C\x07");
+        assert!(!t.read().unread_completion(), "a running command has nothing to report");
+        feed(&t, b"\x1b]133;D\x07");
+        assert!(t.read().unread_completion(), "a new completion must be unread again");
     }
 
     #[test]
