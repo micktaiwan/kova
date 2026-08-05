@@ -2738,32 +2738,40 @@ fn format_key_combo_arrows(s: &str) -> String {
 fn format_key_combo(s: &str) -> String {
     let mut result = String::new();
     let parts: Vec<&str> = s.split('+').collect();
-    for (i, part) in parts.iter().enumerate() {
+    // Same split rule as the keybinding parser: a trailing '+' means the key
+    // itself is '+' (e.g. "cmd+shift++" → modifiers=[cmd,shift], key='+').
+    let (modifier_parts, key_str) = if parts.last() == Some(&"") && parts.len() >= 2 {
+        (&parts[..parts.len() - 1], "+")
+    } else {
+        (&parts[..parts.len() - 1], parts[parts.len() - 1])
+    };
+    for part in modifier_parts {
         let trimmed = part.trim();
-        if i < parts.len() - 1 {
-            // Modifier
-            match trimmed.to_ascii_lowercase().as_str() {
-                "cmd" | "command" => result.push('\u{2318}'),
-                "ctrl" | "control" => result.push('\u{2303}'),
-                "option" | "alt" | "opt" => result.push('\u{2325}'),
-                "shift" => result.push('\u{21E7}'),
-                _ => { result.push_str(trimmed); }
-            }
-        } else {
-            // Key
-            match trimmed.to_ascii_lowercase().as_str() {
-                "up" => result.push('\u{2191}'),
-                "down" => result.push('\u{2193}'),
-                "left" => result.push('\u{2190}'),
-                "right" => result.push('\u{2192}'),
-                "backspace" | "delete" => result.push('\u{232B}'),
-                "enter" | "return" => result.push('\u{21A9}'),
-                "/" => result.push('/'),
-                "[" => result.push('['),
-                "]" => result.push(']'),
-                s => result.push_str(&s.to_ascii_uppercase()),
-            }
+        if trimmed.is_empty() {
+            // Artifact of splitting a literal '+' key on '+' — not a modifier.
+            continue;
         }
+        match trimmed.to_ascii_lowercase().as_str() {
+            "cmd" | "command" => result.push('\u{2318}'),
+            "ctrl" | "control" => result.push('\u{2303}'),
+            "option" | "alt" | "opt" => result.push('\u{2325}'),
+            "shift" => result.push('\u{21E7}'),
+            _ => { result.push_str(trimmed); }
+        }
+    }
+    let key_trimmed = key_str.trim();
+    match key_trimmed.to_ascii_lowercase().as_str() {
+        "up" => result.push('\u{2191}'),
+        "down" => result.push('\u{2193}'),
+        "left" => result.push('\u{2190}'),
+        "right" => result.push('\u{2192}'),
+        "backspace" | "delete" => result.push('\u{232B}'),
+        "enter" | "return" => result.push('\u{21A9}'),
+        "/" => result.push('/'),
+        "[" => result.push('['),
+        "]" => result.push(']'),
+        "+" => result.push('+'),
+        k => result.push_str(&k.to_ascii_uppercase()),
     }
     result
 }
@@ -2815,6 +2823,9 @@ mod tests {
         assert_eq!(format_key_combo("enter"), "\u{21A9}");
         assert_eq!(format_key_combo("backspace"), "\u{232B}");
         assert_eq!(format_key_combo("cmd+["), "\u{2318}[");
+        // A trailing '+' is the literal '+' key, not an empty modifier.
+        assert_eq!(format_key_combo("cmd+shift++"), "\u{2318}\u{21E7}+");
+        assert_eq!(format_key_combo_arrows("cmd+shift++"), "\u{2318}\u{21E7}+");
     }
 
     #[test]
