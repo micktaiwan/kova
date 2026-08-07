@@ -304,13 +304,48 @@ enum SwitcherRow {
     TabHeader(String),
     /// A pane entry — selectable, focuses the pane on Enter/click.
     /// `minimized` panes are restored (unhidden) when selected.
-    Pane { pane_id: PaneId, title: String, is_current: bool, has_bell: bool, has_completion: bool, minimized: bool },
+    Pane {
+        pane_id: PaneId,
+        title: String,
+        is_current: bool,
+        has_bell: bool,
+        has_completion: bool,
+        minimized: bool,
+        /// Claude Code is generating / running a tool in this pane (✳).
+        working: bool,
+        /// This pane told us it is waiting for the user (?).
+        awaiting: bool,
+    },
 }
 
 impl SwitcherRow {
     fn is_pane(&self) -> bool {
         matches!(self, SwitcherRow::Pane { .. })
     }
+}
+
+/// Next pane row flagged as waiting for the user, scanning forward from just
+/// after `(col, row)` in column-major order and wrapping around the whole grid.
+/// `None` when nothing is waiting — the caller then leaves the selection where
+/// it is, so pressing Tab in a quiet switcher does nothing rather than jumping
+/// somewhere arbitrary.
+fn next_awaiting_row(
+    columns: &[Vec<SwitcherRow>],
+    col: usize,
+    row: usize,
+) -> Option<(usize, usize)> {
+    let flat: Vec<(usize, usize)> = columns
+        .iter()
+        .enumerate()
+        .flat_map(|(c, rows)| (0..rows.len()).map(move |r| (c, r)))
+        .collect();
+    let start = flat.iter().position(|&p| p == (col, row)).map_or(0, |i| i + 1);
+    flat.iter()
+        .cycle()
+        .skip(start)
+        .take(flat.len())
+        .find(|&&(c, r)| matches!(columns[c][r], SwitcherRow::Pane { awaiting: true, .. }))
+        .copied()
 }
 
 /// Index of the pane row whose position is closest to `target` within `col`.
@@ -402,6 +437,8 @@ define_class!(
             // Write to PTY
             if let Some(pane) = self.focused_pane() {
                 pane.terminal.write().reset_scroll();
+                // Typing into a pane answers it: it is no longer waiting on us.
+                pane.clear_awaiting();
                 input::write_text(&text, &pane.pty);
             }
         }
@@ -416,6 +453,7 @@ define_class!(
                         (term.cursor_keys_application, term.kitty_flags())
                     };
                     pane.terminal.write().reset_scroll();
+                    pane.clear_awaiting();
                     if let Some(kb) = self.ivars().keybindings.get() {
                         input::handle_key_event(event, &pane.pty, cursor_keys_app, kb, kitty_flags);
                     }
@@ -633,6 +671,7 @@ define_class!(
                 if kitty_flags > 0 && (has_ctrl || has_alt) && !has_cmd {
                     // Kitty mode: bypass macOS text input for modified keys
                     pane.terminal.write().reset_scroll();
+                    pane.clear_awaiting();
                     if let Some(kb) = self.ivars().keybindings.get() {
                         input::handle_key_event(event, &pane.pty, cursor_keys_app, kb, kitty_flags);
                     }
@@ -3169,6 +3208,9 @@ impl KovaView {
                         has_bell,
                         has_completion,
                         minimized: pane.minimized,
+                        working: pane.is_working(),
+                        // Like bell/completion: never on the pane being looked at.
+                        awaiting: !is_current && pane.is_awaiting(),
                     });
                 });
                 groups.push(rows);
@@ -3306,6 +3348,16 @@ impl KovaView {
                         state.selected_col += 1;
                         state.selected_row =
                             nearest_pane_row(&state.columns[state.selected_col], state.selected_row);
+                    }
+                }
+                0x30 => { // Tab → jump to the next pane waiting for an answer
+                    if let Some((c, r)) = next_awaiting_row(
+                        &state.columns,
+                        state.selected_col,
+                        state.selected_row,
+                    ) {
+                        state.selected_col = c;
+                        state.selected_row = r;
                     }
                 }
                 _ => return,
@@ -4207,6 +4259,8 @@ impl KovaView {
                     "child_processes": child_json,
                     "is_idle": is_idle,
                     "working": pane.is_working(),
+                    "awaiting": pane.is_awaiting(),
+                    "awaiting_since": pane.awaiting_since(),
                     "minimized": pane.minimized,
                 }));
             });
@@ -4218,6 +4272,8 @@ impl KovaView {
         let tabs = self.ivars().tabs.borrow();
         for tab in tabs.iter() {
             if let Some(pane) = tab.pane(pane_id) {
+                // Same rule as a keystroke: someone answered this pane.
+                pane.clear_awaiting();
                 pane.pty.write(text.as_bytes());
                 return true;
             }
@@ -4559,6 +4615,26 @@ impl KovaView {
                     }
                 }
             }
+        }
+        false
+    }
+
+    /// IPC: set/clear a pane's "waiting for the user" flag. Returns true if the
+    /// pane was found. The flag is stored as-is; whether it is *shown* on the
+    /// pane the user is currently sitting on is a display decision, made where
+    /// focus is known (mirroring how bell/completion are suppressed).
+    pub fn ipc_set_pane_status(&self, pane_id: PaneId, waiting: bool) -> bool {
+        let tabs = self.ivars().tabs.borrow();
+        for tab in tabs.iter() {
+            let Some(pane) = tab.pane(pane_id) else { continue };
+            if waiting {
+                pane.set_awaiting();
+            } else {
+                pane.clear_awaiting();
+            }
+            log::info!("IPC: pane {} waiting={}", pane_id, waiting);
+            self.mark_dirty();
+            return true;
         }
         false
     }
@@ -5602,7 +5678,7 @@ impl KovaView {
             .map(|c| c.splits.min_width)
             .unwrap_or(300.0)
             * ivars.last_scale.get().max(1.0) as f32;
-        let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width, total_columns, focused_column, active_tab, total_tabs, active_tab_name, working_claudes) = {
+        let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width, total_columns, focused_column, active_tab, total_tabs, active_tab_name, working_claudes, awaiting_claudes) = {
             let mut tabs = ivars.tabs.borrow_mut();
             if tabs.is_empty() {
                 return false;
@@ -5731,10 +5807,14 @@ impl KovaView {
             // Count panes across every tab of this window whose app is signalling
             // activity via the OSC-title marker (Claude Code busy).
             let mut working_claudes = 0usize;
+            let mut awaiting_claudes = 0usize;
             for t in tabs.iter() {
-                t.for_each_pane(&mut |p| if p.is_working() { working_claudes += 1; });
+                t.for_each_pane(&mut |p| {
+                    if p.is_working() { working_claudes += 1; }
+                    if p.is_awaiting() { awaiting_claudes += 1; }
+                });
             }
-            (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width, total_columns, focused_column, active_tab_1based, total_tabs, active_tab_name, working_claudes)
+            (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width, total_columns, focused_column, active_tab_1based, total_tabs, active_tab_name, working_claudes, awaiting_claudes)
         };
 
         // Focus reporting (DEC mode 1004) — send to focused pane only
@@ -5951,8 +6031,8 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false },
-                SwitcherRow::Pane { title, has_bell, has_completion, minimized, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, awaiting: false },
+                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, awaiting, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, awaiting: *awaiting },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -6046,7 +6126,7 @@ impl KovaView {
             }
         }
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_claudes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_claudes, awaiting_claudes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 
@@ -6210,6 +6290,65 @@ fn should_skip_settle_nudge(row_coverage: f32, has_interior_band: bool) -> bool 
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Build a switcher grid from a compact spec: one string per column, one
+    /// char per row — 'h' header, '.' plain pane, '?' pane waiting for the user.
+    fn switcher_grid(spec: &[&str]) -> Vec<Vec<SwitcherRow>> {
+        spec.iter()
+            .map(|col| {
+                col.chars()
+                    .map(|c| match c {
+                        'h' => SwitcherRow::TabHeader("tab".into()),
+                        _ => SwitcherRow::Pane {
+                            pane_id: 0,
+                            title: "p".into(),
+                            is_current: false,
+                            has_bell: false,
+                            has_completion: false,
+                            minimized: false,
+                            working: false,
+                            awaiting: c == '?',
+                        },
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tab_jumps_to_the_next_waiting_pane_forward() {
+        // Column 0: header, pane, waiting pane. Column 1: header, waiting pane.
+        let g = switcher_grid(&["h.?", "h?"]);
+        assert_eq!(next_awaiting_row(&g, 0, 1), Some((0, 2)));
+        // From the last waiting row of column 0, cross into the next column.
+        assert_eq!(next_awaiting_row(&g, 0, 2), Some((1, 1)));
+    }
+
+    #[test]
+    fn tab_wraps_around_to_the_first_waiting_pane() {
+        let g = switcher_grid(&["h.?", "h."]);
+        // Past the only waiting row, the search wraps back onto it.
+        assert_eq!(next_awaiting_row(&g, 1, 1), Some((0, 2)));
+        // Standing on the only waiting row, Tab cycles back to itself rather
+        // than reporting "nothing found".
+        assert_eq!(next_awaiting_row(&g, 0, 2), Some((0, 2)));
+    }
+
+    #[test]
+    fn tab_does_nothing_when_no_pane_is_waiting() {
+        let g = switcher_grid(&["h..", "h."]);
+        assert_eq!(next_awaiting_row(&g, 0, 1), None);
+        assert_eq!(next_awaiting_row(&[], 0, 0), None);
+    }
+
+    #[test]
+    fn tab_never_lands_on_a_tab_header() {
+        // Headers are not selectable; a header row must never be returned even
+        // when it sits between the cursor and the waiting pane.
+        let g = switcher_grid(&["h?", "h?"]);
+        let (c, r) = next_awaiting_row(&g, 0, 1).expect("a waiting pane exists");
+        assert!(matches!(g[c][r], SwitcherRow::Pane { .. }));
+    }
 
     #[test]
     fn resize_settle_fires_once_when_burst_ends() {

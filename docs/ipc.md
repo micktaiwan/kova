@@ -128,6 +128,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "child_processes": [ { "pid": 67890, "name": "node" } ],
   "is_idle": false,
   "working": true,
+  "awaiting": false,
+  "awaiting_since": null,
   "minimized": false
 }
 ```
@@ -137,6 +139,36 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 `minimized` is `true` for a pane collapsed with `minimize-pane` (`Cmd+M` by default). Such a pane still runs and is still listed here; it simply takes no layout space and is not drawn. Kova marks it with a `⊟` glyph in the pane switcher and counts it in the status bar. A remote client should keep showing it and mark it the same way rather than filter it out.
 
 `working` is `true` when the app in the pane is actively generating or running a tool, detected from its OSC 0/2 title: Claude Code prepends an **animated Braille spinner glyph** (U+2800–U+28FF, e.g. `⠂`/`⠐`) followed by a space *only while it works*. At the prompt it instead shows an asterisk-like idle marker (`✳ Claude Code`) or a plain title, so the asterisk is explicitly NOT treated as busy. Counting panes with `working: true` therefore gives the number of Claude Code sessions actually busy — as opposed to those merely open and waiting for input (which stay `is_idle: false` too, since the `claude` process is always a child). It reads the live OSC 0/2 title even when a sticky custom title (OSC 1 / manual rename) shadows the display. Kova also shows this count in the global status bar as `✳N` (hidden when zero).
+
+`awaiting` is `true` when the app in the pane has declared, over `set-pane-status`, that it is waiting for the user — and nothing Kova observed since contradicts it. `awaiting_since` is the epoch second at which the wait started (`null` when not waiting), so a client can show how long a session has been unanswered. Unlike `working`, this is *pushed*, not guessed: `working` is inferred from the terminal title, while `awaiting` is a claim the running app makes about itself. See `set-pane-status` for how it is set and, more importantly, for the ways Kova retracts it on its own.
+
+---
+
+### `set-pane-status` — declare that a pane is waiting for the user
+
+```json
+{ "cmd": "set-pane-status", "pane_id": 42, "status": "waiting" | "none" }
+```
+
+Marks the pane as waiting for an answer, or clears the mark. `status` accepts exactly those two strings; anything else is an error rather than a silent no-op, so a mistyped hook fails loudly instead of quietly clearing the flag.
+
+Meant to be driven by the app running inside the pane. For Claude Code that means its hooks: `Stop` and the `permission_prompt` notification set `waiting`; `UserPromptSubmit` and `SessionEnd` set `none`. A pane knows its own id and socket from `$KOVA_PANE_ID` / `$KOVA_SOCKET`, which hook processes inherit.
+
+Setting `waiting` twice does not restart the clock: `awaiting_since` keeps the timestamp of the first mark, so a second `Stop` on the same unanswered turn does not make an old wait look fresh.
+
+Response: `{ "ok": true }`.
+
+**The flag is a claim, not a fact.** A session killed with `-9` never gets to retract it, so Kova never reports the flag without re-checking it. It is dropped when:
+
+- the pane's foreground process is gone (its Claude Code died, or the pane fell back to a bare shell prompt) — checked on the same throttled probe that maintains the tab "running" indicator;
+- the pane's shell exited;
+- Claude Code went back to work (the Braille spinner reappears in the OSC title) — reported instantly, without waiting for the throttled probe;
+- the user typed into the pane, or `send-keys` wrote to it: someone answered;
+- the pane was closed, or Kova restarted. The state is deliberately not persisted across restarts; a resumed session re-declares itself on its next turn.
+
+There is intentionally **no time-based expiry**. A question left unanswered for three hours is exactly what this flag is for.
+
+Displayed as a `?` marker on the pane's row in the switcher (`Cmd+P`, where `Tab` jumps to the next waiting pane) and as a `?N` counter in the global status bar, next to `✳N`. Like the bell and completion dots, the marker is suppressed on the pane the user is currently looking at.
 
 ---
 

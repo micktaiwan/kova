@@ -482,6 +482,9 @@ fn handle_ipc_command_sync(
         IpcCommand::RenamePane { pane_id, title } => {
             handle_ipc_rename_pane(windows, pane_id, title)
         }
+        IpcCommand::SetPaneStatus { pane_id, waiting } => {
+            handle_ipc_set_pane_status(windows, pane_id, waiting)
+        }
         IpcCommand::DispatchAction { action, pane_id } => {
             handle_ipc_dispatch_action(windows, &action, pane_id)
         }
@@ -1061,6 +1064,27 @@ fn handle_ipc_resize_pane(
 }
 
 /// IPC: rename a pane (set sticky custom title, like OSC 1).
+fn handle_ipc_set_pane_status(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    waiting: bool,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        if view.ipc_set_pane_status(pane_id, waiting) {
+            return IpcResponse::Ok { data: None };
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
 fn handle_ipc_rename_pane(
     windows: &RefCell<Vec<Retained<NSWindow>>>,
     pane_id: u32,

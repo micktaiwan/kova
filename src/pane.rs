@@ -406,18 +406,31 @@ impl Tab {
     /// "something occupies this tab". Panes whose shell exited are skipped —
     /// a shell killed mid-command never emits 133;D, which would strand the
     /// OSC flag.
+    ///
+    /// This pass also reaps stale "waiting for the user" flags, because it is
+    /// already paying for the one probe that answers the question: a pane
+    /// marked waiting whose foreground process is gone (its Claude Code died
+    /// without ever retracting the flag) is dropped here. Piggybacking costs
+    /// nothing; a separate sweep would double the ioctls.
     pub fn check_running(&mut self, refresh_fg: bool) -> bool {
         let mut osc_any = false;
         let mut fg_any = false;
         self.for_each_pane(&mut |pane| {
             if !pane.is_alive() {
+                pane.clear_awaiting();
                 return;
             }
             if pane.terminal.read().command_running.load(std::sync::atomic::Ordering::Relaxed) {
                 osc_any = true;
             }
-            if refresh_fg && pane.pty.has_foreground_process() {
-                fg_any = true;
+            if refresh_fg {
+                let fg = pane.pty.has_foreground_process();
+                if fg {
+                    fg_any = true;
+                } else {
+                    // Back to a bare shell prompt: whatever was waiting is gone.
+                    pane.clear_awaiting();
+                }
             }
         });
         if refresh_fg {
@@ -1349,6 +1362,11 @@ pub struct Pane {
     pub minimized: bool,
     /// Open-latency instrumentation (time-to-rectangle / time-to-prompt).
     pub open_timer: Arc<PaneOpenTimer>,
+    /// The app in this pane told us it is waiting for the user (Claude Code
+    /// pushes this from its `Stop` / permission-prompt hooks over IPC).
+    /// `Some(epoch_secs)` = waiting since that time; `None` = not waiting.
+    /// Never trusted blindly: see `is_awaiting` and `Tab::check_running`.
+    pub awaiting: Cell<Option<u64>>,
 }
 
 /// Resolve the label to show for a pane, in priority order:
@@ -1361,6 +1379,14 @@ pub struct Pane {
 /// running a tool; at the prompt it shows an asterisk-like idle marker
 /// (`✳ Claude Code`) or a plain title instead. So this — and NOT the asterisk —
 /// is the reliable "the app is busy" signal.
+/// Wall-clock seconds since the epoch. Used to stamp when a pane started
+/// waiting; a jump in system time only skews a displayed age, never a decision.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 fn is_working_marker(title: &str) -> bool {
     let mut chars = title.chars();
     matches!(chars.next(), Some(c) if ('\u{2800}'..='\u{28FF}').contains(&c))
@@ -1449,6 +1475,7 @@ impl Pane {
             custom_title: None,
             minimized: false,
             open_timer,
+            awaiting: Cell::new(None),
         })
     }
 
@@ -1476,6 +1503,7 @@ impl Pane {
             custom_title: None,
             minimized: false,
             open_timer: Arc::new(PaneOpenTimer::new()),
+            awaiting: Cell::new(None),
         })
     }
 
@@ -1532,6 +1560,37 @@ impl Pane {
             .title
             .as_deref()
             .map_or(false, is_working_marker)
+    }
+
+    /// True if the app in this pane says it is waiting for the user, and
+    /// nothing observed since contradicts it.
+    ///
+    /// The flag is *pushed* by Claude Code's hooks, but a pushed flag can
+    /// outlive its truth (a session killed with -9 never gets to retract it),
+    /// so it is only ever reported through checks Kova makes itself. Here: a
+    /// pane whose Claude went back to work cannot be waiting, whatever the
+    /// last hook said. The slower liveness reap lives in `Tab::check_running`.
+    pub fn is_awaiting(&self) -> bool {
+        self.awaiting.get().is_some() && !self.is_working()
+    }
+
+    /// Epoch seconds since which this pane has been waiting, if it is.
+    pub fn awaiting_since(&self) -> Option<u64> {
+        self.is_awaiting().then(|| self.awaiting.get()).flatten()
+    }
+
+    /// Mark the pane as waiting for the user, starting now (idempotent: an
+    /// already-waiting pane keeps its original timestamp, so a second `Stop`
+    /// on the same unanswered turn does not reset how long it has waited).
+    pub fn set_awaiting(&self) {
+        if self.awaiting.get().is_none() {
+            self.awaiting.set(Some(now_epoch_secs()));
+        }
+    }
+
+    /// Drop the waiting flag — the user engaged, or the session is gone.
+    pub fn clear_awaiting(&self) {
+        self.awaiting.set(None);
     }
 
     /// If the shell is ready and there's a pending command, write it to the PTY

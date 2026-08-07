@@ -97,6 +97,14 @@ pub enum IpcCommand {
         pane_id: u32,
         title: Option<String>,
     },
+    /// Set/clear the "this pane is waiting for the user" flag. Pushed by the
+    /// app running in the pane (Claude Code's hooks) rather than guessed by
+    /// Kova. `waiting: false` retracts it; Kova also retracts it on its own
+    /// when the pane contradicts the claim (see `Pane::is_awaiting`).
+    SetPaneStatus {
+        pane_id: u32,
+        waiting: bool,
+    },
     /// Trigger any keyboard action by its stable name (see `action_from_ipc_name`).
     /// `pane_id` optionally targets (and focuses) a specific pane's window first;
     /// without it, the action runs against the key window.
@@ -333,6 +341,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "swap-pane" => &["pane_id_a", "pane_id_b"],
         "resize-pane" => &["pane_id", "axis", "direction", "amount_pct"],
         "rename-pane" => &["pane_id", "title"],
+        "set-pane-status" => &["pane_id", "status"],
         "dispatch-action" => &["action", "pane_id"],
         "merge-window" => &["source_window", "target_window"],
         _ => return None,
@@ -560,6 +569,23 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             };
             Ok(IpcCommand::RenamePane { pane_id, title })
         }
+        "set-pane-status" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            let waiting = match v.get("status").and_then(|s| s.as_str()) {
+                Some("waiting") => true,
+                Some("none") => false,
+                _ => {
+                    return Err(
+                        "\"status\" must be \"waiting\" or \"none\"".to_string()
+                    )
+                }
+            };
+            Ok(IpcCommand::SetPaneStatus { pane_id, waiting })
+        }
         "dispatch-action" => {
             let action = v
                 .get("action")
@@ -710,6 +736,36 @@ mod tests {
         )
         .is_ok());
         assert!(parse_command(r#"{"cmd":"list-panes"}"#).is_ok());
+    }
+
+    #[test]
+    fn set_pane_status_parses_both_states() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"set-pane-status","pane_id":7,"status":"waiting"}"#),
+            Ok(IpcCommand::SetPaneStatus { pane_id: 7, waiting: true })
+        ));
+        assert!(matches!(
+            parse_command(r#"{"cmd":"set-pane-status","pane_id":7,"status":"none"}"#),
+            Ok(IpcCommand::SetPaneStatus { pane_id: 7, waiting: false })
+        ));
+    }
+
+    #[test]
+    fn set_pane_status_rejects_anything_else() {
+        // A hook that mistypes the state must fail loudly rather than silently
+        // clearing (or setting) the flag.
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-status","pane_id":7,"status":"busy"}"#),
+            "\"status\" must be \"waiting\" or \"none\""
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-status","pane_id":7}"#),
+            "\"status\" must be \"waiting\" or \"none\""
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-status","status":"waiting"}"#),
+            "missing \"pane_id\" field"
+        );
     }
 
     #[test]
