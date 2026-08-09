@@ -311,6 +311,9 @@ enum SwitcherRow {
         has_bell: bool,
         has_completion: bool,
         minimized: bool,
+        /// Foreground binary running in the pane (`claude`, `nvim`…), `None` at
+        /// a bare shell prompt.
+        process: Option<String>,
         /// Claude Code is generating / running a tool in this pane (✳).
         working: bool,
         /// This pane told us it is waiting for the user (?).
@@ -2431,7 +2434,7 @@ impl KovaView {
             .or_else(|| tabs[idx].neighbor(focused_id, NavDirection::Down, panes_vp))
             .or_else(|| tabs[idx].neighbor(focused_id, NavDirection::Up, panes_vp));
 
-        let old_columns = tabs[idx].num_columns();
+        let old_columns = tabs[idx].num_visible_columns();
         if !tabs[idx].remove_pane(focused_id) {
             // Tab became empty
             drop(tabs);
@@ -2447,7 +2450,7 @@ impl KovaView {
             .or_else(|| tabs[idx].first_visible_pane())
             .unwrap_or_else(|| tabs[idx].first_pane().id);
         tabs[idx].focused_pane = new_focus;
-        let new_columns = tabs[idx].num_columns();
+        let new_columns = tabs[idx].num_visible_columns();
         tabs[idx].scale_virtual_width(old_columns, new_columns);
         // Clamp scroll and auto-scroll to reveal focused pane
         let full = self.drawable_viewport();
@@ -3208,6 +3211,7 @@ impl KovaView {
                         has_bell,
                         has_completion,
                         minimized: pane.minimized,
+                        process: pane.fg_process(),
                         working: pane.is_working(),
                         // Like bell/completion: never on the pane being looked at.
                         awaiting: !is_current && pane.is_awaiting(),
@@ -3869,7 +3873,7 @@ impl KovaView {
             .or_else(|| tabs[idx].neighbor(focused_id, NavDirection::Down, panes_vp))
             .or_else(|| tabs[idx].neighbor(focused_id, NavDirection::Up, panes_vp));
 
-        let old_columns = tabs[idx].num_columns();
+        let old_columns = tabs[idx].num_visible_columns();
 
         // Extract the pane from the tab
         match tabs[idx].extract_pane(focused_id) {
@@ -3879,7 +3883,7 @@ impl KovaView {
                     .filter(|id| tabs[idx].contains(*id))
                     .unwrap_or_else(|| tabs[idx].first_pane().id);
                 tabs[idx].focused_pane = new_focus;
-                let new_columns = tabs[idx].num_columns();
+                let new_columns = tabs[idx].num_visible_columns();
                 tabs[idx].scale_virtual_width(old_columns, new_columns);
                 tabs[idx].minimized_stack.retain(|&pid| pid != focused_id);
 
@@ -4197,7 +4201,7 @@ impl KovaView {
             .or_else(|| tabs[tab_idx].neighbor(pane_id, crate::pane::NavDirection::Down, panes_vp))
             .or_else(|| tabs[tab_idx].neighbor(pane_id, crate::pane::NavDirection::Up, panes_vp));
 
-        let old_columns = tabs[tab_idx].num_columns();
+        let old_columns = tabs[tab_idx].num_visible_columns();
         if !tabs[tab_idx].remove_pane(pane_id) {
             drop(tabs);
             return Some(false);
@@ -4210,7 +4214,7 @@ impl KovaView {
             .or_else(|| tabs[tab_idx].first_visible_pane())
             .unwrap_or_else(|| tabs[tab_idx].first_pane().id);
         tabs[tab_idx].focused_pane = new_focus;
-        let new_columns = tabs[tab_idx].num_columns();
+        let new_columns = tabs[tab_idx].num_visible_columns();
         tabs[tab_idx].scale_virtual_width(old_columns, new_columns);
         let full = self.drawable_viewport();
         let min_w = self.min_split_width_px();
@@ -5634,12 +5638,12 @@ impl KovaView {
                 any_removed = true;
                 log::debug!("Reaping exited panes in tab {}: {:?}", tab_idx, exited);
                 for id in &exited {
-                    let old_cols = tab.num_columns();
+                    let old_cols = tab.num_visible_columns();
                     if !tab.remove_pane(*id) {
                         tabs_to_remove.push(tab_idx);
                         break;
                     }
-                    let new_cols = tab.num_columns();
+                    let new_cols = tab.num_visible_columns();
                     tab.scale_virtual_width(old_cols, new_cols);
                     tab.minimized_stack.retain(|&pid| pid != *id);
                 }
@@ -5730,6 +5734,7 @@ impl KovaView {
                     has_bell,
                     minimized: pane.minimized,
                     input_chars: pane.pty.input_chars.clone(),
+                    fg_process: pane.fg_process(),
                 });
             });
 
@@ -6031,8 +6036,8 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, awaiting: false },
-                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, awaiting, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, awaiting: *awaiting },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), process: "", is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, awaiting: false },
+                SwitcherRow::Pane { title, process, has_bell, has_completion, minimized, working, awaiting, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), process: process.as_deref().unwrap_or(""), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, awaiting: *awaiting },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -6306,6 +6311,7 @@ mod tests {
                             has_bell: false,
                             has_completion: false,
                             minimized: false,
+                            process: None,
                             working: false,
                             awaiting: c == '?',
                         },

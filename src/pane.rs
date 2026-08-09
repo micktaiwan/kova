@@ -1,5 +1,5 @@
 use parking_lot::RwLock;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -34,6 +34,282 @@ pub fn distribute_visible(weights: &[f32], minimized: &[bool], total: f32) -> Ve
             }
         })
         .collect()
+}
+
+/// Sum of the weights that actually occupy layout space. A minimized entry
+/// keeps its weight (so it can come back to its old size) but renders at zero,
+/// so every ratio must be taken against this sum — never against the raw total.
+fn visible_weight_sum(weights: &[f32], minimized: &[bool]) -> f32 {
+    weights
+        .iter()
+        .zip(minimized.iter())
+        .filter(|&(_, &m)| !m)
+        .map(|(w, _)| *w)
+        .sum()
+}
+
+/// Indices of the entries that occupy layout space, in order.
+fn visible_indices(minimized: &[bool]) -> Vec<usize> {
+    minimized
+        .iter()
+        .enumerate()
+        .filter(|&(_, &m)| !m)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Index pairs of adjacent *visible* entries — one per boundary actually drawn
+/// on screen. A minimized entry between two visible ones is skipped over
+/// instead of hiding the separator that sits there.
+fn adjacent_visible_pairs(minimized: &[bool]) -> Vec<(usize, usize)> {
+    let vis = visible_indices(minimized);
+    vis.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// Weight for a newly inserted entry so it renders at the same size as the
+/// entries already on screen: the average of the *visible* weights.
+fn new_entry_weight(weights: &[f32], minimized: &[bool]) -> f32 {
+    let visible = visible_indices(minimized).len();
+    if visible == 0 {
+        let n = weights.len().max(1);
+        return weights.iter().sum::<f32>() / n as f32;
+    }
+    let avg = visible_weight_sum(weights, minimized) / visible as f32;
+    if avg > 0.0 { avg } else { 1.0 }
+}
+
+/// Largest share of the rendered space taken by a single entry, as a fraction
+/// of the total (0.0–1.0).
+fn max_visible_fraction(weights: &[f32], minimized: &[bool]) -> f32 {
+    let sum = visible_weight_sum(weights, minimized);
+    if sum <= 0.0 {
+        return 1.0;
+    }
+    weights
+        .iter()
+        .zip(minimized.iter())
+        .filter(|&(_, &m)| !m)
+        .map(|(w, _)| w / sum)
+        .fold(0.0, f32::max)
+}
+
+/// Shrink the weights of the entries wider than `max_px` so they render at
+/// exactly `max_px`, leaving the others alone. Shrinking one entry grows every
+/// other one's share, so the sum is re-read at each step.
+fn clamp_weights_to_max(weights: &mut [f32], minimized: &[bool], total: f32, max_px: f32) {
+    if total <= 0.0 || max_px <= 0.0 || max_px >= total {
+        return;
+    }
+    for i in 0..weights.len() {
+        if minimized[i] {
+            continue;
+        }
+        let sum = visible_weight_sum(weights, minimized);
+        if sum <= 0.0 {
+            return;
+        }
+        if total * weights[i] / sum <= max_px {
+            continue;
+        }
+        let others = sum - weights[i];
+        if others <= 0.0 {
+            // Sole visible entry: it always fills the space, whatever its
+            // weight. Capping it is the caller's job (shrink the total).
+            continue;
+        }
+        weights[i] = max_px * others / (total - max_px);
+    }
+}
+
+/// Rewrite the weights so that every entry except `idx` keeps its current pixel
+/// size while the total goes from `old_total` to `new_total` — `idx` absorbs the
+/// whole change (edge grow). Weights come out in pixel units.
+fn reweight_for_edge_grow(
+    weights: &mut [f32],
+    minimized: &[bool],
+    idx: usize,
+    old_total: f32,
+    new_total: f32,
+) {
+    if idx >= weights.len() || old_total <= 0.0 || new_total <= 0.0 {
+        return;
+    }
+    let sum = visible_weight_sum(weights, minimized);
+    if sum <= 0.0 {
+        return;
+    }
+    // Only the visible entries share `old_total`, so only they set the pixel
+    // value of one weight unit — and only they have a size to preserve.
+    let px_per_weight = old_total / sum;
+    let others_px: f32 = weights
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != idx && !minimized[i])
+        .map(|(_, w)| *w * px_per_weight)
+        .sum();
+    let target_px = (new_total - others_px).max(1.0);
+    for (i, w) in weights.iter_mut().enumerate() {
+        // Minimized entries are rescaled too, so the weight they hold stays
+        // comparable with the others when they come back.
+        *w = if i == idx { target_px } else { *w * px_per_weight };
+    }
+}
+
+/// Move the separator sitting to the right of the visible entry `left_idx` by
+/// `delta_px`. The entry the separator is pushed into shrinks and becomes
+/// pinned; the freed space goes to the non-pinned entries on the other side
+/// (or, if they are all pinned, to the adjacent one).
+fn apply_separator_drag(
+    weights: &mut [f32],
+    custom: &mut [bool],
+    minimized: &[bool],
+    left_idx: usize,
+    delta_px: f32,
+    total: f32,
+) {
+    let vis = visible_indices(minimized);
+    let p = match vis.iter().position(|&i| i == left_idx) {
+        Some(p) if p + 1 < vis.len() => p,
+        _ => return,
+    };
+    let right_idx = vis[p + 1];
+    let sum = visible_weight_sum(weights, minimized);
+    if sum <= 0.0 || total <= 0.0 {
+        return;
+    }
+    // `total` is shared by the visible entries only: that is what turns a
+    // cursor movement in pixels into the right amount of weight.
+    let delta_weight = delta_px / total * sum;
+    let min_weight = sum * 0.05;
+    if delta_weight.abs() < 0.001 {
+        return;
+    }
+    // delta > 0 → the separator moves right → the entry on its right is pushed
+    // and the ones on its left absorb. delta < 0 → mirror image.
+    let (pushed_idx, free): (usize, Vec<usize>) = if delta_weight > 0.0 {
+        (right_idx, vis[..=p].to_vec())
+    } else {
+        (left_idx, vis[p + 1..].to_vec())
+    };
+    let new_pushed = (weights[pushed_idx] - delta_weight.abs()).max(min_weight);
+    let actual_delta = weights[pushed_idx] - new_pushed;
+    if actual_delta < 0.001 {
+        return;
+    }
+    let free_unpinned: Vec<usize> = free.iter().copied().filter(|&i| !custom[i]).collect();
+    weights[pushed_idx] = new_pushed;
+    if free_unpinned.is_empty() {
+        let adjacent = if delta_weight > 0.0 { left_idx } else { right_idx };
+        weights[adjacent] += actual_delta;
+    } else {
+        let share = actual_delta / free_unpinned.len() as f32;
+        for &i in &free_unpinned {
+            weights[i] += share;
+        }
+    }
+    custom[pushed_idx] = true;
+}
+
+/// Keyboard resize: push the edge of entry `idx` by `delta` (positive = to the
+/// right / downward). Returns false when nothing could move.
+fn apply_directional_resize(
+    weights: &mut [f32],
+    custom: &mut [bool],
+    minimized: &[bool],
+    idx: usize,
+    delta: f32,
+) -> bool {
+    let vis = visible_indices(minimized);
+    if vis.len() < 2 {
+        return false;
+    }
+    let p = match vis.iter().position(|&i| i == idx) {
+        Some(p) => p,
+        None => return false,
+    };
+    // "Last" means last *on screen*: an entry followed only by minimized ones
+    // controls its left edge, like any rightmost entry.
+    let is_last = p == vis.len() - 1;
+    let weight_sum = visible_weight_sum(weights, minimized);
+    let min_weight = weight_sum * 0.05;
+    let step = delta.abs() * 0.5;
+    let growing = if is_last { delta < 0.0 } else { delta > 0.0 };
+    // The "outer side" is where the other visible entries are, relative to the
+    // controlled edge. Minimized entries are never a source nor a target: they
+    // have no size to give or take.
+    let (outer, fallback): (Vec<usize>, usize) = if is_last {
+        (vis[..p].to_vec(), vis[p - 1])
+    } else {
+        (vis[p + 1..].to_vec(), vis[p + 1])
+    };
+
+    if growing {
+        let unpinned: Vec<usize> = outer.iter().copied().filter(|&i| !custom[i]).collect();
+        let sources = if unpinned.is_empty() { vec![fallback] } else { unpinned };
+        let avail: f32 = sources.iter().map(|&i| weights[i] * 0.8).sum();
+        let transfer = (step * weight_sum).min(avail);
+        if transfer > 0.001 {
+            weights[idx] += transfer;
+            custom[idx] = true;
+            redistribute_loss(weights, custom, transfer, &outer, fallback, min_weight);
+            return true;
+        }
+    } else {
+        let transfer = (step * weight_sum).min(weights[idx] * 0.8);
+        if transfer > 0.001 {
+            weights[idx] -= transfer;
+            custom[idx] = true;
+            redistribute_gain(weights, custom, transfer, &outer, fallback);
+            return true;
+        }
+    }
+    false
+}
+
+/// Hand `amount` of weight to the non-pinned entries of `targets` (equal
+/// shares). If they are all pinned, `fallback` takes it all.
+fn redistribute_gain(
+    weights: &mut [f32],
+    custom: &[bool],
+    amount: f32,
+    targets: &[usize],
+    fallback: usize,
+) {
+    let unpinned: Vec<usize> = targets.iter().copied().filter(|&i| !custom[i]).collect();
+    if unpinned.is_empty() {
+        if fallback < weights.len() {
+            weights[fallback] += amount;
+        }
+    } else {
+        let share = amount / unpinned.len() as f32;
+        for &i in &unpinned {
+            weights[i] += share;
+        }
+    }
+}
+
+/// Take `amount` of weight from the non-pinned entries of `targets` (equal
+/// shares), never below `min_weight`. If they are all pinned, `fallback`
+/// gives it all.
+fn redistribute_loss(
+    weights: &mut [f32],
+    custom: &[bool],
+    amount: f32,
+    targets: &[usize],
+    fallback: usize,
+    min_weight: f32,
+) {
+    let unpinned: Vec<usize> = targets.iter().copied().filter(|&i| !custom[i]).collect();
+    if unpinned.is_empty() {
+        if fallback < weights.len() {
+            weights[fallback] = (weights[fallback] - amount).max(min_weight);
+        }
+    } else {
+        let share = amount / unpinned.len() as f32;
+        for &i in &unpinned {
+            weights[i] = (weights[i] - share).max(min_weight);
+        }
+    }
 }
 
 /// Per-pane open-latency instrumentation. Splits the new-pane critical path so
@@ -201,15 +477,17 @@ pub struct Tab {
 /// weight sum is non-positive.
 fn reweight_for_scrolled_split(
     weights: &mut [f32],
+    minimized: &[bool],
     new_col_idx: usize,
     old_virtual: f32,
     new_col_px: f32,
 ) -> Option<f32> {
     if new_col_idx >= weights.len() { return None; }
-    // Old weight sum excludes the just-inserted column, so dividing by it
-    // reproduces each existing column's pre-split pixel width.
+    // Old weight sum: the columns that shared `old_virtual` before the split,
+    // so the just-inserted one and the minimized ones stay out of it. Dividing
+    // by it reproduces each existing column's pre-split pixel width.
     let old_sum: f32 = weights.iter().enumerate()
-        .filter(|&(i, _)| i != new_col_idx)
+        .filter(|&(i, _)| i != new_col_idx && !minimized[i])
         .map(|(_, w)| *w)
         .sum();
     if old_sum <= 0.0 { return None; }
@@ -401,7 +679,8 @@ impl Tab {
     ///   this flag alone dies while claude is still open;
     /// - a foreground process group other than the shell (tcgetpgrp) — covers
     ///   claude, vim, any TUI, no shell integration needed. Only re-probed
-    ///   when `refresh_fg` is true (one ioctl per pane).
+    ///   when `refresh_fg` is true (one ioctl per pane); the same probe caches
+    ///   the process name the status bar and the pane switcher display.
     /// Unlike completion, the focused pane counts too: the indicator says
     /// "something occupies this tab". Panes whose shell exited are skipped —
     /// a shell killed mid-command never emits 133;D, which would strand the
@@ -418,13 +697,16 @@ impl Tab {
         self.for_each_pane(&mut |pane| {
             if !pane.is_alive() {
                 pane.clear_awaiting();
+                pane.fg_process.replace(None);
+                pane.claude_name.replace(None);
                 return;
             }
             if pane.terminal.read().command_running.load(std::sync::atomic::Ordering::Relaxed) {
                 osc_any = true;
             }
             if refresh_fg {
-                let fg = pane.pty.has_foreground_process();
+                pane.refresh_claude_name();
+                let fg = pane.refresh_fg_process();
                 if fg {
                     fg_any = true;
                 } else {
@@ -671,22 +953,21 @@ impl Tab {
         self.columns.iter().position(|col| col.contains(id))
     }
 
-    /// Return the number of columns.
-    pub fn num_columns(&self) -> usize {
-        self.columns.len()
-    }
-
     // ---------------------------------------------------------------
     // Viewport computation
     // ---------------------------------------------------------------
 
+    /// Per-column "takes no layout space" flags, in column order. Every weight
+    /// computation needs these: a fully-minimized column keeps its weight but
+    /// renders at zero width, so it must stay out of the sums and the ratios.
+    fn minimized_columns(&self) -> Vec<bool> {
+        self.columns.iter().map(|col| col.is_fully_minimized()).collect()
+    }
+
     /// Compute column widths from weights and total width.
     /// Fully-minimized columns take zero width (no layout footprint).
     fn column_widths(&self, total_width: f32) -> Vec<f32> {
-        let minimized: Vec<bool> = self.columns.iter()
-            .map(|col| col.is_fully_minimized())
-            .collect();
-        distribute_visible(&self.column_weights, &minimized, total_width)
+        distribute_visible(&self.column_weights, &self.minimized_columns(), total_width)
     }
 
     /// Number of columns that occupy layout space (not fully minimized).
@@ -764,47 +1045,53 @@ impl Tab {
     /// (a visible column draws one only when a visible column precedes it).
     pub fn collect_separators(&self, vp: PaneViewport, out: &mut Vec<(f32, f32, f32, f32)>) {
         let widths = self.column_widths(vp.width);
+        let minimized = self.minimized_columns();
         let ch = self.cell_h.get();
+        // One vertical separator per boundary between two columns actually on
+        // screen — minimized columns are zero-width and simply skipped over.
+        for (left, _) in adjacent_visible_pairs(&minimized) {
+            let x = vp.x + widths[..=left].iter().sum::<f32>();
+            out.push((x, vp.y, x, vp.y + vp.height));
+        }
+        // Horizontal separators within each visible column
         let mut x = vp.x;
-        let mut seen_visible = false;
         for (col, &w) in self.columns.iter().zip(widths.iter()) {
-            let col_vp = PaneViewport { x, y: vp.y, width: w, height: vp.height };
             if !col.is_fully_minimized() {
-                // Vertical separator between this visible column and the previous one
-                if seen_visible {
-                    out.push((x, vp.y, x, vp.y + vp.height));
-                }
-                seen_visible = true;
-                // Horizontal separators within column
+                let col_vp = PaneViewport { x, y: vp.y, width: w, height: vp.height };
                 col.collect_separators(col_vp, ch, out);
             }
             x += w;
         }
     }
 
-    /// Collect separator info for mouse hit-testing and dragging.
+    /// Collect separator info for mouse hit-testing and dragging. Every
+    /// separator drawn by `collect_separators` is listed here, so none of them
+    /// looks draggable without being so: `column_sep_index` is the visible
+    /// column on the left of the separator, and its partner is the next visible
+    /// one (a minimized column in between changes nothing).
     pub fn collect_separator_info(&self, vp: PaneViewport, out: &mut Vec<SeparatorInfo>) {
         let widths = self.column_widths(vp.width);
+        let minimized = self.minimized_columns();
         let ch = self.cell_h.get();
+        for (left, right) in adjacent_visible_pairs(&minimized) {
+            let x = vp.x + widths[..=left].iter().sum::<f32>();
+            out.push(SeparatorInfo {
+                pos: x,
+                cross_start: vp.y,
+                cross_end: vp.y + vp.height,
+                is_column_sep: true,
+                parent_dim: vp.width,
+                column_sep_index: Some(left),
+                col_index: right,
+                row_sep_index: None,
+            });
+        }
         let mut x = vp.x;
         for (i, (col, &w)) in self.columns.iter().zip(widths.iter()).enumerate() {
-            let col_vp = PaneViewport { x, y: vp.y, width: w, height: vp.height };
-            // Column separator between columns[i-1] and columns[i]
-            // Block resize when either adjacent column is fully minimized
-            if i > 0 && !self.columns[i - 1].is_fully_minimized() && !col.is_fully_minimized() {
-                out.push(SeparatorInfo {
-                    pos: x,
-                    cross_start: vp.y,
-                    cross_end: vp.y + vp.height,
-                    is_column_sep: true,
-                    parent_dim: vp.width,
-                    column_sep_index: Some(i - 1),
-                    col_index: i,
-                    row_sep_index: None,
-                });
+            if !col.is_fully_minimized() {
+                let col_vp = PaneViewport { x, y: vp.y, width: w, height: vp.height };
+                col.collect_separator_info(i, col_vp, ch, out);
             }
-            // Row separators within column
-            col.collect_separator_info(i, col_vp, ch, out);
             x += w;
         }
     }
@@ -888,7 +1175,7 @@ impl Tab {
     pub fn insert_column_after_focused(&mut self, new_pane: Pane) -> PaneId {
         let new_id = new_pane.id;
         let idx = self.column_index_of(self.focused_pane).unwrap_or(self.columns.len() - 1);
-        let avg_weight: f32 = self.column_weights.iter().sum::<f32>() / self.columns.len() as f32;
+        let avg_weight = new_entry_weight(&self.column_weights, &self.minimized_columns());
         self.columns.insert(idx + 1, Column::new(new_pane));
         self.column_weights.insert(idx + 1, avg_weight);
         self.custom_weights.insert(idx + 1, false);
@@ -899,7 +1186,7 @@ impl Tab {
     /// Returns the new pane's id.
     pub fn append_column(&mut self, new_pane: Pane) -> PaneId {
         let new_id = new_pane.id;
-        let avg_weight: f32 = self.column_weights.iter().sum::<f32>() / self.columns.len() as f32;
+        let avg_weight = new_entry_weight(&self.column_weights, &self.minimized_columns());
         self.columns.push(Column::new(new_pane));
         self.column_weights.push(avg_weight);
         self.custom_weights.push(false);
@@ -1024,155 +1311,35 @@ impl Tab {
             Some(i) => i,
             None => return false,
         };
-        if self.columns.len() < 2 { return false; }
-
-        let is_last = col_idx == self.columns.len() - 1;
-        let weight_sum: f32 = self.column_weights.iter().sum();
-        let step = delta.abs() * 0.5; // scale down for weight transfer
-
-        // Determine if focused column grows or shrinks.
-        // Non-last: right edge. Right (delta>0) = grow, Left (delta<0) = shrink.
-        // Last: left edge. Right (delta>0) = shrink, Left (delta<0) = grow.
-        let growing = if is_last { delta < 0.0 } else { delta > 0.0 };
-
-        // The "outer side" is where the other columns are (relative to the controlled edge).
-        // Non-last: outer = right side (col_idx+1..)
-        // Last: outer = left side (0..col_idx)
-        let (outer_range, outer_fallback): (std::ops::Range<usize>, usize) = if is_last {
-            (0..col_idx, if col_idx > 0 { col_idx - 1 } else { 0 })
-        } else {
-            (col_idx + 1..self.columns.len(), col_idx + 1)
-        };
-
-        if growing {
-            // Focused grows: take weight from outer side
-            // Calculate max available transfer from outer non-pinned columns
-            let outer_unpinned: Vec<usize> = outer_range.clone()
-                .filter(|&i| !self.custom_weights[i])
-                .collect();
-            let source_indices = if outer_unpinned.is_empty() {
-                vec![outer_fallback] // fallback to adjacent
-            } else {
-                outer_unpinned
-            };
-            let avail: f32 = source_indices.iter().map(|&i| self.column_weights[i] * 0.8).sum();
-            let transfer = (step * weight_sum).min(avail);
-            if transfer > 0.001 {
-                self.column_weights[col_idx] += transfer;
-                self.custom_weights[col_idx] = true;
-                self.redistribute_loss(transfer, outer_range, outer_fallback);
-                return true;
-            }
-        } else {
-            // Focused shrinks: give weight to outer side
-            let transfer = (step * weight_sum).min(self.column_weights[col_idx] * 0.8);
-            if transfer > 0.001 {
-                self.column_weights[col_idx] -= transfer;
-                self.custom_weights[col_idx] = true;
-                self.redistribute_weight(transfer, outer_range, outer_fallback);
-                return true;
-            }
-        }
-        false
-    }
-
-
-
-    /// Redistribute `amount` of weight among non-pinned columns in `range`.
-    /// If all columns in range are pinned, fallback to `fallback_idx`.
-    fn redistribute_weight(&mut self, amount: f32, range: std::ops::Range<usize>, fallback_idx: usize) {
-        let unpinned: Vec<usize> = range.clone()
-            .filter(|&i| !self.custom_weights[i])
-            .collect();
-        if unpinned.is_empty() {
-            // Fallback: all pinned → adjacent absorbs
-            if fallback_idx < self.column_weights.len() {
-                self.column_weights[fallback_idx] += amount;
-            }
-        } else {
-            let share = amount / unpinned.len() as f32;
-            for &i in &unpinned {
-                self.column_weights[i] += share;
-            }
-        }
-    }
-
-    /// Remove `amount` of weight from non-pinned columns in `range` (equally shared).
-    /// If all columns in range are pinned, fallback to `fallback_idx`.
-    fn redistribute_loss(&mut self, amount: f32, range: std::ops::Range<usize>, fallback_idx: usize) {
-        let sum: f32 = self.column_weights.iter().sum();
-        let min_weight = sum * 0.05;
-        let unpinned: Vec<usize> = range.clone()
-            .filter(|&i| !self.custom_weights[i])
-            .collect();
-        if unpinned.is_empty() {
-            if fallback_idx < self.column_weights.len() {
-                self.column_weights[fallback_idx] = (self.column_weights[fallback_idx] - amount).max(min_weight);
-            }
-        } else {
-            let share = amount / unpinned.len() as f32;
-            for &i in &unpinned {
-                self.column_weights[i] = (self.column_weights[i] - share).max(min_weight);
-            }
-        }
+        let minimized = self.minimized_columns();
+        apply_directional_resize(
+            &mut self.column_weights,
+            &mut self.custom_weights,
+            &minimized,
+            col_idx,
+            delta,
+        )
     }
 
     /// Returns the maximum leaf width as a fraction of total width (0.0–1.0).
     pub fn max_leaf_width_fraction(&self) -> f32 {
-        let sum: f32 = self.column_weights.iter().sum();
-        if sum <= 0.0 { return 1.0; }
-        let mut max_frac = 0.0f32;
-        for (col, &w) in self.columns.iter().zip(self.column_weights.iter()) {
-            let col_frac = w / sum;
-            // Within the column, VSplit doesn't change width
-            let leaf_frac = col.max_leaf_width_fraction() * col_frac;
-            max_frac = max_frac.max(leaf_frac);
-        }
-        max_frac
+        max_visible_fraction(&self.column_weights, &self.minimized_columns())
     }
 
     /// Post-validation: adjust weights so no leaf exceeds `max_w` pixels.
     pub fn clamp_pane_widths(&mut self, total: f32, max_w: f32) {
-        let sum: f32 = self.column_weights.iter().sum();
-        if sum <= 0.0 { return; }
-        for i in 0..self.columns.len() {
-            let col_w = total * self.column_weights[i] / sum;
-            let col_max = col_w; // flat column: each pane has full column width
-            if col_max > max_w && col_max > 0.0 {
-                // Scale down the column weight so its widest pane = max_w
-                let new_col_w = col_w * max_w / col_max;
-                self.column_weights[i] = new_col_w / total * sum;
-            }
-        }
+        let minimized = self.minimized_columns();
+        clamp_weights_to_max(&mut self.column_weights, &minimized, total, max_w);
     }
 
     /// Scale ratios so that only `target_id` absorbs the size change (edge grow).
     pub fn scale_ratios_for_edge_grow(&mut self, target_id: PaneId, old_total: f32, new_total: f32) {
-        if new_total <= 0.0 || old_total <= 0.0 { return; }
         let col_idx = match self.column_index_of(target_id) {
             Some(i) => i,
             None => return,
         };
-        let sum: f32 = self.column_weights.iter().sum();
-        if sum <= 0.0 { return; }
-
-        // Keep all other columns at their old pixel widths, target absorbs the change
-        let others_total_px: f32 = (0..self.columns.len())
-            .filter(|&i| i != col_idx)
-            .map(|i| self.column_weights[i] / sum * old_total)
-            .sum();
-
-        // Target gets the new total minus what others need
-        let target_new_w = (new_total - others_total_px).max(1.0);
-
-        // Convert pixel widths to weights (proportional to new_total)
-        for i in 0..self.columns.len() {
-            if i == col_idx {
-                self.column_weights[i] = target_new_w;
-            } else {
-                self.column_weights[i] = self.column_weights[i] / sum * old_total;
-            }
-        }
+        let minimized = self.minimized_columns();
+        reweight_for_edge_grow(&mut self.column_weights, &minimized, col_idx, old_total, new_total);
     }
 
     /// After a horizontal split that happens while already scrolling (virtual
@@ -1193,68 +1360,32 @@ impl Tab {
         screen: f32,
     ) {
         if new_col_idx >= self.columns.len() { return; }
+        let minimized = self.minimized_columns();
         if let Some(new_virtual) = reweight_for_scrolled_split(
-            &mut self.column_weights, new_col_idx, old_virtual, new_col_px,
+            &mut self.column_weights, &minimized, new_col_idx, old_virtual, new_col_px,
         ) {
             self.virtual_width_override = if new_virtual > screen { new_virtual } else { 0.0 };
         }
     }
 
     /// Set column weights by dragging a column separator.
-    /// `col_idx` is the index such that the separator is between columns[col_idx] and columns[col_idx+1].
+    /// `col_idx` is the index of the visible column left of the separator (the
+    /// right-hand partner is the next visible column, skipping minimized ones).
     ///
     /// Redistribution: the "pushed" column (on the side the separator moves toward) absorbs the
     /// delta directly and becomes pinned. The freed/consumed space is redistributed among all
     /// non-pinned columns on the opposite side. If all opposite columns are pinned, only the
     /// adjacent one absorbs (fallback).
     pub fn set_column_weights_by_drag(&mut self, col_idx: usize, delta_px: f32, total_width: f32) {
-        if col_idx + 1 >= self.columns.len() { return; }
-        let sum: f32 = self.column_weights.iter().sum();
-        if sum <= 0.0 || total_width <= 0.0 { return; }
-
-        let delta_weight = delta_px / total_width * sum;
-        let min_weight = sum * 0.05; // minimum 5% of total
-
-        if delta_weight.abs() < 0.001 { return; }
-
-        // Determine pushed side (shrinks) and free side (absorbs).
-        // delta > 0 → separator moves right → right column (col_idx+1) is pushed, left side is free.
-        // delta < 0 → separator moves left → left column (col_idx) is pushed, right side is free.
-        let (pushed_idx, free_range): (usize, std::ops::Range<usize>) = if delta_weight > 0.0 {
-            (col_idx + 1, 0..col_idx + 1)
-        } else {
-            (col_idx, col_idx + 1..self.columns.len())
-        };
-
-        let abs_delta = delta_weight.abs();
-
-        // Pushed column shrinks
-        let new_pushed = (self.column_weights[pushed_idx] - abs_delta).max(min_weight);
-        let actual_delta = self.column_weights[pushed_idx] - new_pushed;
-        if actual_delta < 0.001 { return; }
-
-        // Find non-pinned columns on the free side
-        let free_unpinned: Vec<usize> = free_range.clone()
-            .filter(|&i| !self.custom_weights[i])
-            .collect();
-
-        if free_unpinned.is_empty() {
-            // Fallback: all pinned on free side → only adjacent absorbs
-            let adjacent = if delta_weight > 0.0 { col_idx } else { col_idx + 1 };
-            let new_adj = self.column_weights[adjacent] + actual_delta;
-            self.column_weights[pushed_idx] = new_pushed;
-            self.column_weights[adjacent] = new_adj;
-        } else {
-            // Redistribute equally among non-pinned columns on the free side
-            let share = actual_delta / free_unpinned.len() as f32;
-            self.column_weights[pushed_idx] = new_pushed;
-            for &i in &free_unpinned {
-                self.column_weights[i] += share;
-            }
-        }
-
-        // Mark pushed column as pinned
-        self.custom_weights[pushed_idx] = true;
+        let minimized = self.minimized_columns();
+        apply_separator_drag(
+            &mut self.column_weights,
+            &mut self.custom_weights,
+            &minimized,
+            col_idx,
+            delta_px,
+            total_width,
+        );
     }
 
     /// Swap the focused pane with its neighbor. For Left/Right, swap entire columns.
@@ -1367,10 +1498,22 @@ pub struct Pane {
     /// `Some(epoch_secs)` = waiting since that time; `None` = not waiting.
     /// Never trusted blindly: see `is_awaiting` and `Tab::check_running`.
     pub awaiting: Cell<Option<u64>>,
+    /// Name of the Claude Code session running in this pane, as set by its
+    /// `/rename` command. Refreshed on the same throttle as the foreground
+    /// probe (`Tab::check_running`) rather than read per frame, because the
+    /// lookup goes through a directory scan. `None` = no Claude session here,
+    /// or one the user never named.
+    pub claude_name: RefCell<Option<String>>,
+    /// Name of the binary running in the foreground (`claude`, `nvim`, `ssh`…),
+    /// `None` at a bare shell prompt. Cached because the status bar reads it on
+    /// every frame while resolving it costs two syscalls: it is refreshed on the
+    /// same ~0.5s throttle as the running-state probe, in `Tab::check_running`.
+    fg_process: RefCell<Option<String>>,
 }
 
-/// Resolve the label to show for a pane, in priority order:
-/// user-set custom title → non-empty OSC title → cwd basename → `fallback`.
+/// Resolve the label to show for a pane, in priority order: user-set custom
+/// title → Claude Code session name (its `/rename`) → non-empty OSC title →
+/// cwd basename → `fallback`.
 /// An empty or whitespace-only OSC title is treated as absent so we never
 /// render a blank row (the "invisible white line" bug in the pane switcher).
 /// True if `title` begins with a Claude Code *working* marker: an animated
@@ -1419,14 +1562,33 @@ fn strip_activity_prefix(title: &str) -> &str {
     }
 }
 
+/// Clean up a raw foreground process name for display: drop surrounding
+/// whitespace, keep only the last path component (some processes report a full
+/// path), and drop the leading `-` a login shell carries (`-zsh`). Returns
+/// `None` when nothing displayable is left, so callers can treat "no name" and
+/// "empty name" the same way.
+fn normalize_process_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    let name = name.rsplit('/').next().unwrap_or(name);
+    let name = name.strip_prefix('-').unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 fn derive_display_title(
     custom_title: Option<&str>,
+    claude_name: Option<&str>,
     osc_title: Option<&str>,
     cwd: Option<&str>,
     fallback: &str,
 ) -> String {
     if let Some(custom) = custom_title {
         return custom.to_string();
+    }
+    // A Claude session name beats the OSC title, which is only ever the generic
+    // "Claude Code" plus a status marker, but stays below a title the user set
+    // by hand here — Kova's own rename must win over the app's.
+    if let Some(name) = claude_name.map(str::trim).filter(|n| !n.is_empty()) {
+        return name.to_string();
     }
     if let Some(title) = osc_title.filter(|t| !t.trim().is_empty()) {
         return strip_activity_prefix(title).to_string();
@@ -1476,6 +1638,8 @@ impl Pane {
             minimized: false,
             open_timer,
             awaiting: Cell::new(None),
+            claude_name: RefCell::new(None),
+            fg_process: RefCell::new(None),
         })
     }
 
@@ -1504,6 +1668,8 @@ impl Pane {
             minimized: false,
             open_timer: Arc::new(PaneOpenTimer::new()),
             awaiting: Cell::new(None),
+            claude_name: RefCell::new(None),
+            fg_process: RefCell::new(None),
         })
     }
 
@@ -1513,6 +1679,26 @@ impl Pane {
 
     pub fn foreground_process_name(&self) -> Option<String> {
         self.pty.foreground_process_name()
+    }
+
+    /// Re-probe the foreground process and refresh the cached name. Returns
+    /// whether a process other than the shell owns the terminal — the answer
+    /// `Tab::check_running` needs, so both come out of a single probe.
+    /// An unresolvable name caches as `None` (nothing to display) without
+    /// changing the returned yes/no.
+    fn refresh_fg_process(&self) -> bool {
+        let probe = self.pty.foreground_process();
+        let running = probe.is_some();
+        self.fg_process
+            .replace(probe.and_then(|name| normalize_process_name(&name)));
+        running
+    }
+
+    /// Cached name of the foreground binary, `None` at a bare shell prompt.
+    /// Up to ~0.5s stale (see `Tab::check_running`), which is what makes it
+    /// free to read on every frame.
+    pub fn fg_process(&self) -> Option<String> {
+        self.fg_process.borrow().clone()
     }
 
     pub fn is_alive(&self) -> bool {
@@ -1539,15 +1725,24 @@ impl Pane {
             .map(|t| strip_activity_prefix(t).to_string())
     }
 
-    /// Display title for this pane: custom title > OSC title > CWD basename > fallback.
+    /// Display title for this pane: custom title > Claude session name > OSC
+    /// title > CWD basename > fallback.
     pub fn display_title(&self, fallback: &str) -> String {
         let term = self.terminal.read();
         derive_display_title(
             self.custom_title.as_deref(),
+            self.claude_name.borrow().as_deref(),
             term.title.as_deref(),
             term.cwd.as_deref(),
             fallback,
         )
+    }
+
+    /// Re-read the name of the Claude Code session running in this pane (the
+    /// one its `/rename` sets). Called from the throttled probe pass, never per
+    /// frame: the lookup is a cached scan of `~/.claude/sessions/`.
+    pub fn refresh_claude_name(&self) {
+        *self.claude_name.borrow_mut() = crate::claude_session::name_for_shell(self.pty.pid());
     }
 
     /// True if the app in this pane is actively working: its live OSC 0/2 title
@@ -1659,9 +1854,14 @@ impl Column {
     /// get zero height (no layout footprint).
     /// When cell_h > 0, snap non-minimized heights to multiples of cell_h so that
     /// pane y-offsets always land on cell boundaries (prevents prompt drift during resize).
+    /// Per-pane "takes no layout space" flags, in row order.
+    fn minimized_rows(&self) -> Vec<bool> {
+        self.panes.iter().map(|p| p.minimized).collect()
+    }
+
     pub fn row_heights(&self, total_height: f32, cell_h: f32) -> Vec<f32> {
         let n = self.panes.len();
-        let minimized: Vec<bool> = self.panes.iter().map(|p| p.minimized).collect();
+        let minimized = self.minimized_rows();
         let mut heights = distribute_visible(&self.row_weights, &minimized, total_height);
         // Snap non-minimized heights to multiples of cell_h
         if cell_h > 0.0 {
@@ -1733,45 +1933,35 @@ impl Column {
 
     pub fn collect_separators(&self, vp: PaneViewport, cell_h: f32, out: &mut Vec<(f32, f32, f32, f32)>) {
         let heights = self.row_heights(vp.height, cell_h);
-        let mut y = vp.y;
-        for i in 0..self.panes.len().saturating_sub(1) {
-            y += heights[i];
-            // Minimized panes are zero-height: draw one separator per visible
-            // boundary only (skip when either side is minimized, and only if a
-            // visible pane follows below).
-            let below_visible = self.panes[i + 1..].iter().any(|p| !p.minimized);
-            if !self.panes[i].minimized && below_visible {
-                out.push((vp.x, y, vp.x + vp.width, y));
-            }
+        // Minimized panes are zero-height: one separator per boundary between
+        // two panes actually on screen.
+        for (top, _) in adjacent_visible_pairs(&self.minimized_rows()) {
+            let y = vp.y + heights[..=top].iter().sum::<f32>();
+            out.push((vp.x, y, vp.x + vp.width, y));
         }
     }
 
     pub fn collect_separator_info(&self, col_index: usize, vp: PaneViewport, cell_h: f32, out: &mut Vec<SeparatorInfo>) {
         let heights = self.row_heights(vp.height, cell_h);
-        let mut y = vp.y;
-        for i in 0..self.panes.len().saturating_sub(1) {
-            y += heights[i];
-            let top_min = self.panes[i].minimized;
-            let bot_min = self.panes[i + 1].minimized;
-            if !top_min && !bot_min {
-                out.push(SeparatorInfo {
-                    pos: y,
-                    cross_start: vp.x,
-                    cross_end: vp.x + vp.width,
-                    is_column_sep: false,
-                    parent_dim: vp.height,
-                    column_sep_index: None,
-                    col_index,
-                    row_sep_index: Some(i),
-                });
-            }
+        for (top, _) in adjacent_visible_pairs(&self.minimized_rows()) {
+            let y = vp.y + heights[..=top].iter().sum::<f32>();
+            out.push(SeparatorInfo {
+                pos: y,
+                cross_start: vp.x,
+                cross_end: vp.x + vp.width,
+                is_column_sep: false,
+                parent_dim: vp.height,
+                column_sep_index: None,
+                col_index,
+                row_sep_index: Some(top),
+            });
         }
     }
 
     /// Insert a new pane after the pane with target_id.
     pub fn insert_pane_after(&mut self, target_id: PaneId, new_pane: Pane) {
         let idx = self.pane_index_of(target_id).unwrap_or(self.panes.len() - 1);
-        let avg = self.row_weights.iter().sum::<f32>() / self.panes.len() as f32;
+        let avg = new_entry_weight(&self.row_weights, &self.minimized_rows());
         self.panes.insert(idx + 1, new_pane);
         self.row_weights.insert(idx + 1, avg);
         self.custom_row_weights.insert(idx + 1, false);
@@ -1779,7 +1969,7 @@ impl Column {
 
     /// Append a new pane at the bottom.
     pub fn append_pane(&mut self, new_pane: Pane) {
-        let avg = self.row_weights.iter().sum::<f32>() / self.panes.len() as f32;
+        let avg = new_entry_weight(&self.row_weights, &self.minimized_rows());
         self.panes.push(new_pane);
         self.row_weights.push(avg);
         self.custom_row_weights.push(false);
@@ -1831,89 +2021,29 @@ impl Column {
             Some(i) => i,
             None => return false,
         };
-        if self.panes.len() < 2 { return false; }
-
-        let is_last = row_idx == self.panes.len() - 1;
-        let weight_sum: f32 = self.row_weights.iter().sum();
-        let step = delta.abs() * 0.5;
-
-        // Controlled edge = bottom, except last pane (top).
-        // delta > 0 (Down): push edge down. delta < 0 (Up): push edge up.
-        let growing = if is_last { delta < 0.0 } else { delta > 0.0 };
-
-        let (outer_range, outer_fallback): (std::ops::Range<usize>, usize) = if is_last {
-            (0..row_idx, if row_idx > 0 { row_idx - 1 } else { 0 })
-        } else {
-            (row_idx + 1..self.panes.len(), row_idx + 1)
-        };
-
-        if growing {
-            let outer_unpinned: Vec<usize> = outer_range.clone()
-                .filter(|&i| !self.custom_row_weights[i])
-                .collect();
-            let source_indices = if outer_unpinned.is_empty() {
-                vec![outer_fallback]
-            } else {
-                outer_unpinned
-            };
-            let avail: f32 = source_indices.iter().map(|&i| self.row_weights[i] * 0.8).sum();
-            let transfer = (step * weight_sum).min(avail);
-            if transfer > 0.001 {
-                self.row_weights[row_idx] += transfer;
-                self.custom_row_weights[row_idx] = true;
-                Self::redistribute_loss_static(&mut self.row_weights, &self.custom_row_weights, transfer, outer_range, outer_fallback);
-                return true;
-            }
-        } else {
-            let transfer = (step * weight_sum).min(self.row_weights[row_idx] * 0.8);
-            if transfer > 0.001 {
-                self.row_weights[row_idx] -= transfer;
-                self.custom_row_weights[row_idx] = true;
-                Self::redistribute_gain_static(&mut self.row_weights, &self.custom_row_weights, transfer, outer_range, outer_fallback);
-                return true;
-            }
-        }
-        false
+        let minimized = self.minimized_rows();
+        apply_directional_resize(
+            &mut self.row_weights,
+            &mut self.custom_row_weights,
+            &minimized,
+            row_idx,
+            delta,
+        )
     }
 
     /// Set row weights by dragging a row separator.
-    /// Same logic as Tab::set_column_weights_by_drag but for rows.
+    /// `row_idx` is the index of the visible pane above the separator (the pane
+    /// below is the next visible one, skipping minimized ones).
     pub fn set_row_weights_by_drag(&mut self, row_idx: usize, delta_px: f32, total_height: f32) {
-        if row_idx + 1 >= self.panes.len() { return; }
-        let sum: f32 = self.row_weights.iter().sum();
-        if sum <= 0.0 || total_height <= 0.0 { return; }
-
-        let delta_weight = delta_px / total_height * sum;
-        let min_weight = sum * 0.05;
-        if delta_weight.abs() < 0.001 { return; }
-
-        let (pushed_idx, free_range): (usize, std::ops::Range<usize>) = if delta_weight > 0.0 {
-            (row_idx + 1, 0..row_idx + 1)
-        } else {
-            (row_idx, row_idx + 1..self.panes.len())
-        };
-
-        let abs_delta = delta_weight.abs();
-        let new_pushed = (self.row_weights[pushed_idx] - abs_delta).max(min_weight);
-        let actual_delta = self.row_weights[pushed_idx] - new_pushed;
-        if actual_delta < 0.001 { return; }
-
-        let free_unpinned: Vec<usize> = free_range.clone()
-            .filter(|&i| !self.custom_row_weights[i])
-            .collect();
-
-        if free_unpinned.is_empty() {
-            let adjacent = if delta_weight > 0.0 { row_idx } else { row_idx + 1 };
-            self.row_weights[pushed_idx] = new_pushed;
-            self.row_weights[adjacent] += actual_delta;
-        } else {
-            let share = actual_delta / free_unpinned.len() as f32;
-            self.row_weights[pushed_idx] = new_pushed;
-            for &i in &free_unpinned {
-                self.row_weights[i] += share;
-            }
-        }
-        self.custom_row_weights[pushed_idx] = true;
+        let minimized = self.minimized_rows();
+        apply_separator_drag(
+            &mut self.row_weights,
+            &mut self.custom_row_weights,
+            &minimized,
+            row_idx,
+            delta_px,
+            total_height,
+        );
     }
 
     /// Swap two panes within this column.
@@ -1947,42 +2077,139 @@ impl Column {
         }
     }
 
-    pub fn max_leaf_width_fraction(&self) -> f32 { 1.0 }
-
-    fn redistribute_loss_static(weights: &mut Vec<f32>, custom: &Vec<bool>, amount: f32, range: std::ops::Range<usize>, fallback: usize) {
-        let sum: f32 = weights.iter().sum();
-        let min_weight = sum * 0.05;
-        let unpinned: Vec<usize> = range.filter(|&i| !custom[i]).collect();
-        if unpinned.is_empty() {
-            if fallback < weights.len() {
-                weights[fallback] = (weights[fallback] - amount).max(min_weight);
-            }
-        } else {
-            let share = amount / unpinned.len() as f32;
-            for &i in &unpinned {
-                weights[i] = (weights[i] - share).max(min_weight);
-            }
-        }
-    }
-
-    fn redistribute_gain_static(weights: &mut Vec<f32>, custom: &Vec<bool>, amount: f32, range: std::ops::Range<usize>, fallback: usize) {
-        let unpinned: Vec<usize> = range.filter(|&i| !custom[i]).collect();
-        if unpinned.is_empty() {
-            if fallback < weights.len() {
-                weights[fallback] += amount;
-            }
-        } else {
-            let share = amount / unpinned.len() as f32;
-            for &i in &unpinned {
-                weights[i] += share;
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
+    use super::{adjacent_visible_pairs, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, max_visible_fraction, new_entry_weight, normalize_process_name, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
+
+    // ------------------------------------------------------------------
+    // Minimized entries must not pollute the layout of the visible ones.
+    //
+    // A minimized column keeps its weight so it can come back at its old
+    // size, but it renders at zero width. Every one of these tests puts a
+    // minimized entry next to visible ones and checks the visible ones are
+    // laid out exactly as if it were not there.
+    // ------------------------------------------------------------------
+
+    /// Rendered sizes, minimized entries included (0.0 each).
+    fn rendered(weights: &[f32], minimized: &[bool], total: f32) -> Vec<f32> {
+        distribute_visible(weights, minimized, total)
+    }
+
+    #[test]
+    fn split_while_scrolling_keeps_the_visible_widths_with_a_minimized_column() {
+        // Columns [A, M(minimized)], A alone fills the 2000px virtual space.
+        // Splitting A inserts N between them, born at A's width (2000px), and
+        // the virtual space grows to hold both: A and N keep 2000px each.
+        let mut weights = vec![1.0, 1.0, 1.0];
+        let minimized = [false, false, true]; // [A, N, M]
+        let new_virtual =
+            reweight_for_scrolled_split(&mut weights, &minimized, 1, 2000.0, 2000.0).unwrap();
+        assert!((new_virtual - 4000.0).abs() < 0.01, "virtual = {}", new_virtual);
+        let px = rendered(&weights, &minimized, new_virtual);
+        assert!((px[0] - 2000.0).abs() < 1.0, "A = {}px, expected 2000", px[0]);
+        assert!((px[1] - 2000.0).abs() < 1.0, "N = {}px, expected 2000", px[1]);
+    }
+
+    #[test]
+    fn a_new_column_is_born_the_size_of_the_visible_ones() {
+        // One wide visible column (weight 3) and two minimized leftovers.
+        // The new column should share the space with the visible one: 50/50.
+        let weights = [3.0, 0.5, 0.5];
+        let minimized = [false, true, true];
+        let w = new_entry_weight(&weights, &minimized);
+        let after = [3.0, w, 0.5, 0.5];
+        let after_min = [false, false, true, true];
+        let px = rendered(&after, &after_min, 1000.0);
+        assert!((px[0] - 500.0).abs() < 1.0, "old = {}px, expected 500", px[0]);
+        assert!((px[1] - 500.0).abs() < 1.0, "new = {}px, expected 500", px[1]);
+    }
+
+    #[test]
+    fn dragging_a_separator_follows_the_cursor_with_a_minimized_column() {
+        // Two visible columns at 500px each, plus a minimized one holding
+        // weight 2. Dragging the separator 100px right must move it 100px.
+        let mut weights = vec![1.0, 1.0, 2.0];
+        let mut custom = vec![false, false, false];
+        let minimized = [false, false, true];
+        apply_separator_drag(&mut weights, &mut custom, &minimized, 0, 100.0, 1000.0);
+        let px = rendered(&weights, &minimized, 1000.0);
+        assert!((px[0] - 600.0).abs() < 1.0, "left = {}px, expected 600", px[0]);
+        assert!((px[1] - 400.0).abs() < 1.0, "right = {}px, expected 400", px[1]);
+    }
+
+    #[test]
+    fn the_widest_visible_column_is_measured_against_the_rendered_space() {
+        // Visible weights 1 and 3 → the wide one takes 3/4 of the screen.
+        // The minimized weight-4 column must not dilute that fraction.
+        let frac = max_visible_fraction(&[1.0, 3.0, 4.0], &[false, false, true]);
+        assert!((frac - 0.75).abs() < 0.001, "fraction = {}, expected 0.75", frac);
+    }
+
+    #[test]
+    fn clamping_caps_the_width_actually_rendered() {
+        // Same layout: the wide column renders at 750px of a 1000px space.
+        // Capping at 600px must bring it to 600px on screen.
+        let mut weights = vec![1.0, 3.0, 4.0];
+        let minimized = [false, false, true];
+        clamp_weights_to_max(&mut weights, &minimized, 1000.0, 600.0);
+        let px = rendered(&weights, &minimized, 1000.0);
+        assert!(px[1] <= 601.0, "wide column = {}px, expected ≤ 600", px[1]);
+    }
+
+    #[test]
+    fn edge_grow_leaves_the_other_visible_column_alone() {
+        // Two visible columns at 500px each in a 1000px space (plus a
+        // minimized one). Growing the first to a 1200px total: it takes the
+        // whole +200px, the second stays at 500px.
+        let mut weights = vec![1.0, 1.0, 2.0];
+        let minimized = [false, false, true];
+        reweight_for_edge_grow(&mut weights, &minimized, 0, 1000.0, 1200.0);
+        let px = rendered(&weights, &minimized, 1200.0);
+        assert!((px[0] - 700.0).abs() < 1.0, "grown = {}px, expected 700", px[0]);
+        assert!((px[1] - 500.0).abs() < 1.0, "other = {}px, expected 500", px[1]);
+    }
+
+    #[test]
+    fn keyboard_resize_only_moves_weight_between_visible_columns() {
+        // Growing the first column must take from the visible column next to
+        // it, never from the minimized one hiding behind.
+        let mut weights = vec![1.0, 1.0, 1.0];
+        let mut custom = vec![false, false, false];
+        let minimized = [false, false, true];
+        let before_visible = weights[0] + weights[1];
+        assert!(apply_directional_resize(&mut weights, &mut custom, &minimized, 0, 1.0));
+        assert!((weights[2] - 1.0).abs() < 0.001, "minimized weight moved: {}", weights[2]);
+        assert!(
+            ((weights[0] + weights[1]) - before_visible).abs() < 0.001,
+            "visible weight sum changed: {} → {}",
+            before_visible,
+            weights[0] + weights[1]
+        );
+        assert!(weights[0] > 1.0, "focused column did not grow: {}", weights[0]);
+    }
+
+    #[test]
+    fn the_last_visible_column_resizes_from_its_left_edge() {
+        // Column 1 is the last one on screen (column 2 is minimized), so it
+        // controls its left edge: Right shrinks it.
+        let mut weights = vec![1.0, 1.0, 1.0];
+        let mut custom = vec![false, false, false];
+        let minimized = [false, false, true];
+        assert!(apply_directional_resize(&mut weights, &mut custom, &minimized, 1, 1.0));
+        assert!(weights[1] < 1.0, "last visible column grew instead: {}", weights[1]);
+        assert!(weights[0] > 1.0, "its left neighbour did not grow: {}", weights[0]);
+    }
+
+    #[test]
+    fn a_minimized_column_does_not_swallow_the_separator_it_sits_on() {
+        // [A, M(minimized), B] draws one separator, between A and B.
+        assert_eq!(adjacent_visible_pairs(&[false, true, false]), vec![(0, 2)]);
+        // Trailing and leading minimized entries add no separator.
+        assert_eq!(adjacent_visible_pairs(&[false, false, true]), vec![(0, 1)]);
+        assert_eq!(adjacent_visible_pairs(&[true, false]), vec![]);
+    }
 
     #[test]
     fn shrink_virtual_gives_back_hidden_column_width() {
@@ -2064,6 +2291,35 @@ mod tests {
     }
 
     #[test]
+    fn process_name_kept_as_is_when_already_a_bare_binary() {
+        assert_eq!(normalize_process_name("claude").as_deref(), Some("claude"));
+        assert_eq!(normalize_process_name("nvim").as_deref(), Some("nvim"));
+    }
+
+    #[test]
+    fn process_name_keeps_only_the_last_path_component() {
+        assert_eq!(normalize_process_name("/usr/bin/ssh").as_deref(), Some("ssh"));
+    }
+
+    #[test]
+    fn process_name_drops_the_login_shell_dash() {
+        assert_eq!(normalize_process_name("-zsh").as_deref(), Some("zsh"));
+    }
+
+    #[test]
+    fn process_name_trims_surrounding_whitespace() {
+        assert_eq!(normalize_process_name("  cargo \n").as_deref(), Some("cargo"));
+    }
+
+    #[test]
+    fn unresolvable_process_name_yields_nothing_to_display() {
+        // proc_name failing gives an empty string — must not render a blank label.
+        assert_eq!(normalize_process_name(""), None);
+        assert_eq!(normalize_process_name("   "), None);
+        assert_eq!(normalize_process_name("-"), None);
+    }
+
+    #[test]
     fn strip_activity_prefix_trims_spinner_and_idle_marker() {
         // Braille working spinner stripped for a stable, non-jittering title.
         assert_eq!(strip_activity_prefix("\u{2802} Revue de code"), "Revue de code");
@@ -2098,7 +2354,8 @@ mod tests {
         let old_virtual = 2700.0;
         let new_col_px = 900.0; // focused pane width
         let mut weights = vec![900.0, 900.0, 900.0, 900.0]; // last = just-inserted (avg)
-        let new_virtual = reweight_for_scrolled_split(&mut weights, 3, old_virtual, new_col_px).unwrap();
+        let minimized = [false; 4];
+        let new_virtual = reweight_for_scrolled_split(&mut weights, &minimized, 3, old_virtual, new_col_px).unwrap();
         assert_eq!(new_virtual, 3600.0);
         let widths = col_widths(&weights, new_virtual);
         // All four columns end up at the same width, nothing shrunk.
@@ -2114,7 +2371,8 @@ mod tests {
         let old_virtual = 1800.0;
         let new_col_px = 600.0;
         let mut weights = vec![1200.0, 900.0, 600.0]; // idx 1 = just-inserted (avg of 1200+600)
-        let new_virtual = reweight_for_scrolled_split(&mut weights, 1, old_virtual, new_col_px).unwrap();
+        let minimized = [false; 3];
+        let new_virtual = reweight_for_scrolled_split(&mut weights, &minimized, 1, old_virtual, new_col_px).unwrap();
         assert_eq!(new_virtual, 2400.0);
         let widths = col_widths(&weights, new_virtual);
         assert!((widths[0] - 1200.0).abs() < 0.01);
@@ -2125,38 +2383,70 @@ mod tests {
     #[test]
     fn scrolled_split_bad_index_is_noop() {
         let mut weights = vec![1.0, 1.0];
-        assert!(reweight_for_scrolled_split(&mut weights, 5, 1000.0, 300.0).is_none());
+        assert!(reweight_for_scrolled_split(&mut weights, &[false, false], 5, 1000.0, 300.0).is_none());
         assert_eq!(weights, vec![1.0, 1.0]);
     }
 
     #[test]
     fn custom_title_wins_over_everything() {
-        let t = derive_display_title(Some("my pane"), Some("osc"), Some("/home/x/proj"), "shell");
+        let t = derive_display_title(
+            Some("my pane"),
+            Some("session"),
+            Some("osc"),
+            Some("/home/x/proj"),
+            "shell",
+        );
         assert_eq!(t, "my pane");
     }
 
     #[test]
+    fn claude_session_name_wins_over_osc_title() {
+        // The OSC title a Claude pane carries is the generic "✳ Claude Code";
+        // the name the user gave the session is what identifies the pane.
+        let t = derive_display_title(
+            None,
+            Some("pane switcher"),
+            Some("✳ Claude Code"),
+            Some("/home/x/proj"),
+            "shell",
+        );
+        assert_eq!(t, "pane switcher");
+    }
+
+    #[test]
+    fn blank_claude_session_name_falls_through_to_osc_title() {
+        let t = derive_display_title(None, Some("   "), Some("vim"), Some("/home/x/proj"), "shell");
+        assert_eq!(t, "vim");
+    }
+
+    #[test]
     fn non_empty_osc_title_used() {
-        let t = derive_display_title(None, Some("vim"), Some("/home/x/proj"), "shell");
+        let t = derive_display_title(None, None, Some("vim"), Some("/home/x/proj"), "shell");
         assert_eq!(t, "vim");
     }
 
     #[test]
     fn empty_osc_title_falls_back_to_cwd_basename() {
-        let t = derive_display_title(None, Some(""), Some("/home/x/proj"), "shell");
+        let t = derive_display_title(None, None, Some(""), Some("/home/x/proj"), "shell");
         assert_eq!(t, "proj");
     }
 
     #[test]
     fn whitespace_osc_title_falls_back_to_cwd_basename() {
-        let t = derive_display_title(None, Some("   "), Some("/home/x/proj"), "shell");
+        let t = derive_display_title(None, None, Some("   "), Some("/home/x/proj"), "shell");
         assert_eq!(t, "proj");
     }
 
     #[test]
+    fn claude_session_name_used_when_the_pane_has_no_other_title() {
+        let t = derive_display_title(None, Some("kova-bc"), None, None, "shell");
+        assert_eq!(t, "kova-bc");
+    }
+
+    #[test]
     fn no_title_no_cwd_uses_fallback() {
-        assert_eq!(derive_display_title(None, None, None, "shell"), "shell");
+        assert_eq!(derive_display_title(None, None, None, None, "shell"), "shell");
         // Empty OSC title with no cwd must also reach the fallback, never blank.
-        assert_eq!(derive_display_title(None, Some(""), None, "shell"), "shell");
+        assert_eq!(derive_display_title(None, None, Some(""), None, "shell"), "shell");
     }
 }

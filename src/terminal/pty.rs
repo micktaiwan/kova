@@ -344,25 +344,33 @@ impl Pty {
         // established (setsid + TIOCSCTTY in pre_exec).
     }
 
-    /// Returns the name of the foreground process if it differs from the shell
-    /// (i.e. a command like vim, cargo, etc. is running).
-    /// True when a process other than the shell owns the terminal foreground
-    /// (one tcgetpgrp ioctl — no process-name resolution).
-    pub fn has_foreground_process(&self) -> bool {
-        !self.is_dummy && foreground_pgid(self.master_fd.as_raw_fd(), self.child_pid).is_some()
-    }
-
-    pub fn foreground_process_name(&self) -> Option<String> {
+    /// Foreground process *and* its name in a single tcgetpgrp probe, for
+    /// callers that need both (the status bar and the pane switcher show the
+    /// name; `check_running` needs the yes/no).
+    ///
+    /// `None` = the shell itself owns the terminal. `Some(name)` = another
+    /// process does; `name` is empty when `proc_name` could not resolve it, so
+    /// an empty name must never be read as "no foreground process".
+    pub fn foreground_process(&self) -> Option<String> {
+        if self.is_dummy {
+            return None;
+        }
         let fg_pgid = foreground_pgid(self.master_fd.as_raw_fd(), self.child_pid)?;
         let mut name_buf = [0u8; 256];
         let len = unsafe {
             libc::proc_name(fg_pgid, name_buf.as_mut_ptr() as *mut libc::c_void, 256)
         };
-        if len > 0 {
-            Some(String::from_utf8_lossy(&name_buf[..len as usize]).to_string())
+        Some(if len > 0 {
+            String::from_utf8_lossy(&name_buf[..len as usize]).into_owned()
         } else {
-            None
-        }
+            String::new()
+        })
+    }
+
+    /// Returns the name of the foreground process if it differs from the shell
+    /// (i.e. a command like vim, cargo, etc. is running).
+    pub fn foreground_process_name(&self) -> Option<String> {
+        self.foreground_process().filter(|name| !name.is_empty())
     }
 
     /// Returns the PID of the child shell process.

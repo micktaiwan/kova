@@ -192,6 +192,9 @@ pub struct SendToWindowRenderData<'a> {
 /// or a selectable pane entry.
 pub struct PaneSwitcherRowRender<'a> {
     pub text: &'a str,
+    /// Foreground binary running in that pane (`claude`, `nvim`…), drawn dimmed
+    /// after the label. Empty when the pane sits at a bare shell prompt.
+    pub process: &'a str,
     pub is_header: bool,
     /// Pending bell on this pane (unread) — drives an attention dot.
     pub has_bell: bool,
@@ -243,6 +246,9 @@ pub struct PaneRenderData {
     pub has_bell: bool,
     pub minimized: bool,
     pub input_chars: Arc<std::sync::atomic::AtomicU64>,
+    /// Foreground binary running in the pane (`claude`, `nvim`…), shown in the
+    /// status bar. `None` at a bare shell prompt.
+    pub fg_process: Option<String>,
 }
 
 /// Cached vertex list for one pane, with the conditions it was built under.
@@ -532,7 +538,7 @@ impl Renderer {
                             let t = pane.terminal.read();
                             let show_blink = if pane.is_focused { blink_on } else { true };
                             let pin = pane.input_chars.load(std::sync::atomic::Ordering::Relaxed);
-                            self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin, pane.pane_id)
+                            self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin, pane.pane_id, pane.fg_process.as_deref())
                         } else {
                             self.build_loading_vertices(vp)
                         };
@@ -1021,6 +1027,7 @@ impl Renderer {
         attention: PaneAttention,
         pane_input_chars: u64,
         pane_id: PaneId,
+        fg_process: Option<&str>,
     ) -> Vec<Vertex> {
         // Pass 1: collect unknown chars/clusters for dynamic rasterization
         let display = term.visible_lines();
@@ -1286,7 +1293,7 @@ impl Renderer {
 
         // Status bar
         if self.status_bar_enabled {
-            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention, pane_input_chars, pane_id);
+            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention, pane_input_chars, pane_id, fg_process);
         }
 
         vertices
@@ -1301,6 +1308,7 @@ impl Renderer {
         attention: PaneAttention,
         pane_input_chars: u64,
         pane_id: PaneId,
+        fg_process: Option<&str>,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
@@ -1315,6 +1323,7 @@ impl Renderer {
         let scroll_fg = [self.status_bar_scroll_color[0], self.status_bar_scroll_color[1], self.status_bar_scroll_color[2], 1.0];
         let title_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 1.0];
         let id_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 0.6];
+        let process_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 0.9];
 
         // Pane ID first, always visible: it is the handle used to address the
         // pane over IPC, so it never gets dropped when the bar runs out of room.
@@ -1349,7 +1358,17 @@ impl Renderer {
             Some(_) => branch_fg,
             None => [branch_fg[0] * 0.5, branch_fg[1] * 0.5, branch_fg[2] * 0.5, 0.5],
         };
-        let left_end = self.render_status_text(vertices, &branch_display, cursor_x, bar_y, vp.x + vp.width * 0.6, actual_branch_fg, no_bg);
+        let mut left_end = self.render_status_text(vertices, &branch_display, cursor_x, bar_y, vp.x + vp.width * 0.6, actual_branch_fg, no_bg);
+
+        // Foreground process after the branch: what is actually running in the
+        // pane right now (claude, nvim, ssh…). Absent at a bare shell prompt,
+        // so the bar stays quiet when nothing runs.
+        if let Some(process) = fg_process {
+            let proc_x = left_end + cell_w * 2.0;
+            let proc_w = process.chars().count() as f32 * cell_w;
+            left_end = self.render_status_text(vertices, process, proc_x, bar_y, vp.x + vp.width * 0.75, process_fg, no_bg);
+            self.push_tooltip_zone(proc_x, bar_y, proc_w, cell_h, "Foreground process running in this pane");
+        }
 
         // Right side: title (custom or hovered URL or OSC) + scroll indicator
         let right_edge = vp.x + vp.width - cell_w; // 1 cell padding from right
@@ -2356,6 +2375,12 @@ impl Renderer {
                     let text = format!("    {}", row.text);
                     let row_fg = if row.minimized { dim_fg } else { label_fg };
                     self.render_text(vertices, &text, left_margin, text_y, right_margin, row_fg, no_bg, body_scale);
+                    // What is actually running in that pane, dimmed after the
+                    // label so it reads as an annotation, not a second title.
+                    if !row.process.is_empty() {
+                        let process_x = left_margin + (text.chars().count() + 2) as f32 * scaled_cell_w;
+                        self.render_text(vertices, row.process, process_x, text_y, right_margin, dim_fg, no_bg, body_scale);
+                    }
                     if row.minimized {
                         // Minimized marker in the 1st char slot, in a color of
                         // its own so hidden panes stand out in the list.

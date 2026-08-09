@@ -32,7 +32,18 @@ const START_TIME_TOLERANCE_SECS: u64 = 30;
 /// of times per save for no reason.
 const CACHE_TTL: Duration = Duration::from_secs(1);
 
-static CACHE: Mutex<Option<(Instant, HashMap<u32, String>)>> = Mutex::new(None);
+static CACHE: Mutex<Option<(Instant, HashMap<u32, Session>)>> = Mutex::new(None);
+
+/// What a live Claude Code session file tells us about the session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Session {
+    /// Conversation id, the argument `claude --resume` expects.
+    pub id: String,
+    /// Session name as set by Claude Code's `/rename`, absent until the user
+    /// sets one. Claude Code never puts it in the terminal title, so reading
+    /// the file is the only way to show it.
+    pub name: Option<String>,
+}
 
 fn sessions_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -57,9 +68,28 @@ fn proc_info(pid: u32) -> Option<(u32, u64)> {
     }
 }
 
-/// Build a map of "ancestor PID → Claude session id" from `~/.claude/sessions/`.
+/// Read one `~/.claude/sessions/<pid>.json` body into the PID that owns it, the
+/// epoch-second it started at, and the session it describes. `None` when the
+/// file is not JSON or misses a field we cannot do without.
+fn parse_session_file(data: &str) -> Option<(u32, u64, Session)> {
+    let json = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    let pid = json.get("pid").and_then(|v| v.as_u64())? as u32;
+    let id = json.get("sessionId").and_then(|v| v.as_str())?.to_string();
+    let started_at = json.get("startedAt").and_then(|v| v.as_u64())? / 1000;
+    // `name` is absent until the session is named, and Claude Code accepts a
+    // blank one, so an all-whitespace name counts as no name at all.
+    let name = json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    Some((pid, started_at, Session { id, name }))
+}
+
+/// Build a map of "ancestor PID → Claude session" from `~/.claude/sessions/`.
 /// A pane then finds its session by looking up its own shell PID.
-fn scan_uncached() -> HashMap<u32, String> {
+fn scan_uncached() -> HashMap<u32, Session> {
     let mut map = HashMap::new();
     let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
         return map;
@@ -72,14 +102,7 @@ fn scan_uncached() -> HashMap<u32, String> {
             continue;
         }
         let Ok(data) = std::fs::read_to_string(&path) else { continue };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
-        let (Some(pid), Some(session_id), Some(started_at)) = (
-            json.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32),
-            json.get("sessionId").and_then(|v| v.as_str()),
-            json.get("startedAt").and_then(|v| v.as_u64()).map(|ms| ms / 1000),
-        ) else {
-            continue;
-        };
+        let Some((pid, started_at, session)) = parse_session_file(&data) else { continue };
 
         // The file is normally deleted when Claude Code exits, but one left
         // behind by a killed process would point at whatever later recycled
@@ -99,15 +122,17 @@ fn scan_uncached() -> HashMap<u32, String> {
             if parent <= 1 || parent == own_pid {
                 break;
             }
-            map.insert(parent, session_id.to_string());
+            map.insert(parent, session.clone());
             current = parent;
         }
     }
     map
 }
 
-/// The Claude Code session id running under `shell_pid`, if any.
-pub fn for_shell(shell_pid: u32) -> Option<String> {
+/// The Claude Code session running under `shell_pid`, if any. Shared by the
+/// session snapshot (which wants the id) and the pane title (which wants the
+/// name), so both ride the same cached scan.
+pub fn session_for_shell(shell_pid: u32) -> Option<Session> {
     let mut cache = CACHE.lock();
     let fresh = match cache.as_ref() {
         Some((at, _)) => at.elapsed() < CACHE_TTL,
@@ -117,6 +142,16 @@ pub fn for_shell(shell_pid: u32) -> Option<String> {
         *cache = Some((Instant::now(), scan_uncached()));
     }
     cache.as_ref().and_then(|(_, map)| map.get(&shell_pid).cloned())
+}
+
+/// The Claude Code session id running under `shell_pid`, if any.
+pub fn for_shell(shell_pid: u32) -> Option<String> {
+    session_for_shell(shell_pid).map(|s| s.id)
+}
+
+/// The `/rename` name of the Claude Code session running under `shell_pid`.
+pub fn name_for_shell(shell_pid: u32) -> Option<String> {
+    session_for_shell(shell_pid).and_then(|s| s.name)
 }
 
 /// Build the command line that reopens `session_id`, reusing the flags of the
@@ -185,9 +220,42 @@ mod tests {
     fn claude_sessions_are_detected_on_this_machine() {
         let map = scan_uncached();
         for (pid, session) in &map {
-            println!("  pid {} → {}", pid, session);
+            println!("  pid {} → {} ({:?})", pid, session.id, session.name);
         }
         assert!(!map.is_empty(), "no live Claude Code session found");
+    }
+
+    /// Shape of a real file, taken from a live session on 2026-08-09.
+    const LIVE_FILE: &str = r#"{"pid":10487,"sessionId":"430e0c8f","cwd":"/Users/x/vigie",
+        "startedAt":1786280230040,"version":"2.1.226","kind":"interactive",
+        "entrypoint":"cli","name":"images","status":"busy"}"#;
+
+    #[test]
+    fn session_file_yields_pid_start_and_name() {
+        let (pid, started_at, session) = parse_session_file(LIVE_FILE).unwrap();
+        assert_eq!(pid, 10487);
+        assert_eq!(started_at, 1786280230); // milliseconds → seconds
+        assert_eq!(session.id, "430e0c8f");
+        assert_eq!(session.name.as_deref(), Some("images"));
+    }
+
+    #[test]
+    fn session_never_renamed_has_no_name() {
+        let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000}"#;
+        assert_eq!(parse_session_file(data).unwrap().2.name, None);
+    }
+
+    #[test]
+    fn blank_session_name_counts_as_no_name() {
+        let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000,"name":"  "}"#;
+        assert_eq!(parse_session_file(data).unwrap().2.name, None);
+    }
+
+    #[test]
+    fn unparseable_or_incomplete_session_file_is_skipped() {
+        assert!(parse_session_file("not json").is_none());
+        // No sessionId: nothing to resume and nothing to name.
+        assert!(parse_session_file(r#"{"pid":1,"startedAt":1000}"#).is_none());
     }
 
     #[test]
