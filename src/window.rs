@@ -13,6 +13,7 @@ use crate::input;
 use crate::keybindings::{Action, Keybindings, KeyCombo};
 use crate::pane::{alloc_tab_id, NavDirection, Pane, PaneId, SplitDirection, Tab, TabId};
 use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
+use crate::terminal::pty::ProcessInfo;
 use crate::terminal::{FilterMatch, GridPos, Selection, SelectionMode};
 
 #[derive(Clone, Copy)]
@@ -315,6 +316,10 @@ enum SwitcherRow {
         working: bool,
         /// This pane told us it is waiting for the user (?).
         awaiting: bool,
+        /// The binary running in the pane, with its version when known
+        /// ("claude 2.1.226"). `None` at a bare shell prompt, and also when the
+        /// title already *is* that name — no row should say "vim … vim".
+        process: Option<String>,
     },
 }
 
@@ -322,6 +327,17 @@ impl SwitcherRow {
     fn is_pane(&self) -> bool {
         matches!(self, SwitcherRow::Pane { .. })
     }
+}
+
+/// What a pane switcher row says about the binary running in the pane.
+///
+/// Titles come from the app itself (Claude Code names the session, an editor
+/// names the file), so the program behind them is invisible in the list — this
+/// is what puts it back. It stays out of the way when the title *is* the
+/// program name, which is what a pane at a bare `vim` already shows.
+fn switcher_process_label(process: Option<&ProcessInfo>, title: &str) -> Option<String> {
+    let label = process?.label();
+    (!label.is_empty() && label != title).then_some(label)
 }
 
 /// Next pane row flagged as waiting for the user, scanning forward from just
@@ -3252,9 +3268,11 @@ impl KovaView {
                             term.unread_completion(),
                         )
                     };
+                    let title = pane.display_title("shell");
+                    let process = switcher_process_label(pane.fg_process().as_ref(), &title);
                     rows.push(SwitcherRow::Pane {
                         pane_id: pane.id,
-                        title: pane.display_title("shell"),
+                        title,
                         is_current,
                         has_bell,
                         has_completion,
@@ -3262,6 +3280,7 @@ impl KovaView {
                         working: pane.is_working(),
                         // Like bell/completion: never on the pane being looked at.
                         awaiting: !is_current && pane.is_awaiting(),
+                        process,
                     });
                 });
                 groups.push(rows);
@@ -4298,7 +4317,13 @@ impl KovaView {
                 let is_idle = children.is_empty();
                 let child_json: Vec<serde_json::Value> = children
                     .into_iter()
-                    .map(|(cpid, name)| serde_json::json!({"pid": cpid, "name": name}))
+                    .map(|(cpid, info)| {
+                        serde_json::json!({
+                            "pid": cpid,
+                            "name": info.name,
+                            "version": info.version,
+                        })
+                    })
                     .collect();
                 out.push(serde_json::json!({
                     "id": pane.id,
@@ -5835,7 +5860,9 @@ impl KovaView {
                     has_bell,
                     minimized: pane.minimized,
                     input_chars: pane.pty.input_chars.clone(),
-                    fg_process: pane.fg_process(),
+                    // Name only: the status bar is the densest line in the app,
+                    // and the version has room in the pane switcher instead.
+                    fg_process: pane.fg_process().map(|p| p.name),
                 });
             });
 
@@ -6137,8 +6164,8 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, awaiting: false },
-                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, awaiting, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, awaiting: *awaiting },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, awaiting: false, process: None },
+                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, awaiting, process, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, awaiting: *awaiting, process: process.as_deref() },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -6414,11 +6441,29 @@ mod tests {
                             minimized: false,
                             working: false,
                             awaiting: c == '?',
+                            process: None,
                         },
                     })
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn switcher_row_names_the_binary_and_its_version() {
+        let claude = ProcessInfo { name: "claude".into(), version: Some("2.1.226".into()) };
+        assert_eq!(
+            switcher_process_label(Some(&claude), "Corriger child_processes"),
+            Some("claude 2.1.226".to_string())
+        );
+    }
+
+    #[test]
+    fn switcher_row_stays_quiet_when_the_title_is_already_the_binary() {
+        let vim = ProcessInfo { name: "vim".into(), version: None };
+        assert_eq!(switcher_process_label(Some(&vim), "vim"), None);
+        // A shell prompt has no foreground process at all.
+        assert_eq!(switcher_process_label(None, "kova"), None);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::renderer::PaneViewport;
-use crate::terminal::pty::Pty;
+use crate::terminal::pty::{ProcessInfo, Pty};
 use crate::terminal::TerminalState;
 
 pub type PaneId = u32;
@@ -1508,7 +1508,7 @@ pub struct Pane {
     /// `None` at a bare shell prompt. Cached because the status bar reads it on
     /// every frame while resolving it costs two syscalls: it is refreshed on the
     /// same ~0.5s throttle as the running-state probe, in `Tab::check_running`.
-    fg_process: RefCell<Option<String>>,
+    fg_process: RefCell<Option<ProcessInfo>>,
 }
 
 /// Resolve the label to show for a pane, in priority order: user-set custom
@@ -1695,15 +1695,16 @@ impl Pane {
     fn refresh_fg_process(&self) -> bool {
         let probe = self.pty.foreground_process();
         let running = probe.is_some();
-        self.fg_process
-            .replace(probe.and_then(|name| normalize_process_name(&name)));
+        self.fg_process.replace(probe.and_then(|info| {
+            normalize_process_name(&info.name).map(|name| ProcessInfo { name, ..info })
+        }));
         running
     }
 
-    /// Cached name of the foreground binary, `None` at a bare shell prompt.
-    /// Up to ~0.5s stale (see `Tab::check_running`), which is what makes it
-    /// free to read on every frame.
-    pub fn fg_process(&self) -> Option<String> {
+    /// Cached name and version of the foreground binary, `None` at a bare shell
+    /// prompt. Up to ~0.5s stale (see `Tab::check_running`), which is what makes
+    /// it free to read on every frame.
+    pub fn fg_process(&self) -> Option<ProcessInfo> {
         self.fg_process.borrow().clone()
     }
 
@@ -1739,7 +1740,7 @@ impl Pane {
             self.custom_title.as_deref(),
             self.claude_name.borrow().as_deref(),
             term.title.as_deref(),
-            self.fg_process.borrow().as_deref(),
+            self.fg_process.borrow().as_ref().map(|p| p.name.as_str()),
             term.cwd.as_deref(),
             fallback,
         )

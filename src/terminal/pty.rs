@@ -47,6 +47,120 @@ fn foreground_pgid(master_fd: i32, child_pid: u32) -> Option<i32> {
     }
 }
 
+/// What a process is: the program's name, plus its version when the way it is
+/// installed on disk reveals one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessInfo {
+    pub name: String,
+    pub version: Option<String>,
+}
+
+impl ProcessInfo {
+    /// One string for display: "claude 2.1.226", or just "vim" when the
+    /// version is unknown. Empty when the name could not be resolved.
+    pub fn label(&self) -> String {
+        match &self.version {
+            Some(v) if !self.name.is_empty() => format!("{} {}", self.name, v),
+            _ => self.name.clone(),
+        }
+    }
+}
+
+/// The name and version of the program running as `pid`.
+///
+/// The obvious source, `proc_name`, returns the kernel's `p_comm`: the basename
+/// of the *file* that was executed, truncated to 16 characters. Claude Code
+/// installs its binary as `~/.local/share/claude/versions/2.1.226`, so `p_comm`
+/// there is a version number and never the word "claude" — every caller reading
+/// a program name out of it got `2.1.226`.
+///
+/// argv[0] is the name the program was invoked under, which is what `ps` shows
+/// and what a human calls the program, so that is the name. The executable's
+/// own basename is then worth keeping when it looks like a version: that is
+/// exactly the case that broke the name, and it answers "which version of
+/// Claude is this pane running".
+pub fn process_info(pid: u32) -> ProcessInfo {
+    let args = proc_args(pid);
+    let name = args
+        .as_ref()
+        .map(|(_, argv0)| program_name(argv0))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| proc_comm(pid));
+    let version = args.as_ref().and_then(|(exe_path, _)| version_from_exe_path(exe_path));
+    ProcessInfo { name, version }
+}
+
+/// The executable path and argv[0] of `pid`, via `KERN_PROCARGS2`.
+///
+/// The area is laid out as: argc (i32), the executable path, NUL padding, then
+/// argv[0], argv[1]… Only the first two fields are wanted and they sit at the
+/// front, so a small buffer is enough — the kernel copies out what fits instead
+/// of failing, which avoids allocating `KERN_ARGMAX` (1 MiB) per probe.
+fn proc_args(pid: u32) -> Option<(String, String)> {
+    let mut buf = vec![0u8; 4096];
+    let mut len = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len <= std::mem::size_of::<libc::c_int>() {
+        return None;
+    }
+    parse_proc_args(&buf[..len])
+}
+
+/// Split a `KERN_PROCARGS2` buffer into (executable path, argv[0]).
+fn parse_proc_args(buf: &[u8]) -> Option<(String, String)> {
+    let body = buf.get(std::mem::size_of::<libc::c_int>()..)?; // skip argc
+    let end = body.iter().position(|&b| b == 0)?;
+    let exe_path = String::from_utf8_lossy(&body[..end]).into_owned();
+    // The path is followed by one or more NULs before argv[0] starts.
+    let rest = &body[end..];
+    let start = rest.iter().position(|&b| b != 0)?;
+    let rest = &rest[start..];
+    let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    Some((exe_path, String::from_utf8_lossy(&rest[..end]).into_owned()))
+}
+
+/// The kernel's `p_comm` for `pid` — the fallback when argv[0] is unreadable.
+fn proc_comm(pid: u32) -> String {
+    let mut name_buf = [0u8; 256];
+    let len = unsafe {
+        libc::proc_name(pid as i32, name_buf.as_mut_ptr() as *mut libc::c_void, 256)
+    };
+    if len > 0 {
+        String::from_utf8_lossy(&name_buf[..len as usize]).into_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// The program name inside an argv[0]: its last path component, without the
+/// leading dash a login shell is exec'd with.
+fn program_name(argv0: &str) -> String {
+    argv0.rsplit('/').next().unwrap_or(argv0).trim_start_matches('-').to_string()
+}
+
+/// The version an executable path carries in its own name, if any.
+///
+/// Only a basename that is nothing but a version number counts (`2.1.226`,
+/// `v1.0`); anything a program could plausibly be called is not a version.
+fn version_from_exe_path(exe_path: &str) -> Option<String> {
+    let base = exe_path.rsplit('/').next().unwrap_or(exe_path);
+    let digits = base.strip_prefix('v').unwrap_or(base);
+    let parts: Vec<&str> = digits.split('.').collect();
+    let numeric = parts.len() >= 2
+        && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    numeric.then(|| base.to_string())
+}
+
 pub struct Pty {
     master_fd: OwnedFd,
     child_pid: u32,
@@ -348,29 +462,21 @@ impl Pty {
     /// callers that need both (the status bar and the pane switcher show the
     /// name; `check_running` needs the yes/no).
     ///
-    /// `None` = the shell itself owns the terminal. `Some(name)` = another
-    /// process does; `name` is empty when `proc_name` could not resolve it, so
-    /// an empty name must never be read as "no foreground process".
-    pub fn foreground_process(&self) -> Option<String> {
+    /// `None` = the shell itself owns the terminal. `Some(info)` = another
+    /// process does; `info.name` is empty when the name could not be resolved,
+    /// so an empty name must never be read as "no foreground process".
+    pub fn foreground_process(&self) -> Option<ProcessInfo> {
         if self.is_dummy {
             return None;
         }
         let fg_pgid = foreground_pgid(self.master_fd.as_raw_fd(), self.child_pid)?;
-        let mut name_buf = [0u8; 256];
-        let len = unsafe {
-            libc::proc_name(fg_pgid, name_buf.as_mut_ptr() as *mut libc::c_void, 256)
-        };
-        Some(if len > 0 {
-            String::from_utf8_lossy(&name_buf[..len as usize]).into_owned()
-        } else {
-            String::new()
-        })
+        Some(process_info(fg_pgid as u32))
     }
 
     /// Returns the name of the foreground process if it differs from the shell
     /// (i.e. a command like vim, cargo, etc. is running).
     pub fn foreground_process_name(&self) -> Option<String> {
-        self.foreground_process().filter(|name| !name.is_empty())
+        self.foreground_process().map(|p| p.name).filter(|name| !name.is_empty())
     }
 
     /// Returns the PID of the child shell process.
@@ -378,9 +484,9 @@ impl Pty {
         self.child_pid
     }
 
-    /// Returns the list of child processes of the shell (pid, comm).
-    /// Uses macOS `proc_listchildpids` + `proc_name`.
-    pub fn child_processes(&self) -> Vec<(u32, String)> {
+    /// Returns the list of child processes of the shell (pid, name + version).
+    /// Uses macOS `proc_listchildpids`, then `process_info` for each child.
+    pub fn child_processes(&self) -> Vec<(u32, ProcessInfo)> {
         let pid = self.child_pid as i32;
         // First call to get count
         let count = unsafe { libc::proc_listchildpids(pid, std::ptr::null_mut(), 0) };
@@ -402,20 +508,7 @@ impl Pty {
         // length — dividing by size_of::<i32>() truncated every shell with
         // fewer than four children down to zero.
         pids.truncate(actual as usize);
-        pids.iter()
-            .map(|&cpid| {
-                let mut name_buf = [0u8; 256];
-                let len = unsafe {
-                    libc::proc_name(cpid, name_buf.as_mut_ptr() as *mut libc::c_void, 256)
-                };
-                let name = if len > 0 {
-                    String::from_utf8_lossy(&name_buf[..len as usize]).to_string()
-                } else {
-                    String::new()
-                };
-                (cpid as u32, name)
-            })
-            .collect()
+        pids.iter().map(|&cpid| (cpid as u32, process_info(cpid as u32))).collect()
     }
 
     /// Returns the current working directory of the child shell process.
@@ -531,5 +624,94 @@ impl Drop for Pty {
             reap_child(pid as i32, 50);
         }
         log::info!("PTY child {} cleanup delegated to reaper thread", pid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a KERN_PROCARGS2-shaped buffer: argc, exec path, padding, argv.
+    fn procargs_buffer(exe_path: &str, argv: &[&str]) -> Vec<u8> {
+        let mut buf = (argv.len() as libc::c_int).to_ne_bytes().to_vec();
+        buf.extend_from_slice(exe_path.as_bytes());
+        buf.extend_from_slice(&[0, 0, 0]); // the kernel pads with NULs
+        for arg in argv {
+            buf.extend_from_slice(arg.as_bytes());
+            buf.push(0);
+        }
+        buf
+    }
+
+    #[test]
+    fn proc_args_reads_the_exe_path_and_argv0() {
+        let buf = procargs_buffer("/usr/bin/vim", &["vim", "notes.md"]);
+        assert_eq!(
+            parse_proc_args(&buf),
+            Some(("/usr/bin/vim".to_string(), "vim".to_string()))
+        );
+    }
+
+    #[test]
+    fn proc_args_survives_a_truncated_buffer() {
+        // Only argv[0] is needed, so a buffer cut short mid-argv still answers.
+        let buf = procargs_buffer("/usr/bin/vim", &["vim", "notes.md"]);
+        let cut = buf.len() - 4;
+        assert_eq!(
+            parse_proc_args(&buf[..cut]),
+            Some(("/usr/bin/vim".to_string(), "vim".to_string()))
+        );
+    }
+
+    #[test]
+    fn proc_args_rejects_a_buffer_with_nothing_in_it() {
+        assert_eq!(parse_proc_args(&[]), None);
+        assert_eq!(parse_proc_args(&[1, 2]), None);
+    }
+
+    #[test]
+    fn program_name_is_the_last_path_component() {
+        assert_eq!(program_name("/usr/bin/vim"), "vim");
+        assert_eq!(program_name("claude"), "claude");
+    }
+
+    #[test]
+    fn program_name_drops_the_login_shell_dash() {
+        assert_eq!(program_name("-zsh"), "zsh");
+    }
+
+    #[test]
+    fn version_is_read_from_a_binary_named_after_it() {
+        // How Claude Code installs itself — the case that used to surface as
+        // the program's name.
+        assert_eq!(
+            version_from_exe_path("/Users/x/.local/share/claude/versions/2.1.226").as_deref(),
+            Some("2.1.226")
+        );
+        assert_eq!(version_from_exe_path("/opt/tool/v1.0").as_deref(), Some("v1.0"));
+    }
+
+    #[test]
+    fn a_program_name_is_never_mistaken_for_a_version() {
+        assert_eq!(version_from_exe_path("/usr/bin/vim"), None);
+        assert_eq!(version_from_exe_path("/usr/bin/python3.12"), None);
+        assert_eq!(version_from_exe_path("/usr/bin/2"), None);
+        assert_eq!(version_from_exe_path("/usr/bin/1."), None);
+    }
+
+    #[test]
+    fn label_joins_the_name_and_version() {
+        let claude = ProcessInfo { name: "claude".into(), version: Some("2.1.226".into()) };
+        assert_eq!(claude.label(), "claude 2.1.226");
+        let vim = ProcessInfo { name: "vim".into(), version: None };
+        assert_eq!(vim.label(), "vim");
+    }
+
+    /// Guards the sysctl call itself, which no synthetic buffer can cover.
+    #[test]
+    fn process_info_names_the_running_test_binary() {
+        let info = process_info(std::process::id());
+        assert!(!info.name.is_empty(), "argv[0] and p_comm both unreadable");
+        assert!(info.name.starts_with("kova"), "unexpected name: {}", info.name);
     }
 }

@@ -203,6 +203,9 @@ pub struct PaneSwitcherRowRender<'a> {
     pub working: bool,
     /// This pane is waiting for the user — drives a ? marker.
     pub awaiting: bool,
+    /// Binary running in the pane ("claude 2.1.226"), shown dim at the right
+    /// end of the row. `None` on headers and at a bare shell prompt.
+    pub process: Option<&'a str>,
 }
 
 /// One column of the pane-switcher overlay: a vertical run of rows holding
@@ -229,6 +232,39 @@ pub struct OverlayListGeometry {
     pub content_top: f32,
     pub row_height: f32,
     pub max_visible: usize,
+}
+
+/// Horizontal split of a pane switcher row between its title (left) and the
+/// binary running in the pane (right).
+struct SwitcherRowSplit {
+    /// Where the title stops being drawn, so it never runs into the binary.
+    title_limit: f32,
+    /// Where the binary starts, or `None` when the column is too narrow to
+    /// carry both — a half-written program name is worse than none.
+    process_x: Option<f32>,
+}
+
+/// Lay out one pane switcher row. Pure geometry, so it can be checked without
+/// a GPU: the title keeps the left, the binary is parked flush right with a
+/// two-cell gap, and the binary is dropped entirely when that would leave the
+/// title less than a third of the row.
+fn switcher_row_split(
+    left_margin: f32,
+    right_margin: f32,
+    process_chars: usize,
+    cell_w: f32,
+) -> SwitcherRowSplit {
+    if process_chars == 0 {
+        return SwitcherRowSplit { title_limit: right_margin, process_x: None };
+    }
+    let process_x = right_margin - process_chars as f32 * cell_w;
+    let title_limit = process_x - cell_w * 2.0;
+    let min_title = left_margin + (right_margin - left_margin) / 3.0;
+    if title_limit < min_title {
+        SwitcherRowSplit { title_limit: right_margin, process_x: None }
+    } else {
+        SwitcherRowSplit { title_limit, process_x: Some(process_x) }
+    }
 }
 
 /// Per-pane data passed from window to renderer.
@@ -2372,7 +2408,20 @@ impl Renderer {
                     let attention = PaneAttention::from_flags(row.has_bell, row.has_completion);
                     let text = format!("    {}", row.text);
                     let row_fg = if row.minimized { dim_fg } else { label_fg };
-                    self.render_text(vertices, &text, left_margin, text_y, right_margin, row_fg, no_bg, body_scale);
+                    // The running binary is parked at the right end of the row,
+                    // dim: it says what the pane *is* without competing with the
+                    // title, which is what the eye scans. The title is clipped
+                    // before it rather than drawn under it.
+                    let split = switcher_row_split(
+                        left_margin,
+                        right_margin,
+                        row.process.map_or(0, |p| p.chars().count()),
+                        scaled_cell_w,
+                    );
+                    self.render_text(vertices, &text, left_margin, text_y, split.title_limit, row_fg, no_bg, body_scale);
+                    if let (Some(process), Some(proc_x)) = (row.process, split.process_x) {
+                        self.render_text(vertices, process, proc_x, text_y, right_margin, dim_fg, no_bg, body_scale);
+                    }
                     if row.minimized {
                         // Minimized marker in the 1st char slot, in a color of
                         // its own so hidden panes stand out in the list.
@@ -2859,6 +2908,31 @@ fn format_key_combo(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switcher_row_without_a_binary_gives_the_title_the_whole_row() {
+        let split = switcher_row_split(0.0, 300.0, 0, 10.0);
+        assert_eq!(split.title_limit, 300.0);
+        assert_eq!(split.process_x, None);
+    }
+
+    #[test]
+    fn switcher_row_parks_the_binary_flush_right() {
+        // "claude 2.1.226" = 14 chars → starts 140px before the right margin,
+        // and the title stops two cells earlier.
+        let split = switcher_row_split(0.0, 300.0, 14, 10.0);
+        assert_eq!(split.process_x, Some(160.0));
+        assert_eq!(split.title_limit, 140.0);
+    }
+
+    #[test]
+    fn switcher_row_drops_the_binary_rather_than_squeeze_the_title() {
+        // A column barely wider than the binary itself: the title would be left
+        // with almost nothing, so the binary goes instead.
+        let split = switcher_row_split(0.0, 160.0, 14, 10.0);
+        assert_eq!(split.process_x, None);
+        assert_eq!(split.title_limit, 160.0);
+    }
 
     #[test]
     fn format_count_below_thousand_is_verbatim() {

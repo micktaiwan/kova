@@ -125,7 +125,7 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "cwd": "/path", "title": "...",
   "focused": true,
   "pid": 12345,
-  "child_processes": [ { "pid": 67890, "name": "node" } ],
+  "child_processes": [ { "pid": 67890, "name": "node", "version": null } ],
   "is_idle": false,
   "working": true,
   "awaiting": false,
@@ -135,6 +135,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 ```
 
 `is_idle` means the shell has no child process — useful to check whether a pane is "free to receive a new command".
+
+`child_processes[].name` is the program's name as it was invoked (argv[0], what `ps` shows), not the kernel's `p_comm`. The difference matters for anything installed under a versioned filename: Claude Code's binary is `~/.local/share/claude/versions/2.1.226`, so `p_comm` there is `2.1.226` and the name would say nothing about which program is running. `version` carries that number when the executable's own filename is one, and is `null` otherwise — so a Claude Code pane reads `{"name": "claude", "version": "2.1.226"}`.
 
 `minimized` is `true` for a pane collapsed with `minimize-pane` (`Cmd+M` by default). Such a pane still runs and is still listed here; it simply takes no layout space and is not drawn. Kova marks it with a `⊟` glyph in the pane switcher and counts it in the status bar. A remote client should keep showing it and mark it the same way rather than filter it out.
 
