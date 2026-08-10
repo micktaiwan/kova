@@ -299,6 +299,7 @@ pub struct KeysConfig {
     pub open_pane_switcher: String,
     pub equalize: String,
     pub repaint_pane: String,
+    pub next_attention: String,
     pub terminal: TerminalKeysConfig,
 }
 
@@ -364,6 +365,7 @@ impl Default for KeysConfig {
             open_pane_switcher: "cmd+p".into(),
             equalize: "cmd+shift++".into(),
             repaint_pane: "cmd+r".into(),
+            next_attention: "cmd+j".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }

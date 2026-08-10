@@ -1578,6 +1578,7 @@ fn derive_display_title(
     custom_title: Option<&str>,
     claude_name: Option<&str>,
     osc_title: Option<&str>,
+    process: Option<&str>,
     cwd: Option<&str>,
     fallback: &str,
 ) -> String {
@@ -1592,6 +1593,11 @@ fn derive_display_title(
     }
     if let Some(title) = osc_title.filter(|t| !t.trim().is_empty()) {
         return strip_activity_prefix(title).to_string();
+    }
+    // Nothing named this pane: the binary running in it is still more telling
+    // than the directory it was started from.
+    if let Some(process) = process.map(str::trim).filter(|p| !p.is_empty()) {
+        return process.to_string();
     }
     if let Some(cwd) = cwd {
         if let Some(base) = std::path::Path::new(cwd).file_name() {
@@ -1726,13 +1732,14 @@ impl Pane {
     }
 
     /// Display title for this pane: custom title > Claude session name > OSC
-    /// title > CWD basename > fallback.
+    /// title > foreground process > CWD basename > fallback.
     pub fn display_title(&self, fallback: &str) -> String {
         let term = self.terminal.read();
         derive_display_title(
             self.custom_title.as_deref(),
             self.claude_name.borrow().as_deref(),
             term.title.as_deref(),
+            self.fg_process.borrow().as_deref(),
             term.cwd.as_deref(),
             fallback,
         )
@@ -2393,6 +2400,7 @@ mod tests {
             Some("my pane"),
             Some("session"),
             Some("osc"),
+            Some("claude"),
             Some("/home/x/proj"),
             "shell",
         );
@@ -2407,6 +2415,7 @@ mod tests {
             None,
             Some("pane switcher"),
             Some("✳ Claude Code"),
+            Some("claude"),
             Some("/home/x/proj"),
             "shell",
         );
@@ -2415,38 +2424,60 @@ mod tests {
 
     #[test]
     fn blank_claude_session_name_falls_through_to_osc_title() {
-        let t = derive_display_title(None, Some("   "), Some("vim"), Some("/home/x/proj"), "shell");
+        let t = derive_display_title(None, Some("   "), Some("vim"), None, Some("/home/x/proj"), "shell");
         assert_eq!(t, "vim");
     }
 
     #[test]
     fn non_empty_osc_title_used() {
-        let t = derive_display_title(None, None, Some("vim"), Some("/home/x/proj"), "shell");
+        let t = derive_display_title(None, None, Some("vim"), None, Some("/home/x/proj"), "shell");
         assert_eq!(t, "vim");
     }
 
     #[test]
+    fn osc_title_wins_over_the_foreground_process() {
+        // What the app calls itself says more than the name of its binary.
+        let t = derive_display_title(None, None, Some("README.md"), Some("nvim"), Some("/home/x/proj"), "shell");
+        assert_eq!(t, "README.md");
+    }
+
+    #[test]
+    fn foreground_process_used_when_nothing_named_the_pane() {
+        let t = derive_display_title(None, None, None, Some("nvim"), Some("/home/x/proj"), "shell");
+        assert_eq!(t, "nvim");
+        // A blank OSC title must not shadow the process either.
+        let t = derive_display_title(None, None, Some("  "), Some("nvim"), Some("/home/x/proj"), "shell");
+        assert_eq!(t, "nvim");
+    }
+
+    #[test]
     fn empty_osc_title_falls_back_to_cwd_basename() {
-        let t = derive_display_title(None, None, Some(""), Some("/home/x/proj"), "shell");
+        let t = derive_display_title(None, None, Some(""), None, Some("/home/x/proj"), "shell");
         assert_eq!(t, "proj");
     }
 
     #[test]
     fn whitespace_osc_title_falls_back_to_cwd_basename() {
-        let t = derive_display_title(None, None, Some("   "), Some("/home/x/proj"), "shell");
+        let t = derive_display_title(None, None, Some("   "), None, Some("/home/x/proj"), "shell");
+        assert_eq!(t, "proj");
+    }
+
+    #[test]
+    fn blank_process_falls_through_to_cwd_basename() {
+        let t = derive_display_title(None, None, None, Some("   "), Some("/home/x/proj"), "shell");
         assert_eq!(t, "proj");
     }
 
     #[test]
     fn claude_session_name_used_when_the_pane_has_no_other_title() {
-        let t = derive_display_title(None, Some("kova-bc"), None, None, "shell");
+        let t = derive_display_title(None, Some("kova-bc"), None, None, None, "shell");
         assert_eq!(t, "kova-bc");
     }
 
     #[test]
     fn no_title_no_cwd_uses_fallback() {
-        assert_eq!(derive_display_title(None, None, None, None, "shell"), "shell");
+        assert_eq!(derive_display_title(None, None, None, None, None, "shell"), "shell");
         // Empty OSC title with no cwd must also reach the fallback, never blank.
-        assert_eq!(derive_display_title(None, None, Some(""), None, "shell"), "shell");
+        assert_eq!(derive_display_title(None, None, Some(""), None, None, "shell"), "shell");
     }
 }

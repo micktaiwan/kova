@@ -311,9 +311,6 @@ enum SwitcherRow {
         has_bell: bool,
         has_completion: bool,
         minimized: bool,
-        /// Foreground binary running in the pane (`claude`, `nvim`…), `None` at
-        /// a bare shell prompt.
-        process: Option<String>,
         /// Claude Code is generating / running a tool in this pane (✳).
         working: bool,
         /// This pane told us it is waiting for the user (?).
@@ -348,6 +345,22 @@ fn next_awaiting_row(
         .skip(start)
         .take(flat.len())
         .find(|&&(c, r)| matches!(columns[c][r], SwitcherRow::Pane { awaiting: true, .. }))
+        .copied()
+}
+
+/// Pick the pane to jump to among `waiting` (pane ids of every pane asking for
+/// an answer, in any order — sorted and deduped in place): the first id after
+/// `current`, wrapping around to the lowest one. With `current` itself the only
+/// waiting pane, it is returned rather than `None`, mirroring the switcher's
+/// Tab key, which also cycles back onto a lone waiting row.
+fn next_attention_pane(waiting: &mut Vec<PaneId>, current: Option<PaneId>) -> Option<PaneId> {
+    waiting.sort_unstable();
+    waiting.dedup();
+    let after = current.map_or(0, |c| c);
+    waiting
+        .iter()
+        .find(|&&id| current.is_none() || id > after)
+        .or_else(|| waiting.first())
         .copied()
 }
 
@@ -3122,6 +3135,29 @@ fn jump_to_search_hit(hit: &SearchHit) {
     log::debug!("jump_to_search_hit: tab_id {} not found in any window", hit.tab_id);
 }
 
+/// Focus a pane wherever it lives: find the window holding it, bring that
+/// window front and let it switch to the right tab. Also flashes the pane
+/// border so the jump is visible when it lands far from where the eye was.
+fn focus_pane_in_any_window(pane_id: PaneId) {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let ns_windows = app.windows();
+    for i in 0..ns_windows.count() {
+        let win = ns_windows.objectAtIndex(i);
+        let view = match crate::app::kova_view(&win) {
+            Some(v) => v,
+            None => continue,
+        };
+        if view.ipc_focus_pane(pane_id) {
+            win.makeKeyAndOrderFront(None);
+            // ~30 frames ≈ 0.5s @ 60fps; renderer pulses the pane border.
+            view.set_pane_flash(pane_id, 30);
+            return;
+        }
+    }
+    log::debug!("focus_pane_in_any_window: pane {} not found", pane_id);
+}
+
 impl KovaView {
     /// Handle key events in the "Send Tab to Window" overlay.
     fn handle_send_to_window_key(&self, event: &NSEvent) {
@@ -3211,7 +3247,6 @@ impl KovaView {
                         has_bell,
                         has_completion,
                         minimized: pane.minimized,
-                        process: pane.fg_process(),
                         working: pane.is_working(),
                         // Like bell/completion: never on the pane being looked at.
                         awaiting: !is_current && pane.is_awaiting(),
@@ -3555,6 +3590,7 @@ impl KovaView {
                 }
             }
             Action::RepaintPane => self.do_repaint_pane(),
+            Action::NextAttention => self.do_focus_next_attention(),
             Action::PrevTab => self.do_switch_tab_relative(-1),
             Action::NextTab => self.do_switch_tab_relative(1),
             Action::RenameTab => self.start_rename_tab(),
@@ -4678,6 +4714,48 @@ impl KovaView {
                 self.resize_all_panes();
             }
         }
+    }
+
+    /// Jump to the next pane waiting for an answer, across every tab and every
+    /// window. "Waiting" is the same flag the switcher's Tab key and the
+    /// status-bar counter use: a Claude Code session that told us it is done
+    /// and wants the user (`Pane::is_awaiting`).
+    ///
+    /// Focusing a pane does not clear its waiting flag (only answering it
+    /// does), so the scan walks pane ids in ascending order and wraps around:
+    /// pressing the key repeatedly visits every waiting pane in turn instead of
+    /// bouncing between the same two.
+    fn do_focus_next_attention(&self) {
+        let current = {
+            let tabs = self.ivars().tabs.borrow();
+            tabs.get(self.ivars().active_tab.get()).map(|t| t.focused_pane)
+        };
+
+        let mut waiting: Vec<PaneId> = Vec::new();
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let app = NSApplication::sharedApplication(mtm);
+        let ns_windows = app.windows();
+        for i in 0..ns_windows.count() {
+            let win = ns_windows.objectAtIndex(i);
+            let view = match crate::app::kova_view(&win) {
+                Some(v) => v,
+                None => continue,
+            };
+            let tabs = view.ivars().tabs.borrow();
+            for tab in tabs.iter() {
+                tab.for_each_pane(&mut |pane| {
+                    if pane.is_awaiting() {
+                        waiting.push(pane.id);
+                    }
+                });
+            }
+        }
+
+        let target = match next_attention_pane(&mut waiting, current) {
+            Some(id) => id,
+            None => return,
+        };
+        focus_pane_in_any_window(target);
     }
 
     /// Navigate focus to an adjacent pane.
@@ -6036,8 +6114,8 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), process: "", is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, awaiting: false },
-                SwitcherRow::Pane { title, process, has_bell, has_completion, minimized, working, awaiting, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), process: process.as_deref().unwrap_or(""), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, awaiting: *awaiting },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, awaiting: false },
+                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, awaiting, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, awaiting: *awaiting },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -6311,7 +6389,6 @@ mod tests {
                             has_bell: false,
                             has_completion: false,
                             minimized: false,
-                            process: None,
                             working: false,
                             awaiting: c == '?',
                         },
@@ -6319,6 +6396,28 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn next_attention_walks_waiting_panes_in_id_order() {
+        let mut waiting = vec![7, 2, 5];
+        assert_eq!(next_attention_pane(&mut waiting, Some(2)), Some(5));
+        assert_eq!(next_attention_pane(&mut waiting, Some(5)), Some(7));
+        // Past the highest id, wrap back to the lowest.
+        assert_eq!(next_attention_pane(&mut waiting, Some(7)), Some(2));
+        // From a pane that is not itself waiting, take the next id above it.
+        assert_eq!(next_attention_pane(&mut waiting, Some(3)), Some(5));
+        // Unfocused window: start at the lowest waiting id.
+        assert_eq!(next_attention_pane(&mut waiting, None), Some(2));
+    }
+
+    #[test]
+    fn next_attention_handles_empty_and_lone_candidates() {
+        assert_eq!(next_attention_pane(&mut vec![], Some(4)), None);
+        // The focused pane being the only one waiting: cycle back onto it.
+        assert_eq!(next_attention_pane(&mut vec![4], Some(4)), Some(4));
+        // Duplicates (same pane seen twice) collapse instead of stalling.
+        assert_eq!(next_attention_pane(&mut vec![4, 4, 9], Some(4)), Some(9));
     }
 
     #[test]

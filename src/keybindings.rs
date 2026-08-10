@@ -66,6 +66,7 @@ pub enum Action {
     OpenPaneSwitcher,
     Equalize,
     RepaintPane,
+    NextAttention,
 }
 
 /// Terminal-level actions dispatched from handle_key_event.
@@ -260,6 +261,7 @@ impl Keybindings {
         bind(&keys.open_pane_switcher, Action::OpenPaneSwitcher);
         bind(&keys.equalize, Action::Equalize);
         bind(&keys.repaint_pane, Action::RepaintPane);
+        bind(&keys.next_attention, Action::NextAttention);
 
         // Hard-coded debug binding (not user-configurable)
         window_map.insert(parse_key_combo("cmd+shift+i"), Action::MemReport);
@@ -356,6 +358,7 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "open-pane-switcher" => Action::OpenPaneSwitcher,
         "equalize" => Action::Equalize,
         "repaint-pane" => Action::RepaintPane,
+        "next-attention" => Action::NextAttention,
 
         _ => return None,
     };

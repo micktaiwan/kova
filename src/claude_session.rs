@@ -41,7 +41,8 @@ pub struct Session {
     pub id: String,
     /// Session name as set by Claude Code's `/rename`, absent until the user
     /// sets one. Claude Code never puts it in the terminal title, so reading
-    /// the file is the only way to show it.
+    /// the file is the only way to show it. A name Claude Code derived on its
+    /// own does NOT count — see `parse_session_file`.
     pub name: Option<String>,
 }
 
@@ -78,8 +79,15 @@ fn parse_session_file(data: &str) -> Option<(u32, u64, Session)> {
     let started_at = json.get("startedAt").and_then(|v| v.as_u64())? / 1000;
     // `name` is absent until the session is named, and Claude Code accepts a
     // blank one, so an all-whitespace name counts as no name at all.
+    //
+    // A session nobody renamed still carries a name Claude Code made up from
+    // the directory ("eko-e3"), flagged `nameSource: "derived"`. That one says
+    // strictly less than the app's own title, so it must not shadow it: only a
+    // name the user chose with /rename gets to name the pane.
+    let derived = json.get("nameSource").and_then(|v| v.as_str()) == Some("derived");
     let name = json
         .get("name")
+        .filter(|_| !derived)
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|n| !n.is_empty())
@@ -228,7 +236,7 @@ mod tests {
     /// Shape of a real file, taken from a live session on 2026-08-09.
     const LIVE_FILE: &str = r#"{"pid":10487,"sessionId":"430e0c8f","cwd":"/Users/x/vigie",
         "startedAt":1786280230040,"version":"2.1.226","kind":"interactive",
-        "entrypoint":"cli","name":"images","status":"busy"}"#;
+        "entrypoint":"cli","name":"images","nameSource":"user","status":"busy"}"#;
 
     #[test]
     fn session_file_yields_pid_start_and_name() {
@@ -243,6 +251,24 @@ mod tests {
     fn session_never_renamed_has_no_name() {
         let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000}"#;
         assert_eq!(parse_session_file(data).unwrap().2.name, None);
+    }
+
+    #[test]
+    fn name_claude_derived_from_the_directory_counts_as_no_name() {
+        // Shape of a live never-renamed session: the name is the directory plus
+        // a suffix, and it must not shadow the pane's real title.
+        let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000,
+            "cwd":"/Users/x/eko","name":"eko-e3","nameSource":"derived"}"#;
+        assert_eq!(parse_session_file(data).unwrap().2.name, None);
+    }
+
+    #[test]
+    fn name_the_user_set_is_kept() {
+        let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000,"name":"images","nameSource":"user"}"#;
+        assert_eq!(parse_session_file(data).unwrap().2.name.as_deref(), Some("images"));
+        // No nameSource at all (older Claude Code): trust the name.
+        let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000,"name":"images"}"#;
+        assert_eq!(parse_session_file(data).unwrap().2.name.as_deref(), Some("images"));
     }
 
     #[test]

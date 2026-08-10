@@ -192,9 +192,6 @@ pub struct SendToWindowRenderData<'a> {
 /// or a selectable pane entry.
 pub struct PaneSwitcherRowRender<'a> {
     pub text: &'a str,
-    /// Foreground binary running in that pane (`claude`, `nvim`…), drawn dimmed
-    /// after the label. Empty when the pane sits at a bare shell prompt.
-    pub process: &'a str,
     pub is_header: bool,
     /// Pending bell on this pane (unread) — drives an attention dot.
     pub has_bell: bool,
@@ -2135,6 +2132,7 @@ impl Renderer {
                     ("Restore Minimized", kc.restore_minimized.as_str(), ""),
                     ("Rename Pane", kc.rename_pane.as_str(), "sticky title"),
                     ("Repaint Pane", kc.repaint_pane.as_str(), "redraw / fix winsize"),
+                    ("Next Waiting", kc.next_attention.as_str(), "jump to a pane waiting on you"),
                 ]),
                 ("EDIT & SEARCH", vec![
                     ("Copy", kc.copy.as_str(), ""),
@@ -2375,12 +2373,6 @@ impl Renderer {
                     let text = format!("    {}", row.text);
                     let row_fg = if row.minimized { dim_fg } else { label_fg };
                     self.render_text(vertices, &text, left_margin, text_y, right_margin, row_fg, no_bg, body_scale);
-                    // What is actually running in that pane, dimmed after the
-                    // label so it reads as an annotation, not a second title.
-                    if !row.process.is_empty() {
-                        let process_x = left_margin + (text.chars().count() + 2) as f32 * scaled_cell_w;
-                        self.render_text(vertices, row.process, process_x, text_y, right_margin, dim_fg, no_bg, body_scale);
-                    }
                     if row.minimized {
                         // Minimized marker in the 1st char slot, in a color of
                         // its own so hidden panes stand out in the list.
