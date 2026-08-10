@@ -348,20 +348,32 @@ fn next_awaiting_row(
         .copied()
 }
 
-/// Pick the pane to jump to among `waiting` (pane ids of every pane asking for
-/// an answer, in any order — sorted and deduped in place): the first id after
-/// `current`, wrapping around to the lowest one. With `current` itself the only
-/// waiting pane, it is returned rather than `None`, mirroring the switcher's
-/// Tab key, which also cycles back onto a lone waiting row.
-fn next_attention_pane(waiting: &mut Vec<PaneId>, current: Option<PaneId>) -> Option<PaneId> {
-    waiting.sort_unstable();
-    waiting.dedup();
-    let after = current.map_or(0, |c| c);
-    waiting
-        .iter()
+/// Next id strictly after `current` in `ids`, wrapping around to the lowest
+/// one. `ids` arrives in any order and is sorted, deduped and stripped of
+/// `current` in place first, so the pane being looked at is never the answer.
+fn next_pane_in_cycle(ids: &mut Vec<PaneId>, current: Option<PaneId>) -> Option<PaneId> {
+    ids.sort_unstable();
+    ids.dedup();
+    if let Some(c) = current {
+        ids.retain(|&id| id != c);
+    }
+    let after = current.unwrap_or(0);
+    ids.iter()
         .find(|&&id| current.is_none() || id > after)
-        .or_else(|| waiting.first())
+        .or_else(|| ids.first())
         .copied()
+}
+
+/// Pick the pane to jump to, in two tiers: a pane that asked for an answer
+/// always wins, and unread panes (a bell, or a command that finished while you
+/// were elsewhere) are only considered when nothing is waiting. Within a tier
+/// the walk is by ascending pane id, wrapping around.
+fn next_attention_pane(
+    awaiting: &mut Vec<PaneId>,
+    unread: &mut Vec<PaneId>,
+    current: Option<PaneId>,
+) -> Option<PaneId> {
+    next_pane_in_cycle(awaiting, current).or_else(|| next_pane_in_cycle(unread, current))
 }
 
 /// Index of the pane row whose position is closest to `target` within `col`.
@@ -4716,22 +4728,26 @@ impl KovaView {
         }
     }
 
-    /// Jump to the next pane waiting for an answer, across every tab and every
-    /// window. "Waiting" is the same flag the switcher's Tab key and the
-    /// status-bar counter use: a Claude Code session that told us it is done
-    /// and wants the user (`Pane::is_awaiting`).
+    /// Jump to the next pane asking for attention, across every tab and every
+    /// window, in the two tiers the status bars already draw: first a pane
+    /// waiting for an answer (`Pane::is_awaiting` — the flag the switcher's Tab
+    /// key and the status-bar counter use), and when none is waiting, a pane
+    /// left unread — a bell, or a command that finished while the eye was
+    /// elsewhere.
     ///
     /// Focusing a pane does not clear its waiting flag (only answering it
     /// does), so the scan walks pane ids in ascending order and wraps around:
-    /// pressing the key repeatedly visits every waiting pane in turn instead of
-    /// bouncing between the same two.
+    /// pressing the key repeatedly visits every candidate in turn instead of
+    /// bouncing between the same two. Unread panes drop out of the set on their
+    /// own, since the renderer acks bell and completion on the focused pane.
     fn do_focus_next_attention(&self) {
         let current = {
             let tabs = self.ivars().tabs.borrow();
             tabs.get(self.ivars().active_tab.get()).map(|t| t.focused_pane)
         };
 
-        let mut waiting: Vec<PaneId> = Vec::new();
+        let mut awaiting: Vec<PaneId> = Vec::new();
+        let mut unread: Vec<PaneId> = Vec::new();
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let app = NSApplication::sharedApplication(mtm);
         let ns_windows = app.windows();
@@ -4745,13 +4761,20 @@ impl KovaView {
             for tab in tabs.iter() {
                 tab.for_each_pane(&mut |pane| {
                     if pane.is_awaiting() {
-                        waiting.push(pane.id);
+                        awaiting.push(pane.id);
+                        return;
+                    }
+                    let term = pane.terminal.read();
+                    if term.bell.load(std::sync::atomic::Ordering::Relaxed)
+                        || term.unread_completion()
+                    {
+                        unread.push(pane.id);
                     }
                 });
             }
         }
 
-        let target = match next_attention_pane(&mut waiting, current) {
+        let target = match next_attention_pane(&mut awaiting, &mut unread, current) {
             Some(id) => id,
             None => return,
         };
@@ -6400,24 +6423,36 @@ mod tests {
 
     #[test]
     fn next_attention_walks_waiting_panes_in_id_order() {
-        let mut waiting = vec![7, 2, 5];
-        assert_eq!(next_attention_pane(&mut waiting, Some(2)), Some(5));
-        assert_eq!(next_attention_pane(&mut waiting, Some(5)), Some(7));
+        let waiting = || vec![7, 2, 5];
+        let none = &mut Vec::new();
+        assert_eq!(next_attention_pane(&mut waiting(), none, Some(2)), Some(5));
+        assert_eq!(next_attention_pane(&mut waiting(), none, Some(5)), Some(7));
         // Past the highest id, wrap back to the lowest.
-        assert_eq!(next_attention_pane(&mut waiting, Some(7)), Some(2));
+        assert_eq!(next_attention_pane(&mut waiting(), none, Some(7)), Some(2));
         // From a pane that is not itself waiting, take the next id above it.
-        assert_eq!(next_attention_pane(&mut waiting, Some(3)), Some(5));
+        assert_eq!(next_attention_pane(&mut waiting(), none, Some(3)), Some(5));
         // Unfocused window: start at the lowest waiting id.
-        assert_eq!(next_attention_pane(&mut waiting, None), Some(2));
+        assert_eq!(next_attention_pane(&mut waiting(), none, None), Some(2));
+    }
+
+    #[test]
+    fn next_attention_prefers_waiting_over_unread() {
+        // A pane waiting for an answer wins over a lower-id unread pane...
+        assert_eq!(next_attention_pane(&mut vec![9], &mut vec![3], Some(1)), Some(9));
+        // ...and unread panes are only visited once nothing is waiting.
+        assert_eq!(next_attention_pane(&mut vec![], &mut vec![3, 8], Some(4)), Some(8));
+        // The focused pane being the only one waiting: fall through to unread
+        // rather than re-focusing where the cursor already is.
+        assert_eq!(next_attention_pane(&mut vec![4], &mut vec![6], Some(4)), Some(6));
     }
 
     #[test]
     fn next_attention_handles_empty_and_lone_candidates() {
-        assert_eq!(next_attention_pane(&mut vec![], Some(4)), None);
-        // The focused pane being the only one waiting: cycle back onto it.
-        assert_eq!(next_attention_pane(&mut vec![4], Some(4)), Some(4));
+        assert_eq!(next_attention_pane(&mut vec![], &mut vec![], Some(4)), None);
+        // Nothing else waiting or unread: no jump at all.
+        assert_eq!(next_attention_pane(&mut vec![4], &mut vec![], Some(4)), None);
         // Duplicates (same pane seen twice) collapse instead of stalling.
-        assert_eq!(next_attention_pane(&mut vec![4, 4, 9], Some(4)), Some(9));
+        assert_eq!(next_attention_pane(&mut vec![4, 4, 9], &mut vec![], Some(4)), Some(9));
     }
 
     #[test]

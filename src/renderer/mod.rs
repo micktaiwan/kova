@@ -2132,7 +2132,7 @@ impl Renderer {
                     ("Restore Minimized", kc.restore_minimized.as_str(), ""),
                     ("Rename Pane", kc.rename_pane.as_str(), "sticky title"),
                     ("Repaint Pane", kc.repaint_pane.as_str(), "redraw / fix winsize"),
-                    ("Next Waiting", kc.next_attention.as_str(), "jump to a pane waiting on you"),
+                    ("Next Waiting", kc.next_attention.as_str(), "waiting pane, else unread"),
                 ]),
                 ("EDIT & SEARCH", vec![
                     ("Copy", kc.copy.as_str(), ""),

@@ -303,7 +303,7 @@ reparent-up|down|left|right        (move a pane across the tree)
 resize-left|right|up|down          (ratio resize, ±5%)
 edge-grow-left|right               (grow the focused pane's edge)
 minimize-pane  restore-minimized
-next-attention                     (focus the next pane waiting for an answer)
+next-attention                     (focus the next waiting pane, else an unread one)
 detach-tab  break-pane  merge-tab  merge-window
 rename-tab  rename-pane            (open the inline rename editor)
 open-recent-project  open-search  open-pane-switcher   (open an overlay)
