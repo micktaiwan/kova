@@ -63,3 +63,17 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 - Mac-only, pas de cross-platform
 - Performance et RAM minimale avant tout
 - Pas de feature creep : tabs, splits, config, c'est tout
+
+## Le skill `kova` est la surface publique de cet outil
+
+`~/.claude/skills/kova/SKILL.md` — le vrai fichier est
+`~/projects/perso/dotfiles/claude/skills/kova/SKILL.md`, le symlink n'est que la façon dont Claude
+Code le voit — décrit comment une session, depuis n'importe où sur ce Mac, se sert de kova : les
+commandes, les chemins, les ports, ce qu'elle n'a pas le droit de faire. Rien ne le synchronise
+automatiquement.
+
+**Un changement ici qui touche ce que le skill promet se répercute dans le skill dans la foulée** :
+une commande ou un flag, un chemin de socket ou de données, un port, une valeur par défaut, un nom
+de fichier de conf, une règle sur ce qu'une session peut toucher. Un skill périmé est pire que pas
+de skill du tout, parce qu'une session agit sur ce qu'il dit. `/skill-check kova` compare les deux
+et signale ce qui a divergé.

@@ -1516,12 +1516,13 @@ pub struct Pane {
 /// cwd basename → `fallback`.
 /// An empty or whitespace-only OSC title is treated as absent so we never
 /// render a blank row (the "invisible white line" bug in the pane switcher).
-/// True if `title` begins with a Claude Code *working* marker: an animated
-/// Braille spinner glyph (U+2800–U+28FF) immediately followed by a space.
-/// Claude Code prepends this spinner ONLY while it is actively generating or
+/// True if `title` begins with a Claude Code *working* marker immediately
+/// followed by a space: an animated Braille spinner glyph (U+2800–U+28FF), or a
+/// vertical half-circle spinner frame (`◐` U+25D0, `◑` U+25D1).
+/// Claude Code prepends a spinner ONLY while it is actively generating or
 /// running a tool; at the prompt it shows an asterisk-like idle marker
-/// (`✳ Claude Code`) or a plain title instead. So this — and NOT the asterisk —
-/// is the reliable "the app is busy" signal.
+/// (`✳ Claude Code`) or a plain title instead. So a spinner — and NOT the
+/// asterisk — is the reliable "the app is busy" signal.
 /// Wall-clock seconds since the epoch. Used to stamp when a pane started
 /// waiting; a jump in system time only skews a displayed age, never a decision.
 fn now_epoch_secs() -> u64 {
@@ -1532,20 +1533,24 @@ fn now_epoch_secs() -> u64 {
 
 fn is_working_marker(title: &str) -> bool {
     let mut chars = title.chars();
-    matches!(chars.next(), Some(c) if ('\u{2800}'..='\u{28FF}').contains(&c))
-        && chars.next() == Some(' ')
+    matches!(
+        chars.next(),
+        Some(c) if ('\u{2800}'..='\u{28FF}').contains(&c)
+            || matches!(c, '\u{25D0}' | '\u{25D1}')
+    ) && chars.next() == Some(' ')
 }
 
 /// True if `title` begins with any Claude Code status marker followed by a
-/// space: the Braille working spinner OR an asterisk-like idle marker
-/// (`*`, `✳ ` U+2733, `∗` U+2217). Used to strip the prefix for display so the
+/// space: the Braille working spinner, an asterisk-like idle marker
+/// (`*`, `✳ ` U+2733, `∗` U+2217), or a vertical half-circle spinner frame
+/// (`◐` U+25D0, `◑` U+25D1). Used to strip the prefix for display so the
 /// title neither jitters with the spinner nor carries a bare idle marker.
 fn has_leading_marker(title: &str) -> bool {
     let mut chars = title.chars();
     matches!(
         chars.next(),
         Some(c) if ('\u{2800}'..='\u{28FF}').contains(&c)
-            || matches!(c, '*' | '\u{2733}' | '\u{2217}')
+            || matches!(c, '*' | '\u{2733}' | '\u{2217}' | '\u{25D0}' | '\u{25D1}')
     ) && chars.next() == Some(' ')
 }
 
@@ -1754,7 +1759,7 @@ impl Pane {
     }
 
     /// True if the app in this pane is actively working: its live OSC 0/2 title
-    /// leads with Claude Code's animated Braille spinner (see `is_working_marker`).
+    /// leads with one of Claude Code's animated spinners (see `is_working_marker`).
     /// The asterisk idle marker (`✳ Claude Code`) does NOT count. Reads the live
     /// OSC 0/2 title even when a sticky custom title shadows it in the display.
     pub fn is_working(&self) -> bool {
@@ -2281,9 +2286,13 @@ mod tests {
     }
 
     #[test]
-    fn is_working_marker_only_on_braille_spinner() {
+    fn is_working_marker_only_on_a_spinner() {
         // Working: an animated Braille spinner glyph (U+2800–U+28FF) + space.
         assert!(is_working_marker("\u{2802} Revue de code")); // ⠂
+        // Working: the vertical half-circle spinner frames + space.
+        assert!(is_working_marker("\u{25D0} Configurer le suivi")); // ◐
+        assert!(is_working_marker("\u{25D1} Configurer le suivi")); // ◑
+        assert!(!is_working_marker("\u{25D0}glued"));
         assert!(is_working_marker("\u{2810} Comprendre"));    // ⠐
         assert!(is_working_marker("\u{28FF} x"));             // last frame of range
         assert!(is_working_marker("\u{2800} ")); // spinner + trailing space only
@@ -2336,6 +2345,9 @@ mod tests {
         assert_eq!(strip_activity_prefix("* Add TimeComet.swift"), "Add TimeComet.swift");
         assert_eq!(strip_activity_prefix("\u{2733} Claude Code"), "Claude Code");
         assert_eq!(strip_activity_prefix("\u{2217} foo"), "foo");
+        // Vertical half-circle spinner frames stripped as well.
+        assert_eq!(strip_activity_prefix("\u{25D0} Configurer le suivi"), "Configurer le suivi");
+        assert_eq!(strip_activity_prefix("\u{25D1} Configurer le suivi"), "Configurer le suivi");
         // No marker, or marker without a following space: left untouched.
         assert_eq!(strip_activity_prefix("plain title"), "plain title");
         assert_eq!(strip_activity_prefix("*already glued"), "*already glued");
