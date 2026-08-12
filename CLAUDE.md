@@ -52,6 +52,8 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 
 - **Bytes vs chars** — Les cellules du terminal sont indexées par colonne (1 Cell = 1 char), mais les `String` Rust sont indexées par byte. Ne JAMAIS faire `&text[i..i+n]` sur du texte issu des cellules (contient des emoji, box-drawing, etc.). Toujours travailler avec `Vec<char>` ou itérateurs de chars quand on manipule des positions de colonnes.
 
+- **Découpe de texte en f32** — Un texte aligné à droite part de `max_x - n × cell_w`, donc sa dernière cellule finit pile sur `max_x` en arithmétique exacte, jamais en f32 : un dépassement d'un ulp faisait disparaître le dernier caractère (deux colonnes du switcher affichaient `2.1.22` et `2.1.228` pour la même chaîne). Tout test de dépassement de marge passe par `glyph_fits` (`src/renderer/mod.rs`), qui tolère un quart de pixel — ne jamais recomparer `x + cell_w > max_x` en dur.
+
 ## Tests
 
 - **Lancer les tests automatisés après chaque modification de code.** Dès qu'une modif touche le code Rust, exécuter `cargo test` (le target est global, pas besoin de `build.sh` pour ça) et vérifier que tout est vert avant de considérer la modif terminée. Un test rouge fait partie du diff : le corriger, ne pas le laisser de côté.
