@@ -181,7 +181,10 @@ Displayed as a `?` marker on the pane's row in the switcher (`Cmd+P`, where `Tab
 { "cmd": "focus-pane", "pane_id": 42 }
 ```
 
-Switches tab and window if needed. Response: `{ "ok": true }`.
+Switches tab and window if needed. A minimized pane is given its space back on
+the way — this is the only path that restores one by ID, and the reason the
+keyboard jumps (Cmd+J, back/forward) leave minimized panes alone while this
+command does not. Response: `{ "ok": true }`.
 
 ---
 
@@ -306,8 +309,8 @@ reparent-up|down|left|right        (move a pane across the tree)
 resize-left|right|up|down          (ratio resize, ±5%)
 edge-grow-left|right               (grow the focused pane's edge)
 minimize-pane  restore-minimized
-next-attention                     (focus the next waiting pane, else an unread one)
-history-back|history-forward       (walk the panes you visited, back then forward)
+next-attention                     (focus the next waiting pane, else an unread one; skips minimized panes)
+history-back|history-forward       (walk the panes you visited, back then forward; skips minimized panes)
 detach-tab  break-pane  merge-tab  merge-window
 rename-tab  rename-pane            (open the inline rename editor)
 open-recent-project  open-search  open-pane-switcher   (open an overlay)

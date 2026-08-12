@@ -4907,6 +4907,14 @@ impl KovaView {
             let tabs = view.ivars().tabs.borrow();
             for tab in tabs.iter() {
                 tab.for_each_pane(&mut |pane| {
+                    // A minimized pane is never a landing spot: jumping to it
+                    // would have to give it its space back, and the user
+                    // collapsed it on purpose. It keeps running and keeps its
+                    // marker — Cmd+J simply walks past it. Restoring one is
+                    // `restore-minimized`, or the IPC `focus-pane` command.
+                    if pane.minimized {
+                        return;
+                    }
                     if pane.is_awaiting() {
                         awaiting.push(pane.id);
                         return;
