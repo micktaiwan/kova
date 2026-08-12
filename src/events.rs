@@ -32,12 +32,21 @@ pub struct PaneFlags {
     pub awaiting_since: Option<u64>,
 }
 
-/// Which pane holds the keyboard, identified by where it sits.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Which pane holds the user's attention, and what is running in it.
+///
+/// The Claude conversation is part of the identity on purpose. Launching `claude`
+/// in the pane you are already in changes what you are doing without moving the
+/// focus anywhere, and a client that only hears about pane changes would learn of
+/// it only when you happen to leave and come back.
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct FocusKey {
     window: usize,
     tab: usize,
     pane: PaneId,
+    session: Option<String>,
+    /// The name `/rename` gave it. Part of the identity for the same reason as the id: renaming a
+    /// conversation is how you declare it is about something else now.
+    session_name: Option<String>,
 }
 
 /// The last state published to subscribers.
@@ -117,18 +126,20 @@ impl EventState {
         if next == self.focus {
             return;
         }
-        let previous = self.focus;
-        self.focus = next;
+        let previous = self.focus.take();
+        self.focus = next.clone();
         if silent || !crate::ipc::has_subscribers(topic::FOCUS) {
             return;
         }
-        let pane = next.and_then(|key| pane_json(windows, key.window, key.pane));
+        let pane = next
+            .as_ref()
+            .and_then(|key| pane_json(windows, key.window, key.pane));
         crate::ipc::publish(
             topic::FOCUS,
             serde_json::json!({
                 "event": "focus",
                 "app_active": app_active,
-                "reason": focus_reason(previous, next, app_active),
+                "reason": focus_reason(previous.as_ref(), next.as_ref(), app_active),
                 "pane": pane,
             }),
         );
@@ -213,8 +224,8 @@ fn pane_poll_interval(fps: u32) -> u32 {
 /// Why the focus event fired, derived from the two states rather than from the
 /// call site — there is no call site, the tick found it.
 fn focus_reason(
-    previous: Option<FocusKey>,
-    next: Option<FocusKey>,
+    previous: Option<&FocusKey>,
+    next: Option<&FocusKey>,
     app_active: bool,
 ) -> &'static str {
     match (previous, next) {
@@ -223,7 +234,10 @@ fn focus_reason(
         (None, Some(_)) => "app-active",
         (Some(p), Some(n)) if p.window != n.window => "window",
         (Some(p), Some(n)) if p.tab != n.tab => "tab",
-        _ => "pane",
+        (Some(p), Some(n)) if p.pane != n.pane => "pane",
+        // Same pane, different conversation: `claude` was just launched (or ended)
+        // right where you already were.
+        _ => "session",
     }
 }
 
@@ -235,8 +249,8 @@ fn current_focus(windows: &RefCell<Vec<Retained<NSWindow>>>) -> Option<FocusKey>
             continue;
         }
         if let Some(view) = crate::app::kova_view(win) {
-            if let Some((tab, pane)) = view.events_focus_key() {
-                return Some(FocusKey { window: idx, tab, pane });
+            if let Some((tab, pane, session, session_name)) = view.events_focus_key() {
+                return Some(FocusKey { window: idx, tab, pane, session, session_name });
             }
         }
     }
@@ -292,7 +306,11 @@ mod tests {
     use super::*;
 
     fn key(window: usize, tab: usize, pane: PaneId) -> FocusKey {
-        FocusKey { window, tab, pane }
+        FocusKey { window, tab, pane, session: None, session_name: None }
+    }
+
+    fn key_with_session(window: usize, tab: usize, pane: PaneId, session: &str) -> FocusKey {
+        FocusKey { window, tab, pane, session: Some(session.to_string()), session_name: None }
     }
 
     #[test]
@@ -308,21 +326,32 @@ mod tests {
     fn losing_the_app_is_reported_as_such() {
         // The distinction matters to a client that credits time: "you left Kova"
         // is not the same fact as "Kova has no window right now".
-        assert_eq!(focus_reason(Some(key(0, 0, 1)), None, false), "app-inactive");
-        assert_eq!(focus_reason(Some(key(0, 0, 1)), None, true), "no-key-window");
+        assert_eq!(focus_reason(Some(&key(0, 0, 1)), None, false), "app-inactive");
+        assert_eq!(focus_reason(Some(&key(0, 0, 1)), None, true), "no-key-window");
     }
 
     #[test]
     fn coming_back_to_the_same_pane_reads_as_app_active() {
-        assert_eq!(focus_reason(None, Some(key(0, 0, 1)), true), "app-active");
+        assert_eq!(focus_reason(None, Some(&key(0, 0, 1)), true), "app-active");
+    }
+
+    #[test]
+    fn launching_claude_where_you_already_are_is_an_event() {
+        // The whole reason the conversation is part of the identity: nothing moved,
+        // but the pane is now about something, and a client keyed on conversations
+        // would otherwise hear about it only when you next left and came back.
+        let before = key(0, 0, 1);
+        let after = key_with_session(0, 0, 1, "abc");
+        assert_ne!(before, after);
+        assert_eq!(focus_reason(Some(&before), Some(&after), true), "session");
     }
 
     #[test]
     fn moves_are_named_by_their_widest_hop() {
         // A pane change that is also a tab change is a tab move, and a tab change
         // that is also a window change is a window move — the coarsest true label.
-        assert_eq!(focus_reason(Some(key(0, 0, 1)), Some(key(1, 0, 9)), true), "window");
-        assert_eq!(focus_reason(Some(key(0, 0, 1)), Some(key(0, 2, 9)), true), "tab");
-        assert_eq!(focus_reason(Some(key(0, 0, 1)), Some(key(0, 0, 9)), true), "pane");
+        assert_eq!(focus_reason(Some(&key(0, 0, 1)), Some(&key(1, 0, 9)), true), "window");
+        assert_eq!(focus_reason(Some(&key(0, 0, 1)), Some(&key(0, 2, 9)), true), "tab");
+        assert_eq!(focus_reason(Some(&key(0, 0, 1)), Some(&key(0, 0, 9)), true), "pane");
     }
 }

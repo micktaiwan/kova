@@ -282,6 +282,8 @@ Response: `{ "ok": true }`.
 
 Sets the pane's custom title — the same field that `Cmd+Option+R` and `OSC 1` write to. Sticky: survives OSC 0/2 (window title) sequences emitted by programs running in the pane. Pass `"title": null` to clear (pane falls back to its OSC 0/2 / auto-derived title).
 
+One thing outranks it: the name a Claude Code `/rename` gave the session running in the pane (`claude_session_name` in `list-panes`). That name is the freshest thing said about the pane, while a sticky title outlives whatever the pane is used for next — so a pane running a named session shows that name, and the custom title only reappears once the session ends.
+
 Response: `{ "ok": true }`.
 
 ---
@@ -472,9 +474,16 @@ another app emits `focus` with `pane: null` and `reason: "app-inactive"`; coming
 back emits the pane with `reason: "app-active"`. A client tracking where the
 user's attention goes therefore doesn't have to join this stream with the system's
 active-app notifications — "which pane is focused" and "you are actually looking
-at it" are one fact here. `reason` is one of `pane`, `tab`, `window`,
+at it" are one fact here. `reason` is one of `pane`, `tab`, `window`, `session`,
 `app-active`, `app-inactive`, `no-key-window`, and always names the *coarsest*
 true hop: a pane change that is also a tab change reads `tab`.
+
+`session` is the one that does not involve moving: the focused pane is the same,
+but the Claude conversation in it changed — you launched `claude` (or it ended)
+right where you already were. The conversation is deliberately part of the focused
+pane's identity rather than just its payload, because a client keyed on
+conversations would otherwise hear about a session started in place only when the
+user next happened to leave the pane and come back.
 
 Notes that matter when writing a client:
 

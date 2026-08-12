@@ -157,11 +157,6 @@ pub fn for_shell(shell_pid: u32) -> Option<String> {
     session_for_shell(shell_pid).map(|s| s.id)
 }
 
-/// The `/rename` name of the Claude Code session running under `shell_pid`.
-pub fn name_for_shell(shell_pid: u32) -> Option<String> {
-    session_for_shell(shell_pid).and_then(|s| s.name)
-}
-
 /// Build the command line that reopens `session_id`, reusing the flags of the
 /// command that started it where possible.
 ///

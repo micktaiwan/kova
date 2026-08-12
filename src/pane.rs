@@ -1523,7 +1523,9 @@ pub struct Pane {
     pub scroll_accumulator: Cell<f64>,
     /// Command to inject into PTY once shell is ready (for session restore).
     pub pending_command: Cell<Option<String>>,
-    /// Custom pane title set by user (overrides OSC title).
+    /// Custom pane title set by user (overrides OSC title). Sticky, so it sits
+    /// below the name a `/rename` gave the Claude session running here — see
+    /// `derive_display_title`.
     pub custom_title: Option<String>,
     /// Whether this pane is minimized (collapsed to a thin bar).
     pub minimized: bool,
@@ -1624,14 +1626,16 @@ fn derive_display_title(
     cwd: Option<&str>,
     fallback: &str,
 ) -> String {
-    if let Some(custom) = custom_title {
-        return custom.to_string();
-    }
-    // A Claude session name beats the OSC title, which is only ever the generic
-    // "Claude Code" plus a status marker, but stays below a title the user set
-    // by hand here — Kova's own rename must win over the app's.
+    // The name a `/rename` gave the Claude session wins over everything, the
+    // pane's own sticky title included. Only a deliberate `/rename` reaches here
+    // (a name Claude Code derived on its own is dropped upstream), so it is the
+    // freshest thing anyone said about this pane — while a sticky title survives
+    // whatever the pane is used for next and would otherwise mask it forever.
     if let Some(name) = claude_name.map(str::trim).filter(|n| !n.is_empty()) {
         return name.to_string();
+    }
+    if let Some(custom) = custom_title {
+        return custom.to_string();
     }
     if let Some(title) = osc_title.filter(|t| !t.trim().is_empty()) {
         return strip_activity_prefix(title).to_string();
@@ -1774,7 +1778,7 @@ impl Pane {
             .map(|t| strip_activity_prefix(t).to_string())
     }
 
-    /// Display title for this pane: custom title > Claude session name > OSC
+    /// Display title for this pane: Claude session name > custom title > OSC
     /// title > foreground process > CWD basename > fallback.
     pub fn display_title(&self, fallback: &str) -> String {
         let term = self.terminal.read();
@@ -2497,10 +2501,23 @@ mod tests {
     }
 
     #[test]
-    fn custom_title_wins_over_everything() {
+    fn claude_session_name_wins_over_everything() {
         let t = derive_display_title(
             Some("my pane"),
             Some("session"),
+            Some("osc"),
+            Some("claude"),
+            Some("/home/x/proj"),
+            "shell",
+        );
+        assert_eq!(t, "session", "a /rename must beat the pane's sticky title");
+    }
+
+    #[test]
+    fn custom_title_wins_over_everything_below_the_claude_name() {
+        let t = derive_display_title(
+            Some("my pane"),
+            None,
             Some("osc"),
             Some("claude"),
             Some("/home/x/proj"),
@@ -2528,6 +2545,12 @@ mod tests {
     fn blank_claude_session_name_falls_through_to_osc_title() {
         let t = derive_display_title(None, Some("   "), Some("vim"), None, Some("/home/x/proj"), "shell");
         assert_eq!(t, "vim");
+    }
+
+    #[test]
+    fn blank_claude_session_name_leaves_the_custom_title_alone() {
+        let t = derive_display_title(Some("my pane"), Some("   "), Some("vim"), None, None, "shell");
+        assert_eq!(t, "my pane");
     }
 
     #[test]

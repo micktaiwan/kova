@@ -4440,12 +4440,28 @@ impl KovaView {
     }
 
     /// The pane this window would hand the keyboard to: the focused pane of the
-    /// active tab, with that tab's index. Deliberately cheap (two `RefCell`
-    /// reads, no process introspection) — the event loop compares it every tick.
-    pub fn events_focus_key(&self) -> Option<(usize, PaneId)> {
+    /// active tab, its tab index, and the Claude conversation running in it.
+    ///
+    /// The conversation is part of the identity, not a detail of the payload: a
+    /// pane where you have just launched `claude` is not the same work surface it
+    /// was a second earlier, and without this the event only ever fired when the
+    /// *pane* changed — so a session started in the pane you were already in went
+    /// unannounced until you left and came back.
+    ///
+    /// Still cheap enough for every tick: two `RefCell` reads and a short string
+    /// clone, no process introspection (the session is cached by the throttled probe).
+    pub fn events_focus_key(&self) -> Option<(usize, PaneId, Option<String>, Option<String>)> {
         let tabs = self.ivars().tabs.borrow();
         let idx = self.ivars().active_tab.get();
-        tabs.get(idx).map(|tab| (idx, tab.focused_pane))
+        let tab = tabs.get(idx)?;
+        let pane_id = tab.focused_pane;
+        let pane = tab.pane(pane_id);
+        let session = pane.and_then(|p| p.claude_session_id());
+        // The name too, not just the id: `/rename` is how the user says the conversation is about
+        // something else now, and a client that never hears about it keeps filing the work under
+        // the old subject.
+        let name = pane.and_then(|p| p.claude_session_name());
+        Some((idx, pane_id, session, name))
     }
 
     /// Full JSON for one pane, if this window holds it. Building it costs a
