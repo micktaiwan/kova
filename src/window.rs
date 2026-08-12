@@ -4882,11 +4882,13 @@ impl KovaView {
     /// left unread — a bell, or a command that finished while the eye was
     /// elsewhere.
     ///
-    /// Focusing a pane does not clear its waiting flag (only answering it
-    /// does), so the scan walks pane ids in ascending order and wraps around:
-    /// pressing the key repeatedly visits every candidate in turn instead of
-    /// bouncing between the same two. Unread panes drop out of the set on their
-    /// own, since the renderer acks bell and completion on the focused pane.
+    /// Both tiers hold *unread* panes only: a pane drops out of the set the
+    /// moment it has been looked at (bell and completion are acked on the
+    /// focused pane; a waiting pane gets `awaiting_seen` there, while keeping
+    /// its waiting marker until someone actually answers it). So the key never
+    /// walks the same pane twice, and once everything has been read it says so
+    /// instead of looping over panes already seen. Within a tier the scan walks
+    /// pane ids in ascending order and wraps around.
     fn do_focus_next_attention(&self) {
         let current = {
             let tabs = self.ivars().tabs.borrow();
@@ -4915,7 +4917,7 @@ impl KovaView {
                     if pane.minimized {
                         return;
                     }
-                    if pane.is_awaiting() {
+                    if pane.is_awaiting_unseen() {
                         awaiting.push(pane.id);
                         return;
                     }
@@ -4931,7 +4933,12 @@ impl KovaView {
 
         let target = match next_attention_pane(&mut awaiting, &mut unread, current) {
             Some(id) => id,
-            None => return,
+            None => {
+                // Everything has been read: say so rather than loop back over
+                // panes already seen — a silent key reads as a broken one.
+                self.set_transient_status("Nothing waiting");
+                return;
+            }
         };
         focus_pane_in_any_window(target);
     }
@@ -5696,6 +5703,21 @@ impl KovaView {
             };
             if let Some(id) = focused {
                 crate::pane_history::record(id, &pane_history_state);
+            }
+        }
+
+        // --- A read pane stops pulling Cmd+J back to itself ---
+        // Same sampling rule as the visit history: the focused pane of the key
+        // window is the one under the eye. Only the *jump* set shrinks — the
+        // waiting flag itself stays up (retracting it is for answering, see
+        // `Pane::clear_awaiting`), so the status bar and the switcher keep
+        // showing that this Claude is stuck.
+        if self.window().is_some_and(|w| w.isKeyWindow()) {
+            let tabs = ivars.tabs.borrow();
+            if let Some(tab) = tabs.get(ivars.active_tab.get()) {
+                if let Some(pane) = tab.pane(tab.focused_pane) {
+                    pane.mark_awaiting_seen();
+                }
             }
         }
 

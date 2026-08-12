@@ -1477,6 +1477,42 @@ impl Tab {
     }
 }
 
+/// The "waiting for the user" flag of a pane, with whether the reader has
+/// seen it since it was armed. The two live in one value because every
+/// transition that arms the flag must also re-arm the read state: keeping
+/// them apart is what let a pane the user had already read (or worse, one
+/// that asked a *second* question) fall out of step with Cmd+J.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct AwaitingFlag {
+    since: Option<u64>,
+    read: bool,
+}
+
+impl AwaitingFlag {
+    /// The pane says it waits for the user. Idempotent on the timestamp — a
+    /// second `Stop` on the same unanswered turn keeps the original
+    /// waiting-since, so the status bar does not restart its clock — but never
+    /// on the read state: a fresh question is unread again.
+    fn armed(self, now: u64) -> Self {
+        Self { since: Some(self.since.unwrap_or(now)), read: false }
+    }
+
+    /// The user has had the pane under the eye. Only the jump cycle cares;
+    /// the pane keeps saying it waits.
+    fn read(self) -> Self {
+        Self { read: true, ..self }
+    }
+
+    /// Epoch seconds since which the pane has been waiting, if it is.
+    fn since(self) -> Option<u64> {
+        self.since
+    }
+
+    fn is_read(self) -> bool {
+        self.read
+    }
+}
+
 /// A single terminal pane: owns its PTY, terminal state, and per-pane flags.
 pub struct Pane {
     pub id: PaneId,
@@ -1494,10 +1530,10 @@ pub struct Pane {
     /// Open-latency instrumentation (time-to-rectangle / time-to-prompt).
     pub open_timer: Arc<PaneOpenTimer>,
     /// The app in this pane told us it is waiting for the user (Claude Code
-    /// pushes this from its `Stop` / permission-prompt hooks over IPC).
-    /// `Some(epoch_secs)` = waiting since that time; `None` = not waiting.
-    /// Never trusted blindly: see `is_awaiting` and `Tab::check_running`.
-    pub awaiting: Cell<Option<u64>>,
+    /// pushes this from its `Stop` / permission-prompt hooks over IPC), plus
+    /// whether the user has looked at it since. Never trusted blindly: see
+    /// `is_awaiting` and `Tab::check_running`.
+    pub awaiting: Cell<AwaitingFlag>,
     /// Name of the Claude Code session running in this pane, as set by its
     /// `/rename` command. Refreshed on the same throttle as the foreground
     /// probe (`Tab::check_running`) rather than read per frame, because the
@@ -1648,7 +1684,7 @@ impl Pane {
             custom_title: None,
             minimized: false,
             open_timer,
-            awaiting: Cell::new(None),
+            awaiting: Cell::new(AwaitingFlag::default()),
             claude_name: RefCell::new(None),
             fg_process: RefCell::new(None),
         })
@@ -1678,7 +1714,7 @@ impl Pane {
             custom_title: None,
             minimized: false,
             open_timer: Arc::new(PaneOpenTimer::new()),
-            awaiting: Cell::new(None),
+            awaiting: Cell::new(AwaitingFlag::default()),
             claude_name: RefCell::new(None),
             fg_process: RefCell::new(None),
         })
@@ -1779,26 +1815,37 @@ impl Pane {
     /// pane whose Claude went back to work cannot be waiting, whatever the
     /// last hook said. The slower liveness reap lives in `Tab::check_running`.
     pub fn is_awaiting(&self) -> bool {
-        self.awaiting.get().is_some() && !self.is_working()
+        self.awaiting.get().since().is_some() && !self.is_working()
     }
 
     /// Epoch seconds since which this pane has been waiting, if it is.
     pub fn awaiting_since(&self) -> Option<u64> {
-        self.is_awaiting().then(|| self.awaiting.get()).flatten()
+        self.is_awaiting().then(|| self.awaiting.get().since()).flatten()
     }
 
     /// Mark the pane as waiting for the user, starting now (idempotent: an
     /// already-waiting pane keeps its original timestamp, so a second `Stop`
     /// on the same unanswered turn does not reset how long it has waited).
     pub fn set_awaiting(&self) {
-        if self.awaiting.get().is_none() {
-            self.awaiting.set(Some(now_epoch_secs()));
-        }
+        self.awaiting.set(self.awaiting.get().armed(now_epoch_secs()));
     }
 
     /// Drop the waiting flag — the user engaged, or the session is gone.
     pub fn clear_awaiting(&self) {
-        self.awaiting.set(None);
+        self.awaiting.set(AwaitingFlag::default());
+    }
+
+    /// Record that the pane has been looked at while waiting (called by the
+    /// frame loop on the focused pane of the key window).
+    pub fn mark_awaiting_seen(&self) {
+        self.awaiting.set(self.awaiting.get().read());
+    }
+
+    /// True if the pane waits for the user AND has not been looked at since.
+    /// This — not `is_awaiting` — is what Cmd+J walks: a pane you have read
+    /// keeps its marker but stops pulling the jump back to itself.
+    pub fn is_awaiting_unseen(&self) -> bool {
+        self.is_awaiting() && !self.awaiting.get().is_read()
     }
 
     /// If the shell is ready and there's a pending command, write it to the PTY
