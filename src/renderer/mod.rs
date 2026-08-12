@@ -234,6 +234,77 @@ pub struct OverlayListGeometry {
     pub max_visible: usize,
 }
 
+/// Geometry of the big directory label drawn over a flashing pane.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FlashLabelLayout {
+    name_scale: f32,
+    name_x: f32,
+    name_y: f32,
+    parent_scale: f32,
+    parent_x: f32,
+    parent_y: f32,
+    box_x: f32,
+    box_y: f32,
+    box_w: f32,
+    box_h: f32,
+}
+
+/// Lay out the flash label inside a pane rectangle: the directory name is
+/// blown up as far as it fits (never past `FLASH_NAME_MAX_SCALE`, where the
+/// upscaled atlas bitmap starts to smear), the path above it sits underneath
+/// at a fixed small scale, and the whole block is centered behind a padded
+/// backdrop. Pure geometry, so it can be checked without a GPU.
+fn flash_label_layout(
+    pane: (f32, f32, f32, f32),
+    name_chars: usize,
+    parent_chars: usize,
+    cell_w: f32,
+    cell_h: f32,
+) -> FlashLabelLayout {
+    const FLASH_NAME_MAX_SCALE: f32 = 3.0;
+    const FLASH_NAME_MIN_SCALE: f32 = 1.0;
+    const FLASH_PARENT_SCALE: f32 = 1.1;
+    /// Fraction of the pane width the name is allowed to span.
+    const FLASH_WIDTH_RATIO: f32 = 0.8;
+
+    let (px, py, pw, ph) = pane;
+    let name_chars = name_chars.max(1) as f32;
+    let name_scale = ((pw * FLASH_WIDTH_RATIO) / (name_chars * cell_w))
+        .clamp(FLASH_NAME_MIN_SCALE, FLASH_NAME_MAX_SCALE);
+    let name_w = name_chars * cell_w * name_scale;
+    let name_h = cell_h * name_scale;
+
+    // The path line shrinks below its nominal scale rather than being clipped
+    // in a narrow pane.
+    let parent_scale = if parent_chars == 0 {
+        FLASH_PARENT_SCALE
+    } else {
+        FLASH_PARENT_SCALE.min((pw * FLASH_WIDTH_RATIO) / (parent_chars as f32 * cell_w)).max(0.6)
+    };
+    let parent_w = parent_chars as f32 * cell_w * parent_scale;
+    let parent_h = if parent_chars == 0 { 0.0 } else { cell_h * parent_scale };
+    let gap = if parent_chars == 0 { 0.0 } else { name_h * 0.15 };
+
+    let block_h = name_h + gap + parent_h;
+    let top = py + (ph - block_h) / 2.0;
+    let pad_x = cell_w * name_scale;
+    let pad_y = name_h * 0.35;
+    let box_w = (name_w.max(parent_w) + pad_x * 2.0).min(pw);
+
+    FlashLabelLayout {
+        name_scale,
+        name_x: px + (pw - name_w) / 2.0,
+        name_y: top,
+        parent_scale,
+        parent_x: px + (pw - parent_w) / 2.0,
+        parent_y: top + name_h + gap,
+        box_x: px + (pw - box_w) / 2.0,
+        box_y: top - pad_y,
+        box_w,
+        box_h: block_h + pad_y * 2.0,
+    }
+}
+
 /// Horizontal split of a pane switcher row between its title (left) and the
 /// binary running in the pane (right).
 struct SwitcherRowSplit {
@@ -364,6 +435,9 @@ pub struct Renderer {
     /// Pane flash for search-palette jumps: (x, y, width, height, alpha).
     /// A pulsing rectangle drawn around a pane's viewport for ~half a second.
     pub pane_flash: Option<(f32, f32, f32, f32, f32)>,
+    /// Big label drawn inside the flashing pane: (directory name, path above
+    /// it). Set on Cmd+J jumps so a landing far from the eye names itself.
+    pub pane_flash_label: Option<(String, String)>,
     /// Loading progress: (ready_panes, total_panes). None when all loaded.
     pub loading_progress: Option<(u32, u32)>,
     /// Pane ID of the hovered URL (to show URL only in that pane's status bar)
@@ -482,6 +556,7 @@ impl Renderer {
             resize_feedback_text: None,
             boundary_flash: None,
             pane_flash: None,
+            pane_flash_label: None,
             loading_progress: None,
             hovered_url_pane_id: None,
             cached_help_hint: String::new(),
@@ -878,6 +953,18 @@ impl Renderer {
             push_quad(x, y + h - thickness, w, thickness);
             push_quad(x, y, thickness, h);
             push_quad(x + w - thickness, y, thickness, h);
+
+            // The directory name in big over the pane, when the jump asked for
+            // it (Cmd+J): the border alone does not say where the eye landed.
+            if let Some((name, parent)) = self.pane_flash_label.clone() {
+                self.build_flash_label_vertices(
+                    &mut overlay_vertices,
+                    (x, y, w, h),
+                    alpha,
+                    &name,
+                    &parent,
+                );
+            }
         }
 
         // Draw search palette overlay (on top of everything except tooltip)
@@ -2169,6 +2256,7 @@ impl Renderer {
                     ("Rename Pane", kc.rename_pane.as_str(), "sticky title"),
                     ("Repaint Pane", kc.repaint_pane.as_str(), "redraw / fix winsize"),
                     ("Next Waiting", kc.next_attention.as_str(), "waiting pane, else unread"),
+                    ("Back / Forward", kc.history_back.as_str(), "panes you visited"),
                 ]),
                 ("EDIT & SEARCH", vec![
                     ("Copy", kc.copy.as_str(), ""),
@@ -2804,6 +2892,64 @@ impl Renderer {
         self.render_status_text(vertices, text_str, text_x, text_y, text_x + text_w + cell_w, fg, no_bg);
     }
 
+    /// Draw the big directory label of a pane flash: the directory name, the
+    /// path above it, and a padded backdrop so the terminal content underneath
+    /// does not fight the text. Both lines fade with `alpha`.
+    fn build_flash_label_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        pane: (f32, f32, f32, f32),
+        alpha: f32,
+        name: &str,
+        parent: &str,
+    ) {
+        let cell_w = self.atlas.overlay_cell_width;
+        let cell_h = self.atlas.overlay_cell_height;
+        let layout = flash_label_layout(
+            pane,
+            name.chars().count(),
+            parent.chars().count(),
+            cell_w,
+            cell_h,
+        );
+
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        Self::push_bg_quad_alpha(
+            vertices,
+            layout.box_x,
+            layout.box_y,
+            layout.box_w,
+            layout.box_h,
+            self.bg_color,
+            alpha * 0.92,
+        );
+        let name_fg = [1.0, 0.85, 0.3, alpha];
+        let parent_fg = [0.75, 0.75, 0.75, alpha * 0.8];
+        let right = pane.0 + pane.2;
+        self.render_overlay_text(
+            vertices,
+            name,
+            layout.name_x,
+            layout.name_y,
+            right,
+            name_fg,
+            no_bg,
+            layout.name_scale,
+        );
+        if !parent.is_empty() {
+            self.render_overlay_text(
+                vertices,
+                parent,
+                layout.parent_x,
+                layout.parent_y,
+                right,
+                parent_fg,
+                no_bg,
+                layout.parent_scale,
+            );
+        }
+    }
+
     fn push_bg_quad(
         vertices: &mut Vec<Vertex>,
         x: f32,
@@ -2908,6 +3054,35 @@ fn format_key_combo(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flash_label_fills_the_pane_without_overflowing_it() {
+        // Wide pane, short name: capped at the max scale, centered, and the
+        // backdrop stays inside the pane.
+        let l = flash_label_layout((100.0, 200.0, 800.0, 400.0), 4, 16, 10.0, 20.0);
+        assert_eq!(l.name_scale, 3.0);
+        let name_w = 4.0 * 10.0 * l.name_scale;
+        assert!((l.name_x - (100.0 + (800.0 - name_w) / 2.0)).abs() < 0.01);
+        assert!(l.box_x >= 100.0 && l.box_x + l.box_w <= 900.0 + 0.01);
+        // The path line sits under the name, never over it.
+        assert!(l.parent_y > l.name_y + 20.0 * l.name_scale - 0.01);
+    }
+
+    #[test]
+    fn flash_label_shrinks_a_long_name_to_the_pane_width() {
+        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 40, 0, 10.0, 20.0);
+        assert_eq!(l.name_scale, 1.0, "never shrinks below the overlay size");
+        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 12, 0, 10.0, 20.0);
+        assert!(l.name_scale < 3.0 && l.name_scale > 1.0);
+        assert!(12.0 * 10.0 * l.name_scale <= 300.0, "name must fit the pane");
+    }
+
+    #[test]
+    fn flash_label_without_a_path_line_centers_the_name_alone() {
+        let l = flash_label_layout((0.0, 0.0, 400.0, 100.0), 1, 0, 10.0, 20.0);
+        let name_h = 20.0 * l.name_scale;
+        assert!((l.name_y - (100.0 - name_h) / 2.0).abs() < 0.01);
+    }
 
     #[test]
     fn switcher_row_without_a_binary_gives_the_title_the_whole_row() {

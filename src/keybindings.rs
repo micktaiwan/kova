@@ -67,6 +67,8 @@ pub enum Action {
     Equalize,
     RepaintPane,
     NextAttention,
+    HistoryBack,
+    HistoryForward,
 }
 
 /// Terminal-level actions dispatched from handle_key_event.
@@ -262,6 +264,8 @@ impl Keybindings {
         bind(&keys.equalize, Action::Equalize);
         bind(&keys.repaint_pane, Action::RepaintPane);
         bind(&keys.next_attention, Action::NextAttention);
+        bind(&keys.history_back, Action::HistoryBack);
+        bind(&keys.history_forward, Action::HistoryForward);
 
         // Hard-coded debug binding (not user-configurable)
         window_map.insert(parse_key_combo("cmd+shift+i"), Action::MemReport);
@@ -359,6 +363,8 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "equalize" => Action::Equalize,
         "repaint-pane" => Action::RepaintPane,
         "next-attention" => Action::NextAttention,
+        "history-back" => Action::HistoryBack,
+        "history-forward" => Action::HistoryForward,
 
         _ => return None,
     };

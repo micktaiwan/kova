@@ -26,6 +26,12 @@ pub struct AppDelegateIvars {
     ipc_rx: RefCell<Option<std::sync::mpsc::Receiver<crate::ipc::IpcRequest>>>,
     /// `wait-for-completion` requests that haven't fired yet — checked on each tick.
     pending_waits: RefCell<Vec<PendingWait>>,
+    /// Last state published to IPC event subscribers — diffed on each tick.
+    events: RefCell<crate::events::EventState>,
+    /// Whether Kova is the active app. Kept by the two activation delegate
+    /// methods rather than polled: the tick has no `MainThreadMarker` to ask
+    /// `NSApplication` with, and an edge-driven flag is exact anyway.
+    app_active: Cell<bool>,
 }
 
 /// A `wait-for-completion` request the main thread is still polling.
@@ -85,6 +91,10 @@ define_class!(
 
             let app = NSApplication::sharedApplication(mtm);
             app.activate();
+            // Seed the flag: `activate()` above usually makes AppKit call
+            // `applicationDidBecomeActive:` right after, but a launch that stays
+            // in the background never gets that call.
+            self.ivars().app_active.set(app.isActive());
 
             // Start IPC server (Unix socket for external process control)
             let ipc_rx = crate::ipc::start();
@@ -120,6 +130,16 @@ define_class!(
             true
         }
 
+        #[unsafe(method(applicationDidBecomeActive:))]
+        fn did_become_active(&self, _notification: &NSNotification) {
+            self.ivars().app_active.set(true);
+        }
+
+        #[unsafe(method(applicationDidResignActive:))]
+        fn did_resign_active(&self, _notification: &NSNotification) {
+            self.ivars().app_active.set(false);
+        }
+
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _notification: &NSNotification) {
             log::info!("Kova shutting down");
@@ -147,6 +167,8 @@ impl AppDelegate {
             session_backup,
             ipc_rx: RefCell::new(None),
             pending_waits: RefCell::new(Vec::new()),
+            events: RefCell::new(crate::events::EventState::new()),
+            app_active: Cell::new(false),
         });
         let retained: Retained<Self> = unsafe { msg_send![super(this), init] };
         retained.ivars().config.set(config).ok();
@@ -201,6 +223,31 @@ impl AppDelegate {
                         let rx_borrow = ivars.ipc_rx.borrow();
                         if let Some(ref rx) = *rx_borrow {
                             while let Ok((cmd, responder)) = rx.try_recv() {
+                                // `subscribe` is the one command that needs the
+                                // event state, so it is served here rather than in
+                                // `handle_ipc_command`.
+                                if let crate::ipc::IpcCommand::Subscribe { topics } = cmd {
+                                    let app_active = ivars.app_active.get();
+                                    // Flush what is already pending first: the
+                                    // subscribers that were here before this one
+                                    // must not learn of a change *after* the new
+                                    // client has been handed it as settled state.
+                                    ivars.events.borrow_mut().poll(
+                                        &ivars.windows,
+                                        app_active,
+                                        fps,
+                                        true,
+                                    );
+                                    let data = crate::events::snapshot(
+                                        &ivars.windows,
+                                        app_active,
+                                        topics,
+                                    );
+                                    let _ = responder.send(crate::ipc::IpcResponse::Ok {
+                                        data: Some(data),
+                                    });
+                                    continue;
+                                }
                                 match handle_ipc_command(cmd, &ivars.windows, &ivars.config) {
                                     Disposition::Reply(response) => {
                                         let _ = responder.send(response);
@@ -216,6 +263,15 @@ impl AppDelegate {
                             }
                         }
                     }
+
+                    // Publish whatever changed this tick to IPC event subscribers.
+                    // Costs one atomic load when nobody is subscribed.
+                    ivars.events.borrow_mut().poll(
+                        &ivars.windows,
+                        ivars.app_active.get(),
+                        fps,
+                        false,
+                    );
 
                     // Periodic session save (every ~30s) to survive crashes.
                     // Serialization + I/O is offloaded to a thread to avoid frame drops.
@@ -490,6 +546,15 @@ fn handle_ipc_command_sync(
         }
         IpcCommand::MergeWindow { source_window, target_window } => {
             handle_ipc_merge_window(windows, source_window, target_window)
+        }
+        // Intercepted in the tick, before this dispatcher — it needs the event
+        // state, which lives on the delegate. Reaching here means that branch was
+        // lost in a refactor.
+        IpcCommand::Subscribe { .. } => {
+            log::error!("IPC: subscribe reached the generic dispatcher");
+            crate::ipc::IpcResponse::Error {
+                message: "internal: subscribe was not intercepted".to_string(),
+            }
         }
     }
 }

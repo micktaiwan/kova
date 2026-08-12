@@ -31,6 +31,7 @@ echo "{\"cmd\":\"list-panes\"}" | nc -U "$KOVA_SOCKET"
 - One response per request: a single JSON object on its own line.
 - Multiple requests can be pipelined on the same connection.
 - Each line is capped at **64 KB** on the request side. Responses have **no cap** — `get-pane-content` can return arbitrary size.
+- One command escapes that shape: [`subscribe`](#subscribe--stream-state-changes-as-they-happen) turns the connection into a one-way event stream. After its response, Kova pushes one line per state change and never reads that connection again.
 
 ### Response envelope
 
@@ -306,6 +307,7 @@ resize-left|right|up|down          (ratio resize, ±5%)
 edge-grow-left|right               (grow the focused pane's edge)
 minimize-pane  restore-minimized
 next-attention                     (focus the next waiting pane, else an unread one)
+history-back|history-forward       (walk the panes you visited, back then forward)
 detach-tab  break-pane  merge-tab  merge-window
 rename-tab  rename-pane            (open the inline rename editor)
 open-recent-project  open-search  open-pane-switcher   (open an overlay)
@@ -422,6 +424,73 @@ Response:
 
 **Long timeouts.** The connection-thread timeout is automatically extended to `timeout_ms + 2s`, so you can ask for a long wait without the connection dying first.
 
+---
+
+### `subscribe` — stream state changes as they happen
+
+```json
+{ "cmd": "subscribe", "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close"] }
+```
+
+Turns this connection into an event stream. `events` is optional — omit it to get
+every topic. An unknown name is an error, not a silently ignored entry: a typo
+would otherwise leave the client waiting forever for events that never come.
+
+The **response is a snapshot** of the current state, so a subscriber never needs a
+separate `list-panes` to bootstrap, and has no gap between "what is true now" and
+"what changed since":
+
+```json
+{ "ok": true, "data": {
+  "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close"],
+  "app_active": true,
+  "focus": { ...pane object, or null... },
+  "panes": [ ...same objects as `list-panes`... ]
+} }
+```
+
+Every line after that is one event, told apart from a response by its `event` key:
+
+| `event` | Payload | Fires when |
+|---|---|---|
+| `focus` | `app_active`, `reason`, `pane` (a pane object, or `null`) | the pane holding the user's attention changed |
+| `pane-status` | `pane_id`, `awaiting`, `awaiting_since` | a pane raised or retracted its `awaiting` flag |
+| `pane-working` | `pane_id`, `working` | a pane started or stopped working |
+| `pane-open` | `pane` | a pane appeared |
+| `pane-close` | `pane_id`, `window`, `tab` | a pane went away |
+| `ping` | — | 30 s of silence (see below) |
+
+**`focus` folds "is Kova even frontmost" into the same stream.** Leaving Kova for
+another app emits `focus` with `pane: null` and `reason: "app-inactive"`; coming
+back emits the pane with `reason: "app-active"`. A client tracking where the
+user's attention goes therefore doesn't have to join this stream with the system's
+active-app notifications — "which pane is focused" and "you are actually looking
+at it" are one fact here. `reason` is one of `pane`, `tab`, `window`,
+`app-active`, `app-inactive`, `no-key-window`, and always names the *coarsest*
+true hop: a pane change that is also a tab change reads `tab`.
+
+Notes that matter when writing a client:
+
+- **Redundant edges, never gaps.** The subscription is registered before the
+  snapshot is built, so an event firing in between is delivered right after the
+  snapshot instead of being lost. Every event carries absolute state, so applying
+  one you already knew about changes nothing.
+- **A `ping` every 30 s of silence.** It is how Kova notices a client that died
+  without closing, and how a client notices Kova is gone — treat a long silence
+  (say 90 s) as a dead link, reconnect, and re-subscribe.
+- **Falling behind gets you disconnected.** Each subscriber has a bounded queue
+  (256 events). A client that stops reading is dropped rather than served a hole:
+  it has to reconnect, and the fresh snapshot resyncs it. This is what keeps a
+  slow client from ever stalling Kova's render loop — the main thread only pushes
+  to those queues, and the connection's own thread does the socket write.
+- **The connection is one-way once subscribed.** Kova stops reading it. Open a
+  second connection for commands.
+- **`focus` is compared every frame; the pane sweep runs at ~4 Hz.** So
+  `pane-status` / `pane-working` / `pane-open` / `pane-close` can lag a change by
+  up to ~250 ms, while `focus` is reported on the next frame.
+- **The socket name carries Kova's pid**, so a Kova restart moves it. A long-lived
+  subscriber needs to re-glob `/tmp/kova-*.sock` and re-subscribe.
+
 ## Common patterns
 
 ### Run a command and capture its output
@@ -439,6 +508,14 @@ printf '%s' "{\"cmd\":\"wait-for-completion\",\"pane_id\":$PID,\"timeout_ms\":30
 # 3. Fetch what was printed
 printf '%s' "{\"cmd\":\"get-pane-content\",\"panes\":[$PID],\"mode\":\"all\"}" | nc -U $SOCK \
   | jq -r '.data.panes[0].text'
+```
+
+### Follow the user's attention
+
+```bash
+# One line per change; the first line is the snapshot.
+printf '%s' '{"cmd":"subscribe","events":["focus"]}' | nc -U $KOVA_SOCKET \
+  | jq -r 'if .ok then "snapshot: \(.data.focus.cwd // "-")" else "\(.reason): \(.pane.cwd // "-")" end'
 ```
 
 ### Spawn an agent in a new tab
@@ -465,4 +542,5 @@ fi
 
 - All operations run on Kova's main thread (AppKit requirement). The IPC listener thread forwards parsed commands via an mpsc channel; the main thread processes them on its render tick (~60 Hz). End-to-end latency for a request is typically a single-digit number of milliseconds.
 - `wait-for-completion` is the only command that can defer its response across multiple ticks — it doesn't block the main thread or freeze the UI.
+- `subscribe` is the only command that keeps writing after its response. Events are produced on the main thread by diffing the previous state on the render tick — there is no single mutation site to hook, since focus moves from a dozen places and `working` / `awaiting` are derived rather than set. They are then handed to per-subscriber bounded queues; the socket write happens on the subscriber's own connection thread, so no client can slow the terminal down. When nobody is subscribed, the whole path costs one atomic load per tick.
 - The socket file is removed both on graceful shutdown and on panic (via a guard); a stale socket from a previous crash is cleaned up at startup.

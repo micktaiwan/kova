@@ -1,10 +1,12 @@
 mod app;
 mod claude_session;
 mod config;
+mod events;
 mod input;
 mod ipc;
 mod keybindings;
 mod pane;
+mod pane_history;
 mod recent_projects;
 mod renderer;
 mod session;

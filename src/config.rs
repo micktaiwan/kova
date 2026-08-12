@@ -300,6 +300,8 @@ pub struct KeysConfig {
     pub equalize: String,
     pub repaint_pane: String,
     pub next_attention: String,
+    pub history_back: String,
+    pub history_forward: String,
     pub terminal: TerminalKeysConfig,
 }
 
@@ -366,6 +368,8 @@ impl Default for KeysConfig {
             equalize: "cmd+shift++".into(),
             repaint_pane: "cmd+r".into(),
             next_attention: "cmd+j".into(),
+            history_back: "cmd+shift+option+left".into(),
+            history_forward: "cmd+shift+option+right".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }

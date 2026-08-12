@@ -2,6 +2,27 @@
 
 ## En cours
 
+### IPC — `subscribe`, le flux d'events
+
+**Statut** : codé, `cargo test` vert (193 tests), buildé en release. Pas encore de client branché dessus.
+
+**Pourquoi** : un client qui veut suivre l'attention (track, `/pane-sweep`, Kite) n'avait que le polling de `list-panes`, qui coûte un `proc_pidinfo` + un walk de la table des process par pane. Le déclencheur est track : imputer le temps par projet quand Mickael passe d'une session Claude à l'autre toute la journée.
+
+**Ce que ça fait** : `{"cmd":"subscribe","events":[…]}` transforme la connexion en flux. La réponse est un **snapshot** (focus + tous les panes, mêmes objets que `list-panes`) — donc pas de bootstrap séparé ni de trou entre l'état et les changements — puis une ligne JSON par edge : `focus`, `pane-status`, `pane-working`, `pane-open`, `pane-close`, plus un `ping` toutes les 30 s de silence.
+
+**Décisions structurantes** :
+- **`focus` intègre « Kova est-il au premier plan »**. Partir sur Slack émet `pane: null` / `reason: "app-inactive"`. Sinon chaque client devrait recroiser ce flux avec les notifications d'app active du système pour savoir si l'utilisateur regarde vraiment le pane.
+- **Diff sur le tick, pas d'instrumentation des mutations**. Le focus bouge depuis une douzaine d'endroits et `working`/`awaiting` sont dérivés, pas posés : hooker chaque site aurait garanti d'en oublier un. `src/events.rs` garde le dernier état publié et le compare.
+- **Le main thread n'écrit jamais sur une socket**. Il pousse dans des files bornées (256), le thread de la connexion écrit. Un client lent est **déconnecté** plutôt que servi troué : il se reconnecte, le snapshot le resynchronise. C'est ce qui garantit qu'aucun abonné ne peut ralentir la boucle de rendu.
+- **Inscription avant snapshot** : un event qui tombe entre les deux est livré juste après le snapshot. Redondant parfois, jamais troué — chaque event porte un état absolu.
+- **Coût zéro quand personne n'écoute** : un load atomique par tick. Le focus est comparé chaque frame (deux lectures de `RefCell`), le balayage des panes est throttlé à ~4 Hz, et le JSON coûteux (CWD, process) n'est construit que sur un edge.
+
+**Fichiers** : `src/events.rs` (neuf — diff + snapshot), `src/ipc.rs` (registre d'abonnés, `publish`, `stream_events`, parsing), `src/window.rs` (`pane_json` extrait et partagé par `list-panes`, le snapshot et les events), `src/app.rs` (poll dans le tick, `applicationDidBecomeActive/ResignActive`).
+
+**À tester** : `printf '%s' '{"cmd":"subscribe"}' | nc -U $KOVA_SOCKET` puis bouger entre panes/onglets/apps et regarder les lignes tomber.
+
+**Limite connue** : le socket porte le pid de Kova, donc un redémarrage déplace le chemin — un abonné longue durée doit re-glob `/tmp/kova-*.sock` et se réabonner.
+
 ### Restauration des sessions Claude Code au redémarrage
 
 **Statut** : mécanisme permanent en place et vérifié le 2026-08-04. Le bootstrap jetable qui l'accompagnait est retiré, c'est lui qui a causé la panne du 2026-08-04.

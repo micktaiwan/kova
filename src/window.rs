@@ -118,7 +118,7 @@ pub struct KovaViewIvars {
     /// Tab/pane switcher overlay state (Cmd+P — list tabs & panes, click to focus).
     pane_switcher: RefCell<Option<PaneSwitcherState>>,
     /// Highlight a pane after a search-palette jump (decremented per tick).
-    pane_flash: Cell<Option<PaneFlash>>,
+    pane_flash: RefCell<Option<PaneFlash>>,
     /// Deferred PTY winsize restore after a Cmd+R nudge (decremented per tick).
     pty_restore: RefCell<Vec<PtyRestore>>,
     /// Recent pane sizes (bounded history per pane) for round-trip
@@ -233,10 +233,45 @@ struct SearchPaletteState {
     last_edit: Option<std::time::Instant>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PaneFlash {
     pane_id: PaneId,
     remaining_frames: u32,
+    /// Big label drawn over the pane while it flashes. Set on jumps that can
+    /// land far from where the eye was (Cmd+J), so the pane says where it is
+    /// instead of leaving the reader to hunt for the status bar. `None` keeps
+    /// the plain border pulse.
+    label: Option<PaneFlashLabel>,
+}
+
+/// The two lines of a flash label: the directory the pane sits in, and the
+/// path above it.
+#[derive(Clone)]
+struct PaneFlashLabel {
+    name: String,
+    parent: String,
+}
+
+/// Split a working directory into the big line (the directory's own name) and
+/// the dim line above it, with `$HOME` folded to `~`. The root and the home
+/// directory are their own name and have no parent line.
+fn flash_label_parts(cwd: &str, home: &str) -> (String, String) {
+    let display = if !home.is_empty() && (cwd == home || cwd.starts_with(&format!("{home}/"))) {
+        format!("~{}", &cwd[home.len()..])
+    } else {
+        cwd.to_string()
+    };
+    let trimmed = display.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return ("/".to_string(), String::new());
+    }
+    match trimmed.rsplit_once('/') {
+        Some((parent, name)) => {
+            let parent = if parent.is_empty() { "/".to_string() } else { parent.to_string() };
+            (name.to_string(), parent)
+        }
+        None => (trimmed.to_string(), String::new()),
+    }
 }
 
 /// Pending restore of a PTY winsize after the Cmd+R repaint nudge.
@@ -1454,7 +1489,7 @@ impl KovaView {
             boundary_flash: Cell::new(None),
             search_palette: RefCell::new(None),
             pane_switcher: RefCell::new(None),
-            pane_flash: Cell::new(None),
+            pane_flash: RefCell::new(None),
             pty_restore: RefCell::new(Vec::new()),
             recent_resizes: RefCell::new(std::collections::HashMap::new()),
             resize_settle: RefCell::new(std::collections::HashMap::new()),
@@ -1615,7 +1650,7 @@ impl KovaView {
             restores.retain(|r| r.pane_id != pane_id);
             restores.push(PtyRestore { pane_id, remaining_frames: 3 });
         }
-        self.set_pane_flash(pane_id, 20);
+        self.set_pane_flash(pane_id, 20, None);
     }
 
     fn focused_pane(&self) -> Option<&Pane> {
@@ -2994,9 +3029,19 @@ impl KovaView {
     }
 
     /// Set the highlight pulse on a pane (used by jump_to_search_hit).
-    fn set_pane_flash(&self, pane_id: PaneId, frames: u32) {
-        self.ivars().pane_flash.set(Some(PaneFlash { pane_id, remaining_frames: frames }));
+    fn set_pane_flash(&self, pane_id: PaneId, frames: u32, label: Option<PaneFlashLabel>) {
+        *self.ivars().pane_flash.borrow_mut() =
+            Some(PaneFlash { pane_id, remaining_frames: frames, label });
         self.mark_dirty();
+    }
+
+    /// The working directory of a pane held by this window, whichever tab it
+    /// lives in.
+    fn pane_cwd(&self, pane_id: PaneId) -> Option<String> {
+        let tabs = self.ivars().tabs.borrow();
+        let tab = tabs.iter().find(|t| t.contains(pane_id))?;
+        let cwd = tab.pane(pane_id)?.terminal.read().cwd.clone();
+        cwd
     }
 
     /// Show a transient status-bar message for ~2 seconds. Used to explain why an
@@ -3156,7 +3201,7 @@ fn jump_to_search_hit(hit: &SearchHit) {
         if let Some(pane_id) = hit.pane_id {
             view.focus_pane_in_active_tab(pane_id);
             // ~30 frames ≈ 0.5s @ 60fps; renderer pulses the pane border for that span.
-            view.set_pane_flash(pane_id, 30);
+            view.set_pane_flash(pane_id, 30, None);
         }
         return;
     }
@@ -3178,12 +3223,60 @@ fn focus_pane_in_any_window(pane_id: PaneId) {
         };
         if view.ipc_focus_pane(pane_id) {
             win.makeKeyAndOrderFront(None);
-            // ~30 frames ≈ 0.5s @ 60fps; renderer pulses the pane border.
-            view.set_pane_flash(pane_id, 30);
+            // The jump crosses tabs and windows, so a border pulse alone does
+            // not say where it landed: name the directory in big over the pane.
+            // ~54 frames ≈ 0.9s @ 60fps, held opaque until the last 30 fade.
+            let label = view.pane_cwd(pane_id).map(|cwd| {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let (name, parent) = flash_label_parts(&cwd, &home);
+                PaneFlashLabel { name, parent }
+            });
+            view.set_pane_flash(pane_id, 54, label);
             return;
         }
     }
     log::debug!("focus_pane_in_any_window: pane {} not found", pane_id);
+}
+
+/// Walk the pane visit history one step and focus what it lands on. `forward`
+/// replays the trail toward the most recent pane; otherwise it goes back
+/// toward the older ones. Does nothing at either end of the trail.
+fn do_history_step(forward: bool) {
+    let target = if forward {
+        crate::pane_history::forward(&pane_history_state)
+    } else {
+        crate::pane_history::back(&pane_history_state)
+    };
+    match target {
+        Some(id) => focus_pane_in_any_window(id),
+        None => log::debug!(
+            "pane history: nothing {} of here",
+            if forward { "ahead" } else { "behind" }
+        ),
+    }
+}
+
+/// Where a pane recorded in the visit history stands now: still a valid
+/// landing spot, minimized (walked over, never focused), or closed.
+fn pane_history_state(pane_id: PaneId) -> crate::pane_history::PaneState {
+    use crate::pane_history::PaneState;
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let ns_windows = app.windows();
+    for i in 0..ns_windows.count() {
+        let win = ns_windows.objectAtIndex(i);
+        let view = match crate::app::kova_view(&win) {
+            Some(v) => v,
+            None => continue,
+        };
+        let tabs = view.ivars().tabs.borrow();
+        for tab in tabs.iter() {
+            if let Some(pane) = tab.pane(pane_id) {
+                return if pane.minimized { PaneState::Hidden } else { PaneState::Focusable };
+            }
+        }
+    }
+    PaneState::Gone
 }
 
 impl KovaView {
@@ -3622,6 +3715,8 @@ impl KovaView {
             }
             Action::RepaintPane => self.do_repaint_pane(),
             Action::NextAttention => self.do_focus_next_attention(),
+            Action::HistoryBack => do_history_step(false),
+            Action::HistoryForward => do_history_step(true),
             Action::PrevTab => self.do_switch_tab_relative(-1),
             Action::NextTab => self.do_switch_tab_relative(1),
             Action::RenameTab => self.start_rename_tab(),
@@ -4312,34 +4407,61 @@ impl KovaView {
             let is_active_tab = tab_idx == active_tab;
             tab.for_each_pane(&mut |pane| {
                 let is_focused = pane.id == focused_id && is_active_tab && is_key_window;
-                let pid = pane.pty.pid();
-                let children = pane.pty.child_processes();
-                let is_idle = children.is_empty();
-                let child_json: Vec<serde_json::Value> = children
-                    .into_iter()
-                    .map(|(cpid, info)| {
-                        serde_json::json!({
-                            "pid": cpid,
-                            "name": info.name,
-                            "version": info.version,
-                        })
-                    })
-                    .collect();
-                out.push(serde_json::json!({
-                    "id": pane.id,
-                    "window": win_idx,
-                    "tab": tab_idx,
-                    "cwd": pane.cwd().unwrap_or_default(),
-                    "title": pane.display_title("shell"),
-                    "focused": is_focused,
-                    "pid": pid,
-                    "child_processes": child_json,
-                    "is_idle": is_idle,
-                    "working": pane.is_working(),
-                    "awaiting": pane.is_awaiting(),
-                    "awaiting_since": pane.awaiting_since(),
-                    "minimized": pane.minimized,
-                }));
+                out.push(pane_json(pane, win_idx, tab_idx, is_focused));
+            });
+        }
+    }
+
+    /// The pane this window would hand the keyboard to: the focused pane of the
+    /// active tab, with that tab's index. Deliberately cheap (two `RefCell`
+    /// reads, no process introspection) — the event loop compares it every tick.
+    pub fn events_focus_key(&self) -> Option<(usize, PaneId)> {
+        let tabs = self.ivars().tabs.borrow();
+        let idx = self.ivars().active_tab.get();
+        tabs.get(idx).map(|tab| (idx, tab.focused_pane))
+    }
+
+    /// Full JSON for one pane, if this window holds it. Building it costs a
+    /// `proc_pidinfo` for the CWD, so it happens on an edge only, never on the
+    /// polling path.
+    pub fn events_pane_json(
+        &self,
+        win_idx: usize,
+        pane_id: PaneId,
+        is_key_window: bool,
+    ) -> Option<serde_json::Value> {
+        let tabs = self.ivars().tabs.borrow();
+        let active_tab = self.ivars().active_tab.get();
+        for (tab_idx, tab) in tabs.iter().enumerate() {
+            if let Some(pane) = tab.pane(pane_id) {
+                let focused =
+                    pane.id == tab.focused_pane && tab_idx == active_tab && is_key_window;
+                return Some(pane_json(pane, win_idx, tab_idx, focused));
+            }
+        }
+        None
+    }
+
+    /// Collect the per-pane flags the event diff watches. Reads nothing that
+    /// costs a syscall — this runs on a timer, across every pane of every window.
+    pub fn events_collect_flags(
+        &self,
+        win_idx: usize,
+        out: &mut std::collections::HashMap<PaneId, crate::events::PaneFlags>,
+    ) {
+        let tabs = self.ivars().tabs.borrow();
+        for (tab_idx, tab) in tabs.iter().enumerate() {
+            tab.for_each_pane(&mut |pane| {
+                out.insert(
+                    pane.id,
+                    crate::events::PaneFlags {
+                        window: win_idx,
+                        tab: tab_idx,
+                        working: pane.is_working(),
+                        awaiting: pane.is_awaiting(),
+                        awaiting_since: pane.awaiting_since(),
+                    },
+                );
             });
         }
     }
@@ -5554,6 +5676,21 @@ impl KovaView {
         if ivars.closing.get() {
             return false;
         }
+
+        // --- Feed the pane visit history ---
+        // Sampling the focused pane of the key window once per frame catches
+        // every way of landing on a pane (keyboard, mouse, IPC, tab switch)
+        // without each of those paths having to record anything itself.
+        if self.window().is_some_and(|w| w.isKeyWindow()) {
+            let focused = {
+                let tabs = ivars.tabs.borrow();
+                tabs.get(ivars.active_tab.get()).map(|tab| tab.focused_pane)
+            };
+            if let Some(id) = focused {
+                crate::pane_history::record(id, &pane_history_state);
+            }
+        }
+
         let renderer = match ivars.renderer.get() {
             Some(r) => r.clone(),
             None => return true, // not yet initialized
@@ -6110,27 +6247,31 @@ impl KovaView {
 
         // Pane flash for search-palette jumps: pulse the matching pane's border
         // for the configured number of frames, then clear.
-        if let Some(mut flash) = ivars.pane_flash.get() {
+        r.pane_flash = None;
+        r.pane_flash_label = None;
+        let mut flash_slot = ivars.pane_flash.borrow_mut();
+        if let Some(flash) = flash_slot.as_mut() {
             if flash.remaining_frames > 0 {
                 flash.remaining_frames -= 1;
-                ivars.pane_flash.set(Some(flash));
                 if let Some(target) = pane_data.iter().find(|p| p.pane_id == flash.pane_id) {
                     let vp = &target.viewport;
-                    // Linear fade from 1.0 → 0.0 over the lifetime.
+                    // Linear fade from 1.0 → 0.0 over the last 30 frames; a
+                    // longer flash simply holds at full opacity before it.
                     let alpha = (flash.remaining_frames as f32 / 30.0).clamp(0.0, 1.0);
                     r.pane_flash = Some((vp.x, vp.y, vp.width, vp.height, alpha));
+                    r.pane_flash_label = flash
+                        .label
+                        .as_ref()
+                        .map(|l| (l.name.clone(), l.parent.clone()));
                 } else {
                     // Pane disappeared (e.g. closed) — drop the flash.
-                    ivars.pane_flash.set(None);
-                    r.pane_flash = None;
+                    *flash_slot = None;
                 }
             } else {
-                ivars.pane_flash.set(None);
-                r.pane_flash = None;
+                *flash_slot = None;
             }
-        } else {
-            r.pane_flash = None;
         }
+        drop(flash_slot);
 
         // Build list-overlay render data (send-to-window or merge-tab)
         let stw_guard = ivars.send_to_window.borrow();
@@ -6419,10 +6560,75 @@ fn should_skip_settle_nudge(row_coverage: f32, has_interior_band: bool) -> bool 
     !has_interior_band && row_coverage >= SETTLE_SKIP_COVERAGE
 }
 
+/// The JSON shape of one pane, shared by `list-panes`, the `subscribe` snapshot
+/// and the event payloads — a client parses the same object everywhere.
+///
+/// Costs a `proc_pidinfo` (the CWD) and a process-table walk (the children), so
+/// callers on a polling path must build it only for panes they actually report.
+pub fn pane_json(
+    pane: &Pane,
+    win_idx: usize,
+    tab_idx: usize,
+    focused: bool,
+) -> serde_json::Value {
+    let pid = pane.pty.pid();
+    let children = pane.pty.child_processes();
+    let is_idle = children.is_empty();
+    let child_json: Vec<serde_json::Value> = children
+        .into_iter()
+        .map(|(cpid, info)| {
+            serde_json::json!({
+                "pid": cpid,
+                "name": info.name,
+                "version": info.version,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "id": pane.id,
+        "window": win_idx,
+        "tab": tab_idx,
+        "cwd": pane.cwd().unwrap_or_default(),
+        "title": pane.display_title("shell"),
+        "focused": focused,
+        "pid": pid,
+        "child_processes": child_json,
+        "is_idle": is_idle,
+        "working": pane.is_working(),
+        "awaiting": pane.is_awaiting(),
+        "awaiting_since": pane.awaiting_since(),
+        "minimized": pane.minimized,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn flash_label_splits_a_cwd_into_directory_and_path_above() {
+        let home = "/Users/mick";
+        assert_eq!(
+            flash_label_parts("/Users/mick/projects/perso/kova", home),
+            ("kova".to_string(), "~/projects/perso".to_string())
+        );
+        // Home itself, and the root, are their own name with nothing above.
+        assert_eq!(flash_label_parts(home, home), ("~".to_string(), String::new()));
+        assert_eq!(flash_label_parts("/", home), ("/".to_string(), String::new()));
+        // A top-level directory keeps the root as its path line.
+        assert_eq!(flash_label_parts("/tmp", home), ("tmp".to_string(), "/".to_string()));
+        // A trailing slash must not produce an empty name.
+        assert_eq!(
+            flash_label_parts("/Users/mick/dev/", home),
+            ("dev".to_string(), "~".to_string())
+        );
+        // A path that merely starts with the same bytes as $HOME is not under it.
+        assert_eq!(
+            flash_label_parts("/Users/mickey/dev", home),
+            ("dev".to_string(), "/Users/mickey".to_string())
+        );
+    }
 
     /// Build a switcher grid from a compact spec: one string per column, one
     /// char per row — 'h' header, '.' plain pane, '?' pane waiting for the user.
