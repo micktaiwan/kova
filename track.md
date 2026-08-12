@@ -23,6 +23,8 @@
 
 **Limite connue** : le socket porte le pid de Kova, donc un redémarrage déplace le chemin — un abonné longue durée doit re-glob `/tmp/kova-*.sock` et se réabonner.
 
+**Suite (2026-08-12)** : `claude_session_id` et `claude_session_name` ajoutés à l'objet pane (donc dans `list-panes`, le snapshot et les events). Lus depuis `~/.claude/sessions/<pid>.json` sur le même probe throttlé que le reste ; `Pane.claude_name` devient `Pane.claude_session` et porte l'objet entier. Motif : c'est le **seul identifiant qui survive au pane** — le `pane_id` meurt avec l'onglet, le `cwd` est partagé par toutes les conversations d'un même repo. Track s'en sert pour attacher une conversation à une tâche.
+
 ### Restauration des sessions Claude Code au redémarrage
 
 **Statut** : mécanisme permanent en place et vérifié le 2026-08-04. Le bootstrap jetable qui l'accompagnait est retiré, c'est lui qui a causé la panne du 2026-08-04.

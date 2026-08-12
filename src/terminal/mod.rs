@@ -1214,8 +1214,15 @@ impl TerminalState {
     }
 
     /// Clear scrollback buffer and visible screen, reset cursor to top-left.
+    ///
+    /// Also drops the title the app set with OSC 0/2: it describes what used to
+    /// be on the screen, so leaving it up after a wipe labels an empty pane with
+    /// a dead command. The pane falls back to its foreground process or cwd
+    /// until something sets a title again. A title the user set by hand
+    /// (`custom_title`) is deliberate and survives.
     pub fn clear_scrollback_and_screen(&mut self) {
         self.dirty.store(true, Ordering::Relaxed);
+        self.title = None;
         self.scrollback.clear();
         self.reset_scroll();
         self.selection = None;
@@ -2574,6 +2581,16 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    #[test]
+    fn clear_scrollback_and_screen_drops_the_osc_title() {
+        let mut t = term(10, 3);
+        put_str(&mut t, "hello");
+        t.title = Some("vim notes.md".into());
+        t.clear_scrollback_and_screen();
+        assert_eq!(t.title, None, "a wiped pane must not keep the old app's title");
+        assert_eq!(row_text(&t, 0), "");
     }
 
     // --- Row coverage / interior blank band (hole detection) ---

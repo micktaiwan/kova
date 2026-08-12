@@ -399,15 +399,41 @@ fn next_awaiting_row(
         .copied()
 }
 
-/// Next id strictly after `current` in `ids`, wrapping around to the lowest
-/// one. `ids` arrives in any order and is sorted, deduped and stripped of
+/// How far a candidate pane sits from the pane in focus. Ordering matters:
+/// the variants are ranked nearest-first, and `Ord` is what sorts them.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum PaneLocality {
+    /// Same tab as the focused pane — already on screen, no jump at all.
+    CurrentTab,
+    /// Another tab of the same window.
+    CurrentWindow,
+    /// Another window entirely.
+    OtherWindow,
+}
+
+/// Next pane to land on among `candidates`, all of the same attention tier.
+///
+/// The nearest locality present wins outright: the tab under the eye is walked
+/// dry before the key crosses a tab boundary, and that window before it hops to
+/// another one. Nothing is stranded by this — a pane leaves the candidate set
+/// the moment it has been read, so the near group drains and the far ones come
+/// up next. Within the chosen locality the walk is by ascending pane id,
+/// wrapping around to the lowest.
+///
+/// `candidates` arrives in any order and is sorted, deduped and stripped of
 /// `current` in place first, so the pane being looked at is never the answer.
-fn next_pane_in_cycle(ids: &mut Vec<PaneId>, current: Option<PaneId>) -> Option<PaneId> {
-    ids.sort_unstable();
-    ids.dedup();
+fn next_pane_in_cycle(
+    candidates: &mut Vec<(PaneLocality, PaneId)>,
+    current: Option<PaneId>,
+) -> Option<PaneId> {
+    candidates.sort_unstable();
+    candidates.dedup();
     if let Some(c) = current {
-        ids.retain(|&id| id != c);
+        candidates.retain(|&(_, id)| id != c);
     }
+    let nearest = candidates.first()?.0;
+    let ids: Vec<PaneId> =
+        candidates.iter().filter(|(loc, _)| *loc == nearest).map(|&(_, id)| id).collect();
     let after = current.unwrap_or(0);
     ids.iter()
         .find(|&&id| current.is_none() || id > after)
@@ -417,11 +443,12 @@ fn next_pane_in_cycle(ids: &mut Vec<PaneId>, current: Option<PaneId>) -> Option<
 
 /// Pick the pane to jump to, in two tiers: a pane that asked for an answer
 /// always wins, and unread panes (a bell, or a command that finished while you
-/// were elsewhere) are only considered when nothing is waiting. Within a tier
-/// the walk is by ascending pane id, wrapping around.
+/// were elsewhere) are only considered when nothing is waiting. Locality never
+/// crosses that line — an unread pane sitting right next door still loses to a
+/// question asked in another window — it only orders the walk *within* a tier.
 fn next_attention_pane(
-    awaiting: &mut Vec<PaneId>,
-    unread: &mut Vec<PaneId>,
+    awaiting: &mut Vec<(PaneLocality, PaneId)>,
+    unread: &mut Vec<(PaneLocality, PaneId)>,
     current: Option<PaneId>,
 ) -> Option<PaneId> {
     next_pane_in_cycle(awaiting, current).or_else(|| next_pane_in_cycle(unread, current))
@@ -4887,16 +4914,18 @@ impl KovaView {
     /// focused pane; a waiting pane gets `awaiting_seen` there, while keeping
     /// its waiting marker until someone actually answers it). So the key never
     /// walks the same pane twice, and once everything has been read it says so
-    /// instead of looping over panes already seen. Within a tier the scan walks
-    /// pane ids in ascending order and wraps around.
+    /// instead of looping over panes already seen. Within a tier the scan is
+    /// ordered by locality — the focused tab first, then the rest of its
+    /// window, then other windows — and by ascending pane id inside that.
     fn do_focus_next_attention(&self) {
+        let active_tab = self.ivars().active_tab.get();
         let current = {
             let tabs = self.ivars().tabs.borrow();
-            tabs.get(self.ivars().active_tab.get()).map(|t| t.focused_pane)
+            tabs.get(active_tab).map(|t| t.focused_pane)
         };
 
-        let mut awaiting: Vec<PaneId> = Vec::new();
-        let mut unread: Vec<PaneId> = Vec::new();
+        let mut awaiting: Vec<(PaneLocality, PaneId)> = Vec::new();
+        let mut unread: Vec<(PaneLocality, PaneId)> = Vec::new();
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let app = NSApplication::sharedApplication(mtm);
         let ns_windows = app.windows();
@@ -4906,8 +4935,14 @@ impl KovaView {
                 Some(v) => v,
                 None => continue,
             };
+            let is_current_window = std::ptr::eq(view as *const KovaView, self as *const KovaView);
             let tabs = view.ivars().tabs.borrow();
-            for tab in tabs.iter() {
+            for (tab_idx, tab) in tabs.iter().enumerate() {
+                let locality = match (is_current_window, tab_idx == active_tab) {
+                    (true, true) => PaneLocality::CurrentTab,
+                    (true, false) => PaneLocality::CurrentWindow,
+                    (false, _) => PaneLocality::OtherWindow,
+                };
                 tab.for_each_pane(&mut |pane| {
                     // A minimized pane is never a landing spot: jumping to it
                     // would have to give it its space back, and the user
@@ -4918,14 +4953,14 @@ impl KovaView {
                         return;
                     }
                     if pane.is_awaiting_unseen() {
-                        awaiting.push(pane.id);
+                        awaiting.push((locality, pane.id));
                         return;
                     }
                     let term = pane.terminal.read();
                     if term.bell.load(std::sync::atomic::Ordering::Relaxed)
                         || term.unread_completion()
                     {
-                        unread.push(pane.id);
+                        unread.push((locality, pane.id));
                     }
                 });
             }
@@ -6628,6 +6663,8 @@ pub fn pane_json(
         "awaiting": pane.is_awaiting(),
         "awaiting_since": pane.awaiting_since(),
         "minimized": pane.minimized,
+        "claude_session_id": pane.claude_session_id(),
+        "claude_session_name": pane.claude_session_name(),
     })
 }
 
@@ -6702,9 +6739,15 @@ mod tests {
         assert_eq!(switcher_process_label(None, "kova"), None);
     }
 
+    /// Candidate panes all sitting in the tab under the eye — the shape most of
+    /// these cases care about, where only the id walk is under test.
+    fn here(ids: &[PaneId]) -> Vec<(PaneLocality, PaneId)> {
+        ids.iter().map(|&id| (PaneLocality::CurrentTab, id)).collect()
+    }
+
     #[test]
     fn next_attention_walks_waiting_panes_in_id_order() {
-        let waiting = || vec![7, 2, 5];
+        let waiting = || here(&[7, 2, 5]);
         let none = &mut Vec::new();
         assert_eq!(next_attention_pane(&mut waiting(), none, Some(2)), Some(5));
         assert_eq!(next_attention_pane(&mut waiting(), none, Some(5)), Some(7));
@@ -6719,21 +6762,41 @@ mod tests {
     #[test]
     fn next_attention_prefers_waiting_over_unread() {
         // A pane waiting for an answer wins over a lower-id unread pane...
-        assert_eq!(next_attention_pane(&mut vec![9], &mut vec![3], Some(1)), Some(9));
+        assert_eq!(next_attention_pane(&mut here(&[9]), &mut here(&[3]), Some(1)), Some(9));
         // ...and unread panes are only visited once nothing is waiting.
-        assert_eq!(next_attention_pane(&mut vec![], &mut vec![3, 8], Some(4)), Some(8));
+        assert_eq!(next_attention_pane(&mut vec![], &mut here(&[3, 8]), Some(4)), Some(8));
         // The focused pane being the only one waiting: fall through to unread
         // rather than re-focusing where the cursor already is.
-        assert_eq!(next_attention_pane(&mut vec![4], &mut vec![6], Some(4)), Some(6));
+        assert_eq!(next_attention_pane(&mut here(&[4]), &mut here(&[6]), Some(4)), Some(6));
+    }
+
+    #[test]
+    fn next_attention_walks_the_current_tab_before_leaving_it() {
+        use PaneLocality::{CurrentTab, CurrentWindow, OtherWindow};
+        // A lower id in another window loses to the tab under the eye...
+        let mut spread = vec![(OtherWindow, 2), (CurrentWindow, 3), (CurrentTab, 9)];
+        assert_eq!(next_attention_pane(&mut spread, &mut Vec::new(), Some(1)), Some(9));
+        // ...and the current tab wraps onto itself rather than crossing over,
+        // since a pane leaves the set once read and the group drains.
+        let mut two_here = vec![(CurrentWindow, 8), (CurrentTab, 4), (CurrentTab, 6)];
+        assert_eq!(next_attention_pane(&mut two_here, &mut Vec::new(), Some(6)), Some(4));
+        // Nothing left in the current tab: the rest of the window comes next,
+        // and only then another window.
+        let mut away = vec![(OtherWindow, 2), (CurrentWindow, 8)];
+        assert_eq!(next_attention_pane(&mut away, &mut Vec::new(), Some(6)), Some(8));
+        // Locality never outranks the tier: an unread pane in the current tab
+        // still waits behind a question asked in another window.
+        let mut far_question = vec![(OtherWindow, 2)];
+        assert_eq!(next_attention_pane(&mut far_question, &mut here(&[7]), Some(1)), Some(2));
     }
 
     #[test]
     fn next_attention_handles_empty_and_lone_candidates() {
         assert_eq!(next_attention_pane(&mut vec![], &mut vec![], Some(4)), None);
         // Nothing else waiting or unread: no jump at all.
-        assert_eq!(next_attention_pane(&mut vec![4], &mut vec![], Some(4)), None);
+        assert_eq!(next_attention_pane(&mut here(&[4]), &mut vec![], Some(4)), None);
         // Duplicates (same pane seen twice) collapse instead of stalling.
-        assert_eq!(next_attention_pane(&mut vec![4, 4, 9], &mut vec![], Some(4)), Some(9));
+        assert_eq!(next_attention_pane(&mut here(&[4, 4, 9]), &mut vec![], Some(4)), Some(9));
     }
 
     #[test]

@@ -698,14 +698,14 @@ impl Tab {
             if !pane.is_alive() {
                 pane.clear_awaiting();
                 pane.fg_process.replace(None);
-                pane.claude_name.replace(None);
+                pane.claude_session.replace(None);
                 return;
             }
             if pane.terminal.read().command_running.load(std::sync::atomic::Ordering::Relaxed) {
                 osc_any = true;
             }
             if refresh_fg {
-                pane.refresh_claude_name();
+                pane.refresh_claude_session();
                 let fg = pane.refresh_fg_process();
                 if fg {
                     fg_any = true;
@@ -1535,11 +1535,12 @@ pub struct Pane {
     /// `is_awaiting` and `Tab::check_running`.
     pub awaiting: Cell<AwaitingFlag>,
     /// Name of the Claude Code session running in this pane, as set by its
-    /// `/rename` command. Refreshed on the same throttle as the foreground
-    /// probe (`Tab::check_running`) rather than read per frame, because the
-    /// lookup goes through a directory scan. `None` = no Claude session here,
-    /// or one the user never named.
-    pub claude_name: RefCell<Option<String>>,
+    /// `/rename` command, plus the conversation id that `claude --resume` takes.
+    /// Refreshed on the same throttle as the foreground probe
+    /// (`Tab::check_running`) rather than read per frame, because the lookup
+    /// goes through a directory scan. `None` = no Claude session in this pane;
+    /// a session the user never named is `Some` with a `name` of `None`.
+    pub claude_session: RefCell<Option<crate::claude_session::Session>>,
     /// Name of the binary running in the foreground (`claude`, `nvim`, `ssh`…),
     /// `None` at a bare shell prompt. Cached because the status bar reads it on
     /// every frame while resolving it costs two syscalls: it is refreshed on the
@@ -1685,7 +1686,7 @@ impl Pane {
             minimized: false,
             open_timer,
             awaiting: Cell::new(AwaitingFlag::default()),
-            claude_name: RefCell::new(None),
+            claude_session: RefCell::new(None),
             fg_process: RefCell::new(None),
         })
     }
@@ -1715,7 +1716,7 @@ impl Pane {
             minimized: false,
             open_timer: Arc::new(PaneOpenTimer::new()),
             awaiting: Cell::new(AwaitingFlag::default()),
-            claude_name: RefCell::new(None),
+            claude_session: RefCell::new(None),
             fg_process: RefCell::new(None),
         })
     }
@@ -1777,9 +1778,10 @@ impl Pane {
     /// title > foreground process > CWD basename > fallback.
     pub fn display_title(&self, fallback: &str) -> String {
         let term = self.terminal.read();
+        let session = self.claude_session.borrow();
         derive_display_title(
             self.custom_title.as_deref(),
-            self.claude_name.borrow().as_deref(),
+            session.as_ref().and_then(|s| s.name.as_deref()),
             term.title.as_deref(),
             self.fg_process.borrow().as_ref().map(|p| p.name.as_str()),
             term.cwd.as_deref(),
@@ -1787,11 +1789,27 @@ impl Pane {
         )
     }
 
-    /// Re-read the name of the Claude Code session running in this pane (the
-    /// one its `/rename` sets). Called from the throttled probe pass, never per
-    /// frame: the lookup is a cached scan of `~/.claude/sessions/`.
-    pub fn refresh_claude_name(&self) {
-        *self.claude_name.borrow_mut() = crate::claude_session::name_for_shell(self.pty.pid());
+    /// Re-read the Claude Code session running in this pane. Called from the
+    /// throttled probe pass, never per frame: the lookup is a cached scan of
+    /// `~/.claude/sessions/`.
+    pub fn refresh_claude_session(&self) {
+        *self.claude_session.borrow_mut() =
+            crate::claude_session::session_for_shell(self.pty.pid());
+    }
+
+    /// Id of the Claude Code conversation in this pane — the argument
+    /// `claude --resume` takes. It is the only identifier here that outlives the
+    /// pane, so an external client tying a pane to a subject must key on this,
+    /// not on the pane id: a closed tab reopened tomorrow is the same subject.
+    pub fn claude_session_id(&self) -> Option<String> {
+        self.claude_session.borrow().as_ref().map(|s| s.id.clone())
+    }
+
+    /// Name that `/rename` gave the conversation, `None` until the user sets one.
+    /// Exposed on its own rather than only through `display_title`, where it is
+    /// one candidate among five and indistinguishable from the others.
+    pub fn claude_session_name(&self) -> Option<String> {
+        self.claude_session.borrow().as_ref().and_then(|s| s.name.clone())
     }
 
     /// True if the app in this pane is actively working: its live OSC 0/2 title
