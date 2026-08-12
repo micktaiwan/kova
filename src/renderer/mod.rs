@@ -305,6 +305,22 @@ fn flash_label_layout(
     }
 }
 
+/// How far past `max_x` a glyph cell may end and still count as fitting.
+///
+/// A right-aligned run starts at `max_x - n * cell_w`, so its last cell ends
+/// exactly on `max_x` — in exact arithmetic. In f32 the subtraction and the
+/// n additions that walk the run back rarely cancel to the bit, and an
+/// overshoot of one ulp used to drop the last glyph: the pane switcher showed
+/// "claude 2.1.22" in one column and "claude 2.1.228" in the next, the two
+/// columns differing only by their right margin. A quarter pixel swamps that
+/// rounding and is invisible on screen.
+const GLYPH_FIT_EPSILON: f32 = 0.25;
+
+/// Whether a glyph cell starting at `x` still fits before `max_x`.
+fn glyph_fits(x: f32, cell_w: f32, max_x: f32) -> bool {
+    x + cell_w <= max_x + GLYPH_FIT_EPSILON
+}
+
 /// Horizontal split of a pane switcher row between its title (left) and the
 /// binary running in the pane (right).
 struct SwitcherRowSplit {
@@ -1893,7 +1909,7 @@ impl Renderer {
 
         let mut x = start_x;
         for c in text.chars() {
-            if x + cell_w > max_x { break; }
+            if !glyph_fits(x, cell_w, max_x) { break; }
             let glyph = match self.atlas.glyph(c) {
                 Some(g) => *g,
                 None => { x += cell_w; continue; }
@@ -1957,7 +1973,7 @@ impl Renderer {
 
         let mut x = start_x;
         for c in text.chars() {
-            if x + cell_w > max_x { break; }
+            if !glyph_fits(x, cell_w, max_x) { break; }
             let glyph = match self.atlas.overlay_glyph(c) {
                 Some(g) => *g,
                 None => { x += cell_w; continue; }
@@ -3054,6 +3070,32 @@ fn format_key_combo(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_right_aligned_run_keeps_its_last_glyph() {
+        // Geometry read off the pane switcher: two columns of a two-window
+        // screen, same text, same cell width, different right margins. Both
+        // must draw all seven characters.
+        let cell_w = 10.2_f32;
+        let draw = |max_x: f32, n: usize| {
+            let mut x = max_x - n as f32 * cell_w;
+            let mut drawn = 0;
+            for _ in 0..n {
+                if !glyph_fits(x, cell_w, max_x) { break; }
+                drawn += 1;
+                x += cell_w;
+            }
+            drawn
+        };
+        assert_eq!(draw(861.4, 7), 7);
+        assert_eq!(draw(1713.4, 7), 7);
+    }
+
+    #[test]
+    fn a_glyph_past_the_limit_is_still_dropped() {
+        assert!(!glyph_fits(100.0, 10.0, 109.0));
+        assert!(glyph_fits(100.0, 10.0, 110.0));
+    }
 
     #[test]
     fn flash_label_fills_the_pane_without_overflowing_it() {

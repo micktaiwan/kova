@@ -2141,7 +2141,31 @@ impl Column {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjacent_visible_pairs, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, max_visible_fraction, new_entry_weight, normalize_process_name, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
+    use super::{adjacent_visible_pairs, AwaitingFlag, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, max_visible_fraction, new_entry_weight, normalize_process_name, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
+
+    #[test]
+    fn a_read_waiting_pane_re_enters_the_jump_cycle_only_on_a_new_question() {
+        let quiet = AwaitingFlag::default();
+        assert_eq!(quiet.since(), None);
+        assert!(!quiet.is_read());
+
+        // Claude stops and asks: waiting, and unread.
+        let asked = quiet.armed(100);
+        assert_eq!(asked.since(), Some(100));
+        assert!(!asked.is_read());
+
+        // The eye lands on the pane: still waiting (reading is not answering),
+        // but read — Cmd+J must now walk past it.
+        let seen = asked.read();
+        assert!(seen.is_read());
+        assert_eq!(seen.since(), Some(100), "looking at a pane does not answer it");
+
+        // A second question on the same unanswered turn makes it unread again,
+        // without restarting the waiting clock.
+        let asked_again = seen.armed(160);
+        assert!(!asked_again.is_read(), "a fresh question must resurface the pane");
+        assert_eq!(asked_again.since(), Some(100), "the waiting clock keeps its origin");
+    }
 
     // ------------------------------------------------------------------
     // Minimized entries must not pollute the layout of the visible ones.
