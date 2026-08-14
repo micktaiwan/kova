@@ -108,11 +108,11 @@ min_width = 300.0  # minimum pane width in points before horizontal scroll activ
 | Cmd+Shift+= | Equalize all splits |
 | Cmd+R | Repaint focused pane (force redraw via SIGWINCH) |
 | Cmd+F | Search scrollback |
+| Ctrl+L | Passed to the app as usual, and clears Kova's scrollback with it (not in alt-screen) |
 | Cmd+Shift+F | Global search (all tabs and panes) |
 | Cmd+O | Open recent project |
 | Cmd+Shift+W | Close tab |
 | Cmd+Shift+C | Copy selection (raw) |
-| Cmd+K | Clear scrollback and screen |
 | Cmd+C | Copy selection |
 | Cmd+V | Paste |
 | Cmd+Q | Close window |

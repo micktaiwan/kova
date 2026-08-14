@@ -28,6 +28,9 @@ pub struct ColorsConfig {
     pub foreground: [f32; 3],
     pub background: [f32; 3],
     pub cursor: [f32; 3],
+    /// The body of a tagged block (see `terminal::paste_block`): the part of an
+    /// answer meant to leave the terminal rather than be read in it.
+    pub paste_block: [f32; 3],
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -155,6 +158,7 @@ impl Default for ColorsConfig {
             foreground: [1.0, 1.0, 1.0],
             background: [0.1, 0.1, 0.12],
             cursor: [0.8, 0.8, 0.8],
+            paste_block: [0.60, 0.80, 1.0],
         }
     }
 }
@@ -253,7 +257,6 @@ pub struct KeysConfig {
     pub copy_raw: String,
     pub paste: String,
     pub toggle_filter: String,
-    pub clear_scrollback: String,
     pub prev_tab: String,
     pub next_tab: String,
     pub rename_tab: String,
@@ -321,7 +324,6 @@ impl Default for KeysConfig {
             copy_raw: "cmd+shift+c".into(),
             paste: "cmd+v".into(),
             toggle_filter: "cmd+f".into(),
-            clear_scrollback: "cmd+k".into(),
             prev_tab: "cmd+shift+[".into(),
             next_tab: "cmd+shift+]".into(),
             rename_tab: "cmd+shift+r".into(),

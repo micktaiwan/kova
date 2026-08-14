@@ -54,6 +54,10 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 
 - **Découpe de texte en f32** — Un texte aligné à droite part de `max_x - n × cell_w`, donc sa dernière cellule finit pile sur `max_x` en arithmétique exacte, jamais en f32 : un dépassement d'un ulp faisait disparaître le dernier caractère (deux colonnes du switcher affichaient `2.1.22` et `2.1.228` pour la même chaîne). Tout test de dépassement de marge passe par `glyph_fits` (`src/renderer/mod.rs`), qui tolère un quart de pixel — ne jamais recomparer `x + cell_w > max_x` en dur.
 
+- **Une notif de bureau qui s'affiche ne prouve pas que son clic marche** — `terminal-notifier` 2.0.0 ne parle que `NSUserNotification`, l'API dépréciée depuis 10.14 (`nm` sur son binaire ne montre que ça). Sur macOS 26 la bannière est bien livrée, mais le mécanisme qui relance l'app au clic est mort : son `-execute` ne tourne jamais, en silence. Symptôme : « cliquer la notif ne fait rien », et le diagnostic part à tort vers le socket ou la commande. Kova poste donc ses notifications lui-même (`src/notification.rs`, commande IPC `notify`) : le pane id voyage dans le `userInfo` et le clic est traité dans le process, sans helper externe. Toute action au clic passe par là — ne jamais la rebrancher sur un notifier tiers sans avoir vérifié qu'il utilise `UNUserNotificationCenter`.
+
+- **`NSApplication::windows()` liste des fenêtres qui ne sont pas les nôtres** — panneaux AppKit, porteurs de tooltip, etc. Caster leur `contentView` en `KovaView` sans vérifier lit les ivars d'une autre classe : le `Vec` de tabs obtenu portait un pointeur nul, et `Cmd+J` a segfaulté dans `Tab::for_each_pane` avec `self = 0` (crash du 2026-08-14, v1.9.0). `kova_view` (`src/app.rs`) demande maintenant `isKindOfClass` avant de caster — passer par lui, jamais par un cast direct.
+
 ## Tests
 
 - **Lancer les tests automatisés après chaque modification de code.** Dès qu'une modif touche le code Rust, exécuter `cargo test` (le target est global, pas besoin de `build.sh` pour ça) et vérifier que tout est vert avant de considérer la modif terminée. Un test rouge fait partie du diff : le corriger, ne pas le laisser de côté.
@@ -65,6 +69,7 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 - Mac-only, pas de cross-platform
 - Performance et RAM minimale avant tout
 - Pas de feature creep : tabs, splits, config, c'est tout
+- **Du code que Mickael a validé (« ça me convient », « c'est bon ») ne se modifie plus.** Si une revue trouve ensuite un écart entre le code et les specs, ce sont les specs qu'on aligne sur le code, jamais l'inverse : toucher au comportement après validation introduit des régressions sur quelque chose qu'il a déjà accepté.
 
 ## Le skill `kova` est la surface publique de cet outil
 

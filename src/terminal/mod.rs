@@ -1,4 +1,5 @@
 pub mod parser;
+pub mod paste_block;
 pub mod pty;
 
 use std::borrow::Cow;
@@ -1213,7 +1214,13 @@ impl TerminalState {
         }
     }
 
-    /// Clear scrollback buffer and visible screen, reset cursor to top-left.
+    /// Clear the scrollback buffer and the visible screen, cursor back to
+    /// top-left. Called when the user hits Ctrl+L: the app answers the key by
+    /// clearing its own screen, but the scrollback belongs to Kova and no
+    /// escape sequence a shell sends on Ctrl+L (`ESC[H ESC[2J`) touches it.
+    /// Blanking the grid here also matters for ordering — the `ED 2` that
+    /// follows pushes the visible screen into the scrollback, so it must find
+    /// nothing left to push.
     ///
     /// Also drops the title the app set with OSC 0/2: it describes what used to
     /// be on the screen, so leaving it up after a wipe labels an empty pane with
@@ -2212,6 +2219,11 @@ impl TerminalState {
                 if line_idx < end.line && !row.wrapped {
                     result.push('\n');
                 }
+                continue;
+            }
+            // A tag line is punctuation for the renderer, never part of the message it
+            // labels: swept over by a selection, it would land in the paste.
+            if paste_block::is_marker_line(cells, self.default_fg) {
                 continue;
             }
             let col_start = if line_idx == start.line { start.col as usize } else { 0 };

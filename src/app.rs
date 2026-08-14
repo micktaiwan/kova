@@ -3,6 +3,11 @@ use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSApplicationDelegate, NSApplicationTerminateReply, NSMenu, NSMenuItem, NSWindow};
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
+use objc2_user_notifications::{
+    UNNotification, UNNotificationPresentationOptions, UNNotificationResponse,
+    UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+};
+use objc2::runtime::ProtocolObject;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::ptr::NonNull;
 
@@ -96,6 +101,10 @@ define_class!(
             // in the background never gets that call.
             self.ivars().app_active.set(app.isActive());
 
+            // Desktop notifications: Kova posts them itself so that clicking one
+            // can focus the pane it came from.
+            crate::notification::init(ProtocolObject::from_ref(self));
+
             // Start IPC server (Unix socket for external process control)
             let ipc_rx = crate::ipc::start();
             *self.ivars().ipc_rx.borrow_mut() = Some(ipc_rx);
@@ -152,6 +161,36 @@ define_class!(
             crate::terminal::pty::shutdown_all();
             crate::ipc::cleanup();
             log::logger().flush();
+        }
+    }
+
+    unsafe impl UNUserNotificationCenterDelegate for AppDelegate {
+        /// A notification was clicked. The pane is focused on the next tick —
+        /// see `crate::notification::take_pending_focus`.
+        #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+        fn did_receive_notification_response(
+            &self,
+            _center: &UNUserNotificationCenter,
+            response: &UNNotificationResponse,
+            completion_handler: &block2::DynBlock<dyn Fn()>,
+        ) {
+            crate::notification::handle_response(response);
+            completion_handler.call(());
+        }
+
+        /// Show the banner even when Kova is the frontmost app: the pane that
+        /// finished is usually not the one being looked at, so the notification
+        /// is still news.
+        #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
+        fn will_present_notification(
+            &self,
+            _center: &UNUserNotificationCenter,
+            _notification: &UNNotification,
+            completion_handler: &block2::DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
+        ) {
+            completion_handler.call((UNNotificationPresentationOptions::Banner
+                | UNNotificationPresentationOptions::List
+                | UNNotificationPresentationOptions::Sound,));
         }
     }
 );
@@ -261,6 +300,17 @@ impl AppDelegate {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // Focus the panes whose notification was clicked. Done here
+                    // rather than in the delegate callback because this is the
+                    // point where the main thread is free to borrow the windows.
+                    for pane_id in crate::notification::take_pending_focus() {
+                        if let crate::ipc::IpcResponse::Error { message } =
+                            handle_ipc_focus_pane(&ivars.windows, pane_id)
+                        {
+                            log::warn!("Notifications: click ignored: {}", message);
                         }
                     }
 
@@ -442,13 +492,22 @@ pub fn send_tabs_to_window(mtm: MainThreadMarker, tabs: Vec<crate::pane::Tab>, w
     }
 }
 
-/// Cast the window's contentView to our KovaView.
-/// SAFETY: contentView is always a KovaView (set in `create_window`).
+/// Cast the window's contentView to our KovaView, or `None` when the window
+/// isn't one of ours.
 pub fn kova_view(window: &NSWindow) -> Option<&crate::window::KovaView> {
-    window.contentView().map(|cv| {
-        let ptr: *const objc2_app_kit::NSView = &*cv;
-        unsafe { &*(ptr as *const crate::window::KovaView) }
-    })
+    let cv = window.contentView()?;
+    // Ask the runtime before casting. Several call sites walk
+    // `NSApplication::windows()`, which lists every window the process owns —
+    // AppKit's own panels and tooltip carriers included. Their content view is
+    // not a KovaView, and reading another class's memory as our ivars handed
+    // out a `tabs` Vec with a null pointer: Cmd+J then called
+    // `Tab::for_each_pane` on a null `self` and segfaulted (crash of
+    // 2026-08-14, kova 1.9.0).
+    if !cv.isKindOfClass(<crate::window::KovaView as objc2::ClassType>::class()) {
+        return None;
+    }
+    let ptr: *const objc2_app_kit::NSView = &*cv;
+    Some(unsafe { &*(ptr as *const crate::window::KovaView) })
 }
 
 /// What `handle_ipc_command` decided to do with the request.
@@ -546,6 +605,9 @@ fn handle_ipc_command_sync(
         }
         IpcCommand::MergeWindow { source_window, target_window } => {
             handle_ipc_merge_window(windows, source_window, target_window)
+        }
+        IpcCommand::Notify { pane_id, title, message, sound } => {
+            handle_ipc_notify(pane_id, &title, &message, sound)
         }
         // Intercepted in the tick, before this dispatcher — it needs the event
         // state, which lives on the delegate. Reaching here means that branch was
@@ -940,6 +1002,24 @@ fn handle_ipc_focus_pane(
     }
 
     IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: post a desktop notification whose click focuses `pane_id`.
+///
+/// Nothing is checked about `pane_id` here: the pane may legitimately be gone by
+/// the time the user clicks, and that case is reported then, not now.
+fn handle_ipc_notify(
+    pane_id: Option<u32>,
+    title: &str,
+    message: &str,
+    sound: bool,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    match crate::notification::post(title, message, pane_id, sound) {
+        Ok(()) => IpcResponse::Ok { data: None },
+        Err(e) => IpcResponse::Error { message: e },
+    }
 }
 
 /// IPC: create a new tab in the key window.

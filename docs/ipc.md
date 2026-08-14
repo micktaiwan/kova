@@ -131,6 +131,7 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "working": true,
   "awaiting": false,
   "awaiting_since": null,
+  "awaiting_seen": false,
   "minimized": false,
   "claude_session_id": "0b6f…",
   "claude_session_name": "subscribe côté Kova"
@@ -148,6 +149,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 `working` is `true` when the app in the pane is actively generating or running a tool, detected from its OSC 0/2 title: Claude Code prepends an **animated Braille spinner glyph** (U+2800–U+28FF, e.g. `⠂`/`⠐`) followed by a space *only while it works*. At the prompt it instead shows an asterisk-like idle marker (`✳ Claude Code`) or a plain title, so the asterisk is explicitly NOT treated as busy. Counting panes with `working: true` therefore gives the number of Claude Code sessions actually busy — as opposed to those merely open and waiting for input (which stay `is_idle: false` too, since the `claude` process is always a child). It reads the live OSC 0/2 title even when a sticky custom title (OSC 1 / manual rename) shadows the display. Kova also shows this count in the global status bar as `✳N` (hidden when zero).
 
 `awaiting` is `true` when the app in the pane has declared, over `set-pane-status`, that it is waiting for the user — and nothing Kova observed since contradicts it. `awaiting_since` is the epoch second at which the wait started (`null` when not waiting), so a client can show how long a session has been unanswered. Unlike `working`, this is *pushed*, not guessed: `working` is inferred from the terminal title, while `awaiting` is a claim the running app makes about itself. See `set-pane-status` for how it is set and, more importantly, for the ways Kova retracts it on its own.
+
+`awaiting_seen` is `true` when a waiting pane has been looked at on this Mac since it started waiting: Kova stamps it on the focused pane of the key window, on every frame. It is the difference between the two things `awaiting` alone cannot tell apart, and the reason `Cmd+J` does not hand you the same pane twice. The marker stays up either way, because reading a question is not answering it; only the jump set shrinks. A remote client that walks waiting panes should obey the same halt, otherwise it offers panes already read here. It is `false` on a pane that is not waiting, where the bit means nothing.
 
 ---
 
@@ -189,6 +192,34 @@ Switches tab and window if needed. A minimized pane is given its space back on
 the way — this is the only path that restores one by ID, and the reason the
 keyboard jumps (Cmd+J, back/forward) leave minimized panes alone while this
 command does not. Response: `{ "ok": true }`.
+
+---
+
+### `notify` — post a desktop notification that focuses a pane when clicked
+
+```json
+{ "cmd": "notify", "pane_id": 42, "title": "Claude Code", "message": "done", "sound": false }
+```
+
+Only `message` is required. `title` defaults to `"Kova"`, `sound` to `false`, and
+`pane_id` may be omitted for a notification that carries no destination — clicking
+it then only brings Kova to the front.
+
+Kova posts the notification itself instead of leaving it to a helper because it
+is the only process that can act on the click: the click focuses `pane_id` exactly
+as `focus-pane` would, restoring it if it was minimized. `terminal-notifier
+--execute` cannot do this on macOS 26 — it still speaks the removed
+`NSUserNotification` API, so its notification is delivered but its command never
+runs.
+
+`pane_id` is not checked when the notification is posted: the pane may
+legitimately be gone by the time the user clicks, and Kova logs the miss then
+rather than refusing the notification now. Response: `{ "ok": true }`, or an error
+when Kova runs outside its app bundle (notifications need a bundle identifier).
+
+The first notification of a fresh install triggers the system permission prompt;
+if the user declines, `notify` still answers `{ "ok": true }` and macOS silently
+drops the banner.
 
 ---
 
@@ -320,7 +351,7 @@ history-back|history-forward       (walk the panes you visited, back then forwar
 detach-tab  break-pane  merge-tab  merge-window
 rename-tab  rename-pane            (open the inline rename editor)
 open-recent-project  open-search  open-pane-switcher   (open an overlay)
-copy  copy-raw  paste  toggle-filter  clear-scrollback
+copy  copy-raw  paste  toggle-filter
 toggle-help  mem-report
 ```
 

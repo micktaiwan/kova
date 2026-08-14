@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSNotification", "NSRunLoop", "NSThread", "NSArray", "NSDictionary", "NSValue", "NSRange", "NSData", "NSAttributedString"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSNotification", "NSRunLoop", "NSThread", "NSArray", "NSDictionary", "NSValue", "NSRange", "NSData", "NSAttributedString", "NSBundle", "NSError"] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSWindow",
@@ -63,3 +63,4 @@ block2 = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationRequest", "UNNotificationContent", "UNNotification", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger", "UNNotificationSettings", "UNError"] }

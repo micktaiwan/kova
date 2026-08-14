@@ -85,6 +85,7 @@ use std::time::SystemTime;
 use vertex::Vertex;
 
 use crate::config::{Config, KeysConfig};
+use crate::terminal::paste_block::RowPaint;
 use crate::pane::PaneId;
 
 /// Color of the minimized-pane marker (status-bar counter and switcher ⊟ icon).
@@ -415,6 +416,8 @@ pub struct Renderer {
     /// Compact version of bg_color for comparing with Cell.bg ([u8; 3]).
     bg_color_u8: [u8; 3],
     cursor_color: [f32; 3],
+    /// Colour of a block tagged to be copied out (see `terminal::paste_block`).
+    paste_block_color: [f32; 3],
     font_size: f64,
     font_name: String,
     cursor_blink_frames: u32,
@@ -543,6 +546,7 @@ impl Renderer {
             bg_color: config.colors.background,
             bg_color_u8: crate::terminal::color_to_u8(config.colors.background),
             cursor_color: config.colors.cursor,
+            paste_block_color: config.colors.paste_block,
             font_size: config.font.size,
             font_name: config.font.family.clone(),
             cursor_blink_frames: config.terminal.cursor_blink_frames,
@@ -1258,8 +1262,21 @@ impl Renderer {
             }
         }
 
+        // Rows holding a block Claude tagged as meant to be pasted elsewhere. Read from
+        // the cells rather than tracked as the bytes arrive: Claude Code redraws lines
+        // while it streams, and a state machine fed by those redraws would drift.
+        let paste_rows = {
+            let lines: Vec<&[crate::terminal::Cell]> = display.iter().map(|l| l.as_ref()).collect();
+            crate::terminal::paste_block::paste_block_rows(&lines, term.default_fg)
+        };
+
         // Pass 2: glyphs (on top of backgrounds and selection)
         for (row_idx, line) in display.iter().enumerate() {
+            // The line that closes a paste block: it delimited, it is done, and drawing it
+            // would put a marker on screen for every message.
+            if paste_rows[row_idx] == RowPaint::Hidden {
+                continue;
+            }
             for col_idx in 0..term.cols as usize {
                 let cell = if col_idx < line.len() {
                     &line[col_idx]
@@ -1337,7 +1354,13 @@ impl Renderer {
                 let th = glyph.height as f32 / atlas_h;
 
                 let alpha = if glyph.is_color { 2.0 } else { 1.0 };
-                let fg_f = crate::terminal::color_to_f32(cell.fg);
+                // Inside a tagged block, text that carries no colour of its own takes the
+                // paste colour; anything Claude coloured itself keeps what it was given.
+                let fg_f = if paste_rows[row_idx] == RowPaint::Body && cell.fg == term.default_fg {
+                    self.paste_block_color
+                } else {
+                    crate::terminal::color_to_f32(cell.fg)
+                };
                 let fg = [fg_f[0], fg_f[1], fg_f[2], alpha];
                 let no_bg = [0.0, 0.0, 0.0, 0.0];
 
@@ -2281,7 +2304,6 @@ impl Renderer {
                     ("Find", kc.toggle_filter.as_str(), "search in this pane"),
                     ("Global Search", kc.open_search.as_str(), "across all panes"),
                     ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "quick switcher"),
-                    ("Clear Scrollback", kc.clear_scrollback.as_str(), ""),
                 ]),
                 ("MISC", vec![
                     ("Memory Report", "cmd+shift+i", ""),

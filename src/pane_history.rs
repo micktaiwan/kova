@@ -54,6 +54,11 @@ impl PaneHistory {
     /// browser after going back. But when the pane under the cursor is no
     /// longer focusable — closed or minimized — the focus change is fallout
     /// rather than a jump: `id` takes that slot and the forward trail lives on.
+    ///
+    /// A pane only ever holds one slot: revisiting it moves it to the new spot
+    /// instead of adding a copy. Without that, going back and forth between two
+    /// panes would fill the trail with `A B A B` and walking back would bounce
+    /// between the same two instead of reaching what came before them.
     pub fn record(&mut self, id: PaneId, state: &dyn Fn(PaneId) -> PaneState) {
         if self.current() == Some(id) {
             return;
@@ -61,16 +66,36 @@ impl PaneHistory {
         if let Some(cur) = self.current() {
             if state(cur) != PaneState::Focusable {
                 self.entries[self.pos] = id;
+                self.drop_repeats_of_current();
                 return;
             }
         }
         self.entries.truncate(self.pos + 1);
         self.entries.push(id);
+        self.pos = self.entries.len() - 1;
+        self.drop_repeats_of_current();
         if self.entries.len() > MAX_ENTRIES {
             let excess = self.entries.len() - MAX_ENTRIES;
             self.entries.drain(..excess);
+            self.pos -= excess;
         }
-        self.pos = self.entries.len() - 1;
+    }
+
+    /// Remove every other slot holding the pane the cursor sits on, so that
+    /// pane appears exactly once in the trail.
+    fn drop_repeats_of_current(&mut self) {
+        let id = self.entries[self.pos];
+        let mut i = 0;
+        while i < self.entries.len() {
+            if i != self.pos && self.entries[i] == id {
+                self.entries.remove(i);
+                if i < self.pos {
+                    self.pos -= 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Move the cursor one step toward the older end and return the pane to
@@ -284,6 +309,45 @@ mod tests {
         // must not "move" onto the pane we are already on.
         let state = except(&[2], PaneState::Gone);
         assert_eq!(h.back(&state), None);
+    }
+
+    #[test]
+    fn bouncing_between_two_panes_leaves_one_slot_each() {
+        // A B A B: the user hopped back and forth between two panes after
+        // visiting 1 and 2. Walking back must reach them, not bounce.
+        let mut h = trail(&[1, 2, 3, 4, 3, 4]);
+        assert_eq!(h.entries, vec![1, 2, 3, 4]);
+
+        assert_eq!(h.back(&all_focusable), Some(3));
+        assert_eq!(h.back(&all_focusable), Some(2));
+        assert_eq!(h.back(&all_focusable), Some(1));
+        assert_eq!(h.back(&all_focusable), None);
+    }
+
+    #[test]
+    fn a_revisit_moves_the_pane_instead_of_copying_it() {
+        let mut h = trail(&[1, 2, 3]);
+        h.record(1, &all_focusable);
+
+        assert_eq!(h.entries, vec![2, 3, 1], "1 left its old slot");
+        assert_eq!(h.current(), Some(1));
+        assert_eq!(h.back(&all_focusable), Some(3));
+        assert_eq!(h.back(&all_focusable), Some(2));
+        assert_eq!(h.back(&all_focusable), None);
+    }
+
+    #[test]
+    fn a_fallout_focus_does_not_duplicate_a_pane_ahead() {
+        let mut h = trail(&[1, 2, 3]);
+        assert_eq!(h.back(&all_focusable), Some(2));
+
+        // 2 is closed and focus falls on 3, which is already the forward trail.
+        let state = except(&[2], PaneState::Gone);
+        h.record(3, &state);
+        assert_eq!(h.entries, vec![1, 3]);
+        assert_eq!(h.current(), Some(3));
+        assert_eq!(h.forward(&state), None);
+        assert_eq!(h.back(&state), Some(1));
     }
 
     #[test]

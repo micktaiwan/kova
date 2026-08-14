@@ -40,7 +40,6 @@ pub enum Action {
     CopyRaw,
     Paste,
     ToggleFilter,
-    ClearScrollback,
     PrevTab,
     NextTab,
     RenameTab,
@@ -214,7 +213,6 @@ impl Keybindings {
         bind(&keys.copy_raw, Action::CopyRaw);
         bind(&keys.paste, Action::Paste);
         bind(&keys.toggle_filter, Action::ToggleFilter);
-        bind(&keys.clear_scrollback, Action::ClearScrollback);
         bind(&keys.prev_tab, Action::PrevTab);
         bind(&keys.next_tab, Action::NextTab);
         bind(&keys.rename_tab, Action::RenameTab);
@@ -310,7 +308,6 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "copy-raw" => Action::CopyRaw,
         "paste" => Action::Paste,
         "toggle-filter" => Action::ToggleFilter,
-        "clear-scrollback" => Action::ClearScrollback,
         "prev-tab" => Action::PrevTab,
         "next-tab" => Action::NextTab,
         "rename-tab" => Action::RenameTab,

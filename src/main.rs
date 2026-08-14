@@ -5,6 +5,7 @@ mod events;
 mod input;
 mod ipc;
 mod keybindings;
+mod notification;
 mod pane;
 mod pane_history;
 mod recent_projects;

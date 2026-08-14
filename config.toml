@@ -32,7 +32,6 @@
 # copy = "cmd+c"
 # paste = "cmd+v"
 # toggle_filter = "cmd+f"
-# clear_scrollback = "cmd+k"
 # prev_tab = "cmd+shift+["
 # next_tab = "cmd+shift+]"
 # rename_tab = "cmd+shift+r"

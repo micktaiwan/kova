@@ -742,6 +742,31 @@ define_class!(
                 }
             }
 
+            // Ctrl+L → wipe Kova's scrollback, then let the key through so the app
+            // redraws. The app's own answer to Ctrl+L is `ESC[H ESC[2J` (terminfo
+            // `clear`), which only erases the visible screen — the scrollback needs
+            // `ESC[3J`, which nothing sends here. Skipped in alt-screen, where Ctrl+L
+            // means "repaint" and the scrollback holds whatever ran before the
+            // full-screen app.
+            {
+                let modifiers = event.modifierFlags();
+                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
+                let has_option = modifiers.contains(NSEventModifierFlags::Option);
+                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
+                if has_ctrl && !has_option && !has_cmd {
+                    if let Some(chars) = event.charactersIgnoringModifiers() {
+                        if chars.to_string() == "l" {
+                            if let Some(pane) = self.focused_pane() {
+                                let mut term = pane.terminal.write();
+                                if !term.in_alt_screen {
+                                    term.clear_scrollback_and_screen();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Ctrl+Option+arrows → adjust virtual width
             {
                 let modifiers = event.modifierFlags();
@@ -3709,12 +3734,6 @@ impl KovaView {
                     self.show_mem_report_overlay();
                 }
             }
-            Action::ClearScrollback => {
-                if let Some(pane) = self.focused_pane() {
-                    pane.terminal.write().clear_scrollback_and_screen();
-                    pane.pty.write(b"\x0c");
-                }
-            }
             Action::NewWindow => {
                 let mtm = unsafe { MainThreadMarker::new_unchecked() };
                 crate::app::create_new_window(mtm);
@@ -6678,6 +6697,13 @@ pub fn pane_json(
         "working": pane.is_working(),
         "awaiting": pane.is_awaiting(),
         "awaiting_since": pane.awaiting_since(),
+        // Whether the waiting pane has been looked at here since it started waiting. This is
+        // the halt Cmd+J obeys and the status bar ignores: the `?` marker stays up until the
+        // question is answered, while a pane that has been read stops pulling the jump back to
+        // itself. A remote client walking waiting panes needs the same halt, or it hands back
+        // panes already read on this Mac. False on a pane that is not waiting at all, where the
+        // bit means nothing.
+        "awaiting_seen": pane.is_awaiting() && !pane.is_awaiting_unseen(),
         "minimized": pane.minimized,
         "claude_session_id": pane.claude_session_id(),
         "claude_session_name": pane.claude_session_name(),

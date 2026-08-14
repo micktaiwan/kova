@@ -2,6 +2,50 @@
 
 ## En cours
 
+### Le clic sur la notif de fin de session ne faisait rien
+
+**Statut** : 🔧 corrigé, 224 tests verts, binaire reconstruit et signé. **Il faut redémarrer Kova**, et accepter le prompt d'autorisation des notifications que macOS posera au lancement — refusé, plus aucune notif.
+
+**Le symptôme** : quand une session Claude Code se terminait, la notification de bureau s'affichait bien, mais cliquer dessus ne faisait rien — le pane concerné n'était jamais focus.
+
+**Cause, établie par test** : ce n'était ni le socket ni Kova. Le hook `Stop` passait par `terminal-notifier -execute`, et ce `-execute` ne tourne jamais. Vérifié en postant une notif dont l'action écrivait un fichier marqueur : cliquée, le fichier n'a jamais été créé (dossier vide et écrivable). `nm` sur le binaire (`/opt/homebrew/Cellar/terminal-notifier/2.0.0/`) ne montre que `NSUserNotification` / `NSUserNotificationCenter`, l'API dépréciée depuis 10.14. Sur macOS 26 la bannière est encore livrée, mais le mécanisme qui relance l'app au clic pour exécuter l'action est mort.
+
+**Le fix** : Kova poste ses notifications lui-même, puisqu'il est le seul process capable d'agir sur le clic. Nouveau `src/notification.rs` (`UNUserNotificationCenter`, dépendance `objc2-user-notifications`) ; nouvelle commande IPC `notify` (`pane_id`, `title`, `message`, `sound` — seul `message` est obligatoire) ; le pane id voyage dans le `userInfo` de la notif, et le clic pousse ce pane dans une file que le tick vide en appelant le même chemin que `focus-pane`.
+
+**Décisions structurantes** :
+- **Le clic ne focus pas dans le callback du délégué** : `UNUserNotificationCenter` ne documente pas sur quel thread il appelle son délégué, donc la file est un `Mutex` (avec un `AtomicBool` en garde pour ne pas prendre le verrou à chaque frame) et le focus se fait dans le tick, où le main thread est libre d'emprunter la liste des fenêtres.
+- **Garde-fou hors bundle** : `currentNotificationCenter` lève une exception ObjC si le process n'a pas de bundle identifier (binaire lancé depuis `~/.cargo/target/release/`). `center()` teste `NSBundle::mainBundle().bundleIdentifier()` d'abord et renvoie `None` — sinon l'app tombait au lancement en dev.
+- **`pane_id` n'est pas validé à la pose** : le pane peut légitimement avoir disparu au moment du clic, ce cas se loggue à ce moment-là plutôt que de refuser la notif.
+
+**Côté hooks** : le hook `Stop` de `~/.claude/settings.json` appelle maintenant `~/.claude/hooks/kova-notify.sh`, qui n'envoie rien hors d'un pane Kova et échappe le JSON. terminal-notifier sort de la boucle. Aucun autre outil perso ne l'utilisait (vérifié : seul `pomo/roadmap.md` le mentionne, sans code).
+
+**Documenté** : `docs/ipc.md` (section `notify`), le skill `kova` (21 commandes), et `CLAUDE.md` § Pièges récurrents — « une notif qui s'affiche ne prouve pas que son clic marche ».
+
+**Prochaine action** : redémarrer Kova, accepter le prompt de notifications, puis vérifier qu'un clic sur la notif de fin de session ramène bien au bon pane.
+
+### Crash sur Cmd+J : cast de fenêtre non vérifié
+
+**Statut** : 🔄 corrigé, 219 tests verts, binaire reconstruit et signé. **Il faut redémarrer Kova** — le process courant tourne encore sur le binaire d'avant.
+
+**Ce qui s'est passé** : Kova a segfaulté le 2026-08-14 à 11:16:58 sur un Cmd+J (`kova-2026-08-14-111702.ips`). Le PC tombe sur `Tab::for_each_pane` +32, `ldr x8, [x0, #32]` avec `x0 = 0` : `self` était nul, donc la liste d'onglets parcourue n'était pas la nôtre.
+
+**Cause** : `kova_view` castait le `contentView` de n'importe quelle `NSWindow` en `KovaView` sans vérification, et `do_focus_next_attention` boucle sur `NSApplication::windows()`, qui liste toutes les fenêtres du process — panneaux AppKit compris. Lire les ivars d'une autre classe donnait un `Vec` de tabs bidon. Quelle fenêtre étrangère était ouverte à cet instant n'est pas établi.
+
+**Fix** : `kova_view` (`src/app.rs`) interroge le runtime (`isKindOfClass`) et renvoie `None` si la fenêtre n'est pas à nous. Ça protège d'un coup les six boucles sur `app.windows()`, pas seulement Cmd+J. Le piège est noté dans `CLAUDE.md` § Pièges récurrents.
+
+
+### Blocs à coller peints en bleu (Kova + Kite)
+
+**Statut** : codé des deux côtés, 219 tests verts côté Kova, binaire reconstruit et signé ; APK Kite republié en 0.1.62. **Il faut redémarrer Kova** pour le voir, et installer la mise à jour depuis le téléphone pour la moitié Kite.
+
+**Le problème** : une réponse porte souvent deux choses à la fois — un message à coller dans Slack et les remarques adressées à Mickael autour. À l'écran, rien ne les séparait. Claude Code retire les fences d'un bloc et son renderer ne lui donne jamais qu'une seule des deux choses : la langue imprimée en dim au-dessus quand highlight.js ne la connaît pas, ou de la couleur dedans quand il la connaît. Une phrase en français n'obtient ni l'une ni l'autre.
+
+**Ce qui a été fait** : la ligne dim est le seul signal qui arrive, donc un bloc à coller s'écrit ```slack et se referme par un bloc vide ```/slack. `src/terminal/paste_block.rs` relit les cellules à l'affichage (et non le flux d'octets, que Claude Code réécrit pendant qu'il streame), peint le corps en `colors.paste_block` et **n'affiche pas** la ligne de fermeture. Les deux lignes de tag sont aussi exclues de `selected_text`, pour qu'une sélection trop large ne colle pas `slack` dans le message. Un tag laissé ouvert ne peint rien, exprès. Côté Kite, `CodeBlock` (`ChatScreen.kt`) affiche la langue en gris et le corps en bleu, couleurs ajoutées à `KitePalette` pour tenir aussi sur fond blanc, et un bloc vide est ignoré par le parseur.
+
+**La convention est écrite dans `~/.claude/CLAUDE.md`** (section « Écrire pour moi ») : sans elle, une autre session n'écrit pas les tags et la fonctionnalité est morte.
+
+**Question ouverte** : l'étiquette grise du haut reste visible. Elle se cache d'une ligne si elle gêne.
+
 ### IPC — `subscribe`, le flux d'events
 
 **Statut** : codé, `cargo test` vert (193 tests), buildé en release. Pas encore de client branché dessus.

@@ -126,6 +126,15 @@ pub enum IpcCommand {
         source_window: usize,
         target_window: usize,
     },
+    /// Post a desktop notification. Clicking it focuses `pane_id`.
+    /// Kova posts it itself because it is the only process that can act on the
+    /// click — see `crate::notification`.
+    Notify {
+        pane_id: Option<u32>,
+        title: String,
+        message: String,
+        sound: bool,
+    },
     /// Turn this connection into an event stream for the given topics.
     /// The main thread answers with a snapshot of the current state; every
     /// change after that is pushed as its own line. See `topic`.
@@ -385,6 +394,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "set-pane-status" => &["pane_id", "status"],
         "dispatch-action" => &["action", "pane_id"],
         "merge-window" => &["source_window", "target_window"],
+        "notify" => &["pane_id", "title", "message", "sound"],
         "subscribe" => &["events"],
         _ => return None,
     })
@@ -659,6 +669,33 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 return Err("source_window and target_window must differ".to_string());
             }
             Ok(IpcCommand::MergeWindow { source_window, target_window })
+        }
+        "notify" => {
+            let message = v
+                .get("message")
+                .and_then(|m| m.as_str())
+                .ok_or_else(|| "missing \"message\" field".to_string())?
+                .to_string();
+            let title = v
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("Kova")
+                .to_string();
+            // Optional: a notification with no pane just brings Kova to the front.
+            let pane_id = match v.get("pane_id") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(p) => Some(
+                    p.as_u64()
+                        .ok_or_else(|| "\"pane_id\" must be a number".to_string())?
+                        as u32,
+                ),
+            };
+            let sound = match v.get("sound") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => return Err("\"sound\" must be a boolean".to_string()),
+            };
+            Ok(IpcCommand::Notify { pane_id, title, message, sound })
         }
         "subscribe" => {
             // Omitted / null = every topic. An explicit list is validated name by
@@ -984,6 +1021,54 @@ mod tests {
             parse_command(r#"{"cmd":"set-pane-status","pane_id":7,"status":"none"}"#),
             Ok(IpcCommand::SetPaneStatus { pane_id: 7, waiting: false })
         ));
+    }
+
+    #[test]
+    fn notify_defaults_title_pane_and_sound() {
+        // A hook only has to supply the message; the rest has sane defaults so
+        // that the shortest possible call still produces a usable notification.
+        let parsed = parse_command(r#"{"cmd":"notify","message":"done"}"#);
+        match parsed {
+            Ok(IpcCommand::Notify { pane_id, title, message, sound }) => {
+                assert_eq!(pane_id, None);
+                assert_eq!(title, "Kova");
+                assert_eq!(message, "done");
+                assert!(!sound);
+            }
+            _ => panic!("notify should parse with only a message"),
+        }
+    }
+
+    #[test]
+    fn notify_reads_pane_title_and_sound() {
+        let parsed = parse_command(
+            r#"{"cmd":"notify","pane_id":42,"title":"Claude Code","message":"terminé","sound":true}"#,
+        );
+        match parsed {
+            Ok(IpcCommand::Notify { pane_id, title, message, sound }) => {
+                assert_eq!(pane_id, Some(42));
+                assert_eq!(title, "Claude Code");
+                assert_eq!(message, "terminé");
+                assert!(sound);
+            }
+            _ => panic!("notify should parse all its fields"),
+        }
+    }
+
+    #[test]
+    fn notify_rejects_a_missing_or_mistyped_message() {
+        assert_eq!(
+            err(r#"{"cmd":"notify","pane_id":1}"#),
+            "missing \"message\" field"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"notify","message":"x","sound":"yes"}"#),
+            "\"sound\" must be a boolean"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"notify","message":"x","pane":1}"#),
+            "unknown field \"pane\" for command \"notify\""
+        );
     }
 
     #[test]
