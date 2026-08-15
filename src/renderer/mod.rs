@@ -46,6 +46,21 @@ pub const TAB_COLORS: [[f32; 3]; 6] = [
     [0.60, 0.35, 0.75], // Violet
 ];
 
+/// Saturation kept on an inactive colored tab (CSS `saturate(0.7)`).
+const DIM_SATURATION: f32 = 0.7;
+/// Brightness kept on an inactive colored tab (CSS `brightness(0.82)`).
+const DIM_BRIGHTNESS: f32 = 0.82;
+
+/// Dim a tab color so only the active tab shows its full hue, matching the
+/// CSS filter chain `saturate(0.7) brightness(0.82)`: pull the channels toward
+/// the luminance, then scale. The tint stays recognizable, but the active tab
+/// is the only saturated block in the bar.
+fn dim_inactive_tab(c: [f32; 3]) -> [f32; 3] {
+    let lum = 0.213 * c[0] + 0.715 * c[1] + 0.072 * c[2];
+    let mix = |v: f32| ((lum + (v - lum) * DIM_SATURATION) * DIM_BRIGHTNESS).clamp(0.0, 1.0);
+    [mix(c[0]), mix(c[1]), mix(c[2])]
+}
+
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -1799,9 +1814,13 @@ impl Renderer {
         for (i, (title, is_active, color_idx, is_renaming, has_bell, has_completion, has_running)) in tab_titles.iter().enumerate() {
             let x = left_inset + i as f32 * tab_width;
 
-            // Tab background color
+            // Tab background color. Inactive colored tabs are dimmed: with
+            // every tab colored, a brighter marker on the active one drowns in
+            // the surrounding saturation — the contrast has to come from the
+            // others stepping back.
             let tab_bg: Option<[f32; 3]> = if let Some(idx) = color_idx {
-                Some(TAB_COLORS[*idx % TAB_COLORS.len()])
+                let c = TAB_COLORS[*idx % TAB_COLORS.len()];
+                Some(if *is_active { c } else { dim_inactive_tab(c) })
             } else if *is_active {
                 Some(self.tab_bar_active_bg)
             } else {
@@ -1812,16 +1831,10 @@ impl Renderer {
                 Self::push_bg_quad(vertices, x, 0.0, tab_width, bar_h, bg);
             }
 
-            // Active tab: bright border at bottom
+            // Active tab: white border at bottom, the same on every tab color
             if *is_active {
-                let border_h = 6.0_f32;
-                let border_color = if let Some(idx) = color_idx {
-                    let c = TAB_COLORS[*idx % TAB_COLORS.len()];
-                    [(c[0] + 1.0) * 0.5, (c[1] + 1.0) * 0.5, (c[2] + 1.0) * 0.5]
-                } else {
-                    [0.7, 0.7, 0.7]
-                };
-                Self::push_bg_quad(vertices, x, bar_h - border_h, tab_width, border_h, border_color);
+                let border_h = 4.0_f32;
+                Self::push_bg_quad(vertices, x, bar_h - border_h, tab_width, border_h, [1.0, 1.0, 1.0]);
             }
 
             // Tab indicator: bell (orange ●) > completion (green ●) > running
@@ -1857,9 +1870,12 @@ impl Renderer {
                 title
             };
             let label = format!("{}:{}", i + 1, display_title);
-            // White text on colored tabs (active or not), grey on default bg
-            let fg = if color_idx.is_some() || *is_active {
+            // White text on the active tab; on a dimmed colored tab the label
+            // dims by the same brightness factor as its background.
+            let fg = if *is_active {
                 [1.0, 1.0, 1.0, 1.0]
+            } else if color_idx.is_some() {
+                [DIM_BRIGHTNESS, DIM_BRIGHTNESS, DIM_BRIGHTNESS, 1.0]
             } else {
                 [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 1.0]
             };
@@ -3265,5 +3281,20 @@ mod tests {
         assert_eq!(PaneAttention::None.bar_bg(default), default);
         assert_ne!(PaneAttention::Bell.bar_bg(default), default);
         assert_ne!(PaneAttention::Completion.bar_bg(default), default);
+    }
+
+    #[test]
+    fn dim_inactive_tab_keeps_hue_but_steps_back() {
+        for c in TAB_COLORS {
+            let d = dim_inactive_tab(c);
+            let lum = |v: [f32; 3]| 0.213 * v[0] + 0.715 * v[1] + 0.072 * v[2];
+            // Always darker than the full-color version the active tab keeps.
+            assert!(lum(d) < lum(c), "{c:?} -> {d:?} should be darker");
+            // Still tinted: the widest channel gap survives the desaturation.
+            let spread = |v: [f32; 3]| v.iter().cloned().fold(f32::MIN, f32::max)
+                - v.iter().cloned().fold(f32::MAX, f32::min);
+            assert!(spread(d) > spread(c) * 0.4, "{c:?} -> {d:?} lost its hue");
+            assert!(d.iter().all(|v| (0.0..=1.0).contains(v)), "{d:?} out of range");
+        }
     }
 }

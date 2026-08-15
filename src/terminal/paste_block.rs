@@ -25,10 +25,14 @@
 //! screen is the distinction that was asked for — the message in one colour, the remarks
 //! around it in another — so a block may hold blank lines like any ordinary message.
 //!
-//! Claude Code does not always render the markdown, though — seen on 14/08/2026 in one
-//! same pane, one message showing the dim label and the next leaving the fences on screen,
-//! for a reason this file does not know. So the four raw lines are read too, and taken
-//! away rather than shown:
+//! Claude Code does not always render the markdown, though, and the rule is exact: before
+//! lexing anything it sniffs the text with
+//! `/[#*`|[>\-_~]|\n\n|(?:^|\n) {0,3}\d+\. |https?:\/\/|www\./` — and, past 500 characters,
+//! only the first 500. No match means the whole message is emitted as one plain paragraph,
+//! fences and all. A message that opens with a paragraph of French prose longer than 500
+//! characters therefore reaches the terminal unrendered (read off the binary and checked
+//! against a live pane, 14/08/2026). So the four raw lines are read too, and taken away
+//! rather than shown:
 //!
 //! ```text
 //! ```slack

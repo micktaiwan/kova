@@ -44,6 +44,10 @@
 
 **La convention est écrite dans `~/.claude/CLAUDE.md`** (section « Écrire pour moi ») : sans elle, une autre session n'écrit pas les tags et la fonctionnalité est morte.
 
+**Deux pièges trouvés en regardant de vrais panes** (14/08/2026, contenu lu par l'IPC `get-pane-content`) : quand le bloc ouvre le message, l'étiquette partage sa ligne avec la puce `⏺` de Claude Code, donc la ligne n'est pas « rien qu'un tag » ; et Claude Code ne rend pas toujours le markdown, auquel cas les backticks restent bruts à l'écran. La détection tolère la puce et lit les deux formes.
+
+**Pourquoi le markdown est parfois abandonné** — la vraie cause, lue dans le binaire `claude 2.1.232` : avant de lexer, il renifle le texte avec `/[#*`|[>\-_~]|\n\n|(?:^|\n) {0,3}\d+\. |https?:\/\/|www\./`, **et seulement les 500 premiers caractères** au-delà de cette longueur. Sans correspondance, le message entier ressort en un seul paragraphe brut. Un message qui s'ouvre sur un paragraphe de prose française de plus de 500 caractères n'est donc jamais rendu. Levier d'écriture qui en découle : une ligne vide ou n'importe quel signe de cette liste dans les 500 premiers caractères suffit à rétablir le rendu.
+
 **Question ouverte** : l'étiquette grise du haut reste visible. Elle se cache d'une ligne si elle gêne.
 
 ### IPC — `subscribe`, le flux d'events
