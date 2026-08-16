@@ -185,7 +185,7 @@ pub fn paste_block_rows(lines: &[&[Cell]], default_fg: [u8; 3]) -> Vec<RowPaint>
         Trailing,
     }
     let mut state = State::Idle;
-    let mut fill = |paint: &mut Vec<RowPaint>, from: usize, to: usize| {
+    let fill = |paint: &mut Vec<RowPaint>, from: usize, to: usize| {
         for row in &mut paint[from..to] {
             *row = RowPaint::Body;
         }

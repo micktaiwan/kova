@@ -699,6 +699,7 @@ impl Tab {
                 pane.clear_awaiting();
                 pane.fg_process.replace(None);
                 pane.claude_session.replace(None);
+                pane.rearm_idle_claude();
                 return;
             }
             if pane.terminal.read().command_running.load(std::sync::atomic::Ordering::Relaxed) {
@@ -706,6 +707,13 @@ impl Tab {
             }
             if refresh_fg {
                 pane.refresh_claude_session();
+                // Cmd+J's idle-Claude tier re-arms as soon as the pane stops
+                // being a session sitting still: one that went back to work, or
+                // whose Claude is gone, is a new state — a "already looked at"
+                // flag kept from before would hide it for good.
+                if pane.claude_session.borrow().is_none() || pane.is_working() {
+                    pane.rearm_idle_claude();
+                }
                 let fg = pane.refresh_fg_process();
                 if fg {
                     fg_any = true;
@@ -1543,6 +1551,11 @@ pub struct Pane {
     /// goes through a directory scan. `None` = no Claude session in this pane;
     /// a session the user never named is `Some` with a `name` of `None`.
     pub claude_session: RefCell<Option<crate::claude_session::Session>>,
+    /// Whether the idle Claude session in this pane has been looked at since it
+    /// last did anything. Backs Cmd+J's third tier (see `is_idle_claude_unseen`):
+    /// an open session nobody is using is a candidate exactly once, then drops
+    /// out until it works again — the same drain rule as the waiting flag.
+    idle_claude_seen: Cell<bool>,
     /// Name of the binary running in the foreground (`claude`, `nvim`, `ssh`…),
     /// `None` at a bare shell prompt. Cached because the status bar reads it on
     /// every frame while resolving it costs two syscalls: it is refreshed on the
@@ -1691,6 +1704,7 @@ impl Pane {
             open_timer,
             awaiting: Cell::new(AwaitingFlag::default()),
             claude_session: RefCell::new(None),
+            idle_claude_seen: Cell::new(false),
             fg_process: RefCell::new(None),
         })
     }
@@ -1721,6 +1735,7 @@ impl Pane {
             open_timer: Arc::new(PaneOpenTimer::new()),
             awaiting: Cell::new(AwaitingFlag::default()),
             claude_session: RefCell::new(None),
+            idle_claude_seen: Cell::new(false),
             fg_process: RefCell::new(None),
         })
     }
@@ -1868,6 +1883,42 @@ impl Pane {
     /// keeps its marker but stops pulling the jump back to itself.
     pub fn is_awaiting_unseen(&self) -> bool {
         self.is_awaiting() && !self.awaiting.get().is_read()
+    }
+
+    /// The mirror of `is_idle_claude`: a Claude session that is actively
+    /// working. Never a Cmd+J landing spot — it is counted, not jumped to.
+    pub fn is_working_claude(&self) -> bool {
+        self.claude_session.borrow().is_some() && self.is_working()
+    }
+
+    /// True if a Claude Code session sits open in this pane and is not working.
+    /// "Idle" is the absence of the working spinner (`is_working`), so a session
+    /// chewing on something is never pulled up.
+    ///
+    /// This is what Cmd+J hands back once everything else is dealt with: an open
+    /// session is either closed or picked up again, never quietly accumulated.
+    pub fn is_idle_claude(&self) -> bool {
+        self.claude_session.borrow().is_some() && !self.is_working()
+    }
+
+    /// The same, minus the sessions already looked at since they fell idle —
+    /// Cmd+J's draining third tier. The flag is set when the pane gets focus and
+    /// re-armed in `Tab::check_running` as soon as the session works again or
+    /// goes away, so a walk that covered everything hands straight over to the
+    /// non-draining loop.
+    pub fn is_idle_claude_unseen(&self) -> bool {
+        !self.idle_claude_seen.get() && self.is_idle_claude()
+    }
+
+    /// Record that the idle Claude session here has been looked at (called by the
+    /// frame loop on the focused pane, alongside `mark_awaiting_seen`).
+    pub fn mark_idle_claude_seen(&self) {
+        self.idle_claude_seen.set(true);
+    }
+
+    /// Put this pane back in the idle-Claude tier next time it falls idle.
+    pub fn rearm_idle_claude(&self) {
+        self.idle_claude_seen.set(false);
     }
 
     /// If the shell is ready and there's a pending command, write it to the PTY

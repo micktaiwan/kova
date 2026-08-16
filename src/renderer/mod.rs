@@ -464,6 +464,9 @@ pub struct Renderer {
     pub hovered_url_text: Option<String>,
     /// Resize mode feedback text, displayed on the left of the global status bar.
     pub resize_feedback_text: Option<String>,
+    /// Banner to paint across the focused pane's status bar (text, background):
+    /// which attention tier the last Cmd+J landed in. `None` most of the time.
+    pub pane_banner: Option<(String, [f32; 3])>,
     /// Boundary flash: (edge_x, top_y, bottom_y, alpha, is_right_edge). Set by window when navigation hits tab edge.
     pub boundary_flash: Option<(f32, f32, f32, f32, bool)>,
     /// Pane flash for search-palette jumps: (x, y, width, height, alpha).
@@ -589,6 +592,7 @@ impl Renderer {
             hovered_url: None,
             hovered_url_text: None,
             resize_feedback_text: None,
+            pane_banner: None,
             boundary_flash: None,
             pane_flash: None,
             pane_flash_label: None,
@@ -932,6 +936,15 @@ impl Renderer {
 
         // Draw global status bar
         self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, working_claudes, awaiting_claudes, minimized_counts.0, minimized_counts.1, help_hint_remaining, keys_config);
+
+        // Attention banner over the focused pane's status bar. Drawn in the
+        // overlay pass rather than inside the pane's own vertices: those are
+        // cached per pane and would keep a stale banner alive across frames.
+        if let (Some((text, color)), Some(focused)) =
+            (self.pane_banner.clone(), panes.iter().find(|p| p.is_focused))
+        {
+            self.build_pane_banner_vertices(&mut overlay_vertices, &focused.viewport, &text, color);
+        }
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
@@ -1607,6 +1620,28 @@ impl Renderer {
                 self.push_tooltip_zone(ts_x, bar_y, ts_w, cell_h, "Last input or output on this pane");
             }
         }
+    }
+
+    /// Paint `text` over the whole status-bar row of `vp`, on a solid `color`
+    /// background — the pane's own bar is hidden underneath for as long as it
+    /// lasts, so the message cannot be mistaken for one more field in the bar.
+    /// The text sits one cell in from the left, and is clipped at the right edge
+    /// like every other status-bar string.
+    fn build_pane_banner_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        vp: &PaneViewport,
+        text: &str,
+        color: [f32; 3],
+    ) {
+        let cell_h = self.atlas.cell_height;
+        let cell_w = self.atlas.cell_width;
+        let bar_y = vp.y + vp.height - cell_h;
+        Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, color);
+        let fg = [1.0, 1.0, 1.0, 1.0];
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let text_x = vp.x + PANE_H_PADDING + cell_w;
+        self.render_status_text(vertices, text, text_x, bar_y, vp.x + vp.width - cell_w, fg, no_bg);
     }
 
     fn build_global_status_bar_vertices(
