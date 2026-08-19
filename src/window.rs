@@ -437,11 +437,34 @@ fn next_pane_in_cycle(
     let nearest = candidates.first()?.0;
     let ids: Vec<PaneId> =
         candidates.iter().filter(|(loc, _)| *loc == nearest).map(|&(_, id)| id).collect();
+    next_id_after(&ids, current)
+}
+
+/// Next pane in the non-draining loop over every open idle session.
+///
+/// Locality is deliberately ignored here, unlike in the draining tiers: nothing
+/// leaves this set by being looked at, so favouring the nearest group would pin
+/// the walk to it for good — two idle sessions in the focused tab would hand
+/// each other back and forth, and the sessions sitting in other tabs or other
+/// windows would never come up at all. One global ring by ascending pane id.
+///
+/// `candidates` arrives in any order and is sorted, deduped and stripped of
+/// `current` in place first, so the pane being looked at is never the answer.
+fn next_pane_in_loop(candidates: &mut Vec<PaneId>, current: Option<PaneId>) -> Option<PaneId> {
+    candidates.sort_unstable();
+    candidates.dedup();
+    if let Some(c) = current {
+        candidates.retain(|&id| id != c);
+    }
+    next_id_after(candidates, current)
+}
+
+/// Walk `ids` — ascending, `current` already removed — to the first id above
+/// `current`, wrapping around to the lowest. With no focused pane the walk
+/// starts at the lowest id. `None` when the set is empty.
+fn next_id_after(ids: &[PaneId], current: Option<PaneId>) -> Option<PaneId> {
     let after = current.unwrap_or(0);
-    ids.iter()
-        .find(|&&id| current.is_none() || id > after)
-        .or_else(|| ids.first())
-        .copied()
+    ids.iter().find(|&&id| current.is_none() || id > after).or_else(|| ids.first()).copied()
 }
 
 /// Which of Cmd+J's tiers a jump landed in — what the banner across the focused
@@ -5053,7 +5076,10 @@ impl KovaView {
     /// picked back up rather than forgotten — no dead-end message in between,
     /// since a session left to walk is a better answer than a status line. A
     /// session that is actually working is never a landing spot, in that loop as
-    /// in the tier. "Nothing to show" is left for the one case where the key
+    /// in the tier. That last ring ignores locality and walks every idle session
+    /// by ascending pane id: nothing drains out of it, so preferring the nearest
+    /// group would pin the key to the focused tab and strand the sessions living
+    /// in other tabs and windows. "Nothing to show" is left for the one case where the key
     /// really has nowhere to go: not a single idle session either. It carries
     /// how many Claude sessions are still working, since a session that is
     /// chewing is never a landing spot and would otherwise go unmentioned.
@@ -5071,8 +5097,9 @@ impl KovaView {
         let mut unread: Vec<(PaneLocality, PaneId)> = Vec::new();
         let mut idle_claude: Vec<(PaneLocality, PaneId)> = Vec::new();
         // Every open idle session, looked at or not: what the post-message loop
-        // walks once the draining tiers are empty.
-        let mut idle_all: Vec<(PaneLocality, PaneId)> = Vec::new();
+        // walks once the draining tiers are empty. No locality here — that ring
+        // never drains, so a nearest-first rule would trap it in one tab.
+        let mut idle_all: Vec<PaneId> = Vec::new();
         // Claude sessions actively working: never a landing spot, but the count
         // is what the dead-end message reports.
         let mut thinking = 0usize;
@@ -5125,7 +5152,7 @@ impl KovaView {
                         return;
                     }
                     if pane.is_idle_claude() {
-                        idle_all.push((locality, pane.id));
+                        idle_all.push(pane.id);
                         if pane.is_idle_claude_unseen() {
                             idle_claude.push((locality, pane.id));
                         }
@@ -5137,7 +5164,7 @@ impl KovaView {
         let hit = next_attention_pane(&mut awaiting, &mut unread, &mut idle_claude, current);
         let (tier, target) = match hit {
             Some(hit) => hit,
-            None => match next_pane_in_cycle(&mut idle_all, current) {
+            None => match next_pane_in_loop(&mut idle_all, current) {
                 Some(id) => (AttentionTier::IdleClaudeLoop, id),
                 // Not even an idle session left: nothing to hand over at all.
                 None => {
@@ -7004,6 +7031,25 @@ mod tests {
         assert_eq!(jump_to(&mut nothing(), &mut nothing(), &mut here(&[3, 8]), Some(8)), Some(3));
         // The last idle session being the focused one: the tour is over.
         assert_eq!(jump_to(&mut nothing(), &mut nothing(), &mut here(&[4]), Some(4)), None);
+    }
+
+    #[test]
+    fn the_idle_loop_walks_every_session_wherever_it_lives() {
+        // Two idle sessions in the focused tab used to hand each other back for
+        // ever, since the loop drains nothing and the nearest locality won: the
+        // sessions in the other tab and the other window were never reached.
+        let ring = || vec![4, 6, 8, 2];
+        assert_eq!(next_pane_in_loop(&mut ring(), Some(4)), Some(6));
+        assert_eq!(next_pane_in_loop(&mut ring(), Some(6)), Some(8));
+        // Past the highest id, wrap back to the lowest.
+        assert_eq!(next_pane_in_loop(&mut ring(), Some(8)), Some(2));
+        // From a pane that is not itself an idle session, take the next id above.
+        assert_eq!(next_pane_in_loop(&mut ring(), Some(5)), Some(6));
+        // Unfocused window: start at the lowest id.
+        assert_eq!(next_pane_in_loop(&mut ring(), None), Some(2));
+        // The only idle session is the one under the eye: nothing to hand over.
+        assert_eq!(next_pane_in_loop(&mut vec![4], Some(4)), None);
+        assert_eq!(next_pane_in_loop(&mut Vec::new(), Some(4)), None);
     }
 
     #[test]
