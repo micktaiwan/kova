@@ -383,6 +383,21 @@ Response: `{ "ok": true }`.
 
 ---
 
+### `set-tab-color` — color the tab holding a pane
+
+```json
+{ "cmd": "set-tab-color", "pane_id": 42, "color": 4 }
+```
+
+`color` is an index into the same six-color palette the tab bar's right-click menu offers:
+`0` red, `1` orange, `2` yellow, `3` green, `4` blue, `5` violet. Pass `"color": null` to
+clear it (tab falls back to the default background). Anything outside `0..5` is refused
+rather than wrapped.
+
+Response: `{ "ok": true }`.
+
+---
+
 ### `get-pane-content` — capture the rendered text of one or more panes
 
 ```json

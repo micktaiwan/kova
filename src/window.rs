@@ -477,10 +477,11 @@ enum AttentionTier {
     Unread,
     /// A Claude session sitting open and idle, first time round.
     IdleClaude,
-    /// The same idle sessions, walked again once the draining tiers are empty:
-    /// this tier no longer drains, so the key keeps handing them back until they
-    /// are closed or picked up.
-    IdleClaudeLoop,
+    /// Every open session, walked round and round once the draining tiers are
+    /// empty — working ones included, since a session left chewing is an open
+    /// loop too. This tier no longer drains: the key keeps handing them back
+    /// until they are closed or picked up.
+    ClaudeLoop,
 }
 
 impl AttentionTier {
@@ -490,7 +491,7 @@ impl AttentionTier {
             Self::Awaiting => "Tier 1 — waiting for an answer",
             Self::Unread => "Tier 2 — unread output",
             Self::IdleClaude => "Tier 3 — idle Claude session",
-            Self::IdleClaudeLoop => "Tier 3 — idle Claude session (loop)",
+            Self::ClaudeLoop => "Tier 3 — open Claude session (loop)",
         }
     }
 
@@ -501,7 +502,7 @@ impl AttentionTier {
         match self {
             Self::Awaiting => [0.75, 0.42, 0.10],
             Self::Unread => [0.15, 0.33, 0.68],
-            Self::IdleClaude | Self::IdleClaudeLoop => [0.15, 0.50, 0.24],
+            Self::IdleClaude | Self::ClaudeLoop => [0.15, 0.50, 0.24],
         }
     }
 }
@@ -528,11 +529,12 @@ fn next_attention_pane(
         })
 }
 
-/// Status line for a Cmd+J press that has nowhere to send the eye. The count of
-/// Claude sessions still working is what turns a dead-end key into an answer:
-/// it says whether the quiet means "everything is dealt with" or "wait, two
-/// sessions are still chewing". Working sessions are never landing spots, so
-/// this is the only place they are reported.
+/// Status line for a Cmd+J press that has nowhere to send the eye. Reaching it
+/// means not one open session is left to walk, the pane under the eye aside, so
+/// the count of sessions still working can only come from that pane itself or
+/// from a minimized one — the two places the ring never goes. It says whether
+/// the quiet means "everything is dealt with" or "wait, something is still
+/// chewing behind a collapsed pane".
 fn nothing_to_show_status(thinking: usize) -> String {
     if thinking == 0 {
         "Nothing to show, no thinking".to_string()
@@ -4767,6 +4769,24 @@ impl KovaView {
         true
     }
 
+    /// IPC: color the tab holding `pane_id`, or clear its color with `None`.
+    ///
+    /// Same palette as the tab bar's right-click menu, and the redraw is asked for the
+    /// same way: nothing else observes this field, so without it the tab keeps its old
+    /// color until something unrelated makes the window dirty.
+    pub fn ipc_set_tab_color(&self, pane_id: PaneId, color: Option<usize>) -> bool {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let tab_idx = match tabs.iter().position(|tab| tab.contains(pane_id)) {
+            Some(i) => i,
+            None => return false,
+        };
+        tabs[tab_idx].color = color;
+        drop(tabs);
+        self.mark_dirty();
+        log::info!("IPC: set tab color for pane {}", pane_id);
+        true
+    }
+
     /// IPC: create a new tab. Returns (tab_id, pane_id) on success.
     pub fn ipc_new_tab(
         &self,
@@ -5060,7 +5080,8 @@ impl KovaView {
     /// and idle (`Pane::is_idle_claude_unseen`), which asks for nothing but is
     /// still an open loop: the tour ends on it so it gets closed or resumed
     /// rather than piling up unnoticed. A session that is actually working is
-    /// never a landing spot.
+    /// never announced by one of those three tiers — it has nothing to hand over
+    /// yet.
     ///
     /// All three tiers hold *unread* panes only: a pane drops out of the set the
     /// moment it has been looked at (bell and completion are acked on the
@@ -5071,18 +5092,20 @@ impl KovaView {
     /// first, then the rest of its window, then other windows — and by ascending
     /// pane id inside that.
     ///
-    /// Once the three drain, the key stops draining and walks the open idle
-    /// sessions again, round and round, so an open session is either closed or
-    /// picked back up rather than forgotten — no dead-end message in between,
-    /// since a session left to walk is a better answer than a status line. A
-    /// session that is actually working is never a landing spot, in that loop as
-    /// in the tier. That last ring ignores locality and walks every idle session
-    /// by ascending pane id: nothing drains out of it, so preferring the nearest
-    /// group would pin the key to the focused tab and strand the sessions living
-    /// in other tabs and windows. "Nothing to show" is left for the one case where the key
-    /// really has nowhere to go: not a single idle session either. It carries
-    /// how many Claude sessions are still working, since a session that is
-    /// chewing is never a landing spot and would otherwise go unmentioned.
+    /// Once the three drain, the key stops draining and walks the open sessions
+    /// again, round and round, so an open session is either closed or picked
+    /// back up rather than forgotten — no dead-end message in between, since a
+    /// session left to walk is a better answer than a status line. This last
+    /// ring takes the working sessions too: one still chewing is an open loop
+    /// like any other, and passing back through it is how the eye returns to the
+    /// answer it is about to print. It ignores locality and walks by ascending
+    /// pane id — nothing drains out of it, so preferring the nearest group would
+    /// pin the key to the focused tab and strand the sessions living in other
+    /// tabs and windows. "Nothing to show" is left for the one case where the
+    /// key really has nowhere to go: not one open session besides the pane under
+    /// the eye. It carries how many sessions are still working, which by then
+    /// can only be that pane itself or one behind a minimized split — the two
+    /// spots the ring never visits.
     ///
     /// Each jump paints a banner across the focused pane's status bar naming the
     /// tier it came from, so the key never moves the eye without saying why.
@@ -5096,12 +5119,14 @@ impl KovaView {
         let mut awaiting: Vec<(PaneLocality, PaneId)> = Vec::new();
         let mut unread: Vec<(PaneLocality, PaneId)> = Vec::new();
         let mut idle_claude: Vec<(PaneLocality, PaneId)> = Vec::new();
-        // Every open idle session, looked at or not: what the post-message loop
-        // walks once the draining tiers are empty. No locality here — that ring
-        // never drains, so a nearest-first rule would trap it in one tab.
-        let mut idle_all: Vec<PaneId> = Vec::new();
-        // Claude sessions actively working: never a landing spot, but the count
-        // is what the dead-end message reports.
+        // Every open session — idle or working, looked at or not: what the
+        // post-message loop walks once the draining tiers are empty. No locality
+        // here, that ring never drains and a nearest-first rule would trap it in
+        // one tab.
+        let mut session_ring: Vec<PaneId> = Vec::new();
+        // Claude sessions actively working: what the dead-end message counts,
+        // for the two spots the ring never reaches (the focused pane and the
+        // minimized ones).
         let mut thinking = 0usize;
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let app = NSApplication::sharedApplication(mtm);
@@ -5151,8 +5176,14 @@ impl KovaView {
                         unread.push((locality, pane.id));
                         return;
                     }
-                    if pane.is_idle_claude() {
-                        idle_all.push(pane.id);
+                    if pane.has_claude_session() {
+                        // Working sessions ride the ring too: one still chewing
+                        // is as much an open loop as an idle one, and landing on
+                        // it is how the eye gets back to the answer it will
+                        // print. Only the draining tier stays idle-only, so a
+                        // working session is never announced as something to
+                        // deal with now.
+                        session_ring.push(pane.id);
                         if pane.is_idle_claude_unseen() {
                             idle_claude.push((locality, pane.id));
                         }
@@ -5164,9 +5195,9 @@ impl KovaView {
         let hit = next_attention_pane(&mut awaiting, &mut unread, &mut idle_claude, current);
         let (tier, target) = match hit {
             Some(hit) => hit,
-            None => match next_pane_in_loop(&mut idle_all, current) {
-                Some(id) => (AttentionTier::IdleClaudeLoop, id),
-                // Not even an idle session left: nothing to hand over at all.
+            None => match next_pane_in_loop(&mut session_ring, current) {
+                Some(id) => (AttentionTier::ClaudeLoop, id),
+                // Not one open session left: nothing to hand over at all.
                 None => {
                     self.set_transient_status(&nothing_to_show_status(thinking));
                     return;
@@ -7034,7 +7065,7 @@ mod tests {
     }
 
     #[test]
-    fn the_idle_loop_walks_every_session_wherever_it_lives() {
+    fn the_session_loop_walks_every_session_wherever_it_lives() {
         // Two idle sessions in the focused tab used to hand each other back for
         // ever, since the loop drains nothing and the nearest locality won: the
         // sessions in the other tab and the other window were never reached.

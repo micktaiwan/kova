@@ -1885,8 +1885,16 @@ impl Pane {
         self.is_awaiting() && !self.awaiting.get().is_read()
     }
 
+    /// A Claude Code session lives in this pane, working or not. What Cmd+J's
+    /// non-draining loop walks: an open session is an open loop whether it is
+    /// chewing or waiting to be closed.
+    pub fn has_claude_session(&self) -> bool {
+        self.claude_session.borrow().is_some()
+    }
+
     /// The mirror of `is_idle_claude`: a Claude session that is actively
-    /// working. Never a Cmd+J landing spot — it is counted, not jumped to.
+    /// working. Never a landing spot for the draining tiers — the loop walks it,
+    /// but it is never announced as something asking for an answer.
     pub fn is_working_claude(&self) -> bool {
         self.claude_session.borrow().is_some() && self.is_working()
     }

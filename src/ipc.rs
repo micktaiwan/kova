@@ -19,6 +19,10 @@ use std::sync::{mpsc, Mutex};
 /// Maximum length of a single JSON line from a client (64 KB).
 const MAX_LINE_LEN: usize = 65536;
 
+/// How many colors the tab palette holds. Mirrors `renderer::TAB_COLORS`, which is what
+/// the right-click menu offers; an index outside it would be silently wrapped at draw time.
+const TAB_COLOR_COUNT: usize = crate::renderer::TAB_COLORS.len();
+
 /// Filter for commands that act on a set of panes.
 pub enum PaneFilter {
     /// All panes across all windows.
@@ -53,6 +57,12 @@ pub enum IpcCommand {
     SetTabTitle {
         pane_id: u32,
         title: Option<String>,
+    },
+    /// Set the color of the tab containing the given pane.
+    /// `color: None` clears it (tab falls back to the default background).
+    SetTabColor {
+        pane_id: u32,
+        color: Option<usize>,
     },
     /// Return the rendered text of the requested panes.
     GetPaneContent {
@@ -381,6 +391,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "focus-pane" => &["pane_id"],
         "new-tab" => &["cwd", "command"],
         "set-tab-title" => &["pane_id", "title"],
+        "set-tab-color" => &["pane_id", "color"],
         "get-pane-content" | "count-pane-content" => {
             &["panes", "mode", "trim_trailing_blank_lines"]
         }
@@ -498,6 +509,30 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 Some(_) => return Err("\"title\" must be a string or null".to_string()),
             };
             Ok(IpcCommand::SetTabTitle { pane_id, title })
+        }
+        "set-tab-color" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            let color = match v.get("color") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Number(n)) => {
+                    let index = n
+                        .as_u64()
+                        .ok_or_else(|| "\"color\" must be a palette index".to_string())?;
+                    if index as usize >= TAB_COLOR_COUNT {
+                        return Err(format!(
+                            "\"color\" must be 0..{} or null",
+                            TAB_COLOR_COUNT - 1
+                        ));
+                    }
+                    Some(index as usize)
+                }
+                Some(_) => return Err("\"color\" must be a number or null".to_string()),
+            };
+            Ok(IpcCommand::SetTabColor { pane_id, color })
         }
         "get-pane-content" => {
             let (panes, mode, trim) = parse_pane_content_args(&v)?;

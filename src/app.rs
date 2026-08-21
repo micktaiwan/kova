@@ -569,6 +569,9 @@ fn handle_ipc_command_sync(
         IpcCommand::SetTabTitle { pane_id, title } => {
             handle_ipc_set_tab_title(windows, pane_id, title)
         }
+        IpcCommand::SetTabColor { pane_id, color } => {
+            handle_ipc_set_tab_color(windows, pane_id, color)
+        }
         IpcCommand::GetPaneContent { panes, mode, trim_trailing_blank_lines } => {
             handle_ipc_get_pane_content(windows, panes, &mode, trim_trailing_blank_lines)
         }
@@ -860,6 +863,28 @@ fn handle_ipc_set_tab_title(
             None => continue,
         };
         if view.ipc_set_tab_title(pane_id, title.clone()) {
+            return IpcResponse::Ok { data: None };
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: set the color of the tab holding `pane_id`.
+fn handle_ipc_set_tab_color(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    color: Option<usize>,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        if view.ipc_set_tab_color(pane_id, color) {
             return IpcResponse::Ok { data: None };
         }
     }
