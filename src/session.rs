@@ -235,7 +235,7 @@ fn save_internal(windows: &[WindowSession], rotate: bool) {
                     return;
                 }
             }
-            if let Err(e) = std::fs::write(&path, json) {
+            if let Err(e) = write_owner_only(&path, &json) {
                 log::warn!("Failed to write session file: {}", e);
             } else {
                 log::info!("Session saved to {} ({} window(s))", path.display(), windows.len());
@@ -243,6 +243,28 @@ fn save_internal(windows: &[WindowSession], rotate: bool) {
         }
         Err(e) => log::warn!("Failed to serialize session: {}", e),
     }
+}
+
+/// Write the session file so only its owner can read it.
+///
+/// It holds every pane's cwd and the last command line typed in it — a secret
+/// passed on a command line ends up here — and the rotated backups keep months of
+/// them. A macOS home directory is world-readable, so the file has to carry its
+/// own mode. `mode()` only applies when the file is created, hence the explicit
+/// tightening for a file written before this, done before the new bytes land.
+fn write_owner_only(path: &std::path::Path, json: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(json.as_bytes())
 }
 
 /// Rotate session.json -> session.1.json -> session.2.json -> ...
@@ -377,10 +399,12 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 /// waits for the user to press Enter.
 fn restore_command(sp: &SavedPane) -> Option<String> {
     match sp.claude_session {
-        Some(ref session_id) => Some(crate::claude_session::resume_command(
-            sp.last_command.as_deref(),
-            session_id,
-        )),
+        // A refused id (see `is_safe_session_id`) leaves the pane exactly where a
+        // pane that was never running Claude Code lands: its own last command.
+        Some(ref session_id) => {
+            crate::claude_session::resume_command(sp.last_command.as_deref(), session_id)
+                .or_else(|| sp.last_command.clone())
+        }
         None => sp.last_command.clone(),
     }
 }
@@ -762,6 +786,23 @@ mod tests {
     }
 
     #[test]
+    fn the_session_file_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("kova-session-mode-{}.json", std::process::id()));
+        // A file an older build left world-readable must be tightened, not just
+        // created tight.
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_owner_only(&path, "{}").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn a_pane_that_was_at_a_shell_prompt_keeps_its_last_command() {
         let mut sp = pane("/a");
         sp.last_command = Some("npm run dev".into());
@@ -783,6 +824,16 @@ mod tests {
         sp.last_command = Some("claude --resume days-old-id".into());
         sp.claude_session = Some("live-id".into());
         assert_eq!(restore_command(&sp).as_deref(), Some("claude --resume live-id"));
+    }
+
+    #[test]
+    fn a_session_id_that_could_carry_a_second_command_falls_back_to_the_last_command() {
+        // The id is replayed from a file on disk, so this guard has to hold even
+        // when the file predates the one that refuses to write such an id.
+        let mut sp = pane("/a");
+        sp.last_command = Some("npm run dev".into());
+        sp.claude_session = Some("live-id\nrm -rf ~".into());
+        assert_eq!(restore_command(&sp).as_deref(), Some("npm run dev"));
     }
 
     #[test]

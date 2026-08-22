@@ -287,6 +287,12 @@ pub struct TerminalState {
     pub osc133_primed: bool,
     // Last command executed (set via OSC 7777 from shell integration)
     pub last_command: Option<String>,
+    // True between the shell announcing a command (OSC 133;C) and the one OSC
+    // 7777 it sends right after to name that command. Any program can print an
+    // OSC 7777 — it is just bytes on the tty — and `last_command` is replayed at
+    // the prompt on the next launch, so only the shell's own report is taken:
+    // one per started command, and none at all from a command's output.
+    pub last_command_slot_open: bool,
     // Mouse reporting modes
     // 0 = off, 1000 = button events, 1002 = button+motion, 1003 = all motion
     pub mouse_mode: u16,
@@ -386,6 +392,7 @@ impl TerminalState {
             command_running: AtomicBool::new(false),
             osc133_primed: false,
             last_command: None,
+            last_command_slot_open: false,
             last_printed: None,
             g0_dec_graphics: false,
             g1_dec_graphics: false,

