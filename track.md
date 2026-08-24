@@ -2,6 +2,23 @@
 
 ## En cours
 
+### Durcissement de ce que Kova retape tout seul dans un pane
+
+**Statut** : 🔧 codé, 239 tests verts, binaire reconstruit et signé. **Il faut redémarrer Kova** pour que ça prenne. La release qui embarquera tout ça n'est pas faite.
+
+**D'où ça part** : revue de sécurité demandée le 22/08 sur le code IPC, `subscribe` en tête. Le flux d'events lui-même n'a rien donné (socket 0600 posée sous umask, ligne bornée à 64 Ko avant bufferisation, file d'abonné bornée avec abandon du client lent, écriture jamais faite sur le main thread). Les trois défauts trouvés sont ailleurs, tous sur la même idée : Kova retape du texte dans un pane à partir de sources qu'il n'écrit pas.
+
+**Ce qui a été corrigé** :
+- **L'identifiant de conversation Claude n'était pas validé** avant d'entrer dans la ligne `claude --resume <id>` écrite au PTY, alors que la commande d'à côté était filtrée contre `;|&`. Un `\n` dedans faisait partir la suite comme commande, sans Entrée. `is_safe_session_id` (`src/claude_session.rs`) le restreint à `[A-Za-z0-9_-]`, aux deux portes : à la lecture du fichier de Claude Code, et au moment de fabriquer la ligne — la seconde compte autant, l'identifiant étant relu depuis `session.json` au redémarrage, éventuellement écrit par une version d'avant. `resume_command` renvoie maintenant `Option`, et un refus fait retomber le pane sur sa dernière commande.
+- **N'importe quelle sortie pouvait décider de ce qui serait pré-tapé au prompt** : `last_command` est posé par un OSC 7777, que tout programme peut imprimer sur son tty. Kova n'en accepte plus qu'un par OSC 133;C, celui du hook `preexec` — la sortie d'une commande qui tourne arrive après et est ignorée. Pas d'exécution automatique dans ce cas (vte jette les octets de contrôle dans une chaîne OSC, donc pas de `\n`), mais du texte planté sous le curseur en attendant un Entrée.
+- **`~/.config/kova/session.json` était en 0644** avec les cwd et les dernières commandes de chaque pane, et douze rotations d'historique. Écriture désormais en 0600, resserrée aussi sur un fichier existant (`write_owner_only`, `src/session.rs`) ; les rotations se font par renommage donc héritent du mode. Les treize fichiers déjà sur le disque ont été passés en 0600 à la main.
+
+**Le modèle de confiance, inchangé et assumé** : `KOVA_SOCKET` est exporté dans chaque pane (`src/terminal/pty.rs`), donc tout process lancé dans un pane peut lire le scrollback de tous les autres et faire `send-keys` partout. C'est le périmètre de Kova, pas un défaut à corriger.
+
+**Reste ouvert** : `recent_projects.json`, dans le même dossier, est toujours en 0644 et liste tous les projets — même traitement à décider.
+
+**Prochaine action** : publier la release qui embarque ces gardes plus les 19 commits accumulés depuis v1.9.0 (4 août).
+
 ### Le clic sur la notif de fin de session ne faisait rien
 
 **Statut** : 🔧 corrigé, 224 tests verts, binaire reconstruit et signé. **Il faut redémarrer Kova**, et accepter le prompt d'autorisation des notifications que macOS posera au lancement — refusé, plus aucune notif.
