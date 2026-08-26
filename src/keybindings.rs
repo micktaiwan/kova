@@ -63,6 +63,8 @@ pub enum Action {
     OpenRecentProject,
     OpenSearchPalette,
     OpenPaneSwitcher,
+    /// The same switcher, opened with only the panes asking for something.
+    OpenUnreadSwitcher,
     Equalize,
     RepaintPane,
     NextAttention,
@@ -259,6 +261,7 @@ impl Keybindings {
         bind(&keys.open_recent_project, Action::OpenRecentProject);
         bind(&keys.open_search, Action::OpenSearchPalette);
         bind(&keys.open_pane_switcher, Action::OpenPaneSwitcher);
+        bind(&keys.open_unread_switcher, Action::OpenUnreadSwitcher);
         bind(&keys.equalize, Action::Equalize);
         bind(&keys.repaint_pane, Action::RepaintPane);
         bind(&keys.next_attention, Action::NextAttention);
@@ -357,6 +360,7 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "open-recent-project" => Action::OpenRecentProject,
         "open-search" => Action::OpenSearchPalette,
         "open-pane-switcher" => Action::OpenPaneSwitcher,
+        "open-unread-switcher" => Action::OpenUnreadSwitcher,
         "equalize" => Action::Equalize,
         "repaint-pane" => Action::RepaintPane,
         "next-attention" => Action::NextAttention,

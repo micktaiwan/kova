@@ -365,6 +365,38 @@ impl SwitcherRow {
     fn is_pane(&self) -> bool {
         matches!(self, SwitcherRow::Pane { .. })
     }
+
+    /// Is this row asking for something? A bell, a command that finished while
+    /// the eye was elsewhere, or a pane waiting for an answer — the three
+    /// markers the switcher already draws, and the ones the attention-only list
+    /// keeps. `working` is deliberately not one of them: a session still
+    /// chewing has nothing to hand over yet, exactly as in `Cmd+J`'s tiers.
+    fn needs_attention(&self) -> bool {
+        match self {
+            SwitcherRow::TabHeader(_) => false,
+            SwitcherRow::Pane { has_bell, has_completion, awaiting, .. } => {
+                *has_bell || *has_completion || *awaiting
+            }
+        }
+    }
+}
+
+/// Keep only the rows that ask for something, tab by tab.
+///
+/// A tab header survives as long as one of its panes does — the filtered list
+/// still has to say *where* the pane lives — and a tab whose panes all fall out
+/// disappears whole, header included, rather than naming a tab the list has
+/// nothing to say about. Groups are per-tab (one header followed by its panes),
+/// which is what makes that decision local.
+fn retain_attention_rows(groups: Vec<Vec<SwitcherRow>>) -> Vec<Vec<SwitcherRow>> {
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let kept: Vec<SwitcherRow> =
+                group.into_iter().filter(|r| !r.is_pane() || r.needs_attention()).collect();
+            kept.iter().any(|r| r.is_pane()).then_some(kept)
+        })
+        .collect()
 }
 
 /// What a pane switcher row says about the binary running in the pane.
@@ -567,6 +599,10 @@ struct PaneSwitcherState {
     scroll: Vec<usize>,
     /// Fractional accumulator for trackpad/wheel scroll (sub-row deltas).
     scroll_acc: f64,
+    /// Attention-only list: every row shown is a pane asking for something.
+    /// The toggle rebuilds the overlay, so this is only what the current
+    /// snapshot was built with — what the title says and what the toggle flips.
+    filtered: bool,
 }
 
 /// Outcome of `KovaView::ipc_close_tab`. Lets the caller distinguish "not in this window"
@@ -1159,7 +1195,7 @@ define_class!(
             if let Some(renderer) = self.ivars().renderer.get() {
                 if let Some((zx, zy, zw, zh)) = renderer.read().minimized_counter_zone {
                     if px >= zx && px < zx + zw && py >= zy && py < zy + zh {
-                        self.do_open_pane_switcher();
+                        self.open_pane_switcher(false);
                         return;
                     }
                 }
@@ -3507,7 +3543,15 @@ impl KovaView {
 
     /// Open the tab/pane switcher overlay: every tab with its panes, click or
     /// Enter to focus. Selection starts on the currently-focused pane.
-    fn do_open_pane_switcher(&self) {
+    ///
+    /// With `filtered`, the same list keeps only the panes asking for something
+    /// — the unread and waiting ones. It is the sit-down counterpart of `Cmd+J`,
+    /// which walks the same panes one jump at a time without ever showing how
+    /// many there are; `u` flips between the two lists once open. Two things it
+    /// does not share with `Cmd+J`: this list is one window's tabs (`Cmd+J`
+    /// crosses windows), and its last tier — an idle Claude session — is not an
+    /// unread pane, so it is not in here either.
+    fn open_pane_switcher(&self, filtered: bool) {
         // Build one row group per tab (header followed by its pane rows).
         let mut groups: Vec<Vec<SwitcherRow>> = Vec::new();
         {
@@ -3548,9 +3592,13 @@ impl KovaView {
                 groups.push(rows);
             }
         }
-        if groups.iter().all(|g| g.iter().all(|r| !r.is_pane())) {
+        if !filtered && groups.iter().all(|g| g.iter().all(|r| !r.is_pane())) {
             return; // nothing to switch to
         }
+        // An empty filtered list still opens: the answer "nothing is unread" is
+        // one the overlay has to give out loud, and `u` from there shows all the
+        // panes again. Only the unfiltered list can refuse to open.
+        let groups = if filtered { retain_attention_rows(groups) } else { groups };
 
         // Partition the tab groups into ≤3 contiguous columns, balanced by row
         // count. A group joins the current column unless closing the column now
@@ -3602,8 +3650,14 @@ impl KovaView {
         }
 
         let scroll = vec![0usize; columns.len()];
-        *self.ivars().pane_switcher.borrow_mut() =
-            Some(PaneSwitcherState { columns, selected_col, selected_row, scroll, scroll_acc: 0.0 });
+        *self.ivars().pane_switcher.borrow_mut() = Some(PaneSwitcherState {
+            columns,
+            selected_col,
+            selected_row,
+            scroll,
+            scroll_acc: 0.0,
+            filtered,
+        });
         self.pane_switcher_clamp_scroll();
         self.mark_dirty();
     }
@@ -3643,6 +3697,23 @@ impl KovaView {
         // Enter → focus selected pane
         if keycode == 0x24 {
             self.pane_switcher_focus_selected();
+            return;
+        }
+
+        // `u`, or the shortcut that opens the attention-only list, flips
+        // between "every pane" and "only the ones asking for something".
+        // Flipping rebuilds the overlay rather than hiding rows in place: the
+        // list is a snapshot of the panes either way, and rebuilding is what
+        // lands the selection back where each list wants it — the focused pane
+        // on the full list, the first pane that wants something on the other.
+        let opens_filtered = KeyCombo::from_event(event);
+        let opens_filtered = self.ivars().keybindings.get().is_some_and(|kb| {
+            matches!(kb.window_map.get(&opens_filtered), Some(Action::OpenUnreadSwitcher))
+        });
+        if keycode == 0x20 || opens_filtered {
+            let filtered =
+                self.ivars().pane_switcher.borrow().as_ref().is_some_and(|s| s.filtered);
+            self.open_pane_switcher(!filtered);
             return;
         }
 
@@ -3866,7 +3937,8 @@ impl KovaView {
             Action::CloseTab => self.do_close_tab(),
             Action::OpenRecentProject => self.do_open_recent_projects(),
             Action::OpenSearchPalette => self.do_open_search_palette(),
-            Action::OpenPaneSwitcher => self.do_open_pane_switcher(),
+            Action::OpenPaneSwitcher => self.open_pane_switcher(false),
+            Action::OpenUnreadSwitcher => self.open_pane_switcher(true),
             Action::Equalize => {
                 let mut tabs = self.ivars().tabs.borrow_mut();
                 let idx = self.ivars().active_tab.get();
@@ -6615,6 +6687,7 @@ impl KovaView {
             columns: &ps_columns,
             selected_col: state.selected_col,
             selected_row: state.selected_row,
+            filtered: state.filtered,
         });
 
         // Update resize feedback (decrement frames, build text)
@@ -6962,7 +7035,8 @@ mod tests {
     }
 
     /// Build a switcher grid from a compact spec: one string per column, one
-    /// char per row — 'h' header, '.' plain pane, '?' pane waiting for the user.
+    /// char per row — 'h' header, '.' plain pane, '?' pane waiting for the
+    /// user, 'b' pane with a pending bell, 'c' pane with an unread completion.
     fn switcher_grid(spec: &[&str]) -> Vec<Vec<SwitcherRow>> {
         spec.iter()
             .map(|col| {
@@ -6973,8 +7047,8 @@ mod tests {
                             pane_id: 0,
                             title: "p".into(),
                             is_current: false,
-                            has_bell: false,
-                            has_completion: false,
+                            has_bell: c == 'b',
+                            has_completion: c == 'c',
                             minimized: false,
                             working: false,
                             awaiting: c == '?',
@@ -6984,6 +7058,66 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// Render a grid back to the compact spec, so a filtered grid can be
+    /// compared row by row: 'h' header, '?' waiting, 'b' bell, 'c' completion,
+    /// '.' a pane asking for nothing.
+    fn switcher_spec(groups: &[Vec<SwitcherRow>]) -> Vec<String> {
+        groups
+            .iter()
+            .map(|col| {
+                col.iter()
+                    .map(|r| match r {
+                        SwitcherRow::TabHeader(_) => 'h',
+                        SwitcherRow::Pane { awaiting: true, .. } => '?',
+                        SwitcherRow::Pane { has_bell: true, .. } => 'b',
+                        SwitcherRow::Pane { has_completion: true, .. } => 'c',
+                        SwitcherRow::Pane { .. } => '.',
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn attention_filter_keeps_the_three_markers_and_drops_quiet_panes() {
+        let groups = switcher_grid(&["h.?.b", "h..c"]);
+        assert_eq!(switcher_spec(&retain_attention_rows(groups)), vec!["h?b", "hc"]);
+    }
+
+    #[test]
+    fn attention_filter_drops_a_whole_tab_whose_panes_are_all_quiet() {
+        // Second tab has nothing to say: its header goes with its panes rather
+        // than standing alone over an empty group.
+        let groups = switcher_grid(&["h.b", "h..", "h?"]);
+        assert_eq!(switcher_spec(&retain_attention_rows(groups)), vec!["hb", "h?"]);
+    }
+
+    #[test]
+    fn attention_filter_can_end_up_with_nothing_at_all() {
+        // Every pane quiet: the caller opens an empty overlay that says so,
+        // instead of a list that looks like the full one minus a few rows.
+        let groups = switcher_grid(&["h..", "h."]);
+        assert!(retain_attention_rows(groups).is_empty());
+    }
+
+    #[test]
+    fn a_working_pane_is_not_asking_for_anything() {
+        // Mirrors Cmd+J: a session still chewing has nothing to hand over, so
+        // it stays out of the attention list even though the row draws a ✳.
+        let working = SwitcherRow::Pane {
+            pane_id: 0,
+            title: "p".into(),
+            is_current: false,
+            has_bell: false,
+            has_completion: false,
+            minimized: false,
+            working: true,
+            awaiting: false,
+            process: None,
+        };
+        assert!(!working.needs_attention());
     }
 
     #[test]

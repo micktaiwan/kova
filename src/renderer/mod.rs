@@ -239,6 +239,10 @@ pub struct PaneSwitcherRenderData<'a> {
     pub selected_col: usize,
     /// Selected row within `columns[selected_col]` — always a pane row.
     pub selected_row: usize,
+    /// Attention-only list: every pane row shown is asking for something, and
+    /// the panes that are not have been left out. Changes the title and the
+    /// hint, so the list never looks like a truncated version of the full one.
+    pub filtered: bool,
 }
 
 /// Vertical geometry of a list overlay (title + subtitle + scrolling rows),
@@ -2355,6 +2359,7 @@ impl Renderer {
                     ("Find", kc.toggle_filter.as_str(), "search in this pane"),
                     ("Global Search", kc.open_search.as_str(), "across all panes"),
                     ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "quick switcher"),
+                    ("Unread Panes", kc.open_unread_switcher.as_str(), "switcher, attention only"),
                 ]),
                 ("MISC", vec![
                     ("Memory Report", "cmd+shift+i", ""),
@@ -2528,10 +2533,27 @@ impl Renderer {
             .flat_map(|c| c.rows.iter())
             .filter(|r| r.awaiting)
             .count();
-        let title = match awaiting {
-            0 => "Switch Tab / Pane".to_string(),
-            1 => "Switch Tab / Pane  —  1 waiting".to_string(),
-            n => format!("Switch Tab / Pane  —  {} waiting", n),
+        let title = if data.filtered {
+            // Filtered: the count is of everything the list holds, not just the
+            // waiting ones — a bell and a finished command are in here too, and
+            // an empty list has to say so rather than look like a bad draw.
+            let panes = data
+                .columns
+                .iter()
+                .flat_map(|c| c.rows.iter())
+                .filter(|r| !r.is_header)
+                .count();
+            match panes {
+                0 => "Nothing Unread".to_string(),
+                1 => "Unread Panes  —  1".to_string(),
+                n => format!("Unread Panes  —  {}", n),
+            }
+        } else {
+            match awaiting {
+                0 => "Switch Tab / Pane".to_string(),
+                1 => "Switch Tab / Pane  —  1 waiting".to_string(),
+                n => format!("Switch Tab / Pane  —  {} waiting", n),
+            }
         };
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
@@ -2540,7 +2562,11 @@ impl Renderer {
         y += cell_h * title_scale * 2.0;
 
         // Subtitle
-        let subtitle = "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next waiting  \u{23ce} Focus  click to focus  esc Cancel";
+        let subtitle = if data.filtered {
+            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{23ce} Focus  click to focus  u All panes  esc Cancel"
+        } else {
+            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next waiting  \u{23ce} Focus  u Unread only  esc Cancel"
+        };
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
         self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
