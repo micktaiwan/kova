@@ -180,15 +180,29 @@ struct FilterState {
     matches: Vec<FilterMatch>,
 }
 
-/// One hit returned by the search worker. Stable across window/tab reordering
-/// because we look up by tab_id / pane_id at jump time rather than by index.
+/// What a hit points at: something open right now, or a Claude conversation
+/// that only exists as a transcript on disk.
+#[derive(Clone)]
+enum SearchTarget {
+    /// A pane, or a whole tab when `pane_id` is `None`. Stable across
+    /// window/tab reordering because the lookup happens by id at jump time
+    /// rather than by index.
+    Open {
+        /// Tab containing this hit (always set, even for pane/content hits).
+        tab_id: TabId,
+        /// Pane the hit lives in. `None` for tab-title hits — jump uses the
+        /// tab's currently focused pane and skips the per-pane flash.
+        pane_id: Option<PaneId>,
+    },
+    /// A closed Claude Code session. Opening it means a new pane in the
+    /// session's own project directory, with its `--resume` line pre-typed.
+    Archived { session_id: String, cwd: String },
+}
+
+/// One hit returned by the search worker.
 #[derive(Clone)]
 struct SearchHit {
-    /// Tab containing this hit (always set, even for pane/content hits).
-    tab_id: TabId,
-    /// Pane the hit lives in. `None` for tab-title hits — jump uses the tab's
-    /// currently focused pane and skips the per-pane flash.
-    pane_id: Option<PaneId>,
+    target: SearchTarget,
     /// Pre-rendered label shown in the result list.
     label: String,
 }
@@ -2912,8 +2926,73 @@ impl KovaView {
         }
     }
 
+    /// Bring back a Claude conversation that is no longer open in any pane.
+    ///
+    /// The pane has to land in the session's own project directory: `claude
+    /// --resume <id>` only finds a conversation from the directory it ran in.
+    /// Where exactly it lands follows what is still around — the tab it lived in
+    /// is not recoverable, since nothing outlives the pane that held it:
+    ///   1. a tab already open on that directory → a new pane next to it;
+    ///   2. else the project is in the recents → its saved tab comes back first;
+    ///   3. else a new tab on that directory.
+    /// The `--resume` line is pre-typed, not run, exactly like a restored pane.
+    fn open_archived_claude_session(&self, session_id: &str, cwd: &str) {
+        let config = match self.ivars().config.get() {
+            Some(c) => c,
+            None => return,
+        };
+        // Same guard as the restore path: an id that cannot make a safe command
+        // line never reaches a PTY.
+        let command = match crate::claude_session::resume_command(None, session_id) {
+            Some(c) => c,
+            None => {
+                log::warn!("Refusing to resume an unsafe session id: {:?}", session_id);
+                return;
+            }
+        };
+        let cwd_opt = if cwd.is_empty() { None } else { Some(cwd) };
+
+        // 1. A tab is already open on this project.
+        if open_pane_in_tab_for_cwd(cwd, config, &command) {
+            return;
+        }
+
+        // 2. The project is in the recents: put its tab back, then add the pane
+        //    — unless the restored tab already brought this very session back.
+        let recent = crate::recent_projects::load()
+            .projects
+            .into_iter()
+            .find(|p| p.path == cwd);
+        if let Some(entry) = recent {
+            self.restore_recent_project(&entry);
+            let already_there = {
+                let tabs = self.ivars().tabs.borrow();
+                let idx = self.ivars().active_tab.get();
+                let mut found = false;
+                if let Some(tab) = tabs.get(idx) {
+                    tab.for_each_pane(&mut |pane| {
+                        if pane.last_command().as_deref() == Some(command.as_str()) {
+                            found = true;
+                        }
+                    });
+                }
+                found
+            };
+            if !already_there {
+                self.ipc_split(config, SplitDirection::Horizontal, cwd_opt, Some(command));
+            }
+            return;
+        }
+
+        // 3. Nothing to attach to.
+        self.ipc_new_tab(config, cwd_opt, Some(command));
+    }
+
     /// Open the search palette overlay (Cmd+Shift+F — global search across all panes).
     fn do_open_search_palette(&self) {
+        // Index the closed Claude sessions now, so the scan overlaps with the
+        // user typing rather than delaying the first query.
+        crate::claude_history::warm();
         *self.ivars().search_palette.borrow_mut() = Some(SearchPaletteState {
             query: String::new(),
             cursor: 0,
@@ -2932,9 +3011,12 @@ impl KovaView {
 
     /// Walk every Kova window in the process and collect a snapshot suitable for
     /// off-thread substring search. Cloning Arc<RwLock<TerminalState>> is cheap.
-    fn collect_search_snapshot() -> (Vec<SearchTabSnapshot>, Vec<SearchPaneSnapshot>) {
+    fn collect_search_snapshot() -> (Vec<SearchTabSnapshot>, Vec<SearchPaneSnapshot>, Vec<String>) {
         let mut tabs_snap = Vec::new();
         let mut panes_snap = Vec::new();
+        // Claude sessions currently running in a pane. They are already listed
+        // in the panes section, so the archived section leaves them out.
+        let mut live_sessions = Vec::new();
 
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let app = NSApplication::sharedApplication(mtm);
@@ -2950,6 +3032,9 @@ impl KovaView {
                 let tab_title = tab.title();
                 tabs_snap.push(SearchTabSnapshot { tab_id: tab.id, title: tab_title.clone() });
                 tab.for_each_pane(&mut |pane| {
+                    if let Some(id) = pane.claude_session_id() {
+                        live_sessions.push(id);
+                    }
                     panes_snap.push(SearchPaneSnapshot {
                         tab_id: tab.id,
                         tab_title: tab_title.clone(),
@@ -2960,7 +3045,7 @@ impl KovaView {
                 });
             }
         }
-        (tabs_snap, panes_snap)
+        (tabs_snap, panes_snap, live_sessions)
     }
 
     /// Submit the current query: snapshot panes on the main thread, spawn a
@@ -2984,7 +3069,7 @@ impl KovaView {
             (state.query.clone(), state.query_id)
         };
 
-        let (tabs_snap, panes_snap) = Self::collect_search_snapshot();
+        let (tabs_snap, panes_snap, live_sessions) = Self::collect_search_snapshot();
         let (tx, rx) = std::sync::mpsc::channel();
 
         // Store rx into state before spawning, so the polling tick can pick it up
@@ -2994,7 +3079,7 @@ impl KovaView {
         }
 
         std::thread::spawn(move || {
-            let hits = run_search_worker(&query, &tabs_snap, &panes_snap);
+            let hits = run_search_worker(&query, &tabs_snap, &panes_snap, &live_sessions);
             let _ = tx.send((query_id, hits));
         });
 
@@ -3166,7 +3251,12 @@ impl KovaView {
                 match action {
                     Some(hit) => {
                         *self.ivars().search_palette.borrow_mut() = None;
-                        jump_to_search_hit(&hit);
+                        match &hit.target {
+                            SearchTarget::Open { .. } => jump_to_search_hit(&hit),
+                            SearchTarget::Archived { session_id, cwd } => {
+                                self.open_archived_claude_session(session_id, cwd)
+                            }
+                        }
                     }
                     None => self.submit_search_palette(),
                 }
@@ -3305,29 +3395,47 @@ struct SearchPaneSnapshot {
 /// Worker-thread search. Uses ASCII case-insensitive `contains` — good enough
 /// for terminal text, which is overwhelmingly ASCII.
 ///
-/// Produces a two-section row list:
+/// The query is cut into terms on spaces and commas, and a pane or tab has to
+/// carry every one of them (see `claude_history::split_terms`): one word is too
+/// coarse once there are dozens of panes, and matching the whole query as a
+/// single string would make "dust mcp" find nothing.
+///
+/// Produces a three-section row list:
 ///   1. Panes whose title OR content matches, grouped under a per-tab header
 ///      (one entry per pane — title and content matches are deduped).
 ///   2. A "Tabs" section listing tabs whose title matches.
+///   3. A "Claude sessions (closed)" section: past conversations that match,
+///      most recent first. This is what makes a session findable once its pane
+///      is gone — the whole point of `claude_history`.
 /// `panes` arrives already ordered by tab (window → tab → pane), so consecutive
 /// grouping by `tab_id` reconstructs the per-tab groups without sorting.
 fn run_search_worker(
     query: &str,
     tabs: &[SearchTabSnapshot],
     panes: &[SearchPaneSnapshot],
+    live_sessions: &[String],
 ) -> Vec<SearchRow> {
-    let needle = query.to_ascii_lowercase();
+    let terms = crate::claude_history::split_terms(query);
     let mut rows: Vec<SearchRow> = Vec::new();
+    if terms.is_empty() {
+        return rows;
+    }
 
     // Section 1: matching panes, grouped by tab.
     let mut current_tab: Option<TabId> = None;
     for p in panes {
-        let matches = p.pane_title.to_ascii_lowercase().contains(&needle) || {
+        let title = p.pane_title.to_ascii_lowercase();
+        // Terms the title already covers need no scrollback: dumping a pane's
+        // whole buffer is the expensive part, so it only happens for what is
+        // left, and only once.
+        let unmatched: Vec<&String> = terms.iter().filter(|t| !title.contains(t.as_str())).collect();
+        let matches = unmatched.is_empty() || {
             let term = p.terminal.read();
-            term.dump_text(crate::terminal::DumpMode::All, true)
+            let content = term
+                .dump_text(crate::terminal::DumpMode::All, true)
                 .text
-                .to_ascii_lowercase()
-                .contains(&needle)
+                .to_ascii_lowercase();
+            unmatched.iter().all(|t| content.contains(t.as_str()))
         };
         if !matches {
             continue;
@@ -3337,8 +3445,10 @@ fn run_search_worker(
             current_tab = Some(p.tab_id);
         }
         rows.push(SearchRow::Hit(SearchHit {
-            tab_id: p.tab_id,
-            pane_id: Some(p.pane_id),
+            target: SearchTarget::Open {
+                tab_id: p.tab_id,
+                pane_id: Some(p.pane_id),
+            },
             label: p.pane_title.clone(),
         }));
     }
@@ -3346,15 +3456,45 @@ fn run_search_worker(
     // Section 2: tabs whose title matches.
     let mut tab_section_open = false;
     for tab in tabs {
-        if tab.title.to_ascii_lowercase().contains(&needle) {
+        let title = tab.title.to_ascii_lowercase();
+        if terms.iter().all(|t| title.contains(t.as_str())) {
             if !tab_section_open {
                 rows.push(SearchRow::Header("Tabs".to_string()));
                 tab_section_open = true;
             }
             rows.push(SearchRow::Hit(SearchHit {
-                tab_id: tab.tab_id,
-                pane_id: None,
+                target: SearchTarget::Open {
+                    tab_id: tab.tab_id,
+                    pane_id: None,
+                },
                 label: tab.title.clone(),
+            }));
+        }
+    }
+
+    // Section 3: Claude conversations that are not open anywhere any more.
+    // Only the most recent few are listed — a common word matches hundreds of
+    // sessions, and the rest of them would bury the open panes above. What was
+    // cut is named in the header rather than dropped silently.
+    let archived = crate::claude_history::search(query, live_sessions);
+    if !archived.hits.is_empty() {
+        let header = if archived.total > archived.hits.len() {
+            format!(
+                "Claude sessions (closed) — {} most recent of {}",
+                archived.hits.len(),
+                archived.total
+            )
+        } else {
+            "Claude sessions (closed)".to_string()
+        };
+        rows.push(SearchRow::Header(header));
+        for hit in archived.hits {
+            rows.push(SearchRow::Hit(SearchHit {
+                label: crate::claude_history::hit_label(&hit),
+                target: SearchTarget::Archived {
+                    session_id: hit.id,
+                    cwd: hit.cwd,
+                },
             }));
         }
     }
@@ -3362,9 +3502,72 @@ fn run_search_worker(
     rows
 }
 
+/// Find a tab whose panes sit in `cwd`, bring it to the front and spawn a pane
+/// in it carrying `command`. Returns false when no window holds such a tab.
+///
+/// A pane's cwd is read live from its shell, so this follows the directory the
+/// user is actually in rather than the one the tab was born with.
+fn open_pane_in_tab_for_cwd(cwd: &str, config: &crate::config::Config, command: &str) -> bool {
+    if cwd.is_empty() {
+        return false;
+    }
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let ns_windows = app.windows();
+    for i in 0..ns_windows.count() {
+        let win = ns_windows.objectAtIndex(i);
+        let view = match crate::app::kova_view(&win) {
+            Some(v) => v,
+            None => continue,
+        };
+        let tab_id = {
+            let tabs = view.ivars().tabs.borrow();
+            let mut found = None;
+            for tab in tabs.iter() {
+                let mut hit = false;
+                tab.for_each_pane(&mut |pane| {
+                    if pane.cwd().as_deref() == Some(cwd) {
+                        hit = true;
+                    }
+                });
+                if hit {
+                    found = Some(tab.id);
+                    break;
+                }
+            }
+            found
+        };
+        let tab_id = match tab_id {
+            Some(id) => id,
+            None => continue,
+        };
+        win.makeKeyAndOrderFront(None);
+        if !view.activate_tab(tab_id) {
+            return false;
+        }
+        let spawned = view.ipc_split(
+            config,
+            SplitDirection::Horizontal,
+            Some(cwd),
+            Some(command.to_string()),
+        );
+        if let Some(pane_id) = spawned {
+            // The tab may have been off-screen: pulse the new pane so the eye
+            // finds where the session came back.
+            view.set_pane_flash(pane_id, 30, None);
+        }
+        return spawned.is_some();
+    }
+    false
+}
+
 /// Bring the right window/tab/pane to focus and trigger the highlight flash.
 /// Walks every Kova window in the process to find the hit's tab_id.
 fn jump_to_search_hit(hit: &SearchHit) {
+    let (tab_id, pane_id) = match &hit.target {
+        SearchTarget::Open { tab_id, pane_id } => (*tab_id, *pane_id),
+        SearchTarget::Archived { .. } => return,
+    };
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let app = NSApplication::sharedApplication(mtm);
     let ns_windows = app.windows();
@@ -3376,24 +3579,24 @@ fn jump_to_search_hit(hit: &SearchHit) {
         };
         let has_tab = {
             let tabs = view.ivars().tabs.borrow();
-            tabs.iter().any(|t| t.id == hit.tab_id)
+            tabs.iter().any(|t| t.id == tab_id)
         };
         if !has_tab {
             continue;
         }
         // Order the window front and make it key so it visibly takes focus.
         win.makeKeyAndOrderFront(None);
-        if !view.activate_tab(hit.tab_id) {
+        if !view.activate_tab(tab_id) {
             return;
         }
-        if let Some(pane_id) = hit.pane_id {
+        if let Some(pane_id) = pane_id {
             view.focus_pane_in_active_tab(pane_id);
             // ~30 frames ≈ 0.5s @ 60fps; renderer pulses the pane border for that span.
             view.set_pane_flash(pane_id, 30, None);
         }
         return;
     }
-    log::debug!("jump_to_search_hit: tab_id {} not found in any window", hit.tab_id);
+    log::debug!("jump_to_search_hit: tab_id {} not found in any window", tab_id);
 }
 
 /// Focus a pane wherever it lives: find the window holding it, bring that

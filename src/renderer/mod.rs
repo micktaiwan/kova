@@ -2401,7 +2401,7 @@ impl Renderer {
                     ("Copy Raw", kc.copy_raw.as_str(), ""),
                     ("Paste", kc.paste.as_str(), ""),
                     ("Find", kc.toggle_filter.as_str(), "search in this pane"),
-                    ("Global Search", kc.open_search.as_str(), "across all panes"),
+                    ("Global Search", kc.open_search.as_str(), "panes + closed Claude sessions"),
                     ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "quick switcher"),
                     ("Unread Panes", kc.open_unread_switcher.as_str(), "switcher, attention only"),
                 ]),
@@ -2935,7 +2935,7 @@ impl Renderer {
         let status = if data.searching {
             format!("Searching for \"{}\"...", data.submitted_query)
         } else if data.submitted_query.is_empty() {
-            "Type to search across all panes.".to_string()
+            "Type to search across all panes and closed Claude sessions.".to_string()
         } else if hit_count == 0 {
             format!("No matches for \"{}\".", data.submitted_query)
         } else {
