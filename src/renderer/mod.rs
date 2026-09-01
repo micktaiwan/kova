@@ -99,7 +99,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use vertex::Vertex;
 
-use crate::config::{Config, KeysConfig};
+use crate::config::{Config, DimMode, KeysConfig};
 use crate::terminal::paste_block::RowPaint;
 use crate::pane::PaneId;
 
@@ -441,6 +441,12 @@ pub struct Renderer {
     font_name: String,
     cursor_blink_frames: u32,
     status_bar_enabled: bool,
+    /// How much an unfocused pane is faded (see `DimMode`).
+    dim_opacity: f32,
+    dim_mode: DimMode,
+    /// Outline drawn around the focused pane; width 0.0 disables it.
+    focus_border_width: f32,
+    focus_border_color: [f32; 3],
     status_bar_bg: [f32; 3],
     status_bar_fg: [f32; 3],
     status_bar_cwd_color: [f32; 3],
@@ -573,6 +579,10 @@ impl Renderer {
             font_name: config.font.family.clone(),
             cursor_blink_frames: config.terminal.cursor_blink_frames,
             status_bar_enabled: config.status_bar.enabled,
+            dim_opacity: config.splits.dim_opacity,
+            dim_mode: config.splits.dim_mode,
+            focus_border_width: config.splits.focus_border_width,
+            focus_border_color: config.splits.focus_border_color,
             status_bar_bg: config.status_bar.bg_color,
             status_bar_fg: config.status_bar.fg_color,
             status_bar_cwd_color: config.status_bar.cwd_color,
@@ -1251,6 +1261,14 @@ impl Renderer {
         }
 
         // Pass 3: build vertices
+        // Amount by which this pane's text is faded. Non-zero only for an
+        // unfocused pane in `text` dim mode; `full` mode fades with a veil
+        // quad at the end instead.
+        let text_fade = if !is_focused && self.dim_mode == DimMode::Text {
+            self.dim_opacity
+        } else {
+            0.0
+        };
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
         let baseline_from_top = self.atlas.baseline_from_top();
@@ -1322,7 +1340,7 @@ impl Renderer {
                 if cell.attrs.intersects(CellAttrs::UNDERLINE | CellAttrs::STRIKETHROUGH) {
                     let lx = (ox + col_idx as f32 * cell_w).round();
                     let ly = (oy + y_offset + row_idx as f32 * cell_h).round();
-                    let rule_fg = crate::terminal::color_to_f32(cell.fg);
+                    let rule_fg = Self::fade_toward(crate::terminal::color_to_f32(cell.fg), self.bg_color, text_fade);
                     let thickness = (cell_h * 0.07).max(1.0).round();
                     if cell.attrs.contains(CellAttrs::UNDERLINE) {
                         let uy = (ly + cell_h - thickness).round();
@@ -1393,6 +1411,7 @@ impl Renderer {
                 } else {
                     crate::terminal::color_to_f32(cell.fg)
                 };
+                let fg_f = Self::fade_toward(fg_f, self.bg_color, text_fade);
                 let fg = [fg_f[0], fg_f[1], fg_f[2], alpha];
                 let no_bg = [0.0, 0.0, 0.0, 0.0];
 
@@ -1447,8 +1466,18 @@ impl Renderer {
                 let cx = (ox + term.cursor_x as f32 * cell_w).round();
                 let cy = (oy + y_offset + screen_y as f32 * cell_h).round();
                 match term.cursor_shape {
-                    CursorShape::Block => {
+                    // Filled block only where the keystrokes go. Elsewhere the
+                    // cursor is drawn hollow, the way a text field marks that it
+                    // no longer has the caret.
+                    CursorShape::Block if is_focused => {
                         Self::push_bg_quad(&mut vertices, cx, cy, cell_w, cell_h, self.cursor_color);
+                    }
+                    CursorShape::Block => {
+                        let t = (cell_h * 0.08).max(1.0).round();
+                        Self::push_bg_quad(&mut vertices, cx, cy, cell_w, t, self.cursor_color);
+                        Self::push_bg_quad(&mut vertices, cx, cy + cell_h - t, cell_w, t, self.cursor_color);
+                        Self::push_bg_quad(&mut vertices, cx, cy + t, t, cell_h - 2.0 * t, self.cursor_color);
+                        Self::push_bg_quad(&mut vertices, cx + cell_w - t, cy + t, t, cell_h - 2.0 * t, self.cursor_color);
                     }
                     CursorShape::Underline => {
                         let thickness = (cell_h * 0.1).max(1.0);
@@ -1462,18 +1491,19 @@ impl Renderer {
             }
         }
 
-        // Dim overlay on unfocused panes
-        if !is_focused {
-            let dim = [0.0, 0.0, 0.0]; // black overlay
-            let dim4 = [dim[0], dim[1], dim[2], 0.3]; // 30% opacity
+        // Status bar. Built before the veil so the veil covers it too: leaving
+        // it out made every unfocused bar as bright as the focused one, and with
+        // four splits nothing pointed at the pane that had the keyboard.
+        if self.status_bar_enabled {
+            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention, pane_input_chars, pane_id, fg_process, text_fade);
+        }
+
+        // Veil over an unfocused pane, status bar included.
+        if !is_focused && self.dim_mode == DimMode::Full && self.dim_opacity > 0.0 {
+            let dim4 = [0.0, 0.0, 0.0, self.dim_opacity]; // black overlay
             let no_tex = [0.0, 0.0];
             let white = [1.0, 1.0, 1.0, 0.0];
-            // Cover the whole pane area (excluding status bar)
-            let dim_h = if self.status_bar_enabled {
-                vp.height - self.atlas.cell_height
-            } else {
-                vp.height
-            };
+            let dim_h = vp.height;
             vertices.push(Vertex { position: [vp.x, vp.y], tex_coords: no_tex, color: white, bg_color: dim4 });
             vertices.push(Vertex { position: [vp.x + vp.width, vp.y], tex_coords: no_tex, color: white, bg_color: dim4 });
             vertices.push(Vertex { position: [vp.x, vp.y + dim_h], tex_coords: no_tex, color: white, bg_color: dim4 });
@@ -1482,9 +1512,14 @@ impl Renderer {
             vertices.push(Vertex { position: [vp.x, vp.y + dim_h], tex_coords: no_tex, color: white, bg_color: dim4 });
         }
 
-        // Status bar
-        if self.status_bar_enabled {
-            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention, pane_input_chars, pane_id, fg_process);
+        // Outline around the focused pane, drawn last so nothing covers it.
+        if is_focused && self.focus_border_width > 0.0 {
+            let w = self.focus_border_width.min(vp.width * 0.5).min(vp.height * 0.5);
+            let c = self.focus_border_color;
+            Self::push_bg_quad(&mut vertices, vp.x, vp.y, vp.width, w, c);
+            Self::push_bg_quad(&mut vertices, vp.x, vp.y + vp.height - w, vp.width, w, c);
+            Self::push_bg_quad(&mut vertices, vp.x, vp.y + w, w, vp.height - 2.0 * w, c);
+            Self::push_bg_quad(&mut vertices, vp.x + vp.width - w, vp.y + w, w, vp.height - 2.0 * w, c);
         }
 
         vertices
@@ -1500,21 +1535,30 @@ impl Renderer {
         pane_input_chars: u64,
         pane_id: PaneId,
         fg_process: Option<&str>,
+        text_fade: f32,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
         let bar_y = vp.y + vp.height - cell_h;
 
-        // Background quad: orange for bell, green for completion, default otherwise
-        Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, attention.bar_bg(self.status_bar_bg));
+        // Background quad: orange for bell, green for completion, default otherwise.
+        // In `text` dim mode the veil never comes, so the bar of an unfocused
+        // pane fades here — bar included, or the brightest thing on screen ends
+        // up being a pane nobody is typing in.
+        let bar_bg = Self::fade_toward(attention.bar_bg(self.status_bar_bg), self.bg_color, text_fade);
+        Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, bar_bg);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
-        let cwd_fg = [self.status_bar_cwd_color[0], self.status_bar_cwd_color[1], self.status_bar_cwd_color[2], 1.0];
-        let branch_fg = [self.status_bar_branch_color[0], self.status_bar_branch_color[1], self.status_bar_branch_color[2], 1.0];
-        let scroll_fg = [self.status_bar_scroll_color[0], self.status_bar_scroll_color[1], self.status_bar_scroll_color[2], 1.0];
-        let title_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 1.0];
-        let id_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 0.6];
-        let process_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 0.9];
+        let cwd = Self::fade_toward(self.status_bar_cwd_color, bar_bg, text_fade);
+        let branch = Self::fade_toward(self.status_bar_branch_color, bar_bg, text_fade);
+        let scroll = Self::fade_toward(self.status_bar_scroll_color, bar_bg, text_fade);
+        let fg = Self::fade_toward(self.status_bar_fg, bar_bg, text_fade);
+        let cwd_fg = [cwd[0], cwd[1], cwd[2], 1.0];
+        let branch_fg = [branch[0], branch[1], branch[2], 1.0];
+        let scroll_fg = [scroll[0], scroll[1], scroll[2], 1.0];
+        let title_fg = [fg[0], fg[1], fg[2], 1.0];
+        let id_fg = [fg[0], fg[1], fg[2], 0.6];
+        let process_fg = [fg[0], fg[1], fg[2], 0.9];
 
         // Pane ID first, always visible: it is the handle used to address the
         // pane over IPC, so it never gets dropped when the bar runs out of room.
@@ -3065,6 +3109,21 @@ impl Renderer {
         }
     }
 
+    /// Fade a colour toward `bg`. `t` is the dim amount: 0.0 leaves the colour
+    /// alone, 1.0 makes it the background. Used by `text` dim mode, which fades
+    /// glyphs instead of laying a veil over the pane.
+    fn fade_toward(c: [f32; 3], bg: [f32; 3], t: f32) -> [f32; 3] {
+        if t <= 0.0 {
+            return c;
+        }
+        let t = t.min(1.0);
+        [
+            c[0] + (bg[0] - c[0]) * t,
+            c[1] + (bg[1] - c[1]) * t,
+            c[2] + (bg[2] - c[2]) * t,
+        ]
+    }
+
     fn push_bg_quad(
         vertices: &mut Vec<Vertex>,
         x: f32,
@@ -3169,6 +3228,43 @@ fn format_key_combo(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_dim_fades_toward_the_background_and_never_past_it() {
+        let bg = [0.1, 0.1, 0.12];
+        let fg = [1.0, 0.5, 0.0];
+        assert_eq!(Renderer::fade_toward(fg, bg, 0.0), fg);
+        assert_eq!(Renderer::fade_toward(fg, bg, -1.0), fg, "a negative amount is a no-op");
+        let close = |a: [f32; 3], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 1e-6);
+        assert!(close(Renderer::fade_toward(fg, bg, 1.0), bg));
+        assert!(close(Renderer::fade_toward(fg, bg, 2.0), bg), "clamped, never past the background");
+        let half = Renderer::fade_toward(fg, bg, 0.5);
+        for i in 0..3 {
+            assert!((half[i] - (fg[i] + bg[i]) * 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn a_hollow_cursor_leaves_the_cell_centre_untouched() {
+        // The unfocused-pane cursor is four edge quads; the middle of the cell
+        // must stay clear, otherwise it reads as filled and the focused pane
+        // loses its only unique mark.
+        let (cell_w, cell_h) = (10.0_f32, 20.0_f32);
+        let t = (cell_h * 0.08_f32).max(1.0).round();
+        let edges = [
+            (0.0, 0.0, cell_w, t),
+            (0.0, cell_h - t, cell_w, t),
+            (0.0, t, t, cell_h - 2.0 * t),
+            (cell_w - t, t, t, cell_h - 2.0 * t),
+        ];
+        let (cx, cy) = (cell_w * 0.5, cell_h * 0.5);
+        for (x, y, w, h) in edges {
+            let inside = cx >= x && cx < x + w && cy >= y && cy < y + h;
+            assert!(!inside, "edge quad {:?} covers the cell centre", (x, y, w, h));
+        }
+        let covered: f32 = edges.iter().map(|(_, _, w, h)| w * h).sum();
+        assert!(covered < cell_w * cell_h, "the outline must not fill the cell");
+    }
 
     #[test]
     fn a_right_aligned_run_keeps_its_last_glyph() {

@@ -19,6 +19,13 @@
 # cursor_blink_frames = 60
 # scroll_sensitivity = 6.0
 
+# [splits]
+# min_width = 300.0            # minimum pane width before horizontal scroll kicks in
+# dim_opacity = 0.3            # how much an unfocused pane is faded (0.0 .. 1.0)
+# dim_mode = "full"            # "full" = veil the whole pane, "text" = fade only its glyphs
+# focus_border_width = 2.0     # outline around the focused pane, 0.0 to disable
+# focus_border_color = [0.4, 0.6, 1.0]
+
 # [keys]
 # new_tab = "cmd+t"
 # close_pane_or_tab = "cmd+w"

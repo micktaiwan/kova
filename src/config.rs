@@ -77,11 +77,35 @@ pub struct GlobalStatusBarConfig {
 #[serde(default)]
 pub struct SplitsConfig {
     pub min_width: f32,
+    /// How much an unfocused pane is faded, 0.0 (not at all) .. 1.0 (invisible).
+    pub dim_opacity: f32,
+    /// What the fade applies to: the whole pane, or only its text.
+    pub dim_mode: DimMode,
+    /// Thickness in points of the outline drawn around the focused pane.
+    /// 0.0 disables it.
+    pub focus_border_width: f32,
+    pub focus_border_color: [f32; 3],
+}
+
+/// How an unfocused pane is faded. `Full` lays a veil over everything, which
+/// also washes out the colours a TUI painted; `Text` leaves every background
+/// alone and only fades the glyphs, so a colourful pane stays readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DimMode {
+    Full,
+    Text,
 }
 
 impl Default for SplitsConfig {
     fn default() -> Self {
-        SplitsConfig { min_width: 300.0 }
+        SplitsConfig {
+            min_width: 300.0,
+            dim_opacity: 0.3,
+            dim_mode: DimMode::Full,
+            focus_border_width: 2.0,
+            focus_border_color: [0.4, 0.6, 1.0],
+        }
     }
 }
 
@@ -226,6 +250,15 @@ impl Config {
         }
         if self.terminal.fps == 0 {
             self.terminal.fps = d.fps;
+        }
+        let ds = SplitsConfig::default();
+        if !(0.0..=1.0).contains(&self.splits.dim_opacity) {
+            log::warn!("config: splits.dim_opacity out of 0..1, using default {}", ds.dim_opacity);
+            self.splits.dim_opacity = ds.dim_opacity;
+        }
+        if !(0.0..=64.0).contains(&self.splits.focus_border_width) {
+            log::warn!("config: splits.focus_border_width out of 0..64, using default {}", ds.focus_border_width);
+            self.splits.focus_border_width = ds.focus_border_width;
         }
         if self.font.size <= 0.0 {
             let ds = FontConfig::default().size;

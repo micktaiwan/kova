@@ -77,7 +77,11 @@ branch_color = [0.4, 0.7, 0.5]
 active_bg = [0.22, 0.22, 0.26]
 
 [splits]
-min_width = 300.0  # minimum pane width in points before horizontal scroll activates
+min_width = 300.0                     # minimum pane width in points before horizontal scroll activates
+dim_opacity = 0.3                     # how much an unfocused pane is faded (0.0 .. 1.0)
+dim_mode = "full"                     # "full" veils the whole pane, "text" fades only its glyphs
+focus_border_width = 2.0              # outline around the focused pane, 0.0 to disable
+focus_border_color = [0.4, 0.6, 1.0]
 ```
 
 ### Keyboard shortcuts
