@@ -435,6 +435,32 @@ pub(crate) fn alloc_tab_id() -> TabId {
 
 /// A tab: owns a flat list of columns and tracks which pane is focused.
 #[allow(dead_code)]
+/// Position one step away in a tab's traversal order — columns left to right,
+/// rows top to bottom — given each column's pane count. Stepping past the last
+/// row of a column lands on the first row of the next one; `None` at the two
+/// ends of the whole order. Counts every pane, minimized ones included.
+fn step_in_order(
+    col_lens: &[usize],
+    (col, row): (usize, usize),
+    forward: bool,
+) -> Option<(usize, usize)> {
+    if forward {
+        if row + 1 < *col_lens.get(col)? {
+            Some((col, row + 1))
+        } else if col + 1 < col_lens.len() {
+            Some((col + 1, 0))
+        } else {
+            None
+        }
+    } else if row > 0 {
+        Some((col, row - 1))
+    } else if col > 0 {
+        Some((col - 1, col_lens[col - 1].checked_sub(1)?))
+    } else {
+        None
+    }
+}
+
 pub struct Tab {
     pub id: TabId,
     pub columns: Vec<Column>,
@@ -1428,6 +1454,51 @@ impl Tab {
             delta_px,
             total_width,
         );
+    }
+
+    /// Column and row index of a pane in this tab, in traversal order.
+    fn position_of(&self, id: PaneId) -> Option<(usize, usize)> {
+        self.columns.iter().enumerate().find_map(|(c, col)| col.pane_index_of(id).map(|r| (c, r)))
+    }
+
+    /// Exchange the panes sitting at two positions, each keeping the height it
+    /// had — the row weight travels with the pane, as it already does for a
+    /// swap inside one column.
+    fn swap_positions(&mut self, a: (usize, usize), b: (usize, usize)) {
+        if a.0 == b.0 {
+            let col = &mut self.columns[a.0];
+            col.panes.swap(a.1, b.1);
+            col.row_weights.swap(a.1, b.1);
+            col.custom_row_weights.swap(a.1, b.1);
+            return;
+        }
+        let (lo, hi) = if a.0 < b.0 { (a, b) } else { (b, a) };
+        let (left, right) = self.columns.split_at_mut(hi.0);
+        let (cl, cr) = (&mut left[lo.0], &mut right[0]);
+        std::mem::swap(&mut cl.panes[lo.1], &mut cr.panes[hi.1]);
+        std::mem::swap(&mut cl.row_weights[lo.1], &mut cr.row_weights[hi.1]);
+        std::mem::swap(&mut cl.custom_row_weights[lo.1], &mut cr.custom_row_weights[hi.1]);
+    }
+
+    /// Move a pane one step in the tab's traversal order (columns left to
+    /// right, rows top to bottom), swapping it with the pane it steps over.
+    ///
+    /// Minimized panes are steps like any other: this walks the order the pane
+    /// switcher lists, so one press moves a row by exactly one line there. A
+    /// swap never empties a column, so the layout keeps its shape — only the
+    /// occupants change. Returns false at either end of the order.
+    pub fn move_pane_in_order(&mut self, id: PaneId, forward: bool) -> bool {
+        let (col, row) = match self.position_of(id) {
+            Some(p) => p,
+            None => return false,
+        };
+        let lens: Vec<usize> = self.columns.iter().map(|c| c.panes.len()).collect();
+        let target = match step_in_order(&lens, (col, row), forward) {
+            Some(t) => t,
+            None => return false,
+        };
+        self.swap_positions((col, row), target);
+        true
     }
 
     /// Swap the focused pane with its neighbor. For Left/Right, swap entire columns.
@@ -2717,5 +2788,33 @@ mod tests {
         assert_eq!(geometry_ratio(2.0, 2.0), None, "same display, nothing to convert");
         assert_eq!(geometry_ratio(0.0, 2.0), None, "no scale adopted yet");
         assert_eq!(geometry_ratio(2.0, 0.0), None, "unknown target display");
+    }
+}
+
+
+#[cfg(test)]
+mod order_tests {
+    use super::step_in_order;
+
+    #[test]
+    fn walks_rows_then_crosses_to_the_next_column() {
+        let lens = [2, 3];
+        assert_eq!(step_in_order(&lens, (0, 0), true), Some((0, 1)));
+        assert_eq!(step_in_order(&lens, (0, 1), true), Some((1, 0)));
+        assert_eq!(step_in_order(&lens, (1, 2), true), None);
+    }
+
+    #[test]
+    fn walks_backwards_into_the_last_row_of_the_previous_column() {
+        let lens = [2, 3];
+        assert_eq!(step_in_order(&lens, (1, 0), false), Some((0, 1)));
+        assert_eq!(step_in_order(&lens, (0, 1), false), Some((0, 0)));
+        assert_eq!(step_in_order(&lens, (0, 0), false), None);
+    }
+
+    #[test]
+    fn single_pane_tab_has_nowhere_to_go() {
+        assert_eq!(step_in_order(&[1], (0, 0), true), None);
+        assert_eq!(step_in_order(&[1], (0, 0), false), None);
     }
 }

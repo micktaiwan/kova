@@ -2623,7 +2623,7 @@ impl Renderer {
         let subtitle = if data.filtered {
             "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{23ce} Focus  click to focus  u All panes  esc Cancel"
         } else {
-            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next waiting  \u{23ce} Focus  u Unread only  esc Cancel"
+            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next waiting  \u{23ce} Focus  \u{2318}\u{2191}\u{2193} Move  u Unread only  esc Cancel"
         };
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;

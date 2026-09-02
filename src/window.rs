@@ -4078,6 +4078,22 @@ impl KovaView {
             return;
         }
 
+        // Cmd+↑ / Cmd+↓ → move the selected pane one step in its tab's order
+        // instead of moving the selection. Minimized panes are steps like any
+        // other, so the selected row travels exactly one line of the list per
+        // press, and the selection follows the pane it moved. Only on the full
+        // list: the attention-only one hides rows, so the pane the move steps
+        // over is often not the row above or below, and the list would look
+        // unchanged while the layout moved underneath.
+        let full_list = self.ivars().pane_switcher.borrow().as_ref().is_some_and(|s| !s.filtered);
+        if full_list
+            && event.modifierFlags().contains(NSEventModifierFlags::Command)
+            && (keycode == 0x7E || keycode == 0x7D)
+        {
+            self.pane_switcher_move_selected(keycode == 0x7D);
+            return;
+        }
+
         // Arrow keys: ↑↓ move within a column (headers skipped), ←→ between columns.
         {
             let mut guard = self.ivars().pane_switcher.borrow_mut();
@@ -4125,6 +4141,51 @@ impl KovaView {
                     }
                 }
                 _ => return,
+            }
+        }
+        self.pane_switcher_clamp_scroll();
+        self.mark_dirty();
+    }
+
+    /// Move the pane on the selected switcher row one step in its tab's order.
+    ///
+    /// The overlay is rebuilt afterwards rather than patched in place — the
+    /// list is a snapshot of the panes, and the tab groups it packs into
+    /// columns depend on the order — then the selection is put back on the pane
+    /// that moved, wherever the rebuild landed it.
+    fn pane_switcher_move_selected(&self, forward: bool) {
+        let pane_id = {
+            let guard = self.ivars().pane_switcher.borrow();
+            match guard.as_ref().and_then(|s| {
+                s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row))
+            }) {
+                Some(SwitcherRow::Pane { pane_id, .. }) => *pane_id,
+                _ => return,
+            }
+        };
+        let moved = {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            match tabs.iter_mut().find(|t| t.pane(pane_id).is_some()) {
+                Some(tab) => tab.move_pane_in_order(pane_id, forward),
+                None => false,
+            }
+        };
+        if !moved {
+            return;
+        }
+        self.resize_all_panes();
+
+        let filtered = self.ivars().pane_switcher.borrow().as_ref().is_some_and(|s| s.filtered);
+        self.open_pane_switcher(filtered);
+        if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
+            for (c, col) in state.columns.iter().enumerate() {
+                if let Some(r) = col.iter().position(
+                    |row| matches!(row, SwitcherRow::Pane { pane_id: id, .. } if *id == pane_id),
+                ) {
+                    state.selected_col = c;
+                    state.selected_row = r;
+                    break;
+                }
             }
         }
         self.pane_switcher_clamp_scroll();
