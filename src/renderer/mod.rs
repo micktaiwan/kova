@@ -2,6 +2,10 @@ pub mod glyph_atlas;
 pub mod pipeline;
 pub mod vertex;
 
+/// Horizontal padding inside a pane, in LOGICAL points. Always go through
+/// `Renderer::h_padding()` (or `KovaView::h_padding()`), which scales it to
+/// pixels — using the constant raw makes the pane's apparent padding, and
+/// therefore its column count, depend on the display's scale factor.
 pub const PANE_H_PADDING: f32 = 10.0;
 const TOOLTIP_ANIM_FRAMES: u8 = 10; // ~166ms at 60fps
 
@@ -151,6 +155,9 @@ use crate::terminal::{CellAttrs, CursorShape, FilterMatch, TerminalState};
 pub struct FilterRenderData {
     pub query: String,
     pub matches: Vec<FilterMatch>,
+    /// Shown instead of the match count when there is nothing to count yet —
+    /// how to get back a query filtered earlier in this run.
+    pub hint: Option<String>,
 }
 
 /// A single entry in the recent projects overlay.
@@ -439,6 +446,8 @@ pub struct Renderer {
     paste_block_color: [f32; 3],
     font_size: f64,
     font_name: String,
+    /// Backing scale factor of the display the renderer currently draws on.
+    scale: f32,
     cursor_blink_frames: u32,
     status_bar_enabled: bool,
     /// How much an unfocused pane is faded (see `DimMode`).
@@ -528,7 +537,7 @@ impl Renderer {
 
         let pixel_format = layer.pixelFormat();
         let pipeline = pipeline::create_pipeline(device, pixel_format);
-        let atlas = GlyphAtlas::new(device, config.font.size * scale, &config.font.family);
+        let atlas = GlyphAtlas::new(device, config.font.size * scale, scale, &config.font.family);
 
         let make_vertex_buf = || {
             device.newBufferWithLength_options(
@@ -577,6 +586,7 @@ impl Renderer {
             paste_block_color: config.colors.paste_block,
             font_size: config.font.size,
             font_name: config.font.family.clone(),
+            scale: scale as f32,
             cursor_blink_frames: config.terminal.cursor_blink_frames,
             status_bar_enabled: config.status_bar.enabled,
             dim_opacity: config.splits.dim_opacity,
@@ -1274,7 +1284,7 @@ impl Renderer {
         let baseline_from_top = self.atlas.baseline_from_top();
         let atlas_w = self.atlas.atlas_width as f32;
         let atlas_h = self.atlas.atlas_height as f32;
-        let ox = vp.x + PANE_H_PADDING;
+        let ox = vp.x + self.h_padding();
         let oy = vp.y;
 
         // Push content to bottom when screen isn't full (single source of truth in Terminal)
@@ -1562,7 +1572,7 @@ impl Renderer {
 
         // Pane ID first, always visible: it is the handle used to address the
         // pane over IPC, so it never gets dropped when the bar runs out of room.
-        let mut cursor_x = vp.x + PANE_H_PADDING + cell_w; // 1 cell padding from left
+        let mut cursor_x = vp.x + self.h_padding() + cell_w; // 1 cell padding from left
         {
             let id_str = format!("#{}", pane_id);
             let id_w = id_str.chars().count() as f32 * cell_w;
@@ -1688,7 +1698,7 @@ impl Renderer {
         Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, color);
         let fg = [1.0, 1.0, 1.0, 1.0];
         let no_bg = [0.0, 0.0, 0.0, 0.0];
-        let text_x = vp.x + PANE_H_PADDING + cell_w;
+        let text_x = vp.x + self.h_padding() + cell_w;
         self.render_status_text(vertices, text, text_x, bar_y, vp.x + vp.width - cell_w, fg, no_bg);
     }
 
@@ -2146,29 +2156,32 @@ impl Renderer {
         // 3. Search bar text: "/ query▏"
         let bar_text = format!("/ {}▏", &filter.query);
         let bar_fg = [1.0, 0.8, 0.2, 1.0]; // accent yellow
-        self.render_status_text(vertices, &bar_text, vp.x + PANE_H_PADDING, vp.y, vp.x + vp.width - cell_w, bar_fg, no_bg);
+        self.render_status_text(vertices, &bar_text, vp.x + self.h_padding(), vp.y, vp.x + vp.width - cell_w, bar_fg, no_bg);
 
-        // Match count
-        let count_text = format!("{} matches", filter.matches.len());
+        // Match count — or, on an empty query, how to recall an earlier one.
+        let count_text = match &filter.hint {
+            Some(h) => h.clone(),
+            None => format!("{} matches", filter.matches.len()),
+        };
         let count_fg = [0.6, 0.6, 0.6, 1.0];
         let count_w = count_text.chars().count() as f32 * cell_w;
-        self.render_status_text(vertices, &count_text, vp.x + vp.width - count_w - PANE_H_PADDING, vp.y, vp.x + vp.width, count_fg, no_bg);
+        self.render_status_text(vertices, &count_text, vp.x + vp.width - count_w - self.h_padding(), vp.y, vp.x + vp.width, count_fg, no_bg);
 
         // 4. List matched lines — truncate text to visible columns to limit vertices
         let max_visible = ((vp.height / cell_h).floor() as usize).saturating_sub(1);
         let match_fg = [0.85, 0.85, 0.85, 1.0];
         let highlight_fg = [1.0, 0.8, 0.2, 1.0];
         let query_lower = filter.query.to_lowercase();
-        let max_chars = ((vp.width - 2.0 * PANE_H_PADDING) / cell_w) as usize;
+        let max_chars = ((vp.width - 2.0 * self.h_padding()) / cell_w) as usize;
 
         for (i, m) in filter.matches.iter().take(max_visible).enumerate() {
             let y = vp.y + (i + 1) as f32 * cell_h;
-            let max_x = vp.x + vp.width - PANE_H_PADDING;
+            let max_x = vp.x + vp.width - self.h_padding();
 
             // Line number prefix
             let prefix = format!("{:>6}: ", m.abs_line);
             let prefix_fg = [0.5, 0.5, 0.5, 1.0];
-            let after_prefix = self.render_status_text(vertices, &prefix, vp.x + PANE_H_PADDING, y, max_x, prefix_fg, no_bg);
+            let after_prefix = self.render_status_text(vertices, &prefix, vp.x + self.h_padding(), y, max_x, prefix_fg, no_bg);
 
             // Truncate line text to what fits on screen
             let prefix_chars = prefix.chars().count();
@@ -2267,7 +2280,8 @@ impl Renderer {
 
     pub fn rebuild_atlas(&mut self, scale: f64) {
         let device = self.atlas.device.clone();
-        self.atlas = GlyphAtlas::new(&device, self.font_size * scale, &self.font_name);
+        self.scale = scale as f32;
+        self.atlas = GlyphAtlas::new(&device, self.font_size * scale, scale, &self.font_name);
         // Update atlas size buffer
         let atlas_size = [self.atlas.atlas_width as f32, self.atlas.atlas_height as f32];
         self.last_atlas_size = atlas_size;
@@ -2989,6 +3003,11 @@ impl Renderer {
             let ax = (viewport_w - scaled_cell_w) / 2.0;
             self.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);
         }
+    }
+
+    /// Horizontal pane padding in pixels for the current display scale.
+    pub fn h_padding(&self) -> f32 {
+        PANE_H_PADDING * self.scale
     }
 
     pub fn cell_size(&self) -> (f32, f32) {

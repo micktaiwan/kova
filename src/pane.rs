@@ -461,9 +461,25 @@ pub struct Tab {
     pub scroll_offset_x: f32,
     /// Manual override of virtual width (0.0 = auto from min_split_width).
     pub virtual_width_override: f32,
+    /// Backing scale factor the two pixel fields above are expressed in. A pane
+    /// must keep the same APPARENT width across displays, so when the tab lands
+    /// on a display with another scale they are converted by the ratio (see
+    /// `KovaView::normalize_tab_geometry`). 0.0 = not adopted yet.
+    pub geometry_scale: f32,
     /// Cell height in pixels, used to snap row heights to cell boundaries.
     /// Set by the window before layout; 0.0 = no snapping.
     pub cell_h: Cell<f32>,
+}
+
+/// Pixel conversion factor between the display a tab's geometry was expressed in
+/// and the one it now lands on. `None` when there is nothing to convert: the tab
+/// has not adopted a scale yet, or it is the same display.
+fn geometry_ratio(from: f32, to: f32) -> Option<f32> {
+    if from > 0.0 && to > 0.0 && (from - to).abs() > 0.01 {
+        Some(to / from)
+    } else {
+        None
+    }
 }
 
 /// Rewrite column weights so that, after a horizontal split performed while
@@ -536,6 +552,7 @@ impl Tab {
             minimized_stack: Vec::new(),
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
+            geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
         })
     }
@@ -560,6 +577,7 @@ impl Tab {
             minimized_stack: Vec::new(),
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
+            geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
         })
     }
@@ -583,6 +601,7 @@ impl Tab {
             minimized_stack: Vec::new(),
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
+            geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
         })
     }
@@ -597,6 +616,21 @@ impl Tab {
             let n = self.num_visible_columns() as f32;
             (n * min_split_width).max(screen_width)
         }
+    }
+
+    /// Convert this tab's pixel geometry to a display whose backing scale is
+    /// `scale`, so every pane keeps the same apparent width. Column weights are
+    /// relative and need no conversion. No-op the first time (the tab simply
+    /// adopts the scale it is displayed at).
+    pub fn adopt_geometry_scale(&mut self, scale: f32) {
+        if scale <= 0.0 {
+            return;
+        }
+        if let Some(ratio) = geometry_ratio(self.geometry_scale, scale) {
+            self.virtual_width_override *= ratio;
+            self.scroll_offset_x *= ratio;
+        }
+        self.geometry_scale = scale;
     }
 
     /// Scale virtual_width_override proportionally when column count changes (e.g. pane close).
@@ -2222,7 +2256,7 @@ impl Column {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjacent_visible_pairs, AwaitingFlag, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, max_visible_fraction, new_entry_weight, normalize_process_name, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
+    use super::{adjacent_visible_pairs, geometry_ratio, AwaitingFlag, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, max_visible_fraction, new_entry_weight, normalize_process_name, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
 
     #[test]
     fn a_read_waiting_pane_re_enters_the_jump_cycle_only_on_a_new_question() {
@@ -2663,5 +2697,25 @@ mod tests {
         assert_eq!(derive_display_title(None, None, None, None, None, "shell"), "shell");
         // Empty OSC title with no cwd must also reach the fallback, never blank.
         assert_eq!(derive_display_title(None, None, Some(""), None, None, "shell"), "shell");
+    }
+
+    /// A tab moved from a 2x display to a 1x one must keep the same APPARENT
+    /// width: half as many pixels for the same physical size on screen.
+    #[test]
+    fn geometry_converts_when_the_tab_changes_display() {
+        assert_eq!(geometry_ratio(2.0, 1.0), Some(0.5));
+        assert_eq!(geometry_ratio(1.0, 2.0), Some(2.0));
+        // A 4000px virtual width on retina is 2000px on the external display,
+        // and the round trip is lossless.
+        let there = 4000.0 * geometry_ratio(2.0, 1.0).unwrap();
+        assert_eq!(there, 2000.0);
+        assert_eq!(there * geometry_ratio(1.0, 2.0).unwrap(), 4000.0);
+    }
+
+    #[test]
+    fn geometry_ignores_a_scale_that_did_not_change_or_makes_no_sense() {
+        assert_eq!(geometry_ratio(2.0, 2.0), None, "same display, nothing to convert");
+        assert_eq!(geometry_ratio(0.0, 2.0), None, "no scale adopted yet");
+        assert_eq!(geometry_ratio(2.0, 0.0), None, "unknown target display");
     }
 }

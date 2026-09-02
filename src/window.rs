@@ -178,6 +178,12 @@ struct BoundaryFlash {
 struct FilterState {
     query: String,
     matches: Vec<FilterMatch>,
+    /// Where ↑/↓ currently sits in this run's filter history; `None` when the
+    /// query on screen is the one being typed rather than a recalled one.
+    history_pos: Option<usize>,
+    /// The typed query set aside while browsing history, put back on ↓ past the
+    /// most recent entry.
+    draft: String,
 }
 
 /// What a hit points at: something open right now, or a Claude conversation
@@ -197,6 +203,9 @@ enum SearchTarget {
     /// A closed Claude Code session. Opening it means a new pane in the
     /// session's own project directory, with its `--resume` line pre-typed.
     Archived { session_id: String, cwd: String },
+    /// A query searched earlier in this run of Kova. Opening it does not jump
+    /// anywhere: it retypes the query into the input and searches again.
+    Recall { query: String },
 }
 
 /// One hit returned by the search worker.
@@ -1863,7 +1872,7 @@ impl KovaView {
         let (cell_w, cell_h) = renderer_r.cell_size();
         drop(renderer_r);
 
-        let rel_x = px - vp.x - crate::renderer::PANE_H_PADDING;
+        let rel_x = px - vp.x - self.h_padding();
         let rel_y = py - vp.y;
 
         let term = pane.terminal.read();
@@ -2047,6 +2056,13 @@ impl KovaView {
 
     fn backing_scale(&self) -> f32 {
         self.window().map_or(2.0, |w| w.backingScaleFactor()) as f32
+    }
+
+    /// Horizontal pane padding in pixels for the current display scale. The
+    /// constant is in logical points; using it raw would make the column count
+    /// depend on the display (see `notes/screen-switch-resize.md`).
+    fn h_padding(&self) -> f32 {
+        crate::renderer::PANE_H_PADDING * self.backing_scale()
     }
 
     /// Compute scaled min_split_width in pixels.
@@ -2277,7 +2293,7 @@ impl KovaView {
         let (cell_w, cell_h) = renderer_r.cell_size();
         drop(renderer_r);
 
-        let rel_x = pixel_x - vp.x - crate::renderer::PANE_H_PADDING;
+        let rel_x = pixel_x - vp.x - self.h_padding();
         let rel_y = pixel_y - vp.y;
 
         let term = pane.terminal.read();
@@ -2307,7 +2323,7 @@ impl KovaView {
         let (cell_w, cell_h) = renderer_r.cell_size();
         drop(renderer_r);
 
-        let rel_x = pixel_x - vp.x - crate::renderer::PANE_H_PADDING;
+        let rel_x = pixel_x - vp.x - self.h_padding();
         let rel_y = pixel_y - vp.y;
 
         let term = pane.terminal.read();
@@ -2353,7 +2369,7 @@ impl KovaView {
         let status_bar = renderer_r.status_bar_enabled();
         drop(renderer_r);
 
-        let cols = ((vp.width - 2.0 * crate::renderer::PANE_H_PADDING) / cell_w).floor().max(1.0) as u16;
+        let cols = ((vp.width - 2.0 * self.h_padding()) / cell_w).floor().max(1.0) as u16;
         let usable_h = if status_bar {
             vp.height - cell_h
         } else {
@@ -2911,7 +2927,8 @@ impl KovaView {
         let rows = config.terminal.rows;
 
         match crate::session::restore_saved_tab(&entry.tab, cols, rows, config) {
-            Some(tab) => {
+            Some(mut tab) => {
+                tab.adopt_geometry_scale(self.backing_scale());
                 let mut tabs = self.ivars().tabs.borrow_mut();
                 let new_idx = self.ivars().active_tab.get() + 1;
                 tabs.insert(new_idx, tab);
@@ -2993,6 +3010,10 @@ impl KovaView {
         // Index the closed Claude sessions now, so the scan overlaps with the
         // user typing rather than delaying the first query.
         crate::claude_history::warm();
+        // An empty input is not an empty screen: it offers what was searched
+        // earlier in this run, so a repeat search is one keypress.
+        let rows = recent_search_rows();
+        let selected = rows.iter().position(SearchRow::is_hit).unwrap_or(0);
         *self.ivars().search_palette.borrow_mut() = Some(SearchPaletteState {
             query: String::new(),
             cursor: 0,
@@ -3000,8 +3021,8 @@ impl KovaView {
             rx: None,
             searching: false,
             submitted_query: String::new(),
-            rows: Vec::new(),
-            selected: 0,
+            rows,
+            selected,
             scroll: 0,
             needs_search: false,
             last_edit: None,
@@ -3142,11 +3163,14 @@ impl KovaView {
         }
 
         if clear_for_empty {
+            // Erasing the query brings back the same list the palette opened
+            // with, rather than a blank panel.
+            let rows = recent_search_rows();
             if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
                 state.needs_search = false;
                 state.submitted_query.clear();
-                state.rows.clear();
-                state.selected = 0;
+                state.selected = rows.iter().position(SearchRow::is_hit).unwrap_or(0);
+                state.rows = rows;
                 state.scroll = 0;
             }
             updated = true;
@@ -3158,6 +3182,18 @@ impl KovaView {
         if updated {
             self.mark_dirty();
         }
+    }
+
+    /// Close the palette, remembering what was typed. The one exit point for
+    /// the overlay, so no path can drop a query without recording it.
+    fn close_search_palette(&self) {
+        if let Some(state) = self.ivars().search_palette.borrow_mut().take() {
+            crate::search_history::record(
+                crate::search_history::Scope::Palette,
+                &state.query,
+            );
+        }
+        self.mark_dirty();
     }
 
     /// Handle key events while the search palette overlay is active.
@@ -3229,9 +3265,9 @@ impl KovaView {
 
         match ch {
             '\u{1B}' => {
-                // Escape — close the palette.
-                *self.ivars().search_palette.borrow_mut() = None;
-                self.mark_dirty();
+                // Escape — close the palette, keeping the query in the history:
+                // a search abandoned is still a search one may want back.
+                self.close_search_palette();
             }
             '\r' => {
                 // Enter: open the selected hit. Live search keeps the rows fresh,
@@ -3249,13 +3285,27 @@ impl KovaView {
                     }
                 };
                 match action {
+                    // A recalled query stays in the palette: it retypes the
+                    // query and searches again, it does not open anything.
+                    Some(SearchHit { target: SearchTarget::Recall { query }, .. }) => {
+                        if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
+                            state.cursor = query.chars().count();
+                            state.query = query;
+                            state.needs_search = true;
+                            // No debounce for a query the user did not type:
+                            // it is complete, so run it on the next tick.
+                            state.last_edit = None;
+                        }
+                        self.mark_dirty();
+                    }
                     Some(hit) => {
-                        *self.ivars().search_palette.borrow_mut() = None;
+                        self.close_search_palette();
                         match &hit.target {
                             SearchTarget::Open { .. } => jump_to_search_hit(&hit),
                             SearchTarget::Archived { session_id, cwd } => {
                                 self.open_archived_claude_session(session_id, cwd)
                             }
+                            SearchTarget::Recall { .. } => unreachable!("handled above"),
                         }
                     }
                     None => self.submit_search_palette(),
@@ -3271,13 +3321,14 @@ impl KovaView {
                             state.cursor -= 1;
                             state.needs_search = true;
                             state.last_edit = Some(std::time::Instant::now());
+                            drop_recall_rows(state);
                         }
                     }
                 }
                 drop(guard);
                 self.mark_dirty();
             }
-            c if c >= ' ' && !c.is_control() => {
+            c if is_typed_char(c) => {
                 // Insert printable character; queue a live search.
                 let mut guard = self.ivars().search_palette.borrow_mut();
                 if let Some(state) = guard.as_mut() {
@@ -3288,6 +3339,7 @@ impl KovaView {
                     state.cursor += 1;
                     state.needs_search = true;
                     state.last_edit = Some(std::time::Instant::now());
+                    drop_recall_rows(state);
                 }
                 drop(guard);
                 self.mark_dirty();
@@ -3392,6 +3444,97 @@ struct SearchPaneSnapshot {
     terminal: Arc<parking_lot::RwLock<crate::terminal::TerminalState>>,
 }
 
+/// Drop the recall list once the user starts typing a query of their own.
+///
+/// The recall rows are only on screen while nothing has been searched yet
+/// (`submitted_query` empty). Leaving them there during the debounce would show
+/// a list that has nothing to do with what is being typed — and ⏎ before the
+/// first results land would recall an old query instead of searching the new
+/// one, silently throwing away what was just typed.
+fn drop_recall_rows(state: &mut SearchPaletteState) {
+    if state.submitted_query.is_empty() && !state.query.is_empty() {
+        state.rows.clear();
+        state.selected = 0;
+        state.scroll = 0;
+    }
+}
+
+/// Whether a key event's character is something to type into a text input.
+///
+/// AppKit hands the arrows, the function keys, Home/End/PageUp and friends as
+/// characters in the Unicode private-use block (U+F700…U+F8FF). Those are
+/// neither control chars nor below ' ', so the plain "printable" test lets them
+/// through and they land in the query as an invisible char that matches nothing.
+fn is_typed_char(c: char) -> bool {
+    // Only AppKit's own range (NSUpArrowFunctionKey…NSModeSwitchFunctionKey).
+    // The rest of the private-use block is real typing: U+F8FF is the Apple
+    // logo, and Nerd Font glyphs live just below it.
+    c >= ' ' && !c.is_control() && !('\u{F700}'..='\u{F747}').contains(&c)
+}
+
+/// The rows shown while the input is empty: the queries searched earlier in
+/// this run of Kova, most recent first. Empty (no header either) on the first
+/// search of the run, so nothing is announced before there is anything to show.
+fn recent_search_rows() -> Vec<SearchRow> {
+    let recent = crate::search_history::list(crate::search_history::Scope::Palette);
+    if recent.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = vec![SearchRow::Header("Recent searches".to_string())];
+    rows.extend(recent.into_iter().map(|query| {
+        SearchRow::Hit(SearchHit {
+            label: query.clone(),
+            target: SearchTarget::Recall { query },
+        })
+    }));
+    rows
+}
+
+/// The line of a pane's scrollback that explains why it matched, trimmed to fit
+/// one row. Without it every content hit reads as a bare pane title and the list
+/// gives no reason to prefer one row over another.
+///
+/// `text` is the pane dump in its original case and `lower` its ASCII-lowercased
+/// twin — the one the worker already built to test the match. Both are passed so
+/// the line is found on `lower` (no per-line allocation over a 10k-line dump) and
+/// shown from `text`. ASCII lowercasing leaves byte lengths untouched, so an
+/// offset into one indexes the other.
+fn content_snippet(text: &str, lower: &str, term: &str) -> Option<String> {
+    const MAX_SNIPPET_CHARS: usize = 90;
+    /// Chars of context kept before the match, so it does not sit on the edge.
+    const LEAD_CHARS: usize = 20;
+    debug_assert_eq!(text.len(), lower.len());
+
+    let pos = lower.find(term)?;
+    let line_start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = text[pos..].find('\n').map(|i| pos + i).unwrap_or(text.len());
+    let raw = &text[line_start..line_end];
+    let line = raw.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    // Where the match sits in the trimmed line, in chars.
+    let lead_ws = raw.len() - raw.trim_start().len();
+    let match_byte = (pos - line_start).saturating_sub(lead_ws).min(line.len());
+    let match_char = line[..match_byte].chars().count();
+
+    // Start a few words before the match rather than at the start of a line
+    // that may be mostly indentation or a long prefix.
+    let start = match_char.saturating_sub(LEAD_CHARS);
+    let chars: Vec<char> = line.chars().collect();
+    let end = (start + MAX_SNIPPET_CHARS).min(chars.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(chars[start..end].iter());
+    if end < chars.len() {
+        out.push('…');
+    }
+    Some(out)
+}
+
 /// Worker-thread search. Uses ASCII case-insensitive `contains` — good enough
 /// for terminal text, which is overwhelmingly ASCII.
 ///
@@ -3429,13 +3572,24 @@ fn run_search_worker(
         // whole buffer is the expensive part, so it only happens for what is
         // left, and only once.
         let unmatched: Vec<&String> = terms.iter().filter(|t| !title.contains(t.as_str())).collect();
-        let matches = unmatched.is_empty() || {
-            let term = p.terminal.read();
-            let content = term
-                .dump_text(crate::terminal::DumpMode::All, true)
-                .text
-                .to_ascii_lowercase();
-            unmatched.iter().all(|t| content.contains(t.as_str()))
+        // Snippet of the scrollback line that matched, for the rows the title
+        // alone does not explain.
+        let mut snippet = None;
+        let matches = if unmatched.is_empty() {
+            true
+        } else {
+            let text = {
+                let term = p.terminal.read();
+                term.dump_text(crate::terminal::DumpMode::All, true).text
+            };
+            let lower = text.to_ascii_lowercase();
+            let all = unmatched.iter().all(|t| lower.contains(t.as_str()));
+            if all {
+                // The first term the title did not carry is the one whose line
+                // says something the row does not already show.
+                snippet = content_snippet(&text, &lower, unmatched[0]);
+            }
+            all
         };
         if !matches {
             continue;
@@ -3444,12 +3598,16 @@ fn run_search_worker(
             rows.push(SearchRow::Header(p.tab_title.clone()));
             current_tab = Some(p.tab_id);
         }
+        let label = match snippet {
+            Some(s) => format!("{}  ·  {}", p.pane_title, s),
+            None => p.pane_title.clone(),
+        };
         rows.push(SearchRow::Hit(SearchHit {
             target: SearchTarget::Open {
                 tab_id: p.tab_id,
                 pane_id: Some(p.pane_id),
             },
-            label: p.pane_title.clone(),
+            label,
         }));
     }
 
@@ -3566,7 +3724,7 @@ fn open_pane_in_tab_for_cwd(cwd: &str, config: &crate::config::Config, command: 
 fn jump_to_search_hit(hit: &SearchHit) {
     let (tab_id, pane_id) = match &hit.target {
         SearchTarget::Open { tab_id, pane_id } => (*tab_id, *pane_id),
-        SearchTarget::Archived { .. } => return,
+        SearchTarget::Archived { .. } | SearchTarget::Recall { .. } => return,
     };
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let app = NSApplication::sharedApplication(mtm);
@@ -4234,8 +4392,9 @@ impl KovaView {
                         }
                         drop(filter);
                         copy_to_pasteboard(&text);
-                        // Close filter after copying
-                        *self.ivars().filter.borrow_mut() = None;
+                        // Close filter after copying — through close_filter, so
+                        // the query joins the recall list like any other exit.
+                        self.close_filter();
                         self.mark_dirty();
                     } else {
                         drop(filter);
@@ -4509,6 +4668,7 @@ impl KovaView {
                     minimized_stack: Vec::new(),
                     scroll_offset_x: 0.0,
                     virtual_width_override: 0.0,
+                    geometry_scale: self.backing_scale(),
                     cell_h: std::cell::Cell::new(0.0),
                 };
 
@@ -5616,6 +5776,7 @@ impl KovaView {
         let (cell_w, cell_h) = renderer_r.cell_size();
         let status_bar = renderer_r.status_bar_enabled();
         drop(renderer_r);
+        let h_pad = self.h_padding();
 
         // Drop expired resize histories (also clears entries of closed panes)
         self.ivars().recent_resizes.borrow_mut().retain(|_, h| {
@@ -5632,7 +5793,7 @@ impl KovaView {
                 if pane.minimized {
                     return;
                 }
-                let cols = ((vp.width - 2.0 * crate::renderer::PANE_H_PADDING) / cell_w).floor().max(1.0) as u16;
+                let cols = ((vp.width - 2.0 * h_pad) / cell_w).floor().max(1.0) as u16;
                 let usable_h = if status_bar { vp.height - cell_h } else { vp.height };
                 let rows = (usable_h / cell_h).floor().max(1.0) as u16;
                 let mut term = pane.terminal.write();
@@ -5820,13 +5981,16 @@ impl KovaView {
     fn toggle_filter(&self) {
         let mut filter = self.ivars().filter.borrow_mut();
         if filter.is_some() {
-            *filter = None;
-        } else {
-            *filter = Some(FilterState {
-                query: String::new(),
-                matches: Vec::new(),
-            });
+            drop(filter);
+            self.close_filter();
+            return;
         }
+        *filter = Some(FilterState {
+            query: String::new(),
+            matches: Vec::new(),
+            history_pos: None,
+            draft: String::new(),
+        });
         drop(filter);
         // Mark dirty to trigger redraw
         if let Some(pane) = self.focused_pane() {
@@ -5834,7 +5998,59 @@ impl KovaView {
         }
     }
 
+    /// Close the filter overlay, remembering the query so ↑ can bring it back.
+    /// Returns the state that was closed, for the callers that need its matches.
+    /// The one exit point, so no path drops a query without recording it.
+    fn close_filter(&self) -> Option<FilterState> {
+        let state = self.ivars().filter.borrow_mut().take();
+        if let Some(state) = state.as_ref() {
+            // The query the user was browsing from history is what is on
+            // screen, and re-recording it just moves it back to the front.
+            crate::search_history::record(
+                crate::search_history::Scope::Filter,
+                &state.query,
+            );
+        }
+        if let Some(pane) = self.focused_pane() {
+            pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        state
+    }
+
+    /// Walk the filter's recall list. `older` is ↑ (further back), otherwise ↓.
+    /// Returns true if the query changed and the matches need re-running.
+    fn recall_filter_query(state: &mut FilterState, older: bool) -> bool {
+        let history = crate::search_history::list(crate::search_history::Scope::Filter);
+        if history.is_empty() {
+            return false;
+        }
+        let next_pos = match (state.history_pos, older) {
+            // Entering the list: keep what was typed so ↓ can restore it.
+            (None, true) => Some(0),
+            (None, false) => return false,
+            (Some(i), true) => {
+                if i + 1 >= history.len() {
+                    return false; // already at the oldest
+                }
+                Some(i + 1)
+            }
+            // Past the most recent entry: back to what the user typed.
+            (Some(0), false) => None,
+            (Some(i), false) => Some(i - 1),
+        };
+        if state.history_pos.is_none() {
+            state.draft = state.query.clone();
+        }
+        state.query = match next_pos {
+            Some(i) => history[i].clone(),
+            None => state.draft.clone(),
+        };
+        state.history_pos = next_pos;
+        true
+    }
+
     fn handle_filter_key(&self, event: &NSEvent) {
+        let key_code = event.keyCode();
         let chars = event.charactersIgnoringModifiers();
         let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
         let ch = ch_str.chars().next().unwrap_or('\0');
@@ -5845,21 +6061,38 @@ impl KovaView {
             None => return,
         };
 
+        // Arrows first: their `charactersIgnoringModifiers` is a private-use
+        // char (U+F700…), which is neither a control char nor below ' ', so the
+        // printable branch below would happily type it into the query.
+        match key_code {
+            0x7E | 0x7D => {
+                // ↑/↓ walk the queries filtered earlier in this run.
+                if !Self::recall_filter_query(state, key_code == 0x7E) {
+                    return;
+                }
+                if let Some(pane) = self.focused_pane() {
+                    let term = pane.terminal.read();
+                    state.matches = term.search_lines(&state.query);
+                    term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                return;
+            }
+            _ => {}
+        }
+
         match ch {
             '\u{1B}' => {
                 // Escape → close filter without scrolling
-                *filter = None;
                 drop(filter);
-                if let Some(pane) = self.focused_pane() {
-                    pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+                self.close_filter();
                 return;
             }
             '\r' => {
                 // Enter → close filter and scroll to first match
-                let first_match = state.matches.first().map(|m| m.abs_line);
-                *filter = None;
                 drop(filter);
+                let first_match = self
+                    .close_filter()
+                    .and_then(|state| state.matches.first().map(|m| m.abs_line));
                 if let Some(abs_line) = first_match {
                     if let Some(pane) = self.focused_pane() {
                         let mut term = pane.terminal.write();
@@ -5871,9 +6104,13 @@ impl KovaView {
             '\u{7F}' | '\u{08}' => {
                 // Backspace
                 state.query.pop();
+                // Editing a recalled query makes it the draft again, so ↓ does
+                // not throw the edit away.
+                state.history_pos = None;
             }
-            c if c >= ' ' && !c.is_control() => {
+            c if is_typed_char(c) => {
                 state.query.push(c);
+                state.history_pos = None;
             }
             _ => return,
         }
@@ -5958,7 +6195,7 @@ impl KovaView {
                         }
                     }
                 }
-                c if c >= ' ' && !c.is_control() => {
+                c if is_typed_char(c) => {
                     let byte_idx = state.input.char_indices()
                         .nth(state.cursor).map(|(i, _)| i)
                         .unwrap_or(state.input.len());
@@ -6052,7 +6289,7 @@ impl KovaView {
                         }
                     }
                 }
-                c if c >= ' ' && !c.is_control() => {
+                c if is_typed_char(c) => {
                     let byte_idx = state.input.char_indices()
                         .nth(state.cursor).map(|(i, _)| i)
                         .unwrap_or(state.input.len());
@@ -6084,17 +6321,13 @@ impl KovaView {
             return;
         }
 
-        let mut filter = self.ivars().filter.borrow_mut();
-        let abs_line = match filter.as_ref() {
-            Some(state) => {
-                let idx = click_row as usize;
-                state.matches.get(idx).map(|m| m.abs_line)
-            }
-            None => return,
-        };
-
-        *filter = None;
-        drop(filter);
+        if self.ivars().filter.borrow().is_none() {
+            return;
+        }
+        let abs_line = self.close_filter().and_then(|state| {
+            let idx = click_row as usize;
+            state.matches.get(idx).map(|m| m.abs_line)
+        });
 
         if let Some(abs_line) = abs_line {
             if let Some(pane) = self.focused_pane() {
@@ -6117,23 +6350,31 @@ impl KovaView {
         });
 
         // Rebuild glyph atlas if scale changed (e.g. moved to different display)
-        if (scale - self.ivars().last_scale.get()).abs() > 0.01 {
-            log::debug!("Scale changed: {} -> {}", self.ivars().last_scale.get(), scale);
+        // and convert every tab's pixel geometry to the new scale, so a pane keeps
+        // the same APPARENT width across displays (the pixel count changes, the
+        // physical size does not). Column weights are relative and need nothing.
+        let old_scale = self.ivars().last_scale.get();
+        if (scale - old_scale).abs() > 0.01 {
+            log::debug!("Scale changed: {} -> {}", old_scale, scale);
             self.ivars().last_scale.set(scale);
             renderer.write().rebuild_atlas(scale);
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            for tab in tabs.iter_mut() {
+                tab.adopt_geometry_scale(scale as f32);
+            }
         }
 
-        // Reflow every tab's layout against the new window size: cap panes that
-        // now exceed screen width (which may also shrink virtual_width_override)
-        // and clamp scroll_offset_x. Without this, a tab with a wide
-        // virtual_width_override from an external display keeps its absolute
-        // pixel widths after switching back to a smaller screen.
+        // Only clamp the scroll offset. Pane widths are deliberately NOT capped
+        // to the new screen: on a narrower display the panes keep their size and
+        // the tab scrolls horizontally instead. Capping them here mutated
+        // column_weights and dropped virtual_width_override for good, so coming
+        // back to the wide display never restored the layout.
         let screen_w = self.drawable_viewport().width;
         let min_w = self.min_split_width_px();
         {
             let mut tabs = self.ivars().tabs.borrow_mut();
             for tab in tabs.iter_mut() {
-                self.enforce_max_pane_width(tab, screen_w, min_w);
+                tab.clamp_scroll(screen_w, min_w);
             }
         }
 
@@ -6218,6 +6459,12 @@ impl KovaView {
         self.ivars().keybindings.set(Keybindings::from_config(&config.keys)).ok();
         self.ivars().git_poll_interval.set(config.terminal.fps * 2);
         self.ivars().help_hint_frames.set(config.terminal.fps * 3);
+        // Tabs restored from a session carry the pixel geometry of the display
+        // they were saved on: convert it to this window's display.
+        let mut tabs = tabs;
+        for tab in tabs.iter_mut() {
+            tab.adopt_geometry_scale(scale as f32);
+        }
         *self.ivars().tabs.borrow_mut() = tabs;
         self.ivars().active_tab.set(active_tab);
     }
@@ -6318,7 +6565,8 @@ impl KovaView {
                     let cols = config.terminal.columns;
                     let rows = config.terminal.rows;
                     match crate::session::restore_saved_tab(&saved_tab, cols, rows, config) {
-                        Some(tab) => {
+                        Some(mut tab) => {
+                            tab.adopt_geometry_scale(self.backing_scale());
                             loading += pane_count as u32;
                             let mut tabs = ivars.tabs.borrow_mut();
                             if let Some(pos) = tabs.iter().position(|t| t.id == tab_id) {
@@ -6736,6 +6984,11 @@ impl KovaView {
             filter.as_ref().map(|f| FilterRenderData {
                 query: f.query.clone(),
                 matches: f.matches.clone(),
+                // Only while the input is empty: once the user types, the match
+                // count is the useful number.
+                hint: (f.query.is_empty()
+                    && !crate::search_history::is_empty(crate::search_history::Scope::Filter))
+                .then(|| "↑ recent".to_string()),
             })
         };
 
@@ -7211,6 +7464,114 @@ mod tests {
         // Sessions still chewing are the reason the screen looks quiet.
         assert_eq!(nothing_to_show_status(1), "Nothing to show (1 thinking)");
         assert_eq!(nothing_to_show_status(4), "Nothing to show (4 thinking)");
+    }
+
+    /// Call `content_snippet` the way the worker does: the dump and its
+    /// lowercased twin.
+    fn snippet_of(text: &str, term: &str) -> Option<String> {
+        content_snippet(text, &text.to_ascii_lowercase(), term)
+    }
+
+    fn palette_state(query: &str, submitted: &str, rows: Vec<SearchRow>) -> SearchPaletteState {
+        SearchPaletteState {
+            cursor: query.chars().count(),
+            query: query.to_string(),
+            query_id: 0,
+            rx: None,
+            searching: false,
+            submitted_query: submitted.to_string(),
+            selected: rows.iter().position(SearchRow::is_hit).unwrap_or(0),
+            rows,
+            scroll: 0,
+            needs_search: false,
+            last_edit: None,
+        }
+    }
+
+    #[test]
+    fn typing_drops_the_recall_list_before_it_can_be_opened_by_mistake() {
+        // Opened, nothing searched yet: the rows are the recall list.
+        let recall = vec![
+            SearchRow::Header("Recent searches".to_string()),
+            SearchRow::Hit(SearchHit {
+                label: "old query".to_string(),
+                target: SearchTarget::Recall { query: "old query".to_string() },
+            }),
+        ];
+        let mut state = palette_state("d", "", recall.clone());
+        drop_recall_rows(&mut state);
+        // Gone: ⏎ during the debounce searches what was typed instead of
+        // recalling an unrelated query.
+        assert!(state.rows.is_empty());
+        assert_eq!(state.selected, 0);
+
+        // Still empty input (the user only moved the caret): the list stays.
+        let mut state = palette_state("", "", recall);
+        drop_recall_rows(&mut state);
+        assert_eq!(state.rows.len(), 2);
+
+        // Real results are never dropped by an edit.
+        let results = vec![SearchRow::Hit(SearchHit {
+            label: "a pane".to_string(),
+            target: SearchTarget::Archived { session_id: "x".into(), cwd: "/tmp".into() },
+        })];
+        let mut state = palette_state("de", "d", results);
+        drop_recall_rows(&mut state);
+        assert_eq!(state.rows.len(), 1);
+    }
+
+    #[test]
+    fn function_keys_are_not_typed_into_an_input() {
+        // What a person types.
+        assert!(is_typed_char('a'));
+        assert!(is_typed_char(' '));
+        assert!(is_typed_char('é'));
+        assert!(is_typed_char('▲'));
+        // AppKit's private-use block: arrows, F-keys, Home/End, Page Up/Down.
+        assert!(!is_typed_char('\u{F700}')); // up arrow
+        assert!(!is_typed_char('\u{F701}')); // down arrow
+        assert!(!is_typed_char('\u{F729}')); // home
+        assert!(!is_typed_char('\u{F747}')); // mode switch, the last of them
+        // Above that range the private-use block carries characters people do
+        // type: the Apple logo, and the Nerd Font glyphs in a shell prompt.
+        assert!(is_typed_char('\u{F8FF}'));
+        assert!(is_typed_char('\u{F748}'));
+        // Control chars stay out, as before.
+        assert!(!is_typed_char('\u{1B}'));
+        assert!(!is_typed_char('\r'));
+    }
+
+    #[test]
+    fn a_content_hit_shows_the_line_that_matched() {
+        let text = "first line\n  the deploy failed on staging\nlast line";
+        assert_eq!(
+            snippet_of(text, "deploy").as_deref(),
+            Some("the deploy failed on staging")
+        );
+        // Case-insensitive, and the row shows the original case.
+        assert_eq!(snippet_of("Deploy Failed", "deploy").as_deref(), Some("Deploy Failed"));
+        // A term nowhere in the text has no line to show.
+        assert_eq!(snippet_of(text, "absent"), None);
+    }
+
+    #[test]
+    fn a_long_line_is_cut_around_the_match() {
+        let line = format!("{}needle{}", "a".repeat(200), "b".repeat(200));
+        let snippet = snippet_of(&line, "needle").expect("the line matches");
+        // Ellipsis on both sides, the match kept in view, and the row stays short.
+        assert!(snippet.starts_with('…'), "{snippet}");
+        assert!(snippet.ends_with('…'), "{snippet}");
+        assert!(snippet.contains("needle"), "{snippet}");
+        assert!(snippet.chars().count() <= 92, "{}", snippet.chars().count());
+    }
+
+    #[test]
+    fn a_snippet_never_splits_a_multibyte_char() {
+        // Box-drawing and emoji are everywhere in a terminal: cutting by bytes
+        // would panic here.
+        let line = format!("{}échec du déploiement", "é".repeat(50));
+        let snippet = snippet_of(&line, "déploiement").expect("the line matches");
+        assert!(snippet.contains("déploiement"), "{snippet}");
     }
 
     #[test]

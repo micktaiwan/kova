@@ -72,8 +72,49 @@ pub struct GlyphAtlas {
     pub actual_font_name: String,
 }
 
+/// Round a physical font metric up to a whole number of LOGICAL points, then
+/// express it back in pixels. Rounding in pixels instead would make the cell's
+/// apparent size display-dependent — a 2x display would round to a different
+/// point value than a 1x one, changing the grid when the window moves screens.
+fn round_metric_in_points(physical: f64, scale: f64) -> f32 {
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    ((physical / scale).ceil() * scale) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::round_metric_in_points;
+
+    /// Hack 13pt, measured with CoreText: the line height is 15.133pt logical,
+    /// so 30.266px on a 2x display. Rounding in pixels gave 31px = 15.5pt there
+    /// against 16pt on a 1x display — the rows changed when switching screens.
+    #[test]
+    fn a_metric_keeps_the_same_point_size_on_every_display() {
+        let one_x = round_metric_in_points(15.1328125, 1.0);
+        let two_x = round_metric_in_points(30.265625, 2.0);
+        assert_eq!(one_x, 16.0);
+        assert_eq!(two_x, 32.0);
+        assert_eq!(one_x, two_x / 2.0);
+    }
+
+    #[test]
+    fn a_metric_already_whole_in_points_is_left_alone() {
+        assert_eq!(round_metric_in_points(16.0, 2.0), 16.0);
+        assert_eq!(round_metric_in_points(8.0, 1.0), 8.0);
+    }
+
+    #[test]
+    fn a_zero_or_negative_scale_falls_back_to_one() {
+        assert_eq!(round_metric_in_points(7.2, 0.0), 8.0);
+    }
+}
+
 impl GlyphAtlas {
-    pub fn new(device: &ProtocolObject<dyn MTLDevice>, font_size: f64, font_name: &str) -> Self {
+    /// `font_size` is the physical size (logical size × `scale`); `scale` is the
+    /// display's backing scale factor. The cell is rounded in LOGICAL points and
+    /// only then scaled back to pixels, so a cell keeps the same apparent size on
+    /// every display — see `notes/screen-switch-resize.md`.
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>, font_size: f64, scale: f64, font_name: &str) -> Self {
         let cf_font_name = CFString::from_str(font_name);
         let mut font = unsafe { CTFont::with_name(&cf_font_name, font_size, ptr::null()) };
 
@@ -93,7 +134,7 @@ impl GlyphAtlas {
         let ascent = unsafe { font.ascent() };
         let descent = unsafe { font.descent() };
         let leading = unsafe { font.leading() };
-        let cell_height = (ascent + descent + leading).ceil() as f32;
+        let cell_height = round_metric_in_points(ascent + descent + leading, scale);
 
         // Get cell width from 'M'
         let mut uni: u16 = 'M' as u16;
@@ -114,11 +155,13 @@ impl GlyphAtlas {
                 1,
             );
         }
-        let cell_width = advance.width.ceil() as f32;
+        let cell_width = round_metric_in_points(advance.width, scale);
 
         let chars_per_row = 16u32;
-        let glyph_cell_w = cell_width.round() as u32;
-        let glyph_cell_h = cell_height.round() as u32;
+        // Atlas cells must never be smaller than the drawn glyph: ceil, not round
+        // (a fractional scale leaves cell_width/height fractional in pixels).
+        let glyph_cell_w = cell_width.ceil() as u32;
+        let glyph_cell_h = cell_height.ceil() as u32;
         let num_chars = 95u32; // ' ' to '~'
         let rows = (num_chars + chars_per_row - 1) / chars_per_row;
         let atlas_width = chars_per_row * glyph_cell_w;
@@ -131,8 +174,8 @@ impl GlyphAtlas {
         let mut atlas_buf = vec![0u8; atlas_bpr * atlas_height as usize];
         let mut glyphs = HashMap::new();
 
-        let bmp_w = cell_width as usize;
-        let bmp_h = cell_height as usize;
+        let bmp_w = glyph_cell_w as usize;
+        let bmp_h = glyph_cell_h as usize;
         let bmp_bpr = bmp_w * 4;
 
         for (i, c) in (' '..='~').enumerate() {
@@ -852,8 +895,8 @@ impl GlyphAtlas {
         let width_cells = UnicodeWidthChar::width(c).unwrap_or(1).max(1);
 
         // Try builtin drawing for block elements and box-drawing first
-        let bmp_w = self.cell_width as usize * width_cells;
-        let bmp_h = self.cell_height as usize;
+        let bmp_w = (self.cell_width * width_cells as f32).ceil() as usize;
+        let bmp_h = self.cell_height.ceil() as usize;
         let bmp_bpr = bmp_w * 4;
         let mut builtin_buf = vec![0u8; bmp_bpr * bmp_h];
 
@@ -939,8 +982,8 @@ impl GlyphAtlas {
         self.italic_font.as_ref()?;
 
         let width_cells = UnicodeWidthChar::width(c).unwrap_or(1).max(1);
-        let bmp_w = self.cell_width as usize * width_cells;
-        let bmp_h = self.cell_height as usize;
+        let bmp_w = (self.cell_width * width_cells as f32).ceil() as usize;
+        let bmp_h = self.cell_height.ceil() as usize;
         let bmp_bpr = bmp_w * 4;
 
         // Resolve glyph id + draw font (italic face, then CoreText fallback).
@@ -1036,8 +1079,8 @@ impl GlyphAtlas {
 
         use unicode_width::UnicodeWidthStr;
         let width_cells = UnicodeWidthStr::width(cluster).max(1);
-        let bmp_w = self.cell_width as usize * width_cells;
-        let bmp_h = self.cell_height as usize;
+        let bmp_w = (self.cell_width * width_cells as f32).ceil() as usize;
+        let bmp_h = self.cell_height.ceil() as usize;
         let bmp_bpr = bmp_w * 4;
 
         // Create attributed string with the cluster text

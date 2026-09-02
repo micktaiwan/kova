@@ -56,6 +56,13 @@ pub struct SavedTab {
     pub virtual_width_override: Option<f32>,
     #[serde(default)]
     pub scroll_offset_x: Option<f32>,
+    /// Backing scale factor in effect when `virtual_width_override` and
+    /// `scroll_offset_x` were captured — both are in pixels, so they mean a
+    /// different physical size on a display with another scale. `restore_saved_tab`
+    /// converts them to the target display. Absent in sessions written before
+    /// this field existed: they are then taken as already matching.
+    #[serde(default)]
+    pub geometry_scale: Option<f32>,
 }
 
 /// Flat column format (v4): a column is a list of panes with row weights.
@@ -190,6 +197,7 @@ pub fn snapshot_tab(tab: &Tab) -> SavedTab {
         color: tab.color,
         virtual_width_override: if tab.virtual_width_override > 0.0 { Some(tab.virtual_width_override) } else { None },
         scroll_offset_x: if tab.scroll_offset_x != 0.0 { Some(tab.scroll_offset_x) } else { None },
+        geometry_scale: if tab.geometry_scale > 0.0 { Some(tab.geometry_scale) } else { None },
     }
 }
 
@@ -670,6 +678,9 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         minimized_stack: Vec::new(),
         scroll_offset_x: saved.scroll_offset_x.unwrap_or(0.0),
         virtual_width_override: saved.virtual_width_override.unwrap_or(0.0),
+        // Pixels of the display this tab was saved on; `normalize_tab_geometry`
+        // converts them to the display it actually lands on.
+        geometry_scale: saved.geometry_scale.unwrap_or(0.0),
         cell_h: std::cell::Cell::new(0.0),
     };
     tab.rebuild_minimized_stack();

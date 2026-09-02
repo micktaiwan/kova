@@ -11,6 +11,7 @@ mod pane;
 mod pane_history;
 mod recent_projects;
 mod renderer;
+mod search_history;
 mod session;
 mod terminal;
 mod window;
