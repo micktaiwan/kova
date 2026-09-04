@@ -46,6 +46,12 @@ pub struct KovaViewIvars {
     active_tab: Cell<usize>,
     metal_layer: OnceCell<Retained<CAMetalLayer>>,
     last_scale: Cell<f64>,
+    /// Width, in logical points, of the screen this window was on at the last
+    /// `handle_resize`. Kept so a display switch can tell how wide the *previous*
+    /// screen was and pin the pane widths that were derived from it — the scale
+    /// alone cannot say that, and it may change on a later event than the move
+    /// (see `handle_resize`).
+    last_screen_w: Cell<f32>,
     last_focused: Cell<bool>,
     config: OnceCell<Config>,
     keybindings: OnceCell<Keybindings>,
@@ -375,8 +381,6 @@ enum SwitcherRow {
         minimized: bool,
         /// Claude Code is generating / running a tool in this pane (✳).
         working: bool,
-        /// This pane told us it is waiting for the user (?).
-        awaiting: bool,
         /// The binary running in the pane, with its version when known
         /// ("claude 2.1.226"). `None` at a bare shell prompt, and also when the
         /// title already *is* that name — no row should say "vim … vim".
@@ -389,17 +393,15 @@ impl SwitcherRow {
         matches!(self, SwitcherRow::Pane { .. })
     }
 
-    /// Is this row asking for something? A bell, a command that finished while
-    /// the eye was elsewhere, or a pane waiting for an answer — the three
-    /// markers the switcher already draws, and the ones the attention-only list
-    /// keeps. `working` is deliberately not one of them: a session still
-    /// chewing has nothing to hand over yet, exactly as in `Cmd+J`'s tiers.
+    /// Is this row asking for something? A bell, or a command that finished
+    /// while the eye was elsewhere — the two markers the switcher draws, and the
+    /// ones the attention-only list keeps. `working` is deliberately not one of
+    /// them: a session still chewing has nothing to hand over yet, exactly as in
+    /// `Cmd+J`'s tiers.
     fn needs_attention(&self) -> bool {
         match self {
             SwitcherRow::TabHeader(_) => false,
-            SwitcherRow::Pane { has_bell, has_completion, awaiting, .. } => {
-                *has_bell || *has_completion || *awaiting
-            }
+            SwitcherRow::Pane { has_bell, has_completion, .. } => *has_bell || *has_completion,
         }
     }
 }
@@ -433,12 +435,12 @@ fn switcher_process_label(process: Option<&ProcessInfo>, title: &str) -> Option<
     (!label.is_empty() && label != title).then_some(label)
 }
 
-/// Next pane row flagged as waiting for the user, scanning forward from just
-/// after `(col, row)` in column-major order and wrapping around the whole grid.
-/// `None` when nothing is waiting — the caller then leaves the selection where
-/// it is, so pressing Tab in a quiet switcher does nothing rather than jumping
-/// somewhere arbitrary.
-fn next_awaiting_row(
+/// Next pane row with unread output — a bell, or a command that finished while
+/// the eye was elsewhere — scanning forward from just after `(col, row)` in
+/// column-major order and wrapping around the whole grid. `None` when nothing is
+/// unread: the caller then leaves the selection where it is, so pressing Tab in
+/// a quiet switcher does nothing rather than jumping somewhere arbitrary.
+fn next_unread_row(
     columns: &[Vec<SwitcherRow>],
     col: usize,
     row: usize,
@@ -453,7 +455,12 @@ fn next_awaiting_row(
         .cycle()
         .skip(start)
         .take(flat.len())
-        .find(|&&(c, r)| matches!(columns[c][r], SwitcherRow::Pane { awaiting: true, .. }))
+        .find(|&&(c, r)| {
+            matches!(
+                columns[c][r],
+                SwitcherRow::Pane { has_bell: true, .. } | SwitcherRow::Pane { has_completion: true, .. }
+            )
+        })
         .copied()
 }
 
@@ -526,8 +533,6 @@ fn next_id_after(ids: &[PaneId], current: Option<PaneId>) -> Option<PaneId> {
 /// pane's status bar names, and what colours it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AttentionTier {
-    /// A pane that told us it is waiting for an answer.
-    Awaiting,
     /// A bell, or a command that finished while the eye was elsewhere.
     Unread,
     /// A Claude session sitting open and idle, first time round.
@@ -543,10 +548,9 @@ impl AttentionTier {
     /// Label painted across the focused pane's status bar.
     fn label(self) -> &'static str {
         match self {
-            Self::Awaiting => "Tier 1 — waiting for an answer",
-            Self::Unread => "Tier 2 — unread output",
-            Self::IdleClaude => "Tier 3 — idle Claude session",
-            Self::ClaudeLoop => "Tier 3 — open Claude session (loop)",
+            Self::Unread => "Tier 1 — unread output",
+            Self::IdleClaude => "Tier 2 — idle Claude session",
+            Self::ClaudeLoop => "Tier 2 — open Claude session (loop)",
         }
     }
 
@@ -555,30 +559,26 @@ impl AttentionTier {
     /// read as the same event.
     fn color(self) -> [f32; 3] {
         match self {
-            Self::Awaiting => [0.75, 0.42, 0.10],
             Self::Unread => [0.15, 0.33, 0.68],
             Self::IdleClaude | Self::ClaudeLoop => [0.15, 0.50, 0.24],
         }
     }
 }
 
-/// Pick the pane to jump to, in three tiers: a pane that asked for an answer
-/// always wins; then unread panes (a bell, or a command that finished while you
-/// were elsewhere); and last, Claude sessions left open and idle, which nobody
-/// is waiting on but which still have to be closed or picked back up. Locality
-/// never crosses those lines — an unread pane sitting right next door still
-/// loses to a question asked in another window — it only orders the walk
-/// *within* a tier. Returns the tier alongside the pane, since the banner has to
-/// name it.
+/// Pick the pane to jump to, in two tiers: unread panes first (a bell, or a
+/// command that finished while you were elsewhere), then Claude sessions left
+/// open and idle, which nobody is waiting on but which still have to be closed
+/// or picked back up. Locality never crosses that line — an idle session sitting
+/// right next door still loses to unread output in another window — it only
+/// orders the walk *within* a tier. Returns the tier alongside the pane, since
+/// the banner has to name it.
 fn next_attention_pane(
-    awaiting: &mut Vec<(PaneLocality, PaneId)>,
     unread: &mut Vec<(PaneLocality, PaneId)>,
     idle_claude: &mut Vec<(PaneLocality, PaneId)>,
     current: Option<PaneId>,
 ) -> Option<(AttentionTier, PaneId)> {
-    next_pane_in_cycle(awaiting, current)
-        .map(|id| (AttentionTier::Awaiting, id))
-        .or_else(|| next_pane_in_cycle(unread, current).map(|id| (AttentionTier::Unread, id)))
+    next_pane_in_cycle(unread, current)
+        .map(|id| (AttentionTier::Unread, id))
         .or_else(|| {
             next_pane_in_cycle(idle_claude, current).map(|id| (AttentionTier::IdleClaude, id))
         })
@@ -1653,6 +1653,7 @@ impl KovaView {
             active_tab: Cell::new(0),
             metal_layer: OnceCell::new(),
             last_scale: Cell::new(0.0),
+            last_screen_w: Cell::new(0.0),
             last_focused: Cell::new(true),
             config: OnceCell::new(),
             drag_separator: Cell::new(None),
@@ -2052,6 +2053,14 @@ impl KovaView {
         };
         let r = renderer.read();
         r.cell_size().1
+    }
+
+    /// Width in logical points of the screen this window is on, 0.0 if unknown.
+    fn screen_logical_width(&self) -> f32 {
+        self.window()
+            .and_then(|w| w.screen())
+            .map(|s| s.frame().size.width as f32)
+            .unwrap_or(0.0)
     }
 
     fn backing_scale(&self) -> f32 {
@@ -3945,8 +3954,6 @@ impl KovaView {
                         has_completion,
                         minimized: pane.minimized,
                         working: pane.is_working(),
-                        // Like bell/completion: never on the pane being looked at.
-                        awaiting: !is_current && pane.is_awaiting(),
                         process,
                     });
                 });
@@ -4130,8 +4137,8 @@ impl KovaView {
                             nearest_pane_row(&state.columns[state.selected_col], state.selected_row);
                     }
                 }
-                0x30 => { // Tab → jump to the next pane waiting for an answer
-                    if let Some((c, r)) = next_awaiting_row(
+                0x30 => { // Tab → jump to the next pane with unread output
+                    if let Some((c, r)) = next_unread_row(
                         &state.columns,
                         state.selected_col,
                         state.selected_row,
@@ -5512,9 +5519,9 @@ impl KovaView {
     }
 
     /// IPC: set/clear a pane's "waiting for the user" flag. Returns true if the
-    /// pane was found. The flag is stored as-is; whether it is *shown* on the
-    /// pane the user is currently sitting on is a display decision, made where
-    /// focus is known (mirroring how bell/completion are suppressed).
+    /// pane was found. Nothing in the UI draws this flag — it exists for IPC
+    /// clients (`list-panes`, the `pane-status` event), which is why it is
+    /// stored as-is and never filtered on the focused pane.
     pub fn ipc_set_pane_status(&self, pane_id: PaneId, waiting: bool) -> bool {
         let tabs = self.ivars().tabs.borrow();
         for tab in tabs.iter() {
@@ -5569,26 +5576,22 @@ impl KovaView {
     }
 
     /// Jump to the next pane asking for attention, across every tab and every
-    /// window, in three tiers: first a pane waiting for an answer
-    /// (`Pane::is_awaiting` — the flag the switcher's Tab key and the status-bar
-    /// counter use); then a pane left unread — a bell, or a command that
-    /// finished while the eye was elsewhere; and last a Claude session left open
-    /// and idle (`Pane::is_idle_claude_unseen`), which asks for nothing but is
-    /// still an open loop: the tour ends on it so it gets closed or resumed
-    /// rather than piling up unnoticed. A session that is actually working is
-    /// never announced by one of those three tiers — it has nothing to hand over
-    /// yet.
+    /// window, in two tiers: first a pane left unread — a bell, or a command that
+    /// finished while the eye was elsewhere (the same signal the switcher's Tab
+    /// key and the status-bar counter use); then a Claude session left open and
+    /// idle (`Pane::is_idle_claude_unseen`), which asks for nothing but is still
+    /// an open loop: the tour ends on it so it gets closed or resumed rather than
+    /// piling up unnoticed. A session that is actually working is never announced
+    /// by one of those tiers — it has nothing to hand over yet.
     ///
-    /// All three tiers hold *unread* panes only: a pane drops out of the set the
+    /// Both tiers hold *unread* panes only: a pane drops out of the set the
     /// moment it has been looked at (bell and completion are acked on the
-    /// focused pane; a waiting pane gets `awaiting_seen` there, while keeping
-    /// its waiting marker until someone actually answers it; an idle session is
-    /// marked seen there too, and re-armed by `Tab::check_running` when it works
-    /// again). Within a tier the scan is ordered by locality — the focused tab
-    /// first, then the rest of its window, then other windows — and by ascending
-    /// pane id inside that.
+    /// focused pane; an idle session is marked seen there too, and re-armed by
+    /// `Tab::check_running` when it works again). Within a tier the scan is
+    /// ordered by locality — the focused tab first, then the rest of its window,
+    /// then other windows — and by ascending pane id inside that.
     ///
-    /// Once the three drain, the key stops draining and walks the open sessions
+    /// Once the two drain, the key stops draining and walks the open sessions
     /// again, round and round, so an open session is either closed or picked
     /// back up rather than forgotten — no dead-end message in between, since a
     /// session left to walk is a better answer than a status line. This last
@@ -5612,7 +5615,6 @@ impl KovaView {
             tabs.get(active_tab).map(|t| t.focused_pane)
         };
 
-        let mut awaiting: Vec<(PaneLocality, PaneId)> = Vec::new();
         let mut unread: Vec<(PaneLocality, PaneId)> = Vec::new();
         let mut idle_claude: Vec<(PaneLocality, PaneId)> = Vec::new();
         // Every open session — idle or working, looked at or not: what the
@@ -5656,10 +5658,6 @@ impl KovaView {
                     if pane.minimized {
                         return;
                     }
-                    if pane.is_awaiting_unseen() {
-                        awaiting.push((locality, pane.id));
-                        return;
-                    }
                     // Scoped: `is_idle_claude_unseen` reads the terminal too,
                     // and holding two read guards on the same lock deadlocks
                     // the moment a writer queues between them.
@@ -5688,7 +5686,7 @@ impl KovaView {
             }
         }
 
-        let hit = next_attention_pane(&mut awaiting, &mut unread, &mut idle_claude, current);
+        let hit = next_attention_pane(&mut unread, &mut idle_claude, current);
         let (tier, target) = match hit {
             Some(hit) => hit,
             None => match next_pane_in_loop(&mut session_ring, current) {
@@ -6425,6 +6423,40 @@ impl KovaView {
             }
         }
 
+        // Moved to another screen: a tab that never had a manual width takes its
+        // total from the screen it is on, so a narrower one shrinks every pane —
+        // the "my panes came back small after unplugging the monitor" half of the
+        // symptom, which the scale conversion above does nothing about. Pin the
+        // width the tab was laid out at and let it scroll instead. Done in
+        // logical points, and keyed on the screen rather than the scale: two
+        // displays can share a scale, and AppKit can move the window on one event
+        // and change the backing scale on the next.
+        let screen_logical_w = self.screen_logical_width();
+        let old_screen_logical_w = self.ivars().last_screen_w.get();
+        if screen_logical_w > 0.0 {
+            self.ivars().last_screen_w.set(screen_logical_w);
+        }
+        if old_screen_logical_w > 0.0
+            && screen_logical_w > 0.0
+            && (screen_logical_w - old_screen_logical_w).abs() > 1.0
+        {
+            let min_w = self.ivars().config.get()
+                .map(|c| c.splits.min_width)
+                .unwrap_or(300.0);
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            for tab in tabs.iter_mut() {
+                if tab.virtual_width_override > 0.0 {
+                    continue;
+                }
+                let old_vw = tab.virtual_width(old_screen_logical_w, min_w);
+                if let Some(pinned) =
+                    crate::pane::pinned_virtual_width(old_vw, screen_logical_w, scale as f32)
+                {
+                    tab.virtual_width_override = pinned;
+                }
+            }
+        }
+
         // Only clamp the scroll offset. Pane widths are deliberately NOT capped
         // to the new screen: on a narrower display the panes keep their size and
         // the tab scrolls horizontally instead. Capping them here mutated
@@ -6556,10 +6588,10 @@ impl KovaView {
 
         // --- A read pane stops pulling Cmd+J back to itself ---
         // Same sampling rule as the visit history: the focused pane of the key
-        // window is the one under the eye. Only the *jump* set shrinks — the
-        // waiting flag itself stays up (retracting it is for answering, see
-        // `Pane::clear_awaiting`), so the status bar and the switcher keep
-        // showing that this Claude is stuck.
+        // window is the one under the eye. The waiting flag itself stays up
+        // (retracting it is for answering, see `Pane::clear_awaiting`): nothing
+        // in the UI draws it any more, but IPC clients still read it, and
+        // `awaiting_seen` is what tells them the pane has been looked at.
         if self.window().is_some_and(|w| w.isKeyWindow()) {
             let tabs = ivars.tabs.borrow();
             if let Some(tab) = tabs.get(ivars.active_tab.get()) {
@@ -6825,7 +6857,7 @@ impl KovaView {
             .map(|c| c.splits.min_width)
             .unwrap_or(300.0)
             * ivars.last_scale.get().max(1.0) as f32;
-        let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width, total_columns, focused_column, active_tab, total_tabs, active_tab_name, working_claudes, awaiting_claudes) = {
+        let (pane_data, pty_ptr, focus_reporting, tab_titles, active_panes_vp, screen_width, total_columns, focused_column, active_tab, total_tabs, active_tab_name, working_claudes, unread_panes) = {
             let mut tabs = ivars.tabs.borrow_mut();
             if tabs.is_empty() {
                 return false;
@@ -6957,14 +6989,20 @@ impl KovaView {
             // Count panes across every tab of this window whose app is signalling
             // activity via the OSC-title marker (Claude Code busy).
             let mut working_claudes = 0usize;
-            let mut awaiting_claudes = 0usize;
+            // Panes carrying output nobody has looked at: a bell, or a command
+            // that finished while the eye was elsewhere — the same signal as the
+            // per-pane dot and as Cmd+J's first tier.
+            let mut unread_panes = 0usize;
             for t in tabs.iter() {
                 t.for_each_pane(&mut |p| {
                     if p.is_working() { working_claudes += 1; }
-                    if p.is_awaiting() { awaiting_claudes += 1; }
+                    let term = p.terminal.read();
+                    if term.bell.load(std::sync::atomic::Ordering::Relaxed) || term.unread_completion() {
+                        unread_panes += 1;
+                    }
                 });
             }
-            (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width, total_columns, focused_column, active_tab_1based, total_tabs, active_tab_name, working_claudes, awaiting_claudes)
+            (pane_data, pty_ptr, focus_reporting, tab_titles, panes_vp, screen_width, total_columns, focused_column, active_tab_1based, total_tabs, active_tab_name, working_claudes, unread_panes)
         };
 
         // Focus reporting (DEC mode 1004) — send to focused pane only
@@ -7190,8 +7228,8 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, awaiting: false, process: None },
-                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, awaiting, process, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, awaiting: *awaiting, process: process.as_deref() },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None },
+                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref() },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -7303,7 +7341,7 @@ impl KovaView {
             }
         }
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_claudes, awaiting_claudes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_claudes, unread_panes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 
@@ -7500,12 +7538,9 @@ pub fn pane_json(
         "working": pane.is_working(),
         "awaiting": pane.is_awaiting(),
         "awaiting_since": pane.awaiting_since(),
-        // Whether the waiting pane has been looked at here since it started waiting. This is
-        // the halt Cmd+J obeys and the status bar ignores: the `?` marker stays up until the
-        // question is answered, while a pane that has been read stops pulling the jump back to
-        // itself. A remote client walking waiting panes needs the same halt, or it hands back
-        // panes already read on this Mac. False on a pane that is not waiting at all, where the
-        // bit means nothing.
+        // Whether the waiting pane has been looked at here since it started waiting. A remote
+        // client walking waiting panes needs that halt, or it hands back panes already read on
+        // this Mac. False on a pane that is not waiting at all, where the bit means nothing.
         "awaiting_seen": pane.is_awaiting() && !pane.is_awaiting_unseen(),
         "minimized": pane.minimized,
         "claude_session_id": pane.claude_session_id(),
@@ -7660,8 +7695,8 @@ mod tests {
     }
 
     /// Build a switcher grid from a compact spec: one string per column, one
-    /// char per row — 'h' header, '.' plain pane, '?' pane waiting for the
-    /// user, 'b' pane with a pending bell, 'c' pane with an unread completion.
+    /// char per row — 'h' header, '.' plain pane, 'b' pane with a pending bell,
+    /// 'c' pane with an unread completion.
     fn switcher_grid(spec: &[&str]) -> Vec<Vec<SwitcherRow>> {
         spec.iter()
             .map(|col| {
@@ -7676,7 +7711,6 @@ mod tests {
                             has_completion: c == 'c',
                             minimized: false,
                             working: false,
-                            awaiting: c == '?',
                             process: None,
                         },
                     })
@@ -7686,8 +7720,8 @@ mod tests {
     }
 
     /// Render a grid back to the compact spec, so a filtered grid can be
-    /// compared row by row: 'h' header, '?' waiting, 'b' bell, 'c' completion,
-    /// '.' a pane asking for nothing.
+    /// compared row by row: 'h' header, 'b' bell, 'c' completion, '.' a pane
+    /// asking for nothing.
     fn switcher_spec(groups: &[Vec<SwitcherRow>]) -> Vec<String> {
         groups
             .iter()
@@ -7695,7 +7729,6 @@ mod tests {
                 col.iter()
                     .map(|r| match r {
                         SwitcherRow::TabHeader(_) => 'h',
-                        SwitcherRow::Pane { awaiting: true, .. } => '?',
                         SwitcherRow::Pane { has_bell: true, .. } => 'b',
                         SwitcherRow::Pane { has_completion: true, .. } => 'c',
                         SwitcherRow::Pane { .. } => '.',
@@ -7706,17 +7739,17 @@ mod tests {
     }
 
     #[test]
-    fn attention_filter_keeps_the_three_markers_and_drops_quiet_panes() {
-        let groups = switcher_grid(&["h.?.b", "h..c"]);
-        assert_eq!(switcher_spec(&retain_attention_rows(groups)), vec!["h?b", "hc"]);
+    fn attention_filter_keeps_the_markers_and_drops_quiet_panes() {
+        let groups = switcher_grid(&["h.b.b", "h..c"]);
+        assert_eq!(switcher_spec(&retain_attention_rows(groups)), vec!["hbb", "hc"]);
     }
 
     #[test]
     fn attention_filter_drops_a_whole_tab_whose_panes_are_all_quiet() {
         // Second tab has nothing to say: its header goes with its panes rather
         // than standing alone over an empty group.
-        let groups = switcher_grid(&["h.b", "h..", "h?"]);
-        assert_eq!(switcher_spec(&retain_attention_rows(groups)), vec!["hb", "h?"]);
+        let groups = switcher_grid(&["h.b", "h..", "hc"]);
+        assert_eq!(switcher_spec(&retain_attention_rows(groups)), vec!["hb", "hc"]);
     }
 
     #[test]
@@ -7739,7 +7772,6 @@ mod tests {
             has_completion: false,
             minimized: false,
             working: true,
-            awaiting: false,
             process: None,
         };
         assert!(!working.needs_attention());
@@ -7776,51 +7808,38 @@ mod tests {
     /// The landing pane alone: the walk-order cases below do not care which
     /// tier answered, only where the key lands.
     fn jump_to(
-        awaiting: &mut Vec<(PaneLocality, PaneId)>,
         unread: &mut Vec<(PaneLocality, PaneId)>,
         idle_claude: &mut Vec<(PaneLocality, PaneId)>,
         current: Option<PaneId>,
     ) -> Option<PaneId> {
-        next_attention_pane(awaiting, unread, idle_claude, current).map(|(_, id)| id)
+        next_attention_pane(unread, idle_claude, current).map(|(_, id)| id)
     }
 
     #[test]
-    fn next_attention_walks_waiting_panes_in_id_order() {
-        let waiting = || here(&[7, 2, 5]);
-        assert_eq!(jump_to(&mut waiting(), &mut nothing(), &mut nothing(), Some(2)), Some(5));
-        assert_eq!(jump_to(&mut waiting(), &mut nothing(), &mut nothing(), Some(5)), Some(7));
+    fn next_attention_walks_unread_panes_in_id_order() {
+        let unread = || here(&[7, 2, 5]);
+        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(2)), Some(5));
+        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(5)), Some(7));
         // Past the highest id, wrap back to the lowest.
-        assert_eq!(jump_to(&mut waiting(), &mut nothing(), &mut nothing(), Some(7)), Some(2));
-        // From a pane that is not itself waiting, take the next id above it.
-        assert_eq!(jump_to(&mut waiting(), &mut nothing(), &mut nothing(), Some(3)), Some(5));
-        // Unfocused window: start at the lowest waiting id.
-        assert_eq!(jump_to(&mut waiting(), &mut nothing(), &mut nothing(), None), Some(2));
-    }
-
-    #[test]
-    fn next_attention_prefers_waiting_over_unread() {
-        // A pane waiting for an answer wins over a lower-id unread pane...
-        assert_eq!(
-            jump_to(&mut here(&[9]), &mut here(&[3]), &mut nothing(), Some(1)),
-            Some(9)
-        );
-        // ...and unread panes are only visited once nothing is waiting.
-        assert_eq!(jump_to(&mut vec![], &mut here(&[3, 8]), &mut nothing(), Some(4)), Some(8));
-        // The focused pane being the only one waiting: fall through to unread
-        // rather than re-focusing where the cursor already is.
-        assert_eq!(jump_to(&mut here(&[4]), &mut here(&[6]), &mut nothing(), Some(4)), Some(6));
+        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(7)), Some(2));
+        // From a pane that is not itself unread, take the next id above it.
+        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(3)), Some(5));
+        // Unfocused window: start at the lowest unread id.
+        assert_eq!(jump_to(&mut unread(), &mut nothing(), None), Some(2));
     }
 
     #[test]
     fn next_attention_visits_idle_claude_sessions_last() {
-        // An idle session loses to anything that actually asks for something...
-        assert_eq!(jump_to(&mut here(&[9]), &mut nothing(), &mut here(&[3]), Some(1)), Some(9));
-        assert_eq!(jump_to(&mut nothing(), &mut here(&[9]), &mut here(&[3]), Some(1)), Some(9));
-        // ...and comes up only once both upper tiers are dry, in id order.
-        assert_eq!(jump_to(&mut nothing(), &mut nothing(), &mut here(&[3, 8]), Some(4)), Some(8));
-        assert_eq!(jump_to(&mut nothing(), &mut nothing(), &mut here(&[3, 8]), Some(8)), Some(3));
+        // An idle session loses to unread output, whatever the ids...
+        assert_eq!(jump_to(&mut here(&[9]), &mut here(&[3]), Some(1)), Some(9));
+        // ...and comes up only once the unread tier is dry, in id order.
+        assert_eq!(jump_to(&mut nothing(), &mut here(&[3, 8]), Some(4)), Some(8));
+        assert_eq!(jump_to(&mut nothing(), &mut here(&[3, 8]), Some(8)), Some(3));
+        // The focused pane being the only unread one: fall through to the idle
+        // tier rather than re-focusing where the cursor already is.
+        assert_eq!(jump_to(&mut here(&[4]), &mut here(&[6]), Some(4)), Some(6));
         // The last idle session being the focused one: the tour is over.
-        assert_eq!(jump_to(&mut nothing(), &mut nothing(), &mut here(&[4]), Some(4)), None);
+        assert_eq!(jump_to(&mut nothing(), &mut here(&[4]), Some(4)), None);
     }
 
     #[test]
@@ -7844,17 +7863,13 @@ mod tests {
 
     #[test]
     fn next_attention_names_the_tier_it_answered_from() {
-        use AttentionTier::{Awaiting, IdleClaude, Unread};
+        use AttentionTier::{IdleClaude, Unread};
         assert_eq!(
-            next_attention_pane(&mut here(&[2]), &mut here(&[3]), &mut here(&[4]), Some(1)),
-            Some((Awaiting, 2))
-        );
-        assert_eq!(
-            next_attention_pane(&mut nothing(), &mut here(&[3]), &mut here(&[4]), Some(1)),
+            next_attention_pane(&mut here(&[3]), &mut here(&[4]), Some(1)),
             Some((Unread, 3))
         );
         assert_eq!(
-            next_attention_pane(&mut nothing(), &mut nothing(), &mut here(&[4]), Some(1)),
+            next_attention_pane(&mut nothing(), &mut here(&[4]), Some(1)),
             Some((IdleClaude, 4))
         );
     }
@@ -7864,74 +7879,62 @@ mod tests {
         use PaneLocality::{CurrentTab, CurrentWindow, OtherWindow};
         // A lower id in another window loses to the tab under the eye...
         let mut spread = vec![(OtherWindow, 2), (CurrentWindow, 3), (CurrentTab, 9)];
-        assert_eq!(
-            jump_to(&mut spread, &mut Vec::new(), &mut Vec::new(), Some(1)),
-            Some(9)
-        );
+        assert_eq!(jump_to(&mut spread, &mut Vec::new(), Some(1)), Some(9));
         // ...and the current tab wraps onto itself rather than crossing over,
         // since a pane leaves the set once read and the group drains.
         let mut two_here = vec![(CurrentWindow, 8), (CurrentTab, 4), (CurrentTab, 6)];
-        assert_eq!(
-            jump_to(&mut two_here, &mut Vec::new(), &mut Vec::new(), Some(6)),
-            Some(4)
-        );
+        assert_eq!(jump_to(&mut two_here, &mut Vec::new(), Some(6)), Some(4));
         // Nothing left in the current tab: the rest of the window comes next,
         // and only then another window.
         let mut away = vec![(OtherWindow, 2), (CurrentWindow, 8)];
-        assert_eq!(
-            jump_to(&mut away, &mut Vec::new(), &mut Vec::new(), Some(6)),
-            Some(8)
-        );
-        // Locality never outranks the tier: an unread pane in the current tab
-        // still waits behind a question asked in another window.
-        let mut far_question = vec![(OtherWindow, 2)];
-        assert_eq!(
-            jump_to(&mut far_question, &mut here(&[7]), &mut Vec::new(), Some(1)),
-            Some(2)
-        );
+        assert_eq!(jump_to(&mut away, &mut Vec::new(), Some(6)), Some(8));
+        // Locality never outranks the tier: an idle session in the current tab
+        // still waits behind unread output in another window.
+        let mut far_unread = vec![(OtherWindow, 2)];
+        assert_eq!(jump_to(&mut far_unread, &mut here(&[7]), Some(1)), Some(2));
     }
 
     #[test]
     fn next_attention_handles_empty_and_lone_candidates() {
-        assert_eq!(jump_to(&mut vec![], &mut vec![], &mut nothing(), Some(4)), None);
-        // Nothing else waiting, unread or idle: no jump at all.
-        assert_eq!(jump_to(&mut here(&[4]), &mut vec![], &mut nothing(), Some(4)), None);
+        assert_eq!(jump_to(&mut vec![], &mut nothing(), Some(4)), None);
+        // Nothing else unread or idle: no jump at all.
+        assert_eq!(jump_to(&mut here(&[4]), &mut nothing(), Some(4)), None);
         // Duplicates (same pane seen twice) collapse instead of stalling.
-        assert_eq!(jump_to(&mut here(&[4, 4, 9]), &mut vec![], &mut nothing(), Some(4)), Some(9));
+        assert_eq!(jump_to(&mut here(&[4, 4, 9]), &mut nothing(), Some(4)), Some(9));
     }
 
     #[test]
-    fn tab_jumps_to_the_next_waiting_pane_forward() {
-        // Column 0: header, pane, waiting pane. Column 1: header, waiting pane.
-        let g = switcher_grid(&["h.?", "h?"]);
-        assert_eq!(next_awaiting_row(&g, 0, 1), Some((0, 2)));
-        // From the last waiting row of column 0, cross into the next column.
-        assert_eq!(next_awaiting_row(&g, 0, 2), Some((1, 1)));
+    fn tab_jumps_to_the_next_unread_pane_forward() {
+        // Column 0: header, pane, unread pane. Column 1: header, unread pane.
+        let g = switcher_grid(&["h.b", "hc"]);
+        assert_eq!(next_unread_row(&g, 0, 1), Some((0, 2)));
+        // From the last unread row of column 0, cross into the next column.
+        assert_eq!(next_unread_row(&g, 0, 2), Some((1, 1)));
     }
 
     #[test]
-    fn tab_wraps_around_to_the_first_waiting_pane() {
-        let g = switcher_grid(&["h.?", "h."]);
-        // Past the only waiting row, the search wraps back onto it.
-        assert_eq!(next_awaiting_row(&g, 1, 1), Some((0, 2)));
-        // Standing on the only waiting row, Tab cycles back to itself rather
+    fn tab_wraps_around_to_the_first_unread_pane() {
+        let g = switcher_grid(&["h.b", "h."]);
+        // Past the only unread row, the search wraps back onto it.
+        assert_eq!(next_unread_row(&g, 1, 1), Some((0, 2)));
+        // Standing on the only unread row, Tab cycles back to itself rather
         // than reporting "nothing found".
-        assert_eq!(next_awaiting_row(&g, 0, 2), Some((0, 2)));
+        assert_eq!(next_unread_row(&g, 0, 2), Some((0, 2)));
     }
 
     #[test]
-    fn tab_does_nothing_when_no_pane_is_waiting() {
+    fn tab_does_nothing_when_no_pane_is_unread() {
         let g = switcher_grid(&["h..", "h."]);
-        assert_eq!(next_awaiting_row(&g, 0, 1), None);
-        assert_eq!(next_awaiting_row(&[], 0, 0), None);
+        assert_eq!(next_unread_row(&g, 0, 1), None);
+        assert_eq!(next_unread_row(&[], 0, 0), None);
     }
 
     #[test]
     fn tab_never_lands_on_a_tab_header() {
         // Headers are not selectable; a header row must never be returned even
-        // when it sits between the cursor and the waiting pane.
-        let g = switcher_grid(&["h?", "h?"]);
-        let (c, r) = next_awaiting_row(&g, 0, 1).expect("a waiting pane exists");
+        // when it sits between the cursor and the unread pane.
+        let g = switcher_grid(&["hb", "hc"]);
+        let (c, r) = next_unread_row(&g, 0, 1).expect("an unread pane exists");
         assert!(matches!(g[c][r], SwitcherRow::Pane { .. }));
     }
 

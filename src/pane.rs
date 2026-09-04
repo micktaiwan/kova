@@ -500,6 +500,30 @@ pub struct Tab {
 /// Pixel conversion factor between the display a tab's geometry was expressed in
 /// and the one it now lands on. `None` when there is nothing to convert: the tab
 /// has not adopted a scale yet, or it is the same display.
+/// The `virtual_width_override` a tab must be pinned to so its panes keep their
+/// apparent size after a move to another screen, or `None` when nothing needs
+/// pinning. Widths in, logical points; width out, physical pixels at `scale`.
+///
+/// A tab with no override derives its total width from the screen it is on, so
+/// moving it to a narrower display shrinks every pane. The width it was laid out
+/// at is what it has to keep — and it only has to be recorded when it no longer
+/// fits the new screen, since a total at or below screen width is exactly what
+/// the fallback already gives.
+pub fn pinned_virtual_width(
+    old_virtual_width: f32,
+    new_screen_width: f32,
+    scale: f32,
+) -> Option<f32> {
+    if old_virtual_width <= 0.0 || new_screen_width <= 0.0 || scale <= 0.0 {
+        return None;
+    }
+    if old_virtual_width > new_screen_width + 0.5 {
+        Some(old_virtual_width * scale)
+    } else {
+        None
+    }
+}
+
 fn geometry_ratio(from: f32, to: f32) -> Option<f32> {
     if from > 0.0 && to > 0.0 && (from - to).abs() > 0.01 {
         Some(to / from)
@@ -2327,7 +2351,7 @@ impl Column {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjacent_visible_pairs, geometry_ratio, AwaitingFlag, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, max_visible_fraction, new_entry_weight, normalize_process_name, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
+    use super::{adjacent_visible_pairs, geometry_ratio, pinned_virtual_width, AwaitingFlag, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, max_visible_fraction, new_entry_weight, normalize_process_name, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
 
     #[test]
     fn a_read_waiting_pane_re_enters_the_jump_cycle_only_on_a_new_question() {
@@ -2540,6 +2564,29 @@ mod tests {
         assert_eq!(w[1], 0.0);
         assert!((w[0] - 300.0).abs() < 0.01);
         assert!((w[2] - 300.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn pinned_virtual_width_keeps_the_wide_screen_layout() {
+        // Six panes filling a 2560pt display, moved to a 1728pt retina one at 2x:
+        // without pinning the tab would fall back to 1728pt and every pane would
+        // lose a third of its width. Pinned, it keeps 2560pt worth, in 2x pixels.
+        assert_eq!(pinned_virtual_width(2560.0, 1728.0, 2.0), Some(5120.0));
+    }
+
+    #[test]
+    fn pinned_virtual_width_is_silent_on_a_wider_screen() {
+        // Moving to a display at least as wide: the screen-width fallback already
+        // gives the panes their size back, nothing to record.
+        assert_eq!(pinned_virtual_width(1728.0, 2560.0, 1.0), None);
+        assert_eq!(pinned_virtual_width(1728.0, 1728.0, 2.0), None);
+    }
+
+    #[test]
+    fn pinned_virtual_width_refuses_unusable_inputs() {
+        assert_eq!(pinned_virtual_width(0.0, 1728.0, 2.0), None, "no width to keep");
+        assert_eq!(pinned_virtual_width(2560.0, 0.0, 2.0), None, "unknown screen");
+        assert_eq!(pinned_virtual_width(2560.0, 1728.0, 0.0), None, "unknown scale");
     }
 
     #[test]

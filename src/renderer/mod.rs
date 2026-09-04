@@ -115,10 +115,9 @@ const MINIMIZED_FG: [f32; 4] = [0.75, 0.55, 0.95, 1.0];
 /// switcher ✳ icon). Green: something is happening, nothing is owed.
 const WORKING_FG: [f32; 4] = [0.6, 0.85, 0.6, 1.0];
 
-/// Color of the "this pane is waiting for you" marker (status-bar ? counter and
-/// switcher ? icon). Amber: the only marker that asks something of the user, so
-/// it must not read as just another shade of the working green.
-const AWAITING_FG: [f32; 4] = [1.0, 0.75, 0.2, 1.0];
+/// Color of the status-bar unread counter. Same amber as the per-pane bell dot:
+/// the counter and the dots it sums must read as one signal.
+const UNREAD_FG: [f32; 4] = [0.9, 0.6, 0.2, 1.0];
 
 /// Attention state for a non-focused pane (bell > completion > none).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -225,7 +224,6 @@ pub struct PaneSwitcherRowRender<'a> {
     /// Claude Code is actively working in this pane — drives a ✳ marker.
     pub working: bool,
     /// This pane is waiting for the user — drives a ? marker.
-    pub awaiting: bool,
     /// Binary running in the pane ("claude 2.1.226"), shown dim at the right
     /// end of the row. `None` on headers and at a bare shell prompt.
     pub process: Option<&'a str>,
@@ -775,7 +773,7 @@ impl Renderer {
         total_tabs: usize,
         active_tab_name: &str,
         working_claudes: usize,
-        awaiting_claudes: usize,
+        unread_panes: usize,
         minimized_counts: (usize, usize),
         show_help: bool,
         show_mem_report: bool,
@@ -959,7 +957,7 @@ impl Renderer {
         }
 
         // Draw global status bar
-        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, working_claudes, awaiting_claudes, minimized_counts.0, minimized_counts.1, help_hint_remaining, keys_config);
+        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, working_claudes, unread_panes, minimized_counts.0, minimized_counts.1, help_hint_remaining, keys_config);
 
         // Attention banner over the focused pane's status bar. Drawn in the
         // overlay pass rather than inside the pane's own vertices: those are
@@ -1715,7 +1713,7 @@ impl Renderer {
         total_tabs: usize,
         active_tab_name: &str,
         working_claudes: usize,
-        awaiting_claudes: usize,
+        unread_panes: usize,
         minimized_current: usize,
         minimized_total: usize,
         help_hint_remaining: u32,
@@ -1848,15 +1846,16 @@ impl Renderer {
                 self.push_tooltip_zone(left_edge, bar_y, claude_w, cell_h, "Claude Code panes currently working");
             }
 
-            // Panes whose Claude Code says it is waiting for an answer. Sits
-            // right of the working counter: together they read as "N running,
-            // M want you". Hidden when nothing is waiting.
-            if awaiting_claudes > 0 {
-                let awaiting_str = format!("?{}", awaiting_claudes);
-                let awaiting_w = awaiting_str.chars().count() as f32 * cell_w;
-                left_edge = left_edge - awaiting_w - gap;
-                self.render_status_text(vertices, &awaiting_str, left_edge, bar_y, viewport_w, AWAITING_FG, no_bg);
-                self.push_tooltip_zone(left_edge, bar_y, awaiting_w, cell_h, "Claude Code panes waiting for your answer");
+            // Panes carrying output nobody has looked at yet — a bell, or a
+            // command that finished while the eye was elsewhere. Sits right of
+            // the working counter: together they read as "N running, M unread".
+            // Hidden when everything has been read.
+            if unread_panes > 0 {
+                let unread_str = format!("\u{25cf}{}", unread_panes);
+                let unread_w = unread_str.chars().count() as f32 * cell_w;
+                left_edge = left_edge - unread_w - gap;
+                self.render_status_text(vertices, &unread_str, left_edge, bar_y, viewport_w, UNREAD_FG, no_bg);
+                self.push_tooltip_zone(left_edge, bar_y, unread_w, cell_h, "Panes with unread output (bell or finished command)");
             }
 
             // Minimized panes: "⊟ current/total" (current tab / all windows).
@@ -2583,13 +2582,13 @@ impl Renderer {
         let body_scale = 1.3_f32;
         let scaled_cell_w = cell_w * body_scale;
 
-        // Title centered. The waiting count rides along so the number is read
-        // before the eye starts scanning columns for the ? markers.
-        let awaiting: usize = data
+        // Title centered. The unread count rides along so the number is read
+        // before the eye starts scanning columns for the dots.
+        let unread: usize = data
             .columns
             .iter()
             .flat_map(|c| c.rows.iter())
-            .filter(|r| r.awaiting)
+            .filter(|r| !r.is_header && (r.has_bell || r.has_completion))
             .count();
         let title = if data.filtered {
             // Filtered: the count is of everything the list holds, not just the
@@ -2607,10 +2606,10 @@ impl Renderer {
                 n => format!("Unread Panes  —  {}", n),
             }
         } else {
-            match awaiting {
+            match unread {
                 0 => "Switch Tab / Pane".to_string(),
-                1 => "Switch Tab / Pane  —  1 waiting".to_string(),
-                n => format!("Switch Tab / Pane  —  {} waiting", n),
+                1 => "Switch Tab / Pane  —  1 unread".to_string(),
+                n => format!("Switch Tab / Pane  —  {} unread", n),
             }
         };
         let title_chars = title.chars().count() as f32;
@@ -2623,7 +2622,7 @@ impl Renderer {
         let subtitle = if data.filtered {
             "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{23ce} Focus  click to focus  u All panes  esc Cancel"
         } else {
-            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next waiting  \u{23ce} Focus  \u{2318}\u{2191}\u{2193} Move  u Unread only  esc Cancel"
+            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next unread  \u{23ce} Focus  \u{2318}\u{2191}\u{2193} Move  u Unread only  esc Cancel"
         };
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
@@ -2693,18 +2692,11 @@ impl Renderer {
                         let dot_x = left_margin + 2.0 * scaled_cell_w;
                         self.render_text(vertices, "\u{25cf}", dot_x, text_y, right_margin, color, no_bg, body_scale);
                     }
-                    // Claude Code state in the 2nd char slot: "?" when the
-                    // session is waiting on the user, "✳" while it works.
-                    // Waiting wins — it is the one that needs an answer.
-                    if let Some((glyph, color)) = if row.awaiting {
-                        Some(("?", AWAITING_FG))
-                    } else if row.working {
-                        Some(("\u{2733}", WORKING_FG))
-                    } else {
-                        None
-                    } {
+                    // Claude Code state in the 2nd char slot: "✳" while the
+                    // session works.
+                    if row.working {
                         let state_x = left_margin + scaled_cell_w;
-                        self.render_text(vertices, glyph, state_x, text_y, right_margin, color, no_bg, body_scale);
+                        self.render_text(vertices, "\u{2733}", state_x, text_y, right_margin, WORKING_FG, no_bg, body_scale);
                     }
                 }
             }

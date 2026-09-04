@@ -120,3 +120,23 @@ part of the visible flicker on switch comes from there, not from the geometry.
    user-driven resize paths (virtual width, edge grow), where it was asked for.
 
 The reflow round-trip machinery in `resize_all_panes` was left untouched.
+
+## Cause 5 — a tab with no manual width follows the screen (2026-09-04)
+
+The four fixes above all act on `virtual_width_override`. A tab that never got
+one is untouched by every one of them: `Tab::virtual_width` (`src/pane.rs`)
+falls back to `max(n * min_split_width, screen_width)`, so its total width *is*
+the screen's. Unplug the 2560pt monitor and the same six panes are redistributed
+over the 1728pt builtin — each loses a third of its columns, permanently, and
+`adopt_geometry_scale` converts nothing because there is nothing stored.
+
+Fixed by pinning: `handle_resize` remembers the screen's logical width
+(`last_screen_w`), and on a change of screen writes the width the tab was laid
+out at into `virtual_width_override`, so the panes keep their size and the tab
+scrolls. `pinned_virtual_width` (`src/pane.rs`, three unit tests) does the
+arithmetic and stays silent when the new screen is at least as wide — there the
+fallback already gives the panes their size back.
+
+Keyed on the **screen**, not the scale, for two reasons: two displays can share a
+backing scale, and AppKit can move the window on one event and change the backing
+scale on the next, so the scale check can fire a resize too late.

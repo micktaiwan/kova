@@ -178,7 +178,7 @@ Response: `{ "ok": true }`.
 
 There is intentionally **no time-based expiry**. A question left unanswered for three hours is exactly what this flag is for.
 
-Displayed as a `?` marker on the pane's row in the switcher (`Cmd+P`, where `Tab` jumps to the next waiting pane) and as a `?N` counter in the global status bar, next to `✳N`. Like the bell and completion dots, the marker is suppressed on the pane the user is currently looking at.
+**Nothing in the UI draws this flag.** It used to show as a `?` on the switcher row and a `?N` status-bar counter; both were dropped, because `Stop` fires at the end of every turn — so the marker said "waiting" on sessions that asked for nothing, and it stayed up until the next prompt was submitted even after the pane had been read. What the UI shows instead is unread output (bell / finished command), which is what `Cmd+P`'s `Tab`, the `●N` counter and `Cmd+J`'s first tier all walk. The flag lives on for IPC clients only — `list-panes` and the `pane-status` event, which `/pane-sweep` consumes.
 
 ---
 
@@ -346,7 +346,7 @@ reparent-up|down|left|right        (move a pane across the tree)
 resize-left|right|up|down          (ratio resize, ±5%)
 edge-grow-left|right               (grow the focused pane's edge)
 minimize-pane  restore-minimized
-next-attention                     (focus the next waiting pane, else an unread one; skips minimized panes)
+next-attention                     (focus the next unread pane, else an idle Claude session; skips minimized panes)
 history-back|history-forward       (walk the panes you visited, back then forward; skips minimized panes)
 detach-tab  break-pane  merge-tab  merge-window
 rename-tab  rename-pane            (open the inline rename editor)
