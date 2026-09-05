@@ -193,8 +193,9 @@ fn content_snippet(text: &str, lower: &str, term: &str) -> Option<String> {
 ///      (one entry per pane — title and content matches are deduped).
 ///   2. A "Tabs" section listing tabs whose title matches.
 ///   3. A "Claude sessions (closed)" section: past conversations that match,
-///      most recent first. This is what makes a session findable once its pane
-///      is gone — the whole point of `claude_history`.
+///      ranked by `claude_history::score` rather than by date alone. This is
+///      what makes a session findable once its pane is gone — the whole point
+///      of `claude_history`.
 /// `panes` arrives already ordered by tab (window → tab → pane), so consecutive
 /// grouping by `tab_id` reconstructs the per-tab groups without sorting.
 fn run_search_worker(
@@ -202,6 +203,7 @@ fn run_search_worker(
     tabs: &[SearchTabSnapshot],
     panes: &[SearchPaneSnapshot],
     live_sessions: &[String],
+    focus_cwd: &str,
 ) -> Vec<SearchRow> {
     let terms = crate::claude_history::split_terms(query);
     let mut rows: Vec<SearchRow> = Vec::new();
@@ -276,14 +278,14 @@ fn run_search_worker(
     }
 
     // Section 3: Claude conversations that are not open anywhere any more.
-    // Only the most recent few are listed — a common word matches hundreds of
+    // Only the best few are listed — a common word matches hundreds of
     // sessions, and the rest of them would bury the open panes above. What was
     // cut is named in the header rather than dropped silently.
-    let archived = crate::claude_history::search(query, live_sessions);
+    let archived = crate::claude_history::search(query, live_sessions, focus_cwd);
     if !archived.hits.is_empty() {
         let header = if archived.total > archived.hits.len() {
             format!(
-                "Claude sessions (closed) — {} most recent of {}",
+                "Claude sessions (closed) — best {} of {}",
                 archived.hits.len(),
                 archived.total
             )
@@ -414,6 +416,9 @@ impl KovaView {
     ///   3. else a new tab on that directory.
     /// The `--resume` line is pre-typed, not run, exactly like a restored pane.
     fn open_archived_claude_session(&self, session_id: &str, cwd: &str) {
+        // Reopening one conversation out of hundreds is a vote for it, and the
+        // only one the user never has to think about casting.
+        crate::claude_history::record_resume(session_id);
         let config = match self.ivars().config.get() {
             Some(c) => c,
             None => return,
@@ -551,6 +556,9 @@ impl KovaView {
         };
 
         let (tabs_snap, panes_snap, live_sessions) = Self::collect_search_snapshot();
+        // Where the user is working right now: a past session of this very
+        // project outranks one from elsewhere.
+        let focus_cwd = self.ipc_focused_cwd().unwrap_or_default();
         let (tx, rx) = std::sync::mpsc::channel();
 
         // Store rx into state before spawning, so the polling tick can pick it up
@@ -560,7 +568,7 @@ impl KovaView {
         }
 
         std::thread::spawn(move || {
-            let hits = run_search_worker(&query, &tabs_snap, &panes_snap, &live_sessions);
+            let hits = run_search_worker(&query, &tabs_snap, &panes_snap, &live_sessions, &focus_cwd);
             let _ = tx.send((query_id, hits));
         });
 
