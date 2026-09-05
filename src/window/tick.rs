@@ -5,6 +5,28 @@
 
 use super::*;
 
+/// Keep the same tab after removals before it. If it closed, prefer the next
+/// surviving tab, falling back to the previous one at the end of the strip.
+fn active_tab_after_removals(active: usize, removed: &[usize], remaining: usize) -> usize {
+    let removed_before = removed.iter().filter(|&&idx| idx < active).count();
+    active.saturating_sub(removed_before).min(remaining.saturating_sub(1))
+}
+
+/// Rendering a background window does not mean its selected pane was read.
+/// Keep the completion flag itself sticky for IPC wait-for-completion.
+fn pane_attention(term: &crate::terminal::TerminalState, seen: bool) -> (bool, bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if seen {
+        let had_bell = term.bell.swap(false, Relaxed);
+        let had_completion = term.unread_completion();
+        term.ack_completion();
+        if had_bell || had_completion {
+            term.dirty.store(true, Relaxed);
+        }
+    }
+    (term.unread_completion(), term.bell.load(Relaxed))
+}
+
 /// How many panes sit entirely off-screen, left and right of the visible strip.
 ///
 /// Fed `(x, width, minimized)` per pane, in the tab's own pixel space. Minimized
@@ -745,15 +767,22 @@ impl KovaView {
 
             // Adjust active_tab if needed; signal close if no tabs left
             if any_removed {
-                let tabs = ivars.tabs.borrow();
+                let mut tabs = ivars.tabs.borrow_mut();
                 if tabs.is_empty() {
                     drop(tabs);
                     return false;
                 }
-                let active = ivars.active_tab.get();
-                if active >= tabs.len() {
-                    ivars.active_tab.set(tabs.len() - 1);
-                }
+                let active = active_tab_after_removals(
+                    ivars.active_tab.get(), &tabs_to_remove, tabs.len(),
+                );
+                ivars.active_tab.set(active);
+                let tab = &mut tabs[active];
+                let screen_w = self.drawable_viewport().width;
+                tab.clamp_scroll(screen_w, self.min_split_width_px());
+                self.scroll_to_reveal_pane(tab, tab.focused_pane, screen_w);
+                tab.mark_all_dirty();
+                drop(tabs);
+                self.resize_all_panes();
             }
         true
     }
@@ -768,6 +797,8 @@ impl KovaView {
         split_min_w: f32,
     ) -> Option<FramePanes> {
         let ivars = self.ivars();
+        let window_focused = self.window().is_some_and(|w| w.isKeyWindow())
+            && NSApplication::sharedApplication(MainThreadMarker::from(self)).isActive();
                 let mut tabs = ivars.tabs.borrow_mut();
                 if tabs.is_empty() {
                     return None;
@@ -795,18 +826,7 @@ impl KovaView {
                     pane.open_timer.mark_first_paint(pane.id);
                     let is_focused = pane.id == focused_id;
                     let term = pane.terminal.read();
-                    // The focused pane is "seen": acknowledge its bell and its
-                    // completion every frame so neither reappears stale once focus
-                    // moves away. The ack is a separate flag — command_completed
-                    // stays sticky until the next OSC 133;C for the IPC
-                    // wait-for-completion contract.
-                    if is_focused {
-                        term.bell.store(false, std::sync::atomic::Ordering::Relaxed);
-                        term.ack_completion();
-                    }
-                    let completed = !is_focused && term.unread_completion();
-                    let has_bell = !is_focused
-                        && term.bell.load(std::sync::atomic::Ordering::Relaxed);
+                    let (completed, has_bell) = pane_attention(&term, is_focused && window_focused);
                     drop(term);
                     pane_data.push(crate::renderer::PaneRenderData {
                         terminal: pane.terminal.clone(),
@@ -994,6 +1014,58 @@ impl KovaView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_background_tabs_preserves_the_selected_tab() {
+        // A/B/C, B selected: removing A leaves B selected at index 0.
+        assert_eq!(active_tab_after_removals(1, &[0], 2), 0);
+        // Removal after the selection must not move it.
+        assert_eq!(active_tab_after_removals(1, &[2], 2), 1);
+        // Multiple shells can exit in the same frame, on either side.
+        assert_eq!(active_tab_after_removals(3, &[0, 2, 4], 3), 1);
+    }
+
+    #[test]
+    fn closing_the_selected_tab_prefers_next_then_previous() {
+        assert_eq!(active_tab_after_removals(1, &[1], 2), 1);
+        assert_eq!(active_tab_after_removals(2, &[2], 2), 1);
+        assert_eq!(active_tab_after_removals(2, &[0, 2, 3], 1), 0);
+    }
+
+    #[test]
+    fn background_frames_preserve_attention_until_the_pane_is_seen() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let config = Config::default();
+        let pane = Pane::placeholder(80, 24, &config).unwrap();
+        let term = pane.terminal.read();
+        term.bell.store(true, Relaxed);
+        term.command_completed.store(true, Relaxed);
+        term.dirty.store(false, Relaxed);
+
+        for _ in 0..3 {
+            assert_eq!(pane_attention(&term, false), (true, true));
+        }
+        assert_eq!(pane_attention(&term, true), (false, false));
+        assert!(term.command_completed.load(Relaxed), "IPC completion must stay sticky");
+        assert!(term.dirty.load(Relaxed), "the indicators must be repainted when read");
+        assert_eq!(pane_attention(&term, false), (false, false));
+
+        // A new command completion must become unread again.
+        term.completion_seen.store(false, Relaxed);
+        assert_eq!(pane_attention(&term, false), (true, false));
+    }
+
+    #[test]
+    fn inactive_single_pane_tab_reports_completion_until_acknowledged() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut tab = Tab::placeholder(&Config::default()).unwrap();
+        assert!(!tab.check_completion());
+        tab.first_pane().terminal.read().command_completed.store(true, Relaxed);
+        assert!(tab.check_completion());
+        tab.first_pane().terminal.read().ack_completion();
+        assert!(!tab.check_completion());
+        assert!(tab.first_pane().terminal.read().command_completed.load(Relaxed));
+    }
 
     #[test]
     fn hidden_pane_counts_splits_the_panes_that_scrolled_out_of_sight() {

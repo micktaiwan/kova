@@ -744,12 +744,12 @@ impl Tab {
         self.has_bell = false;
     }
 
-    /// Check if any non-focused pane has a completed command. Sets tab-level flag.
+    /// Check unread completions in an inactive tab. Its selected pane is not
+    /// being viewed either, so it must contribute to the tab-level flag.
     pub fn check_completion(&mut self) -> bool {
-        let focused = self.focused_pane;
         let mut any = false;
         self.for_each_pane(&mut |pane| {
-            if pane.id != focused && pane.terminal.read().unread_completion() {
+            if pane.terminal.read().unread_completion() {
                 any = true;
             }
         });
