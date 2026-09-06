@@ -60,6 +60,8 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 
 - **`NSApplication::windows()` liste des fenêtres qui ne sont pas les nôtres** — panneaux AppKit, porteurs de tooltip, etc. Caster leur `contentView` en `KovaView` sans vérifier lit les ivars d'une autre classe : le `Vec` de tabs obtenu portait un pointeur nul, et `Cmd+J` a segfaulté dans `Tab::for_each_pane` avec `self = 0` (crash du 2026-08-14, v1.9.0). `kova_view` (`src/app.rs`) demande maintenant `isKindOfClass` avant de caster — passer par lui, jamais par un cast direct.
 
+- **Un deuxième Kova démarre sans tabs, et ce n'est ni la conf ni le fichier de session** — la première instance verrouille `~/.config/kova/session.json` (`owns_session`, `src/session.rs`), les suivantes ouvrent une fenêtre vierge et ne sauvent rien. Le log le dit en clair : « Another Kova owns … : this instance starts fresh and will not save its session ». Symptôme trompeur : on relance `kova &` alors qu'un Kova tourne encore, on ne retrouve pas ses tabs, et le diagnostic part vers la lecture de la conf. Lire `~/Library/Logs/Kova/kova.log` avant de chercher ailleurs.
+
 ## Tests
 
 - **Lancer les tests automatisés après chaque modification de code.** Dès qu'une modif touche le code Rust, exécuter `cargo test` (le target est global, pas besoin de `build.sh` pour ça) et vérifier que tout est vert avant de considérer la modif terminée. Un test rouge fait partie du diff : le corriger, ne pas le laisser de côté.

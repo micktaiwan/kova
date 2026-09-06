@@ -1661,7 +1661,7 @@ pub struct Pane {
     /// Command to inject into PTY once shell is ready (for session restore).
     pub pending_command: Cell<Option<String>>,
     /// Custom pane title set by user (overrides OSC title). Sticky, so it sits
-    /// below the name a `/rename` gave the Claude session running here — see
+    /// below the name of the agent session running here — see
     /// `derive_display_title`.
     pub custom_title: Option<String>,
     /// Whether this pane is minimized (collapsed to a thin bar).
@@ -1674,8 +1674,8 @@ pub struct Pane {
     /// `is_awaiting` and `Tab::check_running`.
     pub awaiting: Cell<AwaitingFlag>,
     /// The coding-agent conversation running in this pane — Claude Code or
-    /// Codex — with the id its `resume` takes and, for Claude, the name
-    /// `/rename` gave it. Refreshed on the same throttle as the foreground
+    /// Codex — with the id its `resume` takes and its conversation name.
+    /// Refreshed on the same throttle as the foreground
     /// probe (`Tab::check_running`) rather than read per frame, because the
     /// lookup scans a directory or the process table. `None` = no agent in this
     /// pane; a conversation nobody named is `Some` with a `name` of `None`.
@@ -1692,11 +1692,6 @@ pub struct Pane {
     fg_process: RefCell<Option<ProcessInfo>>,
 }
 
-/// Resolve the label to show for a pane, in priority order: user-set custom
-/// title → Claude Code session name (its `/rename`) → non-empty OSC title →
-/// cwd basename → `fallback`.
-/// An empty or whitespace-only OSC title is treated as absent so we never
-/// render a blank row (the "invisible white line" bug in the pane switcher).
 /// True if `title` begins with a Claude Code *working* marker immediately
 /// followed by a space: an animated Braille spinner glyph (U+2800–U+28FF), or a
 /// vertical half-circle spinner frame (`◐` U+25D0, `◑` U+25D1).
@@ -1760,20 +1755,20 @@ fn normalize_process_name(raw: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// Conversation name → custom pane title → non-empty OSC title → foreground
+/// process → cwd basename → fallback. Blank names/titles count as absent.
 fn derive_display_title(
     custom_title: Option<&str>,
-    claude_name: Option<&str>,
+    agent_name: Option<&str>,
     osc_title: Option<&str>,
     process: Option<&str>,
     cwd: Option<&str>,
     fallback: &str,
 ) -> String {
-    // The name a `/rename` gave the Claude session wins over everything, the
-    // pane's own sticky title included. Only a deliberate `/rename` reaches here
-    // (a name Claude Code derived on its own is dropped upstream), so it is the
-    // freshest thing anyone said about this pane — while a sticky title survives
-    // whatever the pane is used for next and would otherwise mask it forever.
-    if let Some(name) = claude_name.map(str::trim).filter(|n| !n.is_empty()) {
+    // The current conversation name wins over a sticky pane title, which can
+    // outlive the conversation it originally described. Claude's derived names
+    // are filtered upstream; Codex's index does not distinguish name sources.
+    if let Some(name) = agent_name.map(str::trim).filter(|n| !n.is_empty()) {
         return name.to_string();
     }
     if let Some(custom) = custom_title {
@@ -1952,6 +1947,11 @@ impl Pane {
         self.agent_session.borrow().as_ref().map(|s| s.id.clone())
     }
 
+    /// Current conversation name, regardless of which agent owns it.
+    pub fn agent_session_name(&self) -> Option<String> {
+        self.agent_session.borrow().as_ref().and_then(|s| s.name.clone())
+    }
+
     /// Which agent holds the conversation in this pane, if any.
     pub fn agent_kind(&self) -> Option<crate::agent_session::Agent> {
         self.agent_session.borrow().as_ref().map(|s| s.agent)
@@ -1966,12 +1966,13 @@ impl Pane {
         (session.agent == crate::agent_session::Agent::Claude).then(|| session.id.clone())
     }
 
-    /// Name that `/rename` gave the conversation, `None` until the user sets one
-    /// (and always `None` for Codex, which surfaces no name Kova can read).
+    /// Name that `/rename` gave a Claude conversation; `None` for other agents.
     /// Exposed on its own rather than only through `display_title`, where it is
     /// one candidate among five and indistinguishable from the others.
     pub fn claude_session_name(&self) -> Option<String> {
-        self.agent_session.borrow().as_ref().and_then(|s| s.name.clone())
+        self.agent_session.borrow().as_ref()
+            .filter(|s| s.agent == crate::agent_session::Agent::Claude)
+            .and_then(|s| s.name.clone())
     }
 
     /// True if the app in this pane is actively working: its live OSC 0/2 title
@@ -2723,6 +2724,37 @@ mod tests {
         let mut weights = vec![1.0, 1.0];
         assert!(reweight_for_scrolled_split(&mut weights, &[false, false], 5, 1000.0, 300.0).is_none());
         assert_eq!(weights, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn codex_rename_reaches_the_title_without_leaking_into_claude_fields() {
+        use crate::agent_session::{Agent, AgentSession};
+        let mut pane = super::Pane::placeholder(80, 24, &crate::config::Config::default()).unwrap();
+        pane.custom_title = Some("sticky".into());
+        pane.terminal.write().title = Some("Codex".into());
+        pane.agent_session.replace(Some(AgentSession {
+            agent: Agent::Codex, id: "codex-id".into(), name: Some("premier nom".into()),
+        }));
+        assert_eq!(pane.display_title("shell"), "premier nom");
+        assert_eq!(pane.agent_session_name().as_deref(), Some("premier nom"));
+        assert_eq!(pane.agent_session_id().as_deref(), Some("codex-id"));
+        assert_eq!(pane.claude_session_name(), None);
+        assert_eq!(pane.claude_session_id(), None);
+
+        pane.agent_session.borrow_mut().as_mut().unwrap().name = Some("renommé 🦀".into());
+        assert_eq!(pane.display_title("shell"), "renommé 🦀");
+        pane.agent_session.borrow_mut().as_mut().unwrap().name = None;
+        assert_eq!(pane.display_title("shell"), "sticky");
+        pane.custom_title = None;
+        assert_eq!(pane.display_title("shell"), "Codex");
+
+        pane.agent_session.replace(Some(AgentSession {
+            agent: Agent::Claude, id: "claude-id".into(), name: Some("Claude nommé".into()),
+        }));
+        assert_eq!(pane.display_title("shell"), "Claude nommé");
+        assert_eq!(pane.agent_session_name(), pane.claude_session_name());
+        assert_eq!(pane.claude_session_name().as_deref(), Some("Claude nommé"));
+        assert_eq!(pane.agent_session_id(), pane.claude_session_id());
     }
 
     #[test]

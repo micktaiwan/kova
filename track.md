@@ -2,6 +2,16 @@
 
 ## En cours
 
+### Les bookmarks lus comme une liste de projets en cours
+
+**Statut** : 🔧 codé, 316 tests verts, binaire reconstruit et signé. **Il faut redémarrer Kova** pour voir le bleu.
+
+**D'où ça part** : Mickael se sert des bookmarks (Cmd+B, commit 15ca177) comme d'un rappel des projets en cours, pas comme d'une liste de favoris. Un bookmark dont le pane est ouvert apparaissait deux fois dans Cmd+P : une fois dans son tab, une fois dans la section Bookmarks.
+
+**Ce qui change** : la section Bookmarks ne liste plus que les conversations **non ouvertes** — donc ce qu'il reste à reprendre — et disparaît entièrement quand tout est ouvert (`bookmark_rows`, `src/window/switcher.rs`). Le pane qui porte un bookmark est peint en bleu clair sur texte noir dans l'overlay, avec un bleu plus soutenu quand la ligne est aussi sélectionnée, pour que la sélection reste lisible par-dessus (`build_pane_switcher_overlay_vertices`, `src/renderer/mod.rs`).
+
+**Décidé** : la couleur ne sort pas de l'overlay Cmd+P — ni status bar du pane, ni titre de tab. À rouvrir seulement si le repère manque à l'usage.
+
 ### Durcissement de ce que Kova retape tout seul dans un pane
 
 **Statut** : 🔧 codé, 239 tests verts, binaire reconstruit et signé. **Il faut redémarrer Kova** pour que ça prenne. La release qui embarquera tout ça n'est pas faite.

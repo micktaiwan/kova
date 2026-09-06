@@ -12,7 +12,9 @@
 //! match), hence the shared cache below. And a session that has not written its
 //! first record yet has no transcript open, so it stays invisible for a moment.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -21,14 +23,72 @@ use parking_lot::Mutex;
 const MAX_ANCESTRY_DEPTH: usize = 3;
 
 /// The scan is re-run at most this often — same reason as in `claude_session`:
-/// a snapshot asks once per pane, and the pane title asks once per frame.
+/// a snapshot asks once per pane, and the foreground probe refreshes titles.
 const CACHE_TTL: Duration = Duration::from_secs(1);
 
 /// Name `proc_name` reports for the CLI. Codex ships as a single binary, so
 /// unlike Claude Code (a version-numbered file) the name is stable.
 const PROCESS_NAME: &str = "codex";
 
-static CACHE: Mutex<Option<(Instant, HashMap<u32, String>)>> = Mutex::new(None);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Session {
+    pub id: String,
+    /// Latest persisted name, including `/rename`, absent until Codex names it.
+    pub name: Option<String>,
+}
+
+static CACHE: Mutex<Option<(Instant, HashMap<u32, Session>)>> = Mutex::new(None);
+
+/// Codex 0.153.4 appends name changes to `session_index.jsonl`. File order,
+/// not `updated_at`, decides which name wins. Empty names clear an older name.
+/// Stream the index and retain only live sessions, never the full history.
+fn read_session_names(mut reader: impl BufRead, ids: &HashSet<&str>) -> HashMap<String, String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        id: String,
+        thread_name: String,
+    }
+
+    let mut names = HashMap::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // A concurrently appended, incomplete line must not hide earlier names.
+        let Ok(entry) = serde_json::from_slice::<Entry>(&line) else { continue };
+        if !ids.contains(entry.id.as_str()) {
+            continue;
+        }
+        let name = entry.thread_name.trim();
+        if name.is_empty() {
+            names.remove(&entry.id);
+        } else {
+            names.insert(entry.id, name.to_string());
+        }
+    }
+    names
+}
+
+fn attach_session_names(ids_by_pid: HashMap<u32, String>) -> HashMap<u32, Session> {
+    if ids_by_pid.is_empty() {
+        return HashMap::new();
+    }
+    // Detection above is scoped to ~/.codex/sessions; use the matching index.
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let names = std::fs::File::open(home.join(".codex/session_index.jsonl"))
+        .map(|file| {
+            let ids = ids_by_pid.values().map(String::as_str).collect();
+            read_session_names(BufReader::new(file), &ids)
+        })
+        .unwrap_or_default();
+    ids_by_pid.into_iter().map(|(pid, id)| {
+        let name = names.get(&id).cloned();
+        (pid, Session { id, name })
+    }).collect()
+}
 
 /// `PROC_PIDFDVNODEPATHINFO` — not in the `libc` crate, from `sys/proc_info.h`.
 const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
@@ -191,7 +251,7 @@ pub fn session_id_from_rollout(path: &str) -> Option<String> {
 
 /// Build a map of "ancestor PID → Codex session id" by walking the live
 /// processes named `codex` and reading the transcript each holds open.
-fn scan_uncached() -> HashMap<u32, String> {
+fn scan_uncached() -> HashMap<u32, Session> {
     let mut map = HashMap::new();
     let own_pid = std::process::id();
 
@@ -212,11 +272,12 @@ fn scan_uncached() -> HashMap<u32, String> {
             current = parent;
         }
     }
-    map
+    attach_session_names(map)
 }
 
-/// The Codex session id running under `shell_pid`, if any.
-pub fn for_shell(shell_pid: u32) -> Option<String> {
+/// The Codex session running under `shell_pid`, if any. Names share the process
+/// scan's one-second cache, so a rename refreshes without per-frame file I/O.
+pub fn for_shell(shell_pid: u32) -> Option<Session> {
     let mut cache = CACHE.lock();
     let fresh = match cache.as_ref() {
         Some((at, _)) => at.elapsed() < CACHE_TTL,
@@ -250,6 +311,50 @@ pub fn resume_command(session_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_index_entry_wins_even_when_its_timestamp_is_older() {
+        let data = concat!(
+            "{\"id\":\"a\",\"thread_name\":\"before\",\"updated_at\":\"2026-09-06\"}\n",
+            "{\"id\":\"b\",\"thread_name\":\"other pane\"}\n",
+            "{\"id\":\"a\",\"thread_name\":\"  renommé 🦀 ─  \",\"updated_at\":\"2026-09-05\"}\n",
+            "{\"id\":\"closed\",\"thread_name\":\"do not retain\"}\n",
+        );
+        let names = read_session_names(data.as_bytes(), &HashSet::from(["a", "b", "unnamed"]));
+        assert_eq!(names.len(), 2);
+        assert_eq!(names.get("a").map(String::as_str), Some("renommé 🦀 ─"));
+        assert_eq!(names.get("b").map(String::as_str), Some("other pane"));
+        assert!(!names.contains_key("unnamed"));
+    }
+
+    #[test]
+    fn blank_name_clears_previous_name_and_a_later_rename_restores_it() {
+        let data = concat!(
+            "{\"id\":\"a\",\"thread_name\":\"old\"}\n",
+            "{\"id\":\"a\",\"thread_name\":\"  \\t\"}\n",
+        );
+        let ids = HashSet::from(["a"]);
+        assert!(read_session_names(data.as_bytes(), &ids).is_empty());
+        let renamed = format!("{data}{{\"id\":\"a\",\"thread_name\":\"new\"}}\n");
+        assert_eq!(read_session_names(renamed.as_bytes(), &ids).get("a").unwrap(), "new");
+    }
+
+    #[test]
+    fn broken_index_entries_do_not_hide_the_last_valid_name() {
+        let data = concat!(
+            "garbage\n\n",
+            "{\"id\":\"a\",\"thread_name\":\"valid\"}\n",
+            "{\"id\":\"a\"}\n",
+            "{\"id\":\"a\",\"thread_name\":null}\n",
+            "{\"id\":\"a\",\"thread_name\":\"unfinished",
+        );
+        let ids = HashSet::from(["a"]);
+        assert_eq!(read_session_names(data.as_bytes(), &ids).get("a").unwrap(), "valid");
+        assert!(read_session_names(&b""[..], &ids).is_empty());
+        let mut invalid_utf8 = b"\xff\n".to_vec();
+        invalid_utf8.extend_from_slice(data.as_bytes());
+        assert_eq!(read_session_names(invalid_utf8.as_slice(), &ids).get("a").unwrap(), "valid");
+    }
 
     #[test]
     fn a_rollout_path_yields_its_uuid() {
@@ -292,8 +397,8 @@ mod tests {
         let t0 = std::time::Instant::now();
         let map = scan_uncached();
         println!("scan took {:?}, {} ancestor(s) mapped", t0.elapsed(), map.len());
-        for (pid, id) in &map {
-            println!("  pid {} → {}", pid, id);
+        for (pid, session) in &map {
+            println!("  pid {} → {}, named: {}", pid, session.id, session.name.is_some());
         }
     }
 }

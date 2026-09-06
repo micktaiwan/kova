@@ -33,8 +33,7 @@ pub struct AgentSession {
     pub agent: Agent,
     /// Conversation id — what the agent's `resume` takes.
     pub id: String,
-    /// Name the user gave the conversation. Claude Code only (`/rename`);
-    /// Codex has no equivalent surfaced anywhere Kova can read.
+    /// Conversation name: Claude's explicit `/rename` or Codex's persisted name.
     pub name: Option<String>,
 }
 
@@ -47,8 +46,8 @@ pub fn for_shell(shell_pid: u32) -> Option<AgentSession> {
     if let Some(s) = crate::claude_session::session_for_shell(shell_pid) {
         return Some(AgentSession { agent: Agent::Claude, id: s.id, name: s.name });
     }
-    let id = crate::codex_session::for_shell(shell_pid)?;
-    Some(AgentSession { agent: Agent::Codex, id, name: None })
+    let s = crate::codex_session::for_shell(shell_pid)?;
+    Some(AgentSession { agent: Agent::Codex, id: s.id, name: s.name })
 }
 
 /// The command line that reopens this conversation, or `None` when the id is

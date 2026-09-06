@@ -23,6 +23,10 @@ pub(super) enum SwitcherRow {
         /// ("claude 2.1.226"). `None` at a bare shell prompt, and also when the
         /// title already *is* that name — no row should say "vim … vim".
         process: Option<String>,
+        /// This pane holds a bookmarked conversation. The row is painted so it
+        /// stands out, and the Bookmarks section leaves the conversation out:
+        /// a bookmark that is already open is this row, not a second one.
+        bookmarked: bool,
     },
     /// A bookmarked conversation — selectable. Enter jumps to the pane that
     /// still holds it, or reopens it where it belongs when nothing does.
@@ -33,8 +37,6 @@ pub(super) enum SwitcherRow {
         title: String,
         /// Project name and agent, shown dim at the end of the row.
         detail: Option<String>,
-        /// The pane still running this conversation in this window, if any.
-        open_pane: Option<PaneId>,
     },
 }
 
@@ -132,6 +134,12 @@ fn nearest_pane_row(col: &[SwitcherRow], target: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// What activating a switcher row does.
+enum SwitcherTarget {
+    Pane(PaneId),
+    Bookmark(usize),
+}
+
 pub(super) struct PaneSwitcherState {
     /// Columns of rows. Each column holds whole tabs (a tab header followed by
     /// its pane rows); a tab is never split across two columns.
@@ -150,7 +158,79 @@ pub(super) struct PaneSwitcherState {
     pub(super) filtered: bool,
 }
 
+/// The dim right-hand half of a bookmark row: the project it belongs to, and
+/// the agent holding the conversation. `None` when there is neither, which
+/// keeps the row from ending in a stray separator.
+pub(super) fn bookmark_detail(bm: &crate::bookmarks::Bookmark) -> Option<String> {
+    let project = std::path::Path::new(&bm.cwd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty());
+    let agent = bm.agent.map(|a| a.as_str());
+    match (project, agent) {
+        (Some(p), Some(a)) => Some(format!("{} · {}", p, a)),
+        (Some(p), None) => Some(p.to_string()),
+        (None, Some(a)) => Some(a.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// The Bookmarks section of the list: one row per saved conversation that is
+/// *not* already open, newest first, headed by its title. A bookmark whose pane
+/// is open is up in its tab, painted as a bookmark — repeating it here would
+/// offer two rows for one conversation. Empty when nothing is left to reopen,
+/// and the section then disappears entirely.
+pub(super) fn bookmark_rows(
+    saved: &[crate::bookmarks::Bookmark],
+    is_open: impl Fn(&crate::bookmarks::Bookmark) -> bool,
+) -> Vec<SwitcherRow> {
+    let mut rows: Vec<SwitcherRow> = Vec::new();
+    for (index, bm) in saved.iter().enumerate() {
+        if is_open(bm) {
+            continue;
+        }
+        rows.push(SwitcherRow::Bookmark {
+            index,
+            title: bm.label.clone(),
+            detail: bookmark_detail(bm),
+        });
+    }
+    if !rows.is_empty() {
+        rows.insert(0, SwitcherRow::TabHeader("Bookmarks".to_string()));
+    }
+    rows
+}
+
 impl KovaView {
+    /// The pane of this window still running a bookmarked conversation, if one
+    /// does — jumping to it beats opening a second pane on the same session.
+    fn pane_holding_session(&self, bm: &crate::bookmarks::Bookmark) -> Option<PaneId> {
+        let session_id = bm.session_id.as_deref()?;
+        let tabs = self.ivars().tabs.borrow();
+        let mut found = None;
+        for tab in tabs.iter() {
+            tab.for_each_pane(&mut |pane| {
+                if found.is_none() && pane.agent_session_id().as_deref() == Some(session_id) {
+                    found = Some(pane.id);
+                }
+            });
+        }
+        found
+    }
+
+    /// Act on a bookmark row: focus the pane that still holds the conversation,
+    /// or put it back where it belongs.
+    fn open_bookmark(&self, index: usize) {
+        let saved = crate::bookmarks::load();
+        let Some(bm) = saved.items.get(index) else { return };
+        if let Some(pane_id) = self.pane_holding_session(bm) {
+            self.ipc_focus_pane(pane_id);
+            self.set_pane_flash(pane_id, 30, None);
+            return;
+        }
+        self.open_conversation_in_project(bm.resume_command(), &bm.cwd);
+    }
+
     /// Open the tab/pane switcher overlay: every tab with its panes, click or
     /// Enter to focus. Selection starts on the currently-focused pane.
     ///
@@ -162,6 +242,14 @@ impl KovaView {
     /// crosses windows), and its last tier — an idle Claude session — is not an
     /// unread pane, so it is not in here either.
     pub(super) fn open_pane_switcher(&self, filtered: bool) {
+        // Read once, up front: the same list marks the open panes below and
+        // fills the Bookmarks section at the end.
+        let saved = crate::bookmarks::load();
+        let bookmarked_sessions: std::collections::HashSet<&str> = saved
+            .items
+            .iter()
+            .filter_map(|b| b.session_id.as_deref())
+            .collect();
         // Build one row group per tab (header followed by its pane rows).
         let mut groups: Vec<Vec<SwitcherRow>> = Vec::new();
         {
@@ -186,6 +274,9 @@ impl KovaView {
                     };
                     let title = pane.display_title("shell");
                     let process = switcher_process_label(pane.fg_process().as_ref(), &title);
+                    let bookmarked = pane
+                        .agent_session_id()
+                        .is_some_and(|id| bookmarked_sessions.contains(id.as_str()));
                     rows.push(SwitcherRow::Pane {
                         pane_id: pane.id,
                         title,
@@ -195,6 +286,7 @@ impl KovaView {
                         minimized: pane.minimized,
                         working: pane.is_working(),
                         process,
+                        bookmarked,
                     });
                 });
                 groups.push(rows);
@@ -202,6 +294,15 @@ impl KovaView {
         }
         if !filtered && groups.iter().all(|g| g.iter().all(|r| !r.is_pane())) {
             return; // nothing to switch to
+        }
+        // Saved conversations, as their own group at the end of the list. Only
+        // on the full list: the attention-only one answers "what is asking for
+        // something", and a bookmark never asks for anything.
+        if !filtered {
+            let rows = bookmark_rows(&saved.items, |bm| self.pane_holding_session(bm).is_some());
+            if !rows.is_empty() {
+                groups.push(rows);
+            }
         }
         // An empty filtered list still opens: the answer "nothing is unread" is
         // one the overlay has to give out loud, and `u` from there shows all the
@@ -439,20 +540,28 @@ impl KovaView {
         self.mark_dirty();
     }
 
-    /// Focus the pane on the currently-selected switcher row and close the overlay.
+    /// Act on the currently-selected switcher row and close the overlay: focus
+    /// a pane, or reopen a bookmarked conversation.
     fn pane_switcher_focus_selected(&self) {
-        let pane_id = {
+        let target = {
             let guard = self.ivars().pane_switcher.borrow();
             guard.as_ref().and_then(|s| {
                 match s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row)) {
-                    Some(SwitcherRow::Pane { pane_id, .. }) => Some(*pane_id),
+                    Some(SwitcherRow::Pane { pane_id, .. }) => Some(SwitcherTarget::Pane(*pane_id)),
+                    Some(SwitcherRow::Bookmark { index, .. }) => {
+                        Some(SwitcherTarget::Bookmark(*index))
+                    }
                     _ => None,
                 }
             })
         };
         *self.ivars().pane_switcher.borrow_mut() = None;
-        if let Some(pid) = pane_id {
-            self.ipc_focus_pane(pid);
+        match target {
+            Some(SwitcherTarget::Pane(pid)) => {
+                self.ipc_focus_pane(pid);
+            }
+            Some(SwitcherTarget::Bookmark(index)) => self.open_bookmark(index),
+            None => {}
         }
         self.mark_dirty();
     }
@@ -506,7 +615,7 @@ impl KovaView {
     /// Handle a click in the tab/pane switcher overlay. A click on a pane row
     /// focuses it; a click anywhere else dismisses the overlay.
     pub(super) fn handle_pane_switcher_click(&self, px: f32, py: f32) {
-        let pane_id = {
+        let target = {
             let renderer = match self.ivars().renderer.get() { Some(r) => r, None => return };
             let vp = self.drawable_viewport();
             let geom = renderer.read().overlay_list_geometry(vp.height);
@@ -526,15 +635,24 @@ impl KovaView {
                 } else {
                     let idx = state.scroll.get(col).copied().unwrap_or(0) + vis;
                     match state.columns[col].get(idx) {
-                        Some(SwitcherRow::Pane { pane_id, .. }) => Some(*pane_id),
+                        Some(SwitcherRow::Pane { pane_id, .. }) => {
+                            Some(SwitcherTarget::Pane(*pane_id))
+                        }
+                        Some(SwitcherRow::Bookmark { index, .. }) => {
+                            Some(SwitcherTarget::Bookmark(*index))
+                        }
                         _ => None,
                     }
                 }
             }
         };
         *self.ivars().pane_switcher.borrow_mut() = None;
-        if let Some(pid) = pane_id {
-            self.ipc_focus_pane(pid);
+        match target {
+            Some(SwitcherTarget::Pane(pid)) => {
+                self.ipc_focus_pane(pid);
+            }
+            Some(SwitcherTarget::Bookmark(index)) => self.open_bookmark(index),
+            None => {}
         }
         self.mark_dirty();
     }
@@ -553,6 +671,11 @@ mod tests {
                 col.chars()
                     .map(|c| match c {
                         'h' => SwitcherRow::TabHeader("tab".into()),
+                        'k' => SwitcherRow::Bookmark {
+                            index: 0,
+                            title: "saved".into(),
+                            detail: None,
+                        },
                         _ => SwitcherRow::Pane {
                             pane_id: 0,
                             title: "p".into(),
@@ -562,6 +685,7 @@ mod tests {
                             minimized: false,
                             working: false,
                             process: None,
+                            bookmarked: false,
                         },
                     })
                     .collect()
@@ -582,10 +706,75 @@ mod tests {
                         SwitcherRow::Pane { has_bell: true, .. } => 'b',
                         SwitcherRow::Pane { has_completion: true, .. } => 'c',
                         SwitcherRow::Pane { .. } => '.',
+                        SwitcherRow::Bookmark { .. } => 'k',
                     })
                     .collect()
             })
             .collect()
+    }
+
+    fn saved(id: &str) -> crate::bookmarks::Bookmark {
+        crate::bookmarks::Bookmark {
+            agent: Some(crate::agent_session::Agent::Claude),
+            session_id: Some(id.into()),
+            cwd: "/Users/x/projects/kova".into(),
+            label: format!("conv {}", id),
+        }
+    }
+
+    #[test]
+    fn an_open_bookmark_leaves_the_bookmarks_section() {
+        let items = vec![saved("a"), saved("b")];
+        let rows = bookmark_rows(&items, |bm| bm.session_id.as_deref() == Some("a"));
+        assert_eq!(switcher_spec(&[rows]), vec!["hk".to_string()]);
+        // The row still points at the bookmark's own index in the saved list,
+        // not at its position in the filtered rows.
+        let rows = bookmark_rows(&items, |bm| bm.session_id.as_deref() == Some("a"));
+        match &rows[1] {
+            SwitcherRow::Bookmark { index, .. } => assert_eq!(*index, 1),
+            _ => panic!("expected a bookmark row"),
+        }
+    }
+
+    #[test]
+    fn the_bookmarks_section_disappears_when_every_bookmark_is_open() {
+        let items = vec![saved("a"), saved("b")];
+        assert!(bookmark_rows(&items, |_| true).is_empty(), "no header without rows");
+        assert!(bookmark_rows(&[], |_| false).is_empty());
+    }
+
+    #[test]
+    fn the_attention_list_drops_the_bookmark_section_whole() {
+        // Bookmarks never ask for anything, so the filtered list must not keep
+        // them — header included.
+        let grid = switcher_grid(&["hb.", "hkk"]);
+        assert_eq!(switcher_spec(&retain_attention_rows(grid)), vec!["hb".to_string()]);
+    }
+
+    #[test]
+    fn a_bookmark_row_is_selectable_but_is_not_a_pane() {
+        let col = &switcher_grid(&["hk"])[0];
+        assert!(col[1].is_selectable());
+        assert!(!col[1].is_pane());
+        assert!(!col[0].is_selectable(), "a header is never selected");
+    }
+
+    #[test]
+    fn a_bookmark_row_names_its_project_and_agent() {
+        let bm = crate::bookmarks::Bookmark {
+            agent: Some(crate::agent_session::Agent::Codex),
+            session_id: Some("id".into()),
+            cwd: "/Users/x/projects/kova".into(),
+            label: "the split refactor".into(),
+        };
+        assert_eq!(bookmark_detail(&bm).as_deref(), Some("kova · codex"));
+        let shell = crate::bookmarks::Bookmark {
+            agent: None,
+            session_id: None,
+            cwd: "/Users/x/projects/kova".into(),
+            label: "shell".into(),
+        };
+        assert_eq!(bookmark_detail(&shell).as_deref(), Some("kova"));
     }
 
     #[test]
@@ -658,6 +847,7 @@ mod tests {
             minimized: false,
             working: true,
             process: None,
+            bookmarked: false,
         };
         assert!(!working.needs_attention());
     }

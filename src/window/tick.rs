@@ -372,11 +372,11 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None },
-                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref() },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false },
+                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, bookmarked, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref(), bookmarked: *bookmarked },
                 // A bookmark row borrows the pane row's shape: its title on the
                 // left, the project and agent dim on the right.
-                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref() },
+                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()

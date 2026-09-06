@@ -227,6 +227,9 @@ pub struct PaneSwitcherRowRender<'a> {
     /// Binary running in the pane ("claude 2.1.226"), shown dim at the right
     /// end of the row. `None` on headers and at a bare shell prompt.
     pub process: Option<&'a str>,
+    /// This pane holds a bookmarked conversation — the row is painted light
+    /// blue on black text so a tracked project is spotted without reading.
+    pub bookmarked: bool,
 }
 
 /// One column of the pane-switcher overlay: a vertical run of rows holding
@@ -2415,7 +2418,8 @@ impl Renderer {
                     ("Paste", kc.paste.as_str(), ""),
                     ("Find", kc.toggle_filter.as_str(), "search in this pane"),
                     ("Global Search", kc.open_search.as_str(), "panes + closed Claude sessions"),
-                    ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "quick switcher"),
+                    ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "quick switcher + bookmarks"),
+                    ("Bookmark Pane", kc.toggle_bookmark.as_str(), "keep this conversation"),
                     ("Unread Panes", kc.open_unread_switcher.as_str(), "switcher, attention only"),
                 ]),
                 ("MISC", vec![
@@ -2577,6 +2581,13 @@ impl Renderer {
         let label_fg = [0.85, 0.85, 0.9, 1.0];
         let dim_fg = [0.45, 0.45, 0.5, 1.0];
         let selected_bg = [0.25, 0.35, 0.55];
+        // Bookmarked panes: a light band, dark text on it. The selected variant
+        // is the same hue pushed harder, so selection still reads on a row that
+        // already has a background of its own.
+        let bookmark_bg = [0.62, 0.79, 0.95];
+        let bookmark_selected_bg = [0.40, 0.66, 0.95];
+        let bookmark_fg = [0.05, 0.07, 0.12, 1.0];
+        let bookmark_dim_fg = [0.22, 0.30, 0.42, 1.0];
 
         let title_scale = 1.8_f32;
         let body_scale = 1.3_f32;
@@ -2653,8 +2664,14 @@ impl Renderer {
                 let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
 
                 let is_selected = c == data.selected_col && i == data.selected_row && !row.is_header;
-                if is_selected {
-                    Self::push_bg_quad_alpha(vertices, left_margin - pad * 0.5, row_y, right_margin - left_margin + pad, row_height, selected_bg, 0.8);
+                let band = match (row.bookmarked, is_selected) {
+                    (true, true) => Some(bookmark_selected_bg),
+                    (true, false) => Some(bookmark_bg),
+                    (false, true) => Some(selected_bg),
+                    (false, false) => None,
+                };
+                if let Some(color) = band {
+                    Self::push_bg_quad_alpha(vertices, left_margin - pad * 0.5, row_y, right_margin - left_margin + pad, row_height, color, 0.8);
                 }
 
                 if row.is_header {
@@ -2667,7 +2684,11 @@ impl Renderer {
                     // are already suppressed upstream (has_bell/has_completion = false).
                     let attention = PaneAttention::from_flags(row.has_bell, row.has_completion);
                     let text = format!("    {}", row.text);
-                    let row_fg = if row.minimized { dim_fg } else { label_fg };
+                    let (row_fg, row_dim_fg) = if row.bookmarked {
+                        (if row.minimized { bookmark_dim_fg } else { bookmark_fg }, bookmark_dim_fg)
+                    } else {
+                        (if row.minimized { dim_fg } else { label_fg }, dim_fg)
+                    };
                     // The running binary is parked at the right end of the row,
                     // dim: it says what the pane *is* without competing with the
                     // title, which is what the eye scans. The title is clipped
@@ -2680,7 +2701,7 @@ impl Renderer {
                     );
                     self.render_text(vertices, &text, left_margin, text_y, split.title_limit, row_fg, no_bg, body_scale);
                     if let (Some(process), Some(proc_x)) = (row.process, split.process_x) {
-                        self.render_text(vertices, process, proc_x, text_y, right_margin, dim_fg, no_bg, body_scale);
+                        self.render_text(vertices, process, proc_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
                     }
                     if row.minimized {
                         // Minimized marker in the 1st char slot, in a color of

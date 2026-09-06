@@ -77,6 +77,7 @@ pub fn pane_json(
         // agent-agnostic id is next to it.
         "agent": pane.agent_kind().map(|a| a.as_str()),
         "agent_session_id": pane.agent_session_id(),
+        "agent_session_name": pane.agent_session_name(),
         "claude_session_id": pane.claude_session_id(),
         "claude_session_name": pane.claude_session_name(),
     })
@@ -257,7 +258,7 @@ impl KovaView {
     }
 
     /// The pane this window would hand the keyboard to: the focused pane of the
-    /// active tab, its tab index, and the Claude conversation running in it.
+    /// active tab, its tab index, and the agent conversation running in it.
     ///
     /// The conversation is part of the identity, not a detail of the payload: a
     /// pane where you have just launched `claude` is not the same work surface it
@@ -273,11 +274,11 @@ impl KovaView {
         let tab = tabs.get(idx)?;
         let pane_id = tab.focused_pane;
         let pane = tab.pane(pane_id);
-        let session = pane.and_then(|p| p.claude_session_id());
+        let session = pane.and_then(|p| p.agent_session_id());
         // The name too, not just the id: `/rename` is how the user says the conversation is about
         // something else now, and a client that never hears about it keeps filing the work under
         // the old subject.
-        let name = pane.and_then(|p| p.claude_session_name());
+        let name = pane.and_then(|p| p.agent_session_name());
         Some((idx, pane_id, session, name))
     }
 

@@ -133,6 +133,9 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "awaiting_since": null,
   "awaiting_seen": false,
   "minimized": false,
+  "agent": "claude",
+  "agent_session_id": "0b6f…",
+  "agent_session_name": "subscribe côté Kova",
   "claude_session_id": "0b6f…",
   "claude_session_name": "subscribe côté Kova"
 }
@@ -143,6 +146,12 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 `child_processes[].name` is the program's name as it was invoked (argv[0], what `ps` shows), not the kernel's `p_comm`. The difference matters for anything installed under a versioned filename: Claude Code's binary is `~/.local/share/claude/versions/2.1.226`, so `p_comm` there is `2.1.226` and the name would say nothing about which program is running. `version` carries that number when the executable's own filename is one, and is `null` otherwise — so a Claude Code pane reads `{"name": "claude", "version": "2.1.226"}`.
 
 `claude_session_id` is the id of the Claude Code conversation running in the pane — the argument `claude --resume` takes — and `claude_session_name` is the name its `/rename` set (`null` until the user sets one). Both are `null` in a pane with no Claude session. They are read from `~/.claude/sessions/<pid>.json`, on the same throttled probe as the rest, and they matter because **the id is the only identifier here that outlives the pane**: a client tying a pane to a subject must key on it rather than on `id` or `cwd`. A pane id dies with its tab, and a directory is shared by every unrelated conversation started in the same repository. The name also appears inside `title`, but only as one candidate among five (see `display_title`), where it cannot be told apart from an OSC title or a directory name.
+
+`agent` is `"claude"`, `"codex"`, or `null`. `agent_session_id` and `agent_session_name` expose the detected conversation's id and name for either agent; the name is `null` when absent. The `claude_*` fields remain `null` for Codex, including named Codex sessions. Codex resumes with `codex resume <id>`.
+
+Codex names come from `~/.codex/session_index.jsonl`, joined by session id to the live process detection. The last valid entry for an id wins; a blank name clears it. Reads share the detection's one-second cache, and missing or malformed entries leave the normal title fallback available. Unlike Claude's session files, this index does not distinguish automatic names from explicit `/rename` names: Kova displays the latest persisted name in both cases.
+
+The pane switcher, open-pane search results, IPC `title`, and automatic tab titles use the conversation name before the pane's custom title, OSC title, foreground process, and directory. An explicitly named tab keeps its own title. The per-pane status bar has its own existing rule (hovered URL, custom pane title, OSC title), and does not read the conversation name directly.
 
 `minimized` is `true` for a pane collapsed with `minimize-pane` (`Cmd+M` by default). Such a pane still runs and is still listed here; it simply takes no layout space and is not drawn. Kova marks it with a `⊟` glyph in the pane switcher and counts it in the status bar. A remote client should keep showing it and mark it the same way rather than filter it out.
 
@@ -313,7 +322,7 @@ Response: `{ "ok": true }`.
 
 Sets the pane's custom title — the same field that `Cmd+Option+R` and `OSC 1` write to. Sticky: survives OSC 0/2 (window title) sequences emitted by programs running in the pane. Pass `"title": null` to clear (pane falls back to its OSC 0/2 / auto-derived title).
 
-One thing outranks it: the name a Claude Code `/rename` gave the session running in the pane (`claude_session_name` in `list-panes`). That name is the freshest thing said about the pane, while a sticky title outlives whatever the pane is used for next — so a pane running a named session shows that name, and the custom title only reappears once the session ends.
+One thing outranks it in the pane's display title: the current Claude or Codex conversation name (`agent_session_name` in `list-panes`). A sticky title outlives whatever the pane is used for next, so a pane running a named session shows that name, and the custom title reappears once the session ends or its name is cleared. The per-pane status bar uses the separate rule described under `list-panes`.
 
 Response: `{ "ok": true }`.
 
@@ -526,8 +535,8 @@ at it" are one fact here. `reason` is one of `pane`, `tab`, `window`, `session`,
 true hop: a pane change that is also a tab change reads `tab`.
 
 `session` is the one that does not involve moving: the focused pane is the same,
-but the Claude conversation in it changed — you launched `claude` (or it ended)
-right where you already were. The conversation is deliberately part of the focused
+but the Claude or Codex conversation in it changed — you launched an agent, it ended,
+or its name changed through `/rename`, right where you already were. The conversation is deliberately part of the focused
 pane's identity rather than just its payload, because a client keyed on
 conversations would otherwise hear about a session started in place only when the
 user next happened to leave the pane and come back.

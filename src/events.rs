@@ -34,7 +34,7 @@ pub struct PaneFlags {
 
 /// Which pane holds the user's attention, and what is running in it.
 ///
-/// The Claude conversation is part of the identity on purpose. Launching `claude`
+/// The agent conversation is part of the identity on purpose. Launching an agent
 /// in the pane you are already in changes what you are doing without moving the
 /// focus anywhere, and a client that only hears about pane changes would learn of
 /// it only when you happen to leave and come back.
@@ -342,6 +342,16 @@ mod tests {
         // would otherwise hear about it only when you next left and came back.
         let before = key(0, 0, 1);
         let after = key_with_session(0, 0, 1, "abc");
+        assert_ne!(before, after);
+        assert_eq!(focus_reason(Some(&before), Some(&after), true), "session");
+    }
+
+    #[test]
+    fn renaming_the_focused_conversation_is_a_session_event() {
+        let mut before = key_with_session(0, 0, 1, "codex-id");
+        before.session_name = Some("before".into());
+        let mut after = before.clone();
+        after.session_name = Some("after".into());
         assert_ne!(before, after);
         assert_eq!(focus_reason(Some(&before), Some(&after), true), "session");
     }

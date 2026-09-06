@@ -221,6 +221,52 @@ pub fn snapshot_tab(tab: &Tab) -> SavedTab {
 /// Maximum number of session backups to keep.
 const SESSION_HISTORY_COUNT: usize = 10;
 
+fn session_lock_path() -> PathBuf {
+    session_path().with_file_name("session.lock")
+}
+
+/// Take the session lock, or `None` if another Kova already holds it.
+///
+/// The lock lives on its own file rather than on `session.json`, which `load`
+/// deletes: a lock held on a deleted inode protects nothing.
+fn try_acquire_lock(path: &std::path::Path) -> Option<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+/// Whether this process owns the session file.
+///
+/// One session file cannot describe two Kova at once: both would autosave into
+/// it every 30s and the last one to quit would be the only one restored, while
+/// the second instance would also have started by restoring a clone of the
+/// first one's tabs. So the first Kova to start owns the session, and any other
+/// one neither reads nor writes it — it opens a fresh window and forgets it on
+/// quit. The lock is released by the kernel when the process dies, crash
+/// included, so a stale lock file is never a problem.
+pub fn owns_session() -> bool {
+    static LOCK: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| {
+        let held = try_acquire_lock(&session_lock_path());
+        if held.is_none() {
+            log::warn!(
+                "Another Kova owns {}: this instance starts fresh and will not save its session",
+                session_path().display()
+            );
+        }
+        held
+    })
+    .is_some()
+}
+
 /// Save all windows to a single session file.
 /// Save the current session, rotating backups (`session.1.json` → … → `session.10.json`).
 /// Use this on user-initiated checkpoints — quit, kill, manual save.
@@ -236,6 +282,9 @@ pub fn save_periodic(windows: &[WindowSession]) {
 }
 
 fn save_internal(windows: &[WindowSession], rotate: bool) {
+    if !owns_session() {
+        return;
+    }
     let session = Session {
         version: SESSION_VERSION,
         windows: windows.to_vec(),
@@ -357,7 +406,21 @@ fn print_session_entry(path: &std::path::Path, label: &str) {
     println!("  {}  {} {}", label, modified, summary);
 }
 
+/// Whether a session file of this version can still be read. Every format
+/// from v2 up to the current one is: the fields added by later versions are
+/// all `#[serde(default)]`, and the ones dropped (`claude_session`) are still
+/// deserialized. Comparing against `SESSION_VERSION` rather than listing the
+/// versions one by one means a bump no longer silently drops the session it
+/// was meant to migrate — v5 was left out of the list when v6 landed, and a
+/// whole window of tabs came back as a single empty tab.
+fn is_readable_version(v: u32) -> bool {
+    (2..=SESSION_VERSION).contains(&v)
+}
+
 pub fn load(backup: Option<usize>) -> Option<Session> {
+    if !owns_session() {
+        return None;
+    }
     let path = match backup {
         Some(n) => {
             let dir = session_path().parent().unwrap().to_path_buf();
@@ -371,7 +434,7 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 
     // Try v4/v3 first, then v2, then v1
     let session: Session = if let Ok(s) = serde_json::from_str::<Session>(&data) {
-        if s.version == SESSION_VERSION || s.version == 4 || s.version == 3 || s.version == 2 {
+        if is_readable_version(s.version) {
             s
         } else if s.version == 1 {
             log::warn!("Session v1 with windows field, ignoring");
@@ -786,6 +849,26 @@ pub fn restore_session(session: Session, config: &Config) -> Option<Vec<Restored
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_second_holder_of_the_session_lock_is_refused() {
+        let path = std::env::temp_dir().join(format!("kova-lock-{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let first = try_acquire_lock(&path).expect("the first Kova takes the lock");
+        assert!(try_acquire_lock(&path).is_none(), "a second Kova must be refused");
+        drop(first);
+        assert!(try_acquire_lock(&path).is_some(), "the lock is free once the owner is gone");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn every_version_up_to_the_current_one_is_still_readable() {
+        for v in 2..=SESSION_VERSION {
+            assert!(is_readable_version(v), "v{v} must still load");
+        }
+        assert!(!is_readable_version(1), "v1 is handled by the legacy path");
+        assert!(!is_readable_version(SESSION_VERSION + 1));
+    }
     use super::*;
 
     fn pane(cwd: &str) -> SavedPane {
