@@ -82,7 +82,7 @@ struct FramePanes {
     active_tab: usize,
     total_tabs: usize,
     active_tab_name: String,
-    working_claudes: usize,
+    working_agents: usize,
     unread_panes: usize,
 }
 
@@ -196,7 +196,7 @@ impl KovaView {
             active_tab,
             total_tabs,
             active_tab_name,
-            working_claudes,
+            working_agents,
             unread_panes,
         } = match self.collect_frame_panes(&renderer, &layer, active_idx, split_min_w) {
             Some(f) => f,
@@ -374,6 +374,9 @@ impl KovaView {
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
                 SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None },
                 SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref() },
+                // A bookmark row borrows the pane row's shape: its title on the
+                // left, the project and agent dim on the right.
+                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref() },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -481,7 +484,7 @@ impl KovaView {
             }
         }
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_claudes, unread_panes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_agents, unread_panes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 
@@ -715,7 +718,7 @@ impl KovaView {
             if let Some(tab) = tabs.get(ivars.active_tab.get()) {
                 if let Some(pane) = tab.pane(tab.focused_pane) {
                     pane.mark_awaiting_seen();
-                    pane.mark_idle_claude_seen();
+                    pane.mark_idle_agent_seen();
                 }
             }
         }
@@ -918,14 +921,14 @@ impl KovaView {
                 let active_tab_name = tabs[active_idx].title();
                 // Count panes across every tab of this window whose app is signalling
                 // activity via the OSC-title marker (Claude Code busy).
-                let mut working_claudes = 0usize;
+                let mut working_agents = 0usize;
                 // Panes carrying output nobody has looked at: a bell, or a command
                 // that finished while the eye was elsewhere — the same signal as the
                 // per-pane dot and as Cmd+J's first tier.
                 let mut unread_panes = 0usize;
                 for t in tabs.iter() {
                     t.for_each_pane(&mut |p| {
-                        if p.is_working() { working_claudes += 1; }
+                        if p.is_working() { working_agents += 1; }
                         let term = p.terminal.read();
                         if term.bell.load(std::sync::atomic::Ordering::Relaxed) || term.unread_completion() {
                             unread_panes += 1;
@@ -944,7 +947,7 @@ impl KovaView {
             active_tab: active_tab_1based,
             total_tabs,
             active_tab_name,
-            working_claudes,
+            working_agents,
             unread_panes,
         })
     }

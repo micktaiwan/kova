@@ -24,11 +24,29 @@ pub(super) enum SwitcherRow {
         /// title already *is* that name — no row should say "vim … vim".
         process: Option<String>,
     },
+    /// A bookmarked conversation — selectable. Enter jumps to the pane that
+    /// still holds it, or reopens it where it belongs when nothing does.
+    Bookmark {
+        /// Index into the saved list, so the row can act on it without carrying
+        /// the whole bookmark around.
+        index: usize,
+        title: String,
+        /// Project name and agent, shown dim at the end of the row.
+        detail: Option<String>,
+        /// The pane still running this conversation in this window, if any.
+        open_pane: Option<PaneId>,
+    },
 }
 
 impl SwitcherRow {
     fn is_pane(&self) -> bool {
         matches!(self, SwitcherRow::Pane { .. })
+    }
+
+    /// Rows Enter and the arrow keys can land on: panes, and bookmarks.
+    /// Headers are the only thing the selection skips.
+    fn is_selectable(&self) -> bool {
+        !matches!(self, SwitcherRow::TabHeader(_))
     }
 
     /// Is this row asking for something? A bell, or a command that finished
@@ -38,8 +56,8 @@ impl SwitcherRow {
     /// `Cmd+J`'s tiers.
     pub(super) fn needs_attention(&self) -> bool {
         match self {
-            SwitcherRow::TabHeader(_) => false,
             SwitcherRow::Pane { has_bell, has_completion, .. } => *has_bell || *has_completion,
+            _ => false,
         }
     }
 }
@@ -108,7 +126,7 @@ pub(super) fn next_unread_row(
 fn nearest_pane_row(col: &[SwitcherRow], target: usize) -> usize {
     col.iter()
         .enumerate()
-        .filter(|(_, r)| r.is_pane())
+        .filter(|(_, r)| r.is_selectable())
         .min_by_key(|(i, _)| (*i as isize - target as isize).unsigned_abs())
         .map(|(i, _)| i)
         .unwrap_or(0)
@@ -231,7 +249,7 @@ impl KovaView {
         }
         if !found {
             for (c, col) in columns.iter().enumerate() {
-                if let Some(r) = col.iter().position(|x| x.is_pane()) {
+                if let Some(r) = col.iter().position(|x| x.is_selectable()) {
                     selected_col = c;
                     selected_row = r;
                     break;
@@ -333,14 +351,14 @@ impl KovaView {
             match keycode {
                 0x7E => { // Up
                     let col = &state.columns[state.selected_col];
-                    if let Some(i) = col[..state.selected_row].iter().rposition(|r| r.is_pane()) {
+                    if let Some(i) = col[..state.selected_row].iter().rposition(|r| r.is_selectable()) {
                         state.selected_row = i;
                     }
                 }
                 0x7D => { // Down
                     let col = &state.columns[state.selected_col];
                     if let Some(off) = col.get(state.selected_row + 1..)
-                        .and_then(|tail| tail.iter().position(|r| r.is_pane()))
+                        .and_then(|tail| tail.iter().position(|r| r.is_selectable()))
                     {
                         state.selected_row = state.selected_row + 1 + off;
                     }

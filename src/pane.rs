@@ -782,21 +782,21 @@ impl Tab {
             if !pane.is_alive() {
                 pane.clear_awaiting();
                 pane.fg_process.replace(None);
-                pane.claude_session.replace(None);
-                pane.rearm_idle_claude();
+                pane.agent_session.replace(None);
+                pane.rearm_idle_agent();
                 return;
             }
             if pane.terminal.read().command_running.load(std::sync::atomic::Ordering::Relaxed) {
                 osc_any = true;
             }
             if refresh_fg {
-                pane.refresh_claude_session();
+                pane.refresh_agent_session();
                 // Cmd+J's idle-Claude tier re-arms as soon as the pane stops
                 // being a session sitting still: one that went back to work, or
                 // whose Claude is gone, is a new state — a "already looked at"
                 // flag kept from before would hide it for good.
-                if pane.claude_session.borrow().is_none() || pane.is_working() {
-                    pane.rearm_idle_claude();
+                if pane.agent_session.borrow().is_none() || pane.is_working() {
+                    pane.rearm_idle_agent();
                 }
                 let fg = pane.refresh_fg_process();
                 if fg {
@@ -1673,18 +1673,18 @@ pub struct Pane {
     /// whether the user has looked at it since. Never trusted blindly: see
     /// `is_awaiting` and `Tab::check_running`.
     pub awaiting: Cell<AwaitingFlag>,
-    /// Name of the Claude Code session running in this pane, as set by its
-    /// `/rename` command, plus the conversation id that `claude --resume` takes.
-    /// Refreshed on the same throttle as the foreground probe
-    /// (`Tab::check_running`) rather than read per frame, because the lookup
-    /// goes through a directory scan. `None` = no Claude session in this pane;
-    /// a session the user never named is `Some` with a `name` of `None`.
-    pub claude_session: RefCell<Option<crate::claude_session::Session>>,
-    /// Whether the idle Claude session in this pane has been looked at since it
-    /// last did anything. Backs Cmd+J's third tier (see `is_idle_claude_unseen`):
+    /// The coding-agent conversation running in this pane — Claude Code or
+    /// Codex — with the id its `resume` takes and, for Claude, the name
+    /// `/rename` gave it. Refreshed on the same throttle as the foreground
+    /// probe (`Tab::check_running`) rather than read per frame, because the
+    /// lookup scans a directory or the process table. `None` = no agent in this
+    /// pane; a conversation nobody named is `Some` with a `name` of `None`.
+    pub agent_session: RefCell<Option<crate::agent_session::AgentSession>>,
+    /// Whether the idle agent session in this pane has been looked at since it
+    /// last did anything. Backs Cmd+J's third tier (see `is_idle_agent_unseen`):
     /// an open session nobody is using is a candidate exactly once, then drops
     /// out until it works again — the same drain rule as the waiting flag.
-    idle_claude_seen: Cell<bool>,
+    idle_agent_seen: Cell<bool>,
     /// Name of the binary running in the foreground (`claude`, `nvim`, `ssh`…),
     /// `None` at a bare shell prompt. Cached because the status bar reads it on
     /// every frame while resolving it costs two syscalls: it is refreshed on the
@@ -1832,8 +1832,8 @@ impl Pane {
             minimized: false,
             open_timer,
             awaiting: Cell::new(AwaitingFlag::default()),
-            claude_session: RefCell::new(None),
-            idle_claude_seen: Cell::new(false),
+            agent_session: RefCell::new(None),
+            idle_agent_seen: Cell::new(false),
             fg_process: RefCell::new(None),
         })
     }
@@ -1863,8 +1863,8 @@ impl Pane {
             minimized: false,
             open_timer: Arc::new(PaneOpenTimer::new()),
             awaiting: Cell::new(AwaitingFlag::default()),
-            claude_session: RefCell::new(None),
-            idle_claude_seen: Cell::new(false),
+            agent_session: RefCell::new(None),
+            idle_agent_seen: Cell::new(false),
             fg_process: RefCell::new(None),
         })
     }
@@ -1922,11 +1922,11 @@ impl Pane {
             .map(|t| strip_activity_prefix(t).to_string())
     }
 
-    /// Display title for this pane: Claude session name > custom title > OSC
+    /// Display title for this pane: agent session name > custom title > OSC
     /// title > foreground process > CWD basename > fallback.
     pub fn display_title(&self, fallback: &str) -> String {
         let term = self.terminal.read();
-        let session = self.claude_session.borrow();
+        let session = self.agent_session.borrow();
         derive_display_title(
             self.custom_title.as_deref(),
             session.as_ref().and_then(|s| s.name.as_deref()),
@@ -1937,27 +1937,41 @@ impl Pane {
         )
     }
 
-    /// Re-read the Claude Code session running in this pane. Called from the
+    /// Re-read the agent conversation running in this pane. Called from the
     /// throttled probe pass, never per frame: the lookup is a cached scan of
-    /// `~/.claude/sessions/`.
-    pub fn refresh_claude_session(&self) {
-        *self.claude_session.borrow_mut() =
-            crate::claude_session::session_for_shell(self.pty.pid());
+    /// `~/.claude/sessions/`, then of the process table for Codex.
+    pub fn refresh_agent_session(&self) {
+        *self.agent_session.borrow_mut() = crate::agent_session::for_shell(self.pty.pid());
     }
 
-    /// Id of the Claude Code conversation in this pane — the argument
-    /// `claude --resume` takes. It is the only identifier here that outlives the
-    /// pane, so an external client tying a pane to a subject must key on this,
-    /// not on the pane id: a closed tab reopened tomorrow is the same subject.
+    /// Id of the agent conversation in this pane — the argument its `resume`
+    /// takes. It is the only identifier here that outlives the pane, so an
+    /// external client tying a pane to a subject must key on this, not on the
+    /// pane id: a closed tab reopened tomorrow is the same subject.
+    pub fn agent_session_id(&self) -> Option<String> {
+        self.agent_session.borrow().as_ref().map(|s| s.id.clone())
+    }
+
+    /// Which agent holds the conversation in this pane, if any.
+    pub fn agent_kind(&self) -> Option<crate::agent_session::Agent> {
+        self.agent_session.borrow().as_ref().map(|s| s.agent)
+    }
+
+    /// Id of the conversation only when it is a Claude one. What an external
+    /// client hands to `claude --resume` or matches against a Claude session
+    /// name; a Codex pane answers `None` rather than an id Claude cannot open.
     pub fn claude_session_id(&self) -> Option<String> {
-        self.claude_session.borrow().as_ref().map(|s| s.id.clone())
+        let session = self.agent_session.borrow();
+        let session = session.as_ref()?;
+        (session.agent == crate::agent_session::Agent::Claude).then(|| session.id.clone())
     }
 
-    /// Name that `/rename` gave the conversation, `None` until the user sets one.
+    /// Name that `/rename` gave the conversation, `None` until the user sets one
+    /// (and always `None` for Codex, which surfaces no name Kova can read).
     /// Exposed on its own rather than only through `display_title`, where it is
     /// one candidate among five and indistinguishable from the others.
     pub fn claude_session_name(&self) -> Option<String> {
-        self.claude_session.borrow().as_ref().and_then(|s| s.name.clone())
+        self.agent_session.borrow().as_ref().and_then(|s| s.name.clone())
     }
 
     /// True if the app in this pane is actively working: its live OSC 0/2 title
@@ -2014,28 +2028,28 @@ impl Pane {
         self.is_awaiting() && !self.awaiting.get().is_read()
     }
 
-    /// A Claude Code session lives in this pane, working or not. What Cmd+J's
+    /// An agent session lives in this pane, working or not. What Cmd+J's
     /// non-draining loop walks: an open session is an open loop whether it is
     /// chewing or waiting to be closed.
-    pub fn has_claude_session(&self) -> bool {
-        self.claude_session.borrow().is_some()
+    pub fn has_agent_session(&self) -> bool {
+        self.agent_session.borrow().is_some()
     }
 
-    /// The mirror of `is_idle_claude`: a Claude session that is actively
+    /// The mirror of `is_idle_agent`: an agent session that is actively
     /// working. Never a landing spot for the draining tiers — the loop walks it,
     /// but it is never announced as something asking for an answer.
-    pub fn is_working_claude(&self) -> bool {
-        self.claude_session.borrow().is_some() && self.is_working()
+    pub fn is_working_agent(&self) -> bool {
+        self.agent_session.borrow().is_some() && self.is_working()
     }
 
-    /// True if a Claude Code session sits open in this pane and is not working.
+    /// True if an agent session sits open in this pane and is not working.
     /// "Idle" is the absence of the working spinner (`is_working`), so a session
     /// chewing on something is never pulled up.
     ///
     /// This is what Cmd+J hands back once everything else is dealt with: an open
     /// session is either closed or picked up again, never quietly accumulated.
-    pub fn is_idle_claude(&self) -> bool {
-        self.claude_session.borrow().is_some() && !self.is_working()
+    pub fn is_idle_agent(&self) -> bool {
+        self.agent_session.borrow().is_some() && !self.is_working()
     }
 
     /// The same, minus the sessions already looked at since they fell idle —
@@ -2043,19 +2057,19 @@ impl Pane {
     /// re-armed in `Tab::check_running` as soon as the session works again or
     /// goes away, so a walk that covered everything hands straight over to the
     /// non-draining loop.
-    pub fn is_idle_claude_unseen(&self) -> bool {
-        !self.idle_claude_seen.get() && self.is_idle_claude()
+    pub fn is_idle_agent_unseen(&self) -> bool {
+        !self.idle_agent_seen.get() && self.is_idle_agent()
     }
 
     /// Record that the idle Claude session here has been looked at (called by the
     /// frame loop on the focused pane, alongside `mark_awaiting_seen`).
-    pub fn mark_idle_claude_seen(&self) {
-        self.idle_claude_seen.set(true);
+    pub fn mark_idle_agent_seen(&self) {
+        self.idle_agent_seen.set(true);
     }
 
     /// Put this pane back in the idle-Claude tier next time it falls idle.
-    pub fn rearm_idle_claude(&self) {
-        self.idle_claude_seen.set(false);
+    pub fn rearm_idle_agent(&self) {
+        self.idle_agent_seen.set(false);
     }
 
     /// If the shell is ready and there's a pending command, write it to the PTY

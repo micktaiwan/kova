@@ -77,12 +77,12 @@ pub(super) enum AttentionTier {
     /// A bell, or a command that finished while the eye was elsewhere.
     Unread,
     /// A Claude session sitting open and idle, first time round.
-    IdleClaude,
+    IdleAgent,
     /// Every open session, walked round and round once the draining tiers are
     /// empty — working ones included, since a session left chewing is an open
     /// loop too. This tier no longer drains: the key keeps handing them back
     /// until they are closed or picked up.
-    ClaudeLoop,
+    AgentLoop,
 }
 
 impl AttentionTier {
@@ -90,8 +90,8 @@ impl AttentionTier {
     fn label(self) -> &'static str {
         match self {
             Self::Unread => "Tier 1 — unread output",
-            Self::IdleClaude => "Tier 2 — idle Claude session",
-            Self::ClaudeLoop => "Tier 2 — open Claude session (loop)",
+            Self::IdleAgent => "Tier 2 — idle agent session",
+            Self::AgentLoop => "Tier 2 — open agent session (loop)",
         }
     }
 
@@ -101,7 +101,7 @@ impl AttentionTier {
     fn color(self) -> [f32; 3] {
         match self {
             Self::Unread => [0.15, 0.33, 0.68],
-            Self::IdleClaude | Self::ClaudeLoop => [0.15, 0.50, 0.24],
+            Self::IdleAgent | Self::AgentLoop => [0.15, 0.50, 0.24],
         }
     }
 }
@@ -115,13 +115,13 @@ impl AttentionTier {
 /// the banner has to name it.
 fn next_attention_pane(
     unread: &mut Vec<(PaneLocality, PaneId)>,
-    idle_claude: &mut Vec<(PaneLocality, PaneId)>,
+    idle_agent: &mut Vec<(PaneLocality, PaneId)>,
     current: Option<PaneId>,
 ) -> Option<(AttentionTier, PaneId)> {
     next_pane_in_cycle(unread, current)
         .map(|id| (AttentionTier::Unread, id))
         .or_else(|| {
-            next_pane_in_cycle(idle_claude, current).map(|id| (AttentionTier::IdleClaude, id))
+            next_pane_in_cycle(idle_agent, current).map(|id| (AttentionTier::IdleAgent, id))
         })
 }
 
@@ -242,7 +242,7 @@ impl KovaView {
     /// window, in two tiers: first a pane left unread — a bell, or a command that
     /// finished while the eye was elsewhere (the same signal the switcher's Tab
     /// key and the status-bar counter use); then a Claude session left open and
-    /// idle (`Pane::is_idle_claude_unseen`), which asks for nothing but is still
+    /// idle (`Pane::is_idle_agent_unseen`), which asks for nothing but is still
     /// an open loop: the tour ends on it so it gets closed or resumed rather than
     /// piling up unnoticed. A session that is actually working is never announced
     /// by one of those tiers — it has nothing to hand over yet.
@@ -279,7 +279,7 @@ impl KovaView {
         };
 
         let mut unread: Vec<(PaneLocality, PaneId)> = Vec::new();
-        let mut idle_claude: Vec<(PaneLocality, PaneId)> = Vec::new();
+        let mut idle_agent: Vec<(PaneLocality, PaneId)> = Vec::new();
         // Every open session — idle or working, looked at or not: what the
         // post-message loop walks once the draining tiers are empty. No locality
         // here, that ring never drains and a nearest-first rule would trap it in
@@ -310,7 +310,7 @@ impl KovaView {
                     // Counted before every early return, minimized included: a
                     // session chewing away behind a collapsed pane is exactly
                     // what the user wants to hear about when nothing else waits.
-                    if pane.is_working_claude() {
+                    if pane.is_working_agent() {
                         thinking += 1;
                     }
                     // A minimized pane is never a landing spot: jumping to it
@@ -321,7 +321,7 @@ impl KovaView {
                     if pane.minimized {
                         return;
                     }
-                    // Scoped: `is_idle_claude_unseen` reads the terminal too,
+                    // Scoped: `is_idle_agent_unseen` reads the terminal too,
                     // and holding two read guards on the same lock deadlocks
                     // the moment a writer queues between them.
                     let has_unread = {
@@ -333,7 +333,7 @@ impl KovaView {
                         unread.push((locality, pane.id));
                         return;
                     }
-                    if pane.has_claude_session() {
+                    if pane.has_agent_session() {
                         // Working sessions ride the ring too: one still chewing
                         // is as much an open loop as an idle one, and landing on
                         // it is how the eye gets back to the answer it will
@@ -341,19 +341,19 @@ impl KovaView {
                         // working session is never announced as something to
                         // deal with now.
                         session_ring.push(pane.id);
-                        if pane.is_idle_claude_unseen() {
-                            idle_claude.push((locality, pane.id));
+                        if pane.is_idle_agent_unseen() {
+                            idle_agent.push((locality, pane.id));
                         }
                     }
                 });
             }
         }
 
-        let hit = next_attention_pane(&mut unread, &mut idle_claude, current);
+        let hit = next_attention_pane(&mut unread, &mut idle_agent, current);
         let (tier, target) = match hit {
             Some(hit) => hit,
             None => match next_pane_in_loop(&mut session_ring, current) {
-                Some(id) => (AttentionTier::ClaudeLoop, id),
+                Some(id) => (AttentionTier::AgentLoop, id),
                 // Not one open session left: nothing to hand over at all.
                 None => {
                     self.set_transient_status(&nothing_to_show_status(thinking));
@@ -394,10 +394,10 @@ mod tests {
     /// tier answered, only where the key lands.
     fn jump_to(
         unread: &mut Vec<(PaneLocality, PaneId)>,
-        idle_claude: &mut Vec<(PaneLocality, PaneId)>,
+        idle_agent: &mut Vec<(PaneLocality, PaneId)>,
         current: Option<PaneId>,
     ) -> Option<PaneId> {
-        next_attention_pane(unread, idle_claude, current).map(|(_, id)| id)
+        next_attention_pane(unread, idle_agent, current).map(|(_, id)| id)
     }
 
     #[test]
@@ -414,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn next_attention_visits_idle_claude_sessions_last() {
+    fn next_attention_visits_idle_agent_sessions_last() {
         // An idle session loses to unread output, whatever the ids...
         assert_eq!(jump_to(&mut here(&[9]), &mut here(&[3]), Some(1)), Some(9));
         // ...and comes up only once the unread tier is dry, in id order.
@@ -448,14 +448,14 @@ mod tests {
 
     #[test]
     fn next_attention_names_the_tier_it_answered_from() {
-        use AttentionTier::{IdleClaude, Unread};
+        use AttentionTier::{IdleAgent, Unread};
         assert_eq!(
             next_attention_pane(&mut here(&[3]), &mut here(&[4]), Some(1)),
             Some((Unread, 3))
         );
         assert_eq!(
             next_attention_pane(&mut nothing(), &mut here(&[4]), Some(1)),
-            Some((IdleClaude, 4))
+            Some((IdleAgent, 4))
         );
     }
 

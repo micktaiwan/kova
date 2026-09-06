@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::pane::{alloc_tab_id, Column, Pane, PaneId, Tab};
 
-const SESSION_VERSION: u32 = 5;
+const SESSION_VERSION: u32 = 6;
 
 /// Multi-window session format (v3 — flat columns).
 #[derive(Serialize, Deserialize)]
@@ -91,11 +91,25 @@ pub struct SavedPane {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Claude Code session running in this pane when the snapshot was taken
-    /// (v5). On restore the pane gets a `claude --resume <id>` line instead of
-    /// the last typed command, so the conversation can be picked up where it
-    /// stopped. `None` for a pane that was at a shell prompt.
+    /// (v5). Superseded by `agent_session`, which names the agent instead of
+    /// assuming Claude; still read so a session file written before v6 restores
+    /// its conversations, and no longer written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session: Option<String>,
+    /// Agent conversation running in this pane when the snapshot was taken
+    /// (v6) — Claude Code or Codex. On restore the pane gets that agent's
+    /// resume line instead of the last typed command, so the conversation can
+    /// be picked up where it stopped. `None` for a pane that was at a shell
+    /// prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<SavedAgentSession>,
+}
+
+/// The conversation a pane was holding, and which agent to hand it back to.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct SavedAgentSession {
+    pub agent: crate::agent_session::Agent,
+    pub id: String,
 }
 
 /// Legacy column format (v3) — kept for backward compat reading.
@@ -154,10 +168,13 @@ fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
             custom_title: p.custom_title.clone(),
             minimized: p.minimized,
             title: p.osc_title(),
+            claude_session: None,
             // Must run while the pane's children are alive: Claude Code deletes
-            // its session file on exit, so this is unreadable once the PTYs are
-            // reaped. `will_terminate` saves before `shutdown_all` for this.
-            claude_session: crate::claude_session::for_shell(p.pty.pid()),
+            // its session file on exit, and a dead Codex no longer holds its
+            // transcript open, so this is unreadable once the PTYs are reaped.
+            // `will_terminate` saves before `shutdown_all` for this.
+            agent_session: crate::agent_session::for_shell(p.pty.pid())
+                .map(|s| SavedAgentSession { agent: s.agent, id: s.id }),
         }).collect(),
         row_weights: col.row_weights.clone(),
         custom_row_weights: if col.custom_row_weights.iter().any(|&cw| cw) {
@@ -260,7 +277,7 @@ fn save_internal(windows: &[WindowSession], rotate: bool) {
 /// them. A macOS home directory is world-readable, so the file has to carry its
 /// own mode. `mode()` only applies when the file is created, hence the explicit
 /// tightening for a file written before this, done before the new bytes land.
-fn write_owner_only(path: &std::path::Path, json: &str) -> std::io::Result<()> {
+pub fn write_owner_only(path: &std::path::Path, json: &str) -> std::io::Result<()> {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -397,22 +414,27 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 /// Restore a flat column (v4 format).
 /// The command line to pre-type into a restored pane.
 ///
-/// A pane that was running Claude Code when the snapshot was taken gets its
-/// resume line; any other pane keeps the last command that was actually run in
-/// it. The session id recorded at snapshot time always wins over one the last
-/// command happens to name, because that older line can be several restarts
-/// old while the recorded id is the conversation that was live at quit.
+/// A pane that was running an agent when the snapshot was taken gets that
+/// agent's resume line; any other pane keeps the last command that was actually
+/// run in it. The session id recorded at snapshot time always wins over one the
+/// last command happens to name, because that older line can be several
+/// restarts old while the recorded id is the conversation that was live at quit.
 ///
 /// Nothing is executed: the caller writes the command without a newline, so it
 /// waits for the user to press Enter.
 fn restore_command(sp: &SavedPane) -> Option<String> {
-    match sp.claude_session {
+    // A file written before v6 only knew about Claude.
+    let session = sp.agent_session.clone().or_else(|| {
+        sp.claude_session.as_ref().map(|id| SavedAgentSession {
+            agent: crate::agent_session::Agent::Claude,
+            id: id.clone(),
+        })
+    });
+    match session {
         // A refused id (see `is_safe_session_id`) leaves the pane exactly where a
-        // pane that was never running Claude Code lands: its own last command.
-        Some(ref session_id) => {
-            crate::claude_session::resume_command(sp.last_command.as_deref(), session_id)
-                .or_else(|| sp.last_command.clone())
-        }
+        // pane that was never running an agent lands: its own last command.
+        Some(s) => crate::agent_session::resume_command(s.agent, &s.id, sp.last_command.as_deref())
+            .or_else(|| sp.last_command.clone()),
         None => sp.last_command.clone(),
     }
 }
@@ -774,6 +796,7 @@ mod tests {
             minimized: false,
             title: None,
             claude_session: None,
+            agent_session: None,
         }
     }
 
@@ -845,6 +868,33 @@ mod tests {
         sp.last_command = Some("npm run dev".into());
         sp.claude_session = Some("live-id\nrm -rf ~".into());
         assert_eq!(restore_command(&sp).as_deref(), Some("npm run dev"));
+    }
+
+    #[test]
+    fn a_pane_that_was_running_codex_gets_a_codex_resume_line() {
+        let mut sp = pane("/a");
+        sp.last_command = Some("codex".into());
+        sp.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Codex,
+            id: "01a07651-015e-78a3-97f2-2eaf0f0cd663".into(),
+        });
+        assert_eq!(
+            restore_command(&sp).as_deref(),
+            Some("codex resume 01a07651-015e-78a3-97f2-2eaf0f0cd663")
+        );
+    }
+
+    #[test]
+    fn the_agent_recorded_at_quit_beats_the_legacy_claude_field() {
+        // A file written by an older build carries `claude_session`; one written
+        // now carries `agent_session`, and that is the pane's real agent.
+        let mut sp = pane("/a");
+        sp.claude_session = Some("old-claude-id".into());
+        sp.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Codex,
+            id: "codex-id".into(),
+        });
+        assert_eq!(restore_command(&sp).as_deref(), Some("codex resume codex-id"));
     }
 
     #[test]

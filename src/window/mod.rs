@@ -1696,6 +1696,41 @@ impl KovaView {
         cwd
     }
 
+    /// Keep the focused pane's conversation in the bookmark list, or drop it if
+    /// it is already there. The list is what Cmd+P offers under "Bookmarks".
+    ///
+    /// Unlike the session file, this survives closing the pane: it is the answer
+    /// to "I want this conversation back tomorrow", not to "put back what was
+    /// open when Kova quit".
+    fn do_toggle_bookmark(&self) {
+        let candidate = {
+            let tabs = self.ivars().tabs.borrow();
+            let idx = self.ivars().active_tab.get();
+            let Some(tab) = tabs.get(idx) else { return };
+            let Some(pane) = tab.pane(tab.focused_pane) else { return };
+            let session = pane.agent_session.borrow().clone();
+            crate::bookmarks::Bookmark {
+                agent: session.as_ref().map(|s| s.agent),
+                session_id: session.as_ref().map(|s| s.id.clone()),
+                cwd: pane.cwd().unwrap_or_default(),
+                label: pane.display_title("shell"),
+            }
+        };
+        if candidate.cwd.is_empty() && candidate.session_id.is_none() {
+            self.set_transient_status("Nothing to bookmark in this pane");
+            return;
+        }
+        let mut bookmarks = crate::bookmarks::load();
+        let label = candidate.label.clone();
+        let kept = crate::bookmarks::toggle(&mut bookmarks.items, candidate);
+        crate::bookmarks::save(&bookmarks);
+        self.set_transient_status(&if kept {
+            format!("Bookmarked {}", label)
+        } else {
+            format!("Removed bookmark {}", label)
+        });
+    }
+
     /// Show a transient status-bar message for ~2 seconds. Used to explain why an
     /// action did nothing (e.g. Break Pane on a tab that has a single pane).
     fn set_transient_status(&self, msg: &str) {
@@ -1843,6 +1878,7 @@ impl KovaView {
             Action::OpenSearchPalette => self.do_open_search_palette(),
             Action::OpenPaneSwitcher => self.open_pane_switcher(false),
             Action::OpenUnreadSwitcher => self.open_pane_switcher(true),
+            Action::ToggleBookmark => self.do_toggle_bookmark(),
             Action::Equalize => {
                 let mut tabs = self.ivars().tabs.borrow_mut();
                 let idx = self.ivars().active_tab.get();

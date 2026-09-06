@@ -312,7 +312,7 @@ fn run_search_worker(
 ///
 /// A pane's cwd is read live from its shell, so this follows the directory the
 /// user is actually in rather than the one the tab was born with.
-fn open_pane_in_tab_for_cwd(cwd: &str, config: &crate::config::Config, command: &str) -> bool {
+fn open_pane_in_tab_for_cwd(cwd: &str, config: &crate::config::Config, command: Option<&str>) -> bool {
     if cwd.is_empty() {
         return false;
     }
@@ -354,7 +354,7 @@ fn open_pane_in_tab_for_cwd(cwd: &str, config: &crate::config::Config, command: 
             config,
             SplitDirection::Horizontal,
             Some(cwd),
-            Some(command.to_string()),
+            command.map(str::to_string),
         );
         if let Some(pane_id) = spawned {
             // The tab may have been off-screen: pulse the new pane so the eye
@@ -419,10 +419,6 @@ impl KovaView {
         // Reopening one conversation out of hundreds is a vote for it, and the
         // only one the user never has to think about casting.
         crate::claude_history::record_resume(session_id);
-        let config = match self.ivars().config.get() {
-            Some(c) => c,
-            None => return,
-        };
         // Same guard as the restore path: an id that cannot make a safe command
         // line never reaches a PTY.
         let command = match crate::claude_session::resume_command(None, session_id) {
@@ -432,10 +428,31 @@ impl KovaView {
                 return;
             }
         };
+        self.open_conversation_in_project(Some(command), cwd);
+    }
+
+    /// Put a conversation back in front of the user, in the project it belongs
+    /// to. `command` is the agent's resume line, pre-typed and not run, exactly
+    /// like a restored pane; `None` just opens a shell in `cwd`.
+    ///
+    /// Shared by the search palette (a closed session found by its text) and the
+    /// bookmark list (a session the user asked to keep).
+    pub(super) fn open_conversation_in_project(&self, command: Option<String>, cwd: &str) {
+        let config = match self.ivars().config.get() {
+            Some(c) => c,
+            None => return,
+        };
         let cwd_opt = if cwd.is_empty() { None } else { Some(cwd) };
+        let Some(command) = command else {
+            // A bookmarked shell: nothing to resume, just the directory.
+            if !open_pane_in_tab_for_cwd(cwd, config, None) {
+                self.ipc_new_tab(config, cwd_opt, None);
+            }
+            return;
+        };
 
         // 1. A tab is already open on this project.
-        if open_pane_in_tab_for_cwd(cwd, config, &command) {
+        if open_pane_in_tab_for_cwd(cwd, config, Some(&command)) {
             return;
         }
 
@@ -518,7 +535,7 @@ impl KovaView {
                 let tab_title = tab.title();
                 tabs_snap.push(SearchTabSnapshot { tab_id: tab.id, title: tab_title.clone() });
                 tab.for_each_pane(&mut |pane| {
-                    if let Some(id) = pane.claude_session_id() {
+                    if let Some(id) = pane.agent_session_id() {
                         live_sessions.push(id);
                     }
                     panes_snap.push(SearchPaneSnapshot {

@@ -772,7 +772,7 @@ impl Renderer {
         active_tab: usize,
         total_tabs: usize,
         active_tab_name: &str,
-        working_claudes: usize,
+        working_agents: usize,
         unread_panes: usize,
         minimized_counts: (usize, usize),
         show_help: bool,
@@ -957,7 +957,7 @@ impl Renderer {
         }
 
         // Draw global status bar
-        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, working_claudes, unread_panes, minimized_counts.0, minimized_counts.1, help_hint_remaining, keys_config);
+        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, working_agents, unread_panes, minimized_counts.0, minimized_counts.1, help_hint_remaining, keys_config);
 
         // Attention banner over the focused pane's status bar. Drawn in the
         // overlay pass rather than inside the pane's own vertices: those are
@@ -1712,7 +1712,7 @@ impl Renderer {
         active_tab: usize,
         total_tabs: usize,
         active_tab_name: &str,
-        working_claudes: usize,
+        working_agents: usize,
         unread_panes: usize,
         minimized_current: usize,
         minimized_total: usize,
@@ -1838,12 +1838,12 @@ impl Renderer {
 
             // Number of panes whose Claude Code is actively working (OSC-title
             // activity marker present). Hidden when none are busy.
-            if working_claudes > 0 {
-                let claude_str = format!("\u{2733}{}", working_claudes);
-                let claude_w = claude_str.chars().count() as f32 * cell_w;
-                left_edge = left_edge - claude_w - gap;
-                self.render_status_text(vertices, &claude_str, left_edge, bar_y, viewport_w, WORKING_FG, no_bg);
-                self.push_tooltip_zone(left_edge, bar_y, claude_w, cell_h, "Claude Code panes currently working");
+            if working_agents > 0 {
+                let agents_str = format!("\u{2733}{}", working_agents);
+                let agents_w = agents_str.chars().count() as f32 * cell_w;
+                left_edge = left_edge - agents_w - gap;
+                self.render_status_text(vertices, &agents_str, left_edge, bar_y, viewport_w, WORKING_FG, no_bg);
+                self.push_tooltip_zone(left_edge, bar_y, agents_w, cell_h, "Claude Code panes currently working");
             }
 
             // Panes carrying output nobody has looked at yet — a bell, or a

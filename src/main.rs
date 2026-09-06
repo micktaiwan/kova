@@ -1,6 +1,9 @@
 mod app;
+mod agent_session;
+mod bookmarks;
 mod claude_history;
 mod claude_session;
+mod codex_session;
 mod config;
 mod events;
 mod input;
