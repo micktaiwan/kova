@@ -126,6 +126,10 @@ pub struct KovaViewIvars {
     /// Transient status-bar message (text, remaining frames) — used for one-off
     /// hints like "no-op" feedback when an action can't apply in the current layout.
     transient_status: RefCell<Option<(String, u32)>>,
+    /// Keys of the saved bookmarks, so the status bar can tell a bookmarked
+    /// pane apart without reading `bookmarks.json` on every frame. Refreshed
+    /// when the list changes (Cmd+B) — the file is only written from here.
+    bookmark_keys: RefCell<std::collections::HashSet<String>>,
     /// Banner painted across the focused pane's status bar (text, colour,
     /// remaining frames): says which attention tier the last Cmd+J landed in.
     attention_banner: RefCell<Option<(String, [f32; 3], u32)>>,
@@ -1316,6 +1320,7 @@ impl KovaView {
             scroll_axis_lock: Cell::new(ScrollAxisLock::None),
             resize_feedback: Cell::new(None),
             transient_status: RefCell::new(None),
+            bookmark_keys: RefCell::new(crate::bookmarks::keys(&crate::bookmarks::load().items)),
             attention_banner: RefCell::new(None),
             deferred_tabs: RefCell::new(Vec::new()),
             loading_total_panes: Cell::new(0),
@@ -1724,6 +1729,7 @@ impl KovaView {
         let label = candidate.label.clone();
         let kept = crate::bookmarks::toggle(&mut bookmarks.items, candidate);
         crate::bookmarks::save(&bookmarks);
+        *self.ivars().bookmark_keys.borrow_mut() = crate::bookmarks::keys(&bookmarks.items);
         self.set_transient_status(&if kept {
             format!("Bookmarked {}", label)
         } else {

@@ -111,6 +111,12 @@ use crate::pane::PaneId;
 /// Violet: distinct from the bell (orange) and completion (green) dots.
 const MINIMIZED_FG: [f32; 4] = [0.75, 0.55, 0.95, 1.0];
 
+/// Status-bar background of a pane holding a bookmarked conversation. Deep
+/// enough to sit under the bar's usual palette (cwd grey, branch green, scroll
+/// amber) without washing it out, and to read as a state rather than an alarm —
+/// the bell and completion bars own the loud end of the range.
+const BOOKMARKED_BAR_BG: [f32; 3] = [0.05, 0.09, 0.24];
+
 /// Color of the "Claude Code is working" marker (status-bar ✳ counter and
 /// switcher ✳ icon). Green: something is happening, nothing is owed.
 const WORKING_FG: [f32; 4] = [0.6, 0.85, 0.6, 1.0];
@@ -397,6 +403,9 @@ pub struct PaneRenderData {
     /// Foreground binary running in the pane (`claude`, `nvim`…), shown in the
     /// status bar. `None` at a bare shell prompt.
     pub fg_process: Option<String>,
+    /// This pane's conversation is bookmarked: its status bar is painted blue,
+    /// so a saved conversation is recognisable without opening the switcher.
+    pub bookmarked: bool,
 }
 
 /// Cached vertex list for one pane, with the conditions it was built under.
@@ -710,7 +719,7 @@ impl Renderer {
                             let t = pane.terminal.read();
                             let show_blink = if pane.is_focused { blink_on } else { true };
                             let pin = pane.input_chars.load(std::sync::atomic::Ordering::Relaxed);
-                            self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin, pane.pane_id, pane.fg_process.as_deref())
+                            self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin, pane.pane_id, pane.fg_process.as_deref(), pane.bookmarked)
                         } else {
                             self.build_loading_vertices(vp)
                         };
@@ -1221,6 +1230,7 @@ impl Renderer {
         pane_input_chars: u64,
         pane_id: PaneId,
         fg_process: Option<&str>,
+        bookmarked: bool,
     ) -> Vec<Vertex> {
         // Pass 1: collect unknown chars/clusters for dynamic rasterization
         let display = term.visible_lines();
@@ -1506,7 +1516,7 @@ impl Renderer {
         // it out made every unfocused bar as bright as the focused one, and with
         // four splits nothing pointed at the pane that had the keyboard.
         if self.status_bar_enabled {
-            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention, pane_input_chars, pane_id, fg_process, text_fade);
+            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention, pane_input_chars, pane_id, fg_process, text_fade, bookmarked);
         }
 
         // Veil over an unfocused pane, status bar included.
@@ -1547,6 +1557,7 @@ impl Renderer {
         pane_id: PaneId,
         fg_process: Option<&str>,
         text_fade: f32,
+        bookmarked: bool,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
@@ -1556,7 +1567,13 @@ impl Renderer {
         // In `text` dim mode the veil never comes, so the bar of an unfocused
         // pane fades here — bar included, or the brightest thing on screen ends
         // up being a pane nobody is typing in.
-        let bar_bg = Self::fade_toward(attention.bar_bg(self.status_bar_bg), self.bg_color, text_fade);
+        // A bookmarked pane paints its whole bar very dark blue: the mark has to
+        // be readable at a glance across four splits, and a single glyph is not.
+        // Darker than the default bar, so the usual text colors keep their
+        // contrast — the bar changes hue, not its readability. Attention still
+        // wins: a bell or a finished run is news, a bookmark is a standing fact.
+        let base_bar_bg = if bookmarked { BOOKMARKED_BAR_BG } else { self.status_bar_bg };
+        let bar_bg = Self::fade_toward(attention.bar_bg(base_bar_bg), self.bg_color, text_fade);
         Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, bar_bg);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];

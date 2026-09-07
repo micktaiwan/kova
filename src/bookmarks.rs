@@ -40,7 +40,7 @@ pub struct Bookmark {
 impl Bookmark {
     /// What makes two bookmarks the same thing: the conversation id when there
     /// is one, the directory otherwise.
-    fn key(&self) -> &str {
+    pub fn key(&self) -> &str {
         self.session_id.as_deref().unwrap_or(&self.cwd)
     }
 
@@ -101,6 +101,13 @@ pub fn save(bookmarks: &Bookmarks) {
     }
 }
 
+/// The keys of every saved bookmark, for the per-frame "is this pane
+/// bookmarked?" test: the status bar asks it for every pane of every frame, so
+/// it reads a cached set instead of the file.
+pub fn keys(items: &[Bookmark]) -> std::collections::HashSet<String> {
+    items.iter().map(|b| b.key().to_string()).collect()
+}
+
 /// Whether `items` already holds this conversation.
 pub fn contains(items: &[Bookmark], candidate: &Bookmark) -> bool {
     items.iter().any(|b| b.key() == candidate.key())
@@ -146,6 +153,19 @@ mod tests {
         moved.label = "renamed".into();
         assert!(!toggle(&mut items, moved));
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn keys_mix_conversation_ids_and_shell_directories() {
+        let mut shell = claude("ignored", "/tmp/work");
+        shell.agent = None;
+        shell.session_id = None;
+        let set = keys(&[claude("abc", "/a"), shell]);
+        assert!(set.contains("abc"));
+        assert!(set.contains("/tmp/work"));
+        // The cwd of a bookmark that has a conversation id is not a key: two
+        // panes in the same directory are not the same bookmark.
+        assert!(!set.contains("/a"));
     }
 
     #[test]

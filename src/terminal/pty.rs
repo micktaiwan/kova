@@ -28,6 +28,10 @@ impl Clone for PtyEntry {
 
 /// Global cumulative I/O counters (persist across pane lifetimes).
 pub static GLOBAL_INPUT_CHARS: AtomicU64 = AtomicU64::new(0);
+
+/// How long `Pty::write` may spend pushing bytes into the PTY before dropping the tail.
+/// It runs on the main thread, so an unresponsive child must never block it for long.
+const WRITE_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 pub static GLOBAL_PRINTABLE_CHARS: AtomicU64 = AtomicU64::new(0);
 
 /// Global registry of live PTYs.
@@ -431,10 +435,61 @@ impl Pty {
         !self.is_dummy
     }
 
+    /// Write every byte, looping on short writes, without ever hanging the UI thread.
+    ///
+    /// A PTY master takes only what fits in the line discipline's input buffer — a few
+    /// kilobytes at most — and returns how much it took. A single `write` therefore drops
+    /// the tail of anything larger, silently, with no error: that is how a long message
+    /// pushed through the IPC `send-keys` path arrived truncated.
+    ///
+    /// Looping alone is not enough: the fd is blocking and this runs on the main thread
+    /// (key input, and IPC commands served from the tick loop), so a child that has
+    /// stopped reading its stdin would freeze the whole app. Every attempt therefore
+    /// waits for writability through `poll`, under a total budget: past it the tail is
+    /// dropped, loudly, which is what the old code did on the very first short write.
+    ///
+    /// Returns how many bytes actually reached the PTY.
+    fn write_bounded(&self, data: &[u8]) -> usize {
+        let raw_fd = self.master_fd.as_raw_fd();
+        let deadline = std::time::Instant::now() + WRITE_BUDGET;
+        let mut done = 0usize;
+        while done < data.len() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                log::warn!("PTY write timed out, dropped {} bytes", data.len() - done);
+                break;
+            }
+            let mut pfd = libc::pollfd { fd: raw_fd, events: libc::POLLOUT, revents: 0 };
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                log::warn!("PTY poll failed, dropped {} bytes", data.len() - done);
+                break;
+            }
+            if ready == 0 {
+                log::warn!("PTY write timed out, dropped {} bytes", data.len() - done);
+                break;
+            }
+            match rustix::io::write(&self.master_fd, &data[done..]) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(rustix::io::Errno::INTR) | Err(rustix::io::Errno::AGAIN) => continue,
+                Err(err) => {
+                    log::warn!("PTY write dropped {} bytes: {err}", data.len() - done);
+                    break;
+                }
+            }
+        }
+        done
+    }
+
     pub fn write(&self, data: &[u8]) {
-        let _ = rustix::io::write(&self.master_fd, data);
-        // Count UTF-8 characters (non-continuation bytes)
-        let n = data.iter().filter(|b| (*b & 0xC0) != 0x80).count() as u64;
+        let written = self.write_bounded(data);
+        // Count UTF-8 characters (non-continuation bytes) actually written
+        let n = data[..written].iter().filter(|b| (*b & 0xC0) != 0x80).count() as u64;
         self.input_chars.fetch_add(n, Ordering::Relaxed);
         GLOBAL_INPUT_CHARS.fetch_add(n, Ordering::Relaxed);
         let now_secs = std::time::SystemTime::now()

@@ -810,6 +810,8 @@ impl KovaView {
                 let focused_id = tab.focused_pane;
 
                 let mut pane_data: Vec<crate::renderer::PaneRenderData> = Vec::new();
+                // Cached set, not the file: this runs for every pane of every frame.
+                let bookmark_keys = ivars.bookmark_keys.borrow();
                 let cell_h = renderer.read().cell_size().1;
                 tab.cell_h.set(cell_h);
                 let tab_bar_h = (cell_h * 2.0).round();
@@ -845,6 +847,12 @@ impl KovaView {
                         // Name only: the status bar is the densest line in the app,
                         // and the version has room in the pane switcher instead.
                         fg_process: pane.fg_process().map(|p| p.name),
+                        // Same key a bookmark is stored under: the conversation
+                        // id when the pane runs an agent, its directory otherwise.
+                        bookmarked: match pane.agent_session.borrow().as_ref() {
+                            Some(session) => bookmark_keys.contains(&session.id),
+                            None => pane.cwd().is_some_and(|cwd| bookmark_keys.contains(&cwd)),
+                        },
                     });
                 });
 

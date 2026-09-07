@@ -245,6 +245,9 @@ impl KovaView {
         // Read once, up front: the same list marks the open panes below and
         // fills the Bookmarks section at the end.
         let saved = crate::bookmarks::load();
+        // Also the moment to refresh the cache the status bars read: another
+        // window may have bookmarked something since this one last did.
+        *self.ivars().bookmark_keys.borrow_mut() = crate::bookmarks::keys(&saved.items);
         let bookmarked_sessions: std::collections::HashSet<&str> = saved
             .items
             .iter()
