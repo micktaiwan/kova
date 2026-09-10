@@ -148,6 +148,14 @@ define_class!(
         fn did_resign_active(&self, _notification: &NSNotification) {
             self.ivars().app_active.set(false);
         }
+    }
+
+    impl AppDelegate {
+        /// Kova menu → Check for Updates…
+        #[unsafe(method(checkForUpdates:))]
+        fn check_for_updates(&self, _sender: &NSMenuItem) {
+            crate::update_check::check_now();
+        }
 
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _notification: &NSNotification) {
@@ -335,6 +343,12 @@ impl AppDelegate {
                             });
                         }
                     }
+
+                    // Daily release check: polled once a minute, first 5s after launch.
+                    if count % (fps as u64 * 60) == fps as u64 * 5 {
+                        crate::update_check::poll();
+                    }
+                    crate::update_check::show_pending(&ivars.windows.borrow());
 
                     if !dead_indices.is_empty() {
                         // Move dead windows to pending_close — they'll be deallocated
@@ -1365,6 +1379,18 @@ fn setup_menu(mtm: MainThreadMarker) {
     let menu_bar = NSMenu::new(mtm);
     let app_menu_item = NSMenuItem::new(mtm);
     let app_menu = NSMenu::new(mtm);
+
+    // No target: the action travels the responder chain up to AppDelegate.
+    let update_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc(),
+            &NSString::from_str("Check for Updates\u{2026}"),
+            Some(objc2::sel!(checkForUpdates:)),
+            &NSString::from_str(""),
+        )
+    };
+    app_menu.addItem(&update_item);
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     // Cmd+Q is handled in KovaView::performKeyEquivalent (close window, not app).
     // Menu item with empty key so it doesn't compete with performKeyEquivalent.

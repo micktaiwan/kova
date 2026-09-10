@@ -17,6 +17,7 @@ mod renderer;
 mod search_history;
 mod session;
 mod terminal;
+mod update_check;
 mod window;
 
 use objc2::{AnyThread, runtime::ProtocolObject};

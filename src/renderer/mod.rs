@@ -165,8 +165,10 @@ pub struct FilterRenderData {
     pub hint: Option<String>,
 }
 
-/// A single entry in the recent projects overlay.
+/// A single closed tab in the `Cmd+O` overlay.
 pub struct RecentProjectEntry {
+    /// Name the user gave the tab; `None` shows the path alone.
+    pub title: Option<String>,
     pub path: String,
     pub time_ago: String,
     pub pane_count: usize,
@@ -1801,7 +1803,7 @@ impl Renderer {
             if self.cached_shortcuts_hint.is_empty() {
                 if let Some(kc) = keys_config {
                     self.cached_shortcuts_hint = format!(
-                        "{} help   {} panes   {} search   {} recent",
+                        "{} help   {} panes   {} search   {} closed tabs",
                         format_key_combo(&kc.toggle_help),
                         format_key_combo(&kc.open_pane_switcher),
                         format_key_combo(&kc.open_search),
@@ -2399,7 +2401,7 @@ impl Renderer {
                     ("New Window", kc.new_window.as_str(), ""),
                     ("Close Window", kc.close_window.as_str(), ""),
                     ("Kill Window", kc.kill_window.as_str(), "force, no prompt"),
-                    ("Open Recent", kc.open_recent_project.as_str(), "recent projects"),
+                    ("Reopen Tab", kc.open_recent_project.as_str(), "closed tabs"),
                 ]),
                 ("SPLITS", vec![
                     ("Vertical Split", kc.vsplit.as_str(), "side by side"),
@@ -2840,7 +2842,7 @@ impl Renderer {
         let row_height = scaled_cell_h * 1.6;
 
         // Title centered
-        let title = "Open Recent Project";
+        let title = "Reopen Closed Tab";
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
         let mut y = cell_h * 3.0;
@@ -2869,7 +2871,7 @@ impl Renderer {
         let right_margin = viewport_w - scaled_cell_w * 3.0;
 
         if data.entries.is_empty() {
-            let msg = "No recent projects to open";
+            let msg = "No closed tabs to reopen";
             let msg_w = msg.chars().count() as f32 * scaled_cell_w;
             let msg_x = (viewport_w - msg_w) / 2.0;
             self.render_text(vertices, msg, msg_x, content_top + row_height, viewport_w, dim_fg, no_bg, body_scale);
@@ -2887,8 +2889,19 @@ impl Renderer {
 
             let fg = if entry.invalid { invalid_fg } else { label_fg };
 
-            // Path
-            self.render_text(vertices, &entry.path, left_margin, text_y, right_margin - scaled_cell_w * 12.0, fg, no_bg, body_scale);
+            // Tab name, then its directory dimmed; an unnamed tab shows the
+            // directory alone.
+            let text_max_x = right_margin - scaled_cell_w * 12.0;
+            match entry.title {
+                Some(ref title) => {
+                    self.render_text(vertices, title, left_margin, text_y, text_max_x, fg, no_bg, body_scale);
+                    let path_x = left_margin + (title.chars().count() as f32 + 3.0) * scaled_cell_w;
+                    self.render_text(vertices, &entry.path, path_x, text_y, text_max_x, dim_fg, no_bg, body_scale);
+                }
+                None => {
+                    self.render_text(vertices, &entry.path, left_margin, text_y, text_max_x, fg, no_bg, body_scale);
+                }
+            }
 
             // Pane count (if > 1)
             let info = if entry.pane_count > 1 {

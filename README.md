@@ -131,7 +131,7 @@ focus_border_color = [0.4, 0.6, 1.0]
 | Cmd+Shift+J | Pane switcher, unread panes only |
 | Cmd+J | Jump to the next unread pane |
 | Cmd+Shift+Option+Left/Right | Walk the panes you visited, back and forward |
-| Cmd+O | Open recent project |
+| Cmd+O | Reopen a closed tab |
 | Cmd+Shift+W | Close tab |
 | Cmd+Shift+C | Copy selection (raw) |
 | Cmd+C | Copy selection |

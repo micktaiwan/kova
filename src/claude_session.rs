@@ -159,11 +159,6 @@ pub fn session_for_shell(shell_pid: u32) -> Option<Session> {
     cache.as_ref().and_then(|(_, map)| map.get(&shell_pid).cloned())
 }
 
-/// The Claude Code session id running under `shell_pid`, if any.
-pub fn for_shell(shell_pid: u32) -> Option<String> {
-    session_for_shell(shell_pid).map(|s| s.id)
-}
-
 /// True if `id` is safe to splice into a command line.
 ///
 /// The id comes from a file Kova does not write — and, on restore, from a session

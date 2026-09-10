@@ -1,4 +1,4 @@
-//! The recent-projects overlay (`Cmd+O`): the saved sessions it lists, and what
+//! The closed-tabs overlay (`Cmd+O`): the tabs it lists, by name, and what
 //! reopening one restores.
 
 use super::*;
@@ -19,6 +19,7 @@ pub(super) struct RecentProjectsState {
 fn build_items(entries: Vec<crate::recent_projects::RecentProject>) -> Vec<RecentProjectItem> {
     entries.into_iter().map(|e| {
         let render = crate::renderer::RecentProjectEntry {
+            title: e.title().map(String::from),
             path: crate::recent_projects::tildify(&e.path),
             time_ago: crate::recent_projects::time_ago(e.last_opened),
             pane_count: crate::recent_projects::pane_count_tab(&e.tab),
@@ -32,32 +33,28 @@ impl KovaView {
     /// Open the recent projects overlay.
     pub(super) fn do_open_recent_projects(&self) {
         use std::collections::HashSet;
-        // Collect CWDs of ALL panes across ALL windows to filter them out.
-        // Use NSApplication::windows() to avoid borrowing the app delegate's
-        // window list (which may be borrowed by the timer tick).
-        let open_cwds: HashSet<String> = {
+        // Keys of the tabs open in ALL windows: a closed tab that is open again
+        // is not offered. Use NSApplication::windows() to avoid borrowing the
+        // app delegate's window list (which may be borrowed by the timer tick).
+        let open_keys: HashSet<String> = {
             let mtm = unsafe { MainThreadMarker::new_unchecked() };
             let app = NSApplication::sharedApplication(mtm);
             let ns_windows = app.windows();
-            let mut cwds = HashSet::new();
+            let mut keys = HashSet::new();
             for i in 0..ns_windows.count() {
                 let win = &ns_windows.objectAtIndex(i);
                 if let Some(view) = crate::app::kova_view(win) {
                     let tabs = view.ivars().tabs.borrow();
                     for tab in tabs.iter() {
-                        tab.for_each_pane(&mut |pane| {
-                            if let Some(cwd) = pane.cwd() {
-                                cwds.insert(cwd);
-                            }
-                        });
+                        keys.insert(crate::recent_projects::tab_key(tab));
                     }
                 }
             }
-            cwds
+            keys
         };
         let all = crate::recent_projects::load();
-        let entries: Vec<_> = all.projects.into_iter()
-            .filter(|p| !open_cwds.contains(&p.path))
+        let entries: Vec<_> = crate::recent_projects::dedup(all.projects).into_iter()
+            .filter(|p| !open_keys.contains(&p.key()))
             .collect();
 
         *self.ivars().recent_projects.borrow_mut() = Some(RecentProjectsState {
@@ -99,7 +96,7 @@ impl KovaView {
         if keycode == 0x33 {
             let has_cmd = event.modifierFlags().contains(NSEventModifierFlags::Command);
             if has_cmd {
-                let path = {
+                let key = {
                     let mut guard = self.ivars().recent_projects.borrow_mut();
                     let state = match guard.as_mut() {
                         Some(s) => s,
@@ -108,16 +105,16 @@ impl KovaView {
                     if state.selected >= state.items.len() {
                         return;
                     }
-                    let path = state.items[state.selected].entry.path.clone();
+                    let key = state.items[state.selected].entry.key();
                     state.items.remove(state.selected);
                     if state.items.is_empty() {
                         *guard = None;
                     } else if state.selected >= state.items.len() {
                         state.selected = state.items.len() - 1;
                     }
-                    path
+                    key
                 };
-                crate::recent_projects::remove(&path);
+                crate::recent_projects::remove(&key);
                 self.mark_dirty();
                 return;
             }

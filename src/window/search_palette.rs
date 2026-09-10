@@ -456,12 +456,16 @@ impl KovaView {
             return;
         }
 
-        // 2. The project is in the recents: put its tab back, then add the pane
+        // 2. A closed tab worked in this project: put it back, then add the pane
         //    — unless the restored tab already brought this very session back.
-        let recent = crate::recent_projects::load()
-            .projects
-            .into_iter()
-            .find(|p| p.path == cwd);
+        //    A tab focused on this directory first, else the latest tab with any
+        //    pane in it: closed tabs are keyed by name, not by directory.
+        let projects = crate::recent_projects::load().projects;
+        let recent = projects
+            .iter()
+            .find(|p| p.path == cwd)
+            .or_else(|| projects.iter().find(|p| p.has_cwd(cwd)))
+            .cloned();
         if let Some(entry) = recent {
             self.restore_recent_project(&entry);
             let already_there = {
