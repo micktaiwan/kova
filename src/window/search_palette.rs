@@ -459,8 +459,15 @@ impl KovaView {
         // 2. A closed tab worked in this project: put it back, then add the pane
         //    — unless the restored tab already brought this very session back.
         //    A tab focused on this directory first, else the latest tab with any
-        //    pane in it: closed tabs are keyed by name, not by directory.
-        let projects = crate::recent_projects::load().projects;
+        //    pane in it: closed tabs are keyed by name, not by directory. A
+        //    closed tab whose name is open again is skipped — restoring it would
+        //    give two tabs of the same name.
+        let open_keys = super::recent_projects_overlay::open_tab_keys();
+        let projects: Vec<_> = crate::recent_projects::load()
+            .projects
+            .into_iter()
+            .filter(|p| !open_keys.contains(&p.key()))
+            .collect();
         let recent = projects
             .iter()
             .find(|p| p.path == cwd)

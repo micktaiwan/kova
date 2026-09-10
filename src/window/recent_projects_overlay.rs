@@ -20,6 +20,7 @@ fn build_items(entries: Vec<crate::recent_projects::RecentProject>) -> Vec<Recen
     entries.into_iter().map(|e| {
         let render = crate::renderer::RecentProjectEntry {
             title: e.title().map(String::from),
+            color: e.tab.color,
             path: crate::recent_projects::tildify(&e.path),
             time_ago: crate::recent_projects::time_ago(e.last_opened),
             pane_count: crate::recent_projects::pane_count_tab(&e.tab),
@@ -29,29 +30,31 @@ fn build_items(entries: Vec<crate::recent_projects::RecentProject>) -> Vec<Recen
     }).collect()
 }
 
-impl KovaView {
-    /// Open the recent projects overlay.
-    pub(super) fn do_open_recent_projects(&self) {
-        use std::collections::HashSet;
-        // Keys of the tabs open in ALL windows: a closed tab that is open again
-        // is not offered. Use NSApplication::windows() to avoid borrowing the
-        // app delegate's window list (which may be borrowed by the timer tick).
-        let open_keys: HashSet<String> = {
-            let mtm = unsafe { MainThreadMarker::new_unchecked() };
-            let app = NSApplication::sharedApplication(mtm);
-            let ns_windows = app.windows();
-            let mut keys = HashSet::new();
-            for i in 0..ns_windows.count() {
-                let win = &ns_windows.objectAtIndex(i);
-                if let Some(view) = crate::app::kova_view(win) {
-                    let tabs = view.ivars().tabs.borrow();
-                    for tab in tabs.iter() {
-                        keys.insert(crate::recent_projects::tab_key(tab));
-                    }
-                }
+/// Keys of the tabs open in ALL windows: a closed tab whose key is here is open
+/// again, and must not be restored a second time. Uses NSApplication::windows()
+/// to avoid borrowing the app delegate's window list (which may be borrowed by
+/// the timer tick).
+pub(super) fn open_tab_keys() -> std::collections::HashSet<String> {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let ns_windows = app.windows();
+    let mut keys = std::collections::HashSet::new();
+    for i in 0..ns_windows.count() {
+        let win = &ns_windows.objectAtIndex(i);
+        if let Some(view) = crate::app::kova_view(win) {
+            let tabs = view.ivars().tabs.borrow();
+            for tab in tabs.iter() {
+                keys.insert(crate::recent_projects::tab_key(tab));
             }
-            keys
-        };
+        }
+    }
+    keys
+}
+
+impl KovaView {
+    /// Open the closed-tabs overlay, minus the tabs that are open again.
+    pub(super) fn do_open_recent_projects(&self) {
+        let open_keys = open_tab_keys();
         let all = crate::recent_projects::load();
         let entries: Vec<_> = crate::recent_projects::dedup(all.projects).into_iter()
             .filter(|p| !open_keys.contains(&p.key()))

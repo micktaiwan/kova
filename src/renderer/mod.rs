@@ -169,6 +169,8 @@ pub struct FilterRenderData {
 pub struct RecentProjectEntry {
     /// Name the user gave the tab; `None` shows the path alone.
     pub title: Option<String>,
+    /// Index into `TAB_COLORS` the tab had; painted as the row background.
+    pub color: Option<usize>,
     pub path: String,
     pub time_ago: String,
     pub pane_count: usize,
@@ -2882,12 +2884,40 @@ impl Renderer {
             let row_y = content_top + (i - scroll) as f32 * row_height;
             let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
 
-            // Selected row background
-            if i == data.selected {
-                Self::push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+            // Row background: the tab's own color, dimmed like an inactive tab
+            // in the bar and at full hue when selected — the same contrast rule
+            // as the tab bar. An uncolored row only gets the selection color.
+            let is_selected = i == data.selected;
+            let row_x = left_margin - scaled_cell_w;
+            let row_w = right_margin - left_margin + scaled_cell_w * 2.0;
+            let tab_color = entry.color.map(|idx| TAB_COLORS[idx % TAB_COLORS.len()]);
+            match tab_color {
+                Some(c) => {
+                    let bg = if is_selected { c } else { dim_inactive_tab(c) };
+                    Self::push_bg_quad(vertices, row_x, row_y, row_w, row_height, bg);
+                }
+                None if is_selected => {
+                    Self::push_bg_quad_alpha(vertices, row_x, row_y, row_w, row_height, selected_bg, 0.8);
+                }
+                None => {}
+            }
+            // Selection marker: on a colored list the background alone does not
+            // say which row is picked (a dimmed blue reads like the selection).
+            if is_selected {
+                Self::push_bg_quad(vertices, row_x, row_y, scaled_cell_w * 0.3, row_height, [1.0, 1.0, 1.0]);
             }
 
-            let fg = if entry.invalid { invalid_fg } else { label_fg };
+            // Text on a colored row follows the tab bar: white when selected,
+            // dimmed by the background's brightness otherwise.
+            let (fg, dim_fg, time_fg) = match (tab_color, entry.invalid) {
+                (_, true) => (invalid_fg, dim_fg, time_fg),
+                (Some(_), false) => {
+                    let v = if is_selected { 1.0 } else { DIM_BRIGHTNESS };
+                    let sub = [v * 0.8, v * 0.8, v * 0.8, 1.0];
+                    ([v, v, v, 1.0], sub, sub)
+                }
+                (None, false) => (label_fg, dim_fg, time_fg),
+            };
 
             // Tab name, then its directory dimmed; an unnamed tab shows the
             // directory alone.
