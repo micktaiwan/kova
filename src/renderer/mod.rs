@@ -2399,6 +2399,7 @@ impl Renderer {
                     ("Close Tab", kc.close_tab.as_str(), "whole tab at once"),
                     ("Previous Tab", kc.prev_tab.as_str(), ""),
                     ("Next Tab", kc.next_tab.as_str(), ""),
+                    ("Jump to Tab", "cmd+1-9", ""),
                     ("Rename Tab", kc.rename_tab.as_str(), ""),
                     ("New Window", kc.new_window.as_str(), ""),
                     ("Close Window", kc.close_window.as_str(), ""),
@@ -2420,17 +2421,22 @@ impl Renderer {
                     ("Swap Pane", kc.swap_up.as_str(), "trade two panes"),
                     ("Reparent Pane", kc.reparent_up.as_str(), "move across the split tree"),
                 ]),
+                ("MISC", vec![
+                    ("Memory Report", "cmd+shift+i", ""),
+                    ("Help", kc.toggle_help.as_str(), "this screen"),
+                ]),
             ];
             let right: Vec<Section> = vec![
                 ("PANES", vec![
                     ("Navigate", kc.navigate_up.as_str(), "move focus"),
                     ("Resize Pane", kc.resize_up.as_str(), "adjust split ratio"),
                     ("Edge Grow", kc.edge_grow_right.as_str(), "grow one edge"),
+                    ("Virtual Width", "ctrl+option+right", "widen / narrow the tab"),
                     ("Minimize Pane", kc.minimize_pane.as_str(), ""),
                     ("Restore Minimized", kc.restore_minimized.as_str(), ""),
                     ("Rename Pane", kc.rename_pane.as_str(), "sticky title"),
                     ("Repaint Pane", kc.repaint_pane.as_str(), "redraw / fix winsize"),
-                    ("Next Waiting", kc.next_attention.as_str(), "waiting pane, else unread"),
+                    ("Next Unread", kc.next_attention.as_str(), "unread, else idle agent session"),
                     ("Back / Forward", kc.history_back.as_str(), "panes you visited"),
                 ]),
                 ("EDIT & SEARCH", vec![
@@ -2443,9 +2449,13 @@ impl Renderer {
                     ("Bookmark Pane", kc.toggle_bookmark.as_str(), "keep this conversation"),
                     ("Unread Panes", kc.open_unread_switcher.as_str(), "switcher, attention only"),
                 ]),
-                ("MISC", vec![
-                    ("Memory Report", "cmd+shift+i", ""),
-                    ("Help", kc.toggle_help.as_str(), "this screen"),
+                ("TERMINAL", vec![
+                    ("Line Start / End", kc.terminal.home.as_str(), "\u{2190} / \u{2192}"),
+                    ("Word Jump", kc.terminal.word_back.as_str(), "\u{2190} / \u{2192}"),
+                    ("Kill Line", kc.terminal.kill_line.as_str(), ""),
+                    ("Newline", kc.terminal.shift_enter.as_str(), "without running"),
+                    ("Clear Scrollback", "ctrl+l", "passed to the app too"),
+                    ("Open URL", "cmd+click", ""),
                 ]),
             ];
             let build = |sections: Vec<Section>| -> Vec<HelpRow> {
@@ -2483,7 +2493,15 @@ impl Renderer {
         let label_off = ocw * 2.0;
         let key_off = label_off + (max_label as f32 + 1.0) * ocw;
         let desc_off = key_off + (max_key as f32 + 2.0) * ocw;
-        let row_h = och * 1.4;
+        // Tighten the spacing when the tallest column would run past the
+        // status bar, so a short window still shows every row.
+        let avail = viewport_h - base_ch - y;
+        let scale = columns.iter().map(|col| {
+            let headers = col.iter().filter(|r| matches!(r, HelpRow::Header(_))).count();
+            help_row_scale(headers, col.len() - headers, avail, och)
+        }).fold(1.0_f32, f32::min);
+        let row_h = och * HELP_ROW_STEP * scale;
+        let header_gap = och * HELP_HEADER_GAP * scale;
 
         for (ci, col) in columns.iter().enumerate() {
             let base_x = ci as f32 * col_width;
@@ -2494,7 +2512,7 @@ impl Renderer {
                 }
                 match row {
                     HelpRow::Header(h) => {
-                        row_y += och * 0.5; // breathing room above each section
+                        row_y += header_gap; // breathing room above each section
                         self.render_overlay_text(vertices, h, base_x + label_off, row_y, base_x + col_width - ocw, title_fg, no_bg, 1.0);
                         row_y += row_h;
                     }
@@ -2654,7 +2672,7 @@ impl Renderer {
         let subtitle = if data.filtered {
             "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{23ce} Focus  click to focus  u All panes  esc Cancel"
         } else {
-            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next unread  \u{23ce} Focus  \u{2318}\u{2191}\u{2193} Move  u Unread only  esc Cancel"
+            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next unread  \u{23ce} Focus  \u{2318}\u{2191}\u{2193} Move  \u{2318}\u{232b} Remove bookmark  u Unread only  esc Cancel"
         };
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
@@ -3255,6 +3273,29 @@ enum HelpRow {
     Item { label: String, key: String, desc: String },
 }
 
+/// Help overlay spacing, in overlay cell heights: the step from one row to the
+/// next, and the extra gap above each section header.
+const HELP_ROW_STEP: f32 = 1.4;
+const HELP_HEADER_GAP: f32 = 0.5;
+
+/// Factor applied to the help overlay spacing so a column of `headers` +
+/// `items` rows fits in `avail` pixels: 1.0 when it already fits, less when it
+/// would run past the status bar, never so tight that rows touch — past that
+/// point the overflow is still cut.
+fn help_row_scale(headers: usize, items: usize, avail: f32, och: f32) -> f32 {
+    let rows = headers + items;
+    if rows < 2 {
+        return 1.0;
+    }
+    // From the first row's top to the last row's bottom: a gap per header,
+    // a step per row but the last, and the last row's own height.
+    let spacing = headers as f32 * HELP_HEADER_GAP + (rows - 1) as f32 * HELP_ROW_STEP;
+    // One pixel of slack keeps f32 rounding from cutting the last row at an
+    // exact fit.
+    let scale = (avail - och - 1.0) / (spacing * och);
+    scale.clamp(1.0 / HELP_ROW_STEP, 1.0)
+}
+
 /// Format a key combo string like "cmd+shift+d" into "⌘⇧D" for display.
 /// Like `format_key_combo` but replaces a trailing arrow direction with "Arrows".
 fn format_key_combo_arrows(s: &str) -> String {
@@ -3320,6 +3361,34 @@ fn format_key_combo(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bottom of the last row of a help column laid out at `scale`, walking
+    /// the rows the way `build_help_overlay_vertices` does.
+    fn help_column_bottom(headers: usize, items: usize, och: f32, scale: f32) -> f32 {
+        let rows = headers + items;
+        headers as f32 * HELP_HEADER_GAP * och * scale
+            + (rows - 1) as f32 * HELP_ROW_STEP * och * scale
+            + och
+    }
+
+    #[test]
+    fn help_spacing_is_untouched_when_the_column_fits() {
+        assert_eq!(help_row_scale(4, 24, 5000.0, 40.0), 1.0);
+    }
+
+    #[test]
+    fn help_spacing_tightens_until_the_column_fits() {
+        let (headers, items, och, avail) = (4, 24, 40.0, 1500.0);
+        let scale = help_row_scale(headers, items, avail, och);
+        assert!(scale < 1.0);
+        assert!(help_column_bottom(headers, items, och, scale) <= avail);
+    }
+
+    #[test]
+    fn help_rows_never_overlap_however_short_the_window() {
+        let scale = help_row_scale(4, 24, 200.0, 40.0);
+        assert!(HELP_ROW_STEP * scale >= 1.0 - f32::EPSILON);
+    }
 
     #[test]
     fn text_dim_fades_toward_the_background_and_never_past_it() {

@@ -201,6 +201,30 @@ pub(super) fn bookmark_rows(
     rows
 }
 
+/// Where the selection lands once the bookmark at `removed` (its index in the
+/// saved list) is gone and the list rebuilt: on the row that took its place,
+/// else the last bookmark row, so a run of Cmd+Backspace walks down the section.
+/// `None` when no bookmark row is left — the caller keeps the default selection.
+pub(super) fn bookmark_row_after_removal(
+    columns: &[Vec<SwitcherRow>],
+    removed: usize,
+) -> Option<(usize, usize)> {
+    let rows: Vec<(usize, usize, usize)> = columns
+        .iter()
+        .enumerate()
+        .flat_map(|(c, col)| {
+            col.iter().enumerate().filter_map(move |(r, row)| match row {
+                SwitcherRow::Bookmark { index, .. } => Some((c, r, *index)),
+                _ => None,
+            })
+        })
+        .collect();
+    rows.iter()
+        .find(|&&(_, _, i)| i >= removed)
+        .or(rows.last())
+        .map(|&(c, r, _)| (c, r))
+}
+
 impl KovaView {
     /// The pane of this window still running a bookmarked conversation, if one
     /// does — jumping to it beats opening a second pane on the same session.
@@ -229,6 +253,53 @@ impl KovaView {
             return;
         }
         self.open_conversation_in_project(bm.resume_command(), &bm.cwd);
+    }
+
+    /// Cmd+Backspace on a bookmark row: drop it from the saved list once an
+    /// alert naming it is confirmed. The list is rebuilt in place, so several
+    /// dead bookmarks can go in a row without reopening Cmd+P.
+    fn pane_switcher_remove_selected_bookmark(&self) {
+        let index = {
+            let guard = self.ivars().pane_switcher.borrow();
+            match guard
+                .as_ref()
+                .and_then(|s| s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row)))
+            {
+                Some(SwitcherRow::Bookmark { index, .. }) => *index,
+                _ => return,
+            }
+        };
+        let Some(bm) = crate::bookmarks::load().items.get(index).cloned() else { return };
+        // No borrow is held past this point: the alert pumps events.
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let informative = format!(
+            "\u{ab}{}\u{bb} will no longer appear in Cmd+P. The conversation itself is not deleted.",
+            bm.label
+        );
+        if !confirm_action(mtm, "Remove this bookmark?", &informative, "Remove") {
+            return;
+        }
+        // Read the file again rather than reuse the copy from before the alert:
+        // another window may have changed the list meanwhile, which is also why
+        // the bookmark is found by its key and not by its old index.
+        let mut saved = crate::bookmarks::load();
+        crate::bookmarks::remove(&mut saved.items, bm.key());
+        crate::bookmarks::save(&saved);
+        *self.ivars().bookmark_keys.borrow_mut() = crate::bookmarks::keys(&saved.items);
+        self.set_transient_status(&format!("Removed bookmark {}", bm.label));
+
+        if self.ivars().pane_switcher.borrow().is_none() {
+            return;
+        }
+        self.open_pane_switcher(false);
+        if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
+            if let Some((c, r)) = bookmark_row_after_removal(&state.columns, index) {
+                state.selected_col = c;
+                state.selected_row = r;
+            }
+        }
+        self.pane_switcher_clamp_scroll();
+        self.mark_dirty();
     }
 
     /// Open the tab/pane switcher overlay: every tab with its panes, click or
@@ -442,6 +513,13 @@ impl KovaView {
             && (keycode == 0x7E || keycode == 0x7D)
         {
             self.pane_switcher_move_selected(keycode == 0x7D);
+            return;
+        }
+
+        // Cmd+Backspace on a bookmark row → remove it, after confirmation. Same
+        // key as the closed-tabs list (Cmd+O). Pane rows ignore it.
+        if keycode == 0x33 && event.modifierFlags().contains(NSEventModifierFlags::Command) {
+            self.pane_switcher_remove_selected_bookmark();
             return;
         }
 
@@ -737,6 +815,22 @@ mod tests {
             SwitcherRow::Bookmark { index, .. } => assert_eq!(*index, 1),
             _ => panic!("expected a bookmark row"),
         }
+    }
+
+    #[test]
+    fn after_a_removal_the_selection_takes_the_next_bookmark_then_the_last() {
+        let bookmark = |index: usize| SwitcherRow::Bookmark { index, title: "b".into(), detail: None };
+        // Saved list after removing index 1: what was 2 and 3 are now 1 and 2,
+        // and the bookmark at 0 is open in a pane, so it has no row.
+        let columns = vec![
+            switcher_grid(&["h."]).remove(0),
+            vec![SwitcherRow::TabHeader("Bookmarks".into()), bookmark(1), bookmark(2)],
+        ];
+        assert_eq!(bookmark_row_after_removal(&columns, 1), Some((1, 1)));
+        // The last one removed: fall back on the row above it.
+        assert_eq!(bookmark_row_after_removal(&columns, 3), Some((1, 2)));
+        // No bookmark left: the caller keeps its own selection.
+        assert_eq!(bookmark_row_after_removal(&switcher_grid(&["h."]), 0), None);
     }
 
     #[test]

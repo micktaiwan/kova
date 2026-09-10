@@ -108,25 +108,29 @@ pub fn keys(items: &[Bookmark]) -> std::collections::HashSet<String> {
     items.iter().map(|b| b.key().to_string()).collect()
 }
 
-/// Whether `items` already holds this conversation.
-pub fn contains(items: &[Bookmark], candidate: &Bookmark) -> bool {
-    items.iter().any(|b| b.key() == candidate.key())
-}
-
 /// Add `candidate`, or drop it if it is already there. Returns true when the
 /// list ends up holding it — what the caller says out loud.
 ///
 /// A new bookmark goes on top: the list is read top-down and the freshest
 /// decision is the one most likely to be wanted again.
 pub fn toggle(items: &mut Vec<Bookmark>, candidate: Bookmark) -> bool {
-    if contains(items, &candidate) {
-        let key = candidate.key().to_string();
-        items.retain(|b| b.key() != key);
+    if remove(items, candidate.key()) {
         return false;
     }
     items.insert(0, candidate);
     items.truncate(MAX_BOOKMARKS);
     true
+}
+
+/// Drop the bookmark with this key. Returns true when there was one.
+///
+/// Cmd+B can only drop the conversation running in the focused pane; this is
+/// what the switcher uses to drop one that no pane holds any more — including
+/// a conversation whose transcript the agent has since deleted.
+pub fn remove(items: &mut Vec<Bookmark>, key: &str) -> bool {
+    let before = items.len();
+    items.retain(|b| b.key() != key);
+    items.len() != before
 }
 
 #[cfg(test)]
@@ -177,7 +181,7 @@ mod tests {
             label: "a".into(),
         };
         let mut items = vec![shell.clone()];
-        assert!(contains(&items, &shell));
+        assert!(keys(&items).contains(shell.key()));
         // A conversation that happens to run in the same directory is a
         // different thing, and does not collide with it.
         assert!(toggle(&mut items, claude("abc", "/a")));
@@ -203,6 +207,17 @@ mod tests {
             codex.resume_command().as_deref(),
             Some("codex resume 01a07651-015e-78a3-97f2-2eaf0f0cd663")
         );
+    }
+
+    #[test]
+    fn removing_by_key_drops_only_that_bookmark() {
+        let mut items = vec![claude("a", "/a"), claude("b", "/b")];
+        assert!(remove(&mut items, "a"));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].session_id.as_deref(), Some("b"));
+        // A key that is not there changes nothing, and says so.
+        assert!(!remove(&mut items, "a"));
+        assert_eq!(items.len(), 1);
     }
 
     #[test]

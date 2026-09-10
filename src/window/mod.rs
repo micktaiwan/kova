@@ -2314,14 +2314,21 @@ pub fn confirm_running_processes(mtm: MainThreadMarker, procs: &[(String, String
     if procs.is_empty() {
         return true;
     }
-    let alert = NSAlert::new(mtm);
-    alert.setAlertStyle(NSAlertStyle::Warning);
-    alert.setMessageText(&NSString::from_str(message));
     let mut lines = String::from("The following processes are running:");
     for (tab, name) in procs {
         lines.push_str(&format!("\n\u{2022} Tab \u{ab}{}\u{bb}: {}", tab, name));
     }
-    alert.setInformativeText(&NSString::from_str(&lines));
+    confirm_action(mtm, message, &lines, confirm_button)
+}
+
+/// Ask a yes/no question in a warning alert. Returns `true` if the user picked
+/// `confirm_button`. The caller must hold no `RefCell` borrow on the view:
+/// `runModal` spins a run loop that dispatches events, which borrow again.
+pub fn confirm_action(mtm: MainThreadMarker, message: &str, informative: &str, confirm_button: &str) -> bool {
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Warning);
+    alert.setMessageText(&NSString::from_str(message));
+    alert.setInformativeText(&NSString::from_str(informative));
     alert.addButtonWithTitle(&NSString::from_str(confirm_button));
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
     alert.runModal() == 1000 // NSAlertFirstButtonReturn

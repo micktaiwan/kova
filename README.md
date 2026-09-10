@@ -39,7 +39,8 @@ Kova tracks which panes have something you have not seen — a bell, or a comman
 
 - Cmd+J jumps to the next unread pane, across tabs and windows, and falls back to an idle Claude Code session when nothing is unread. A banner names the tier it landed in.
 - Cmd+P opens the tab/pane switcher: every tab with its panes, arrows or click to pick, Enter to focus. `u` flips it to the panes asking for something; Cmd+Shift+J opens that filtered list directly.
-- Inside the switcher, Cmd+Up/Down moves the selected pane up or down its tab's order.
+- Inside the switcher, Cmd+Up/Down moves the selected pane up or down its tab's order, and Cmd+Backspace on a bookmark row removes that bookmark after a confirmation.
+- Cmd+B bookmarks the conversation in the focused pane (press again to drop it); bookmarks no pane holds are listed in Cmd+P.
 - The status bar counts working Claude sessions (`✳N`) and unread panes (`●N`).
 - Cmd+Shift+Option+Left/Right walks the panes you visited, back then forward.
 - Desktop notifications are posted by Kova itself, so clicking one focuses the pane it came from.
@@ -119,6 +120,8 @@ focus_border_color = [0.4, 0.6, 1.0]
 | Cmd+Shift+T | Detach tab to new window |
 | Cmd+Ctrl+T | Break pane out to new tab |
 | Cmd+Ctrl+M | Merge tab into another tab (as split) |
+| Cmd+Ctrl+Shift+M | Merge this window into another window |
+| Ctrl+Option+Left/Right | Narrow/widen the tab's virtual width |
 | Cmd+N | New window |
 | Cmd+M | Minimize pane |
 | Cmd+Option+M | Restore last minimized pane |
@@ -129,6 +132,7 @@ focus_border_color = [0.4, 0.6, 1.0]
 | Cmd+Shift+F | Global search (all tabs and panes, plus closed Claude sessions) |
 | Cmd+P | Tab/pane switcher |
 | Cmd+Shift+J | Pane switcher, unread panes only |
+| Cmd+B | Bookmark the focused pane's conversation (toggle) |
 | Cmd+J | Jump to the next unread pane |
 | Cmd+Shift+Option+Left/Right | Walk the panes you visited, back and forward |
 | Cmd+O | Reopen a closed tab |
