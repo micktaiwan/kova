@@ -40,7 +40,7 @@ Kova tracks which panes have something you have not seen — a bell, or a comman
 - Cmd+J jumps to the next unread pane, across tabs and windows, and falls back to an idle Claude Code session when nothing is unread. A banner names the tier it landed in.
 - Cmd+P opens the tab/pane switcher: every tab with its panes, arrows or click to pick, Enter to focus. `u` flips it to the panes asking for something; Cmd+Shift+J opens that filtered list directly.
 - Inside the switcher, Cmd+Up/Down moves the selected pane up or down its tab's order, and Cmd+Backspace on a bookmark row removes that bookmark after a confirmation.
-- Cmd+B bookmarks the conversation in the focused pane (press again to drop it); bookmarks no pane holds are listed in Cmd+P.
+- Cmd+B bookmarks the conversation in the focused pane (press again to drop it); bookmarks no pane holds are listed in Cmd+P, and picking one reopens the conversation and runs its resume line.
 - The status bar counts working Claude sessions (`✳N`) and unread panes (`●N`).
 - Cmd+Shift+Option+Left/Right walks the panes you visited, back then forward.
 - Desktop notifications are posted by Kova itself, so clicking one focuses the pane it came from.

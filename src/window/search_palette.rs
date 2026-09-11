@@ -19,7 +19,7 @@ pub(super) enum SearchTarget {
         pane_id: Option<PaneId>,
     },
     /// A closed Claude Code session. Opening it means a new pane in the
-    /// session's own project directory, with its `--resume` line pre-typed.
+    /// session's own project directory, running its `--resume` line.
     Archived { session_id: String, cwd: String },
     /// A query searched earlier in this run of Kova. Opening it does not jump
     /// anywhere: it retypes the query into the input and searches again.
@@ -308,7 +308,8 @@ fn run_search_worker(
 }
 
 /// Find a tab whose panes sit in `cwd`, bring it to the front and spawn a pane
-/// in it carrying `command`. Returns false when no window holds such a tab.
+/// in it running `command` once the shell is up. Returns false when no window
+/// holds such a tab.
 ///
 /// A pane's cwd is read live from its shell, so this follows the directory the
 /// user is actually in rather than the one the tab was born with.
@@ -357,6 +358,7 @@ fn open_pane_in_tab_for_cwd(cwd: &str, config: &crate::config::Config, command: 
             command.map(str::to_string),
         );
         if let Some(pane_id) = spawned {
+            view.run_pending_command_in(pane_id);
             // The tab may have been off-screen: pulse the new pane so the eye
             // finds where the session came back.
             view.set_pane_flash(pane_id, 30, None);
@@ -414,7 +416,8 @@ impl KovaView {
     ///   1. a tab already open on that directory → a new pane next to it;
     ///   2. else the project is in the recents → its saved tab comes back first;
     ///   3. else a new tab on that directory.
-    /// The `--resume` line is pre-typed, not run, exactly like a restored pane.
+    /// The `--resume` line is typed and run: picking the hit already said which
+    /// conversation to bring back.
     fn open_archived_claude_session(&self, session_id: &str, cwd: &str) {
         // Reopening one conversation out of hundreds is a vote for it, and the
         // only one the user never has to think about casting.
@@ -432,8 +435,9 @@ impl KovaView {
     }
 
     /// Put a conversation back in front of the user, in the project it belongs
-    /// to. `command` is the agent's resume line, pre-typed and not run, exactly
-    /// like a restored pane; `None` just opens a shell in `cwd`.
+    /// to. `command` is the agent's resume line, typed and run once the shell is
+    /// up — unlike a restored pane, where it waits for Enter; `None` just opens
+    /// a shell in `cwd`.
     ///
     /// Shared by the search palette (a closed session found by its text) and the
     /// bookmark list (a session the user asked to keep).
@@ -478,24 +482,37 @@ impl KovaView {
             let already_there = {
                 let tabs = self.ivars().tabs.borrow();
                 let idx = self.ivars().active_tab.get();
-                let mut found = false;
+                let mut found = None;
                 if let Some(tab) = tabs.get(idx) {
                     tab.for_each_pane(&mut |pane| {
                         if pane.last_command().as_deref() == Some(command.as_str()) {
-                            found = true;
+                            found = Some(pane.id);
                         }
                     });
                 }
                 found
             };
-            if !already_there {
-                self.ipc_split(config, SplitDirection::Horizontal, cwd_opt, Some(command));
+            let pane_id = already_there
+                .or_else(|| self.ipc_split(config, SplitDirection::Horizontal, cwd_opt, Some(command)));
+            if let Some(id) = pane_id {
+                self.run_pending_command_in(id);
             }
             return;
         }
 
         // 3. Nothing to attach to.
-        self.ipc_new_tab(config, cwd_opt, Some(command));
+        if let Some((_, pane_id)) = self.ipc_new_tab(config, cwd_opt, Some(command)) {
+            self.run_pending_command_in(pane_id);
+        }
+    }
+
+    /// Have the pane `pane_id` of this window run its pending command once its
+    /// shell is up, instead of leaving it typed at the prompt.
+    fn run_pending_command_in(&self, pane_id: PaneId) {
+        let tabs = self.ivars().tabs.borrow();
+        if let Some(pane) = tabs.iter().find_map(|t| t.pane(pane_id)) {
+            pane.run_pending_command();
+        }
     }
 
     /// Open the search palette overlay (Cmd+Shift+F — global search across all panes).

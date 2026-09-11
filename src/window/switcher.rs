@@ -243,7 +243,8 @@ impl KovaView {
     }
 
     /// Act on a bookmark row: focus the pane that still holds the conversation,
-    /// or put it back where it belongs.
+    /// or put it back where it belongs and run its resume line — picking the
+    /// bookmark already said which conversation to bring back.
     fn open_bookmark(&self, index: usize) {
         let saved = crate::bookmarks::load();
         let Some(bm) = saved.items.get(index) else { return };

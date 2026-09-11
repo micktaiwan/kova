@@ -1660,6 +1660,9 @@ pub struct Pane {
     pub scroll_accumulator: Cell<f64>,
     /// Command to inject into PTY once shell is ready (for session restore).
     pub pending_command: Cell<Option<String>>,
+    /// Press Enter after `pending_command` instead of leaving it for review.
+    /// Only set by `run_pending_command`, for a line Kova built itself.
+    run_pending: Cell<bool>,
     /// Custom pane title set by user (overrides OSC title). Sticky, so it sits
     /// below the name of the agent session running here — see
     /// `derive_display_title`.
@@ -1823,6 +1826,7 @@ impl Pane {
             shell_ready,
             scroll_accumulator: Cell::new(0.0),
             pending_command: Cell::new(None),
+            run_pending: Cell::new(false),
             custom_title: None,
             minimized: false,
             open_timer,
@@ -1854,6 +1858,7 @@ impl Pane {
             shell_ready: Arc::new(AtomicBool::new(true)), // placeholder is immediately "ready"
             scroll_accumulator: Cell::new(0.0),
             pending_command: Cell::new(None),
+            run_pending: Cell::new(false),
             custom_title: None,
             minimized: false,
             open_timer: Arc::new(PaneOpenTimer::new()),
@@ -2074,15 +2079,47 @@ impl Pane {
     }
 
     /// If the shell is ready and there's a pending command, write it to the PTY
-    /// (without \r so the user can review before pressing Enter).
+    /// — without \r so the user can review before pressing Enter, unless
+    /// `run_pending_command` asked for it to run.
     pub fn inject_pending_command(&self) {
         if !self.is_ready() {
             return;
         }
         let cmd = self.pending_command.take();
         if let Some(command) = cmd {
-            self.pty.write(command.as_bytes());
+            let line = injected_line(&command, self.run_pending.replace(false));
+            self.pty.write(line.as_bytes());
         }
+    }
+
+    /// Have the pending command run instead of waiting on the prompt. A no-op
+    /// when nothing is pending, so the flag never outlives its command.
+    pub fn run_pending_command(&self) {
+        let cmd = self.pending_command.take();
+        if cmd.is_some() {
+            self.run_pending.set(true);
+        }
+        self.pending_command.set(cmd);
+    }
+}
+
+/// What `inject_pending_command` writes: the line as is, plus Enter to run it.
+fn injected_line(command: &str, run: bool) -> String {
+    if run {
+        format!("{}\r", command)
+    } else {
+        command.to_string()
+    }
+}
+
+#[cfg(test)]
+mod injected_line_tests {
+    use super::injected_line;
+
+    #[test]
+    fn a_pending_command_waits_for_enter_unless_asked_to_run() {
+        assert_eq!(injected_line("claude --resume abc", false), "claude --resume abc");
+        assert_eq!(injected_line("claude --resume abc", true), "claude --resume abc\r");
     }
 }
 
