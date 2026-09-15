@@ -626,6 +626,9 @@ fn handle_ipc_command_sync(
         IpcCommand::Notify { pane_id, title, message, sound } => {
             handle_ipc_notify(pane_id, &title, &message, sound)
         }
+        IpcCommand::ReloadConfig => {
+            handle_ipc_reload_config(windows)
+        }
         // Intercepted in the tick, before this dispatcher — it needs the event
         // state, which lives on the delegate. Reaching here means that branch was
         // lost in a refactor.
@@ -1288,6 +1291,29 @@ fn handle_ipc_rename_pane(
     }
 
     IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: re-read the config file and push its appearance half into every open
+/// window. Answers with what was left alone, since a reload that silently
+/// ignores a font change would read as a broken command.
+fn handle_ipc_reload_config(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+) -> crate::ipc::IpcResponse {
+    let config = Config::load();
+    let mut applied = 0usize;
+    for win in windows.borrow().iter() {
+        if let Some(view) = kova_view(win) {
+            view.ipc_apply_config(&config);
+            applied += 1;
+        }
+    }
+    log::info!("IPC: config reloaded into {} window(s)", applied);
+    crate::ipc::IpcResponse::Ok {
+        data: Some(serde_json::json!({
+            "windows": applied,
+            "needs_restart": ["font", "keys", "terminal", "window"],
+        })),
+    }
 }
 
 /// IPC: trigger any keyboard action by its stable name. With `pane_id`, the

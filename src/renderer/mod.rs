@@ -111,12 +111,6 @@ use crate::pane::PaneId;
 /// Violet: distinct from the bell (orange) and completion (green) dots.
 const MINIMIZED_FG: [f32; 4] = [0.75, 0.55, 0.95, 1.0];
 
-/// Status-bar background of a pane holding a bookmarked conversation. Deep
-/// enough to sit under the bar's usual palette (cwd grey, branch green, scroll
-/// amber) without washing it out, and to read as a state rather than an alarm —
-/// the bell and completion bars own the loud end of the range.
-const BOOKMARKED_BAR_BG: [f32; 3] = [0.05, 0.09, 0.24];
-
 /// Color of the "Claude Code is working" marker (status-bar ✳ counter and
 /// switcher ✳ icon). Green: something is happening, nothing is owed.
 const WORKING_FG: [f32; 4] = [0.6, 0.85, 0.6, 1.0];
@@ -491,6 +485,8 @@ pub struct Renderer {
     tab_bar_bg: [f32; 3],
     tab_bar_fg: [f32; 3],
     tab_bar_active_bg: [f32; 3],
+    /// Colors of a bookmarked conversation (status bar and switcher row).
+    bookmarks: crate::config::BookmarksConfig,
     /// Hovered URL: per-row segments [(visible_row, col_start, col_end)]
     pub hovered_url: Option<Vec<(usize, u16, u16)>>,
     /// Hovered URL text (for status bar display)
@@ -627,6 +623,7 @@ impl Renderer {
             tab_bar_bg: config.tab_bar.bg_color,
             tab_bar_fg: config.tab_bar.fg_color,
             tab_bar_active_bg: config.tab_bar.active_bg,
+            bookmarks: config.bookmarks.clone(),
             hovered_url: None,
             hovered_url_text: None,
             resize_feedback_text: None,
@@ -646,6 +643,39 @@ impl Renderer {
             tooltip_visible: None,
             tooltip_anim: 0,
         }
+    }
+
+    /// Re-read the appearance half of a freshly loaded config into this
+    /// renderer. Only what can change between two frames: colors, the fade of
+    /// unfocused panes, the focus outline. Font, keybindings and terminal
+    /// geometry are not touched — they are read once at startup and need a
+    /// restart (the atlas and every PTY are sized from them).
+    pub fn apply_config(&mut self, config: &Config) {
+        self.bg_color = config.colors.background;
+        self.bg_color_u8 = crate::terminal::color_to_u8(config.colors.background);
+        self.cursor_color = config.colors.cursor;
+        self.paste_block_color = config.colors.paste_block;
+        self.cursor_blink_frames = config.terminal.cursor_blink_frames;
+        self.status_bar_enabled = config.status_bar.enabled;
+        self.dim_opacity = config.splits.dim_opacity;
+        self.dim_mode = config.splits.dim_mode;
+        self.focus_border_width = config.splits.focus_border_width;
+        self.focus_border_color = config.splits.focus_border_color;
+        self.status_bar_bg = config.status_bar.bg_color;
+        self.status_bar_fg = config.status_bar.fg_color;
+        self.status_bar_cwd_color = config.status_bar.cwd_color;
+        self.status_bar_branch_color = config.status_bar.branch_color;
+        self.status_bar_scroll_color = config.status_bar.scroll_color;
+        self.global_bar_bg = config.global_status_bar.bg_color;
+        self.global_bar_time_color = config.global_status_bar.time_color;
+        self.global_bar_scroll_color = config.global_status_bar.scroll_indicator_color;
+        self.tab_bar_bg = config.tab_bar.bg_color;
+        self.tab_bar_fg = config.tab_bar.fg_color;
+        self.tab_bar_active_bg = config.tab_bar.active_bg;
+        self.bookmarks = config.bookmarks.clone();
+        // Every pane's vertices carry the old colors; drop the cache so the
+        // next frame rebuilds them.
+        self.pane_vertex_cache.clear();
     }
 
 
@@ -1576,7 +1606,7 @@ impl Renderer {
         // Darker than the default bar, so the usual text colors keep their
         // contrast — the bar changes hue, not its readability. Attention still
         // wins: a bell or a finished run is news, a bookmark is a standing fact.
-        let base_bar_bg = if bookmarked { BOOKMARKED_BAR_BG } else { self.status_bar_bg };
+        let base_bar_bg = if bookmarked { self.bookmarks.bar_bg } else { self.status_bar_bg };
         let bar_bg = Self::fade_toward(attention.bar_bg(base_bar_bg), self.bg_color, text_fade);
         Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, bar_bg);
 
@@ -2620,13 +2650,13 @@ impl Renderer {
         let label_fg = [0.85, 0.85, 0.9, 1.0];
         let dim_fg = [0.45, 0.45, 0.5, 1.0];
         let selected_bg = [0.25, 0.35, 0.55];
-        // Bookmarked panes: a light band, dark text on it. The selected variant
-        // is the same hue pushed harder, so selection still reads on a row that
-        // already has a background of its own.
-        let bookmark_bg = [0.62, 0.79, 0.95];
-        let bookmark_selected_bg = [0.40, 0.66, 0.95];
-        let bookmark_fg = [0.05, 0.07, 0.12, 1.0];
-        let bookmark_dim_fg = [0.22, 0.30, 0.42, 1.0];
+        // Bookmarked panes wear a band of their own, from `[bookmarks]` in the
+        // config — the selected variant included, so selection still reads on a
+        // row that already has a background.
+        let bookmark_bg = self.bookmarks.row_bg;
+        let bookmark_selected_bg = self.bookmarks.row_selected_bg;
+        let bookmark_fg = self.bookmarks.row_fg;
+        let bookmark_dim_fg = self.bookmarks.row_dim_fg;
 
         let title_scale = 1.8_f32;
         let body_scale = 1.3_f32;

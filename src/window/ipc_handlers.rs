@@ -341,6 +341,15 @@ impl KovaView {
         false
     }
 
+    /// IPC: apply a freshly read config to this window's renderer. Only the
+    /// appearance half travels (see `Renderer::apply_config`); the config this
+    /// window was built with keeps driving font, keys and geometry.
+    pub fn ipc_apply_config(&self, config: &Config) {
+        if let Some(renderer) = self.ivars().renderer.get() {
+            renderer.write().apply_config(config);
+        }
+    }
+
     /// IPC: focus a pane by ID (switch tab if needed). Returns true if found.
     pub fn ipc_focus_pane(&self, pane_id: PaneId) -> bool {
         let mut tabs = self.ivars().tabs.borrow_mut();

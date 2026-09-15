@@ -12,6 +12,7 @@ pub struct Config {
     pub tab_bar: TabBarConfig,
     pub splits: SplitsConfig,
     pub global_status_bar: GlobalStatusBarConfig,
+    pub bookmarks: BookmarksConfig,
     pub keys: KeysConfig,
 }
 
@@ -71,6 +72,42 @@ pub struct GlobalStatusBarConfig {
     pub fg_color: [f32; 3],
     pub time_color: [f32; 3],
     pub scroll_indicator_color: [f32; 3],
+}
+
+/// Colors of a bookmarked conversation: the band its row wears in the pane
+/// switcher (Cmd+P), and the status bar of the pane that still holds it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BookmarksConfig {
+    /// Status-bar background of a pane holding a bookmarked conversation.
+    pub bar_bg: [f32; 3],
+    /// Switcher row background of a bookmarked pane that is not selected.
+    pub row_bg: [f32; 3],
+    /// Same row when the selection is on it.
+    pub row_selected_bg: [f32; 3],
+    /// Text drawn on that band — dark by default, since the band is light.
+    pub row_fg: [f32; 4],
+    /// Dimmer text on the same band (process name, minimized rows).
+    pub row_dim_fg: [f32; 4],
+}
+
+impl Default for BookmarksConfig {
+    fn default() -> Self {
+        BookmarksConfig {
+            // Deep enough to sit under the status bar's usual palette (cwd grey,
+            // branch green, scroll amber) without washing it out, and to read as
+            // a state rather than an alarm — the bell and completion bars own the
+            // loud end of the range.
+            bar_bg: [0.05, 0.09, 0.24],
+            // A light band, dark text on it. The selected variant is the same hue
+            // pushed harder, so selection still reads on a row that already has a
+            // background of its own.
+            row_bg: [0.62, 0.79, 0.95],
+            row_selected_bg: [0.40, 0.66, 0.95],
+            row_fg: [0.05, 0.07, 0.12, 1.0],
+            row_dim_fg: [0.22, 0.30, 0.42, 1.0],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -162,6 +199,7 @@ impl Default for Config {
             tab_bar: TabBarConfig::default(),
             splits: SplitsConfig::default(),
             global_status_bar: GlobalStatusBarConfig::default(),
+            bookmarks: BookmarksConfig::default(),
             keys: KeysConfig::default(),
         }
     }

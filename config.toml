@@ -26,6 +26,15 @@
 # focus_border_width = 2.0     # outline around the focused pane, 0.0 to disable
 # focus_border_color = [0.4, 0.6, 1.0]
 
+# [bookmarks]
+# Colors of a bookmarked conversation: the band its row wears in the pane
+# switcher (Cmd+P), and the status bar of the pane that still holds it.
+# bar_bg = [0.05, 0.09, 0.24]           # status bar of a bookmarked pane
+# row_bg = [0.62, 0.79, 0.95]           # switcher row, not selected
+# row_selected_bg = [0.40, 0.66, 0.95]  # switcher row, selected
+# row_fg = [0.05, 0.07, 0.12, 1.0]      # text on that band (RGBA)
+# row_dim_fg = [0.22, 0.30, 0.42, 1.0]  # dim text on it (process name, minimized)
+
 # [keys]
 # new_tab = "cmd+t"
 # close_pane_or_tab = "cmd+w"

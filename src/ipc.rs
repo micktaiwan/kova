@@ -145,6 +145,10 @@ pub enum IpcCommand {
         message: String,
         sound: bool,
     },
+    /// Re-read `~/.config/kova/config.toml` and apply what can change without
+    /// a restart (colors, pane fade, focus outline). Font, keybindings and
+    /// terminal geometry keep the values they were started with.
+    ReloadConfig,
     /// Turn this connection into an event stream for the given topics.
     /// The main thread answers with a snapshot of the current state; every
     /// change after that is pushed as its own line. See `topic`.
@@ -406,6 +410,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "dispatch-action" => &["action", "pane_id"],
         "merge-window" => &["source_window", "target_window"],
         "notify" => &["pane_id", "title", "message", "sound"],
+        "reload-config" => &[],
         "subscribe" => &["events"],
         _ => return None,
     })
@@ -732,6 +737,7 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             };
             Ok(IpcCommand::Notify { pane_id, title, message, sound })
         }
+        "reload-config" => Ok(IpcCommand::ReloadConfig),
         "subscribe" => {
             // Omitted / null = every topic. An explicit list is validated name by
             // name: a typo must fail loudly, exactly like an unknown field, rather
@@ -1072,6 +1078,12 @@ mod tests {
             }
             _ => panic!("notify should parse with only a message"),
         }
+    }
+
+    #[test]
+    fn reload_config_takes_no_argument() {
+        assert!(matches!(parse_command(r#"{"cmd":"reload-config"}"#), Ok(IpcCommand::ReloadConfig)));
+        assert!(parse_command(r#"{"cmd":"reload-config","path":"/tmp/x"}"#).is_err());
     }
 
     #[test]

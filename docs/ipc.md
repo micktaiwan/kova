@@ -232,6 +232,26 @@ drops the banner.
 
 ---
 
+### `reload-config` — re-read the config file without restarting
+
+```json
+{ "cmd": "reload-config" }
+```
+
+Reads `~/.config/kova/config.toml` again and pushes its appearance half into
+every open window: `[colors]`, `[status_bar]`, `[global_status_bar]`, `[tab_bar]`,
+`[bookmarks]`, and the fade / focus outline of `[splits]`. The next frame draws
+with the new values — around 16 ms later, no restart, no session reload.
+
+What it does not touch, because they are read once at startup and would mean
+rebuilding the glyph atlas or resizing every PTY: `[font]`, `[terminal]`,
+`[window]`, `[keys]`. An invalid TOML file leaves every window as it was (the
+loader falls back to defaults and logs the parse error).
+
+Response: `{ "ok": true, "data": { "windows": 2, "needs_restart": ["font", "keys", "terminal", "window"] } }`.
+
+---
+
 ### `close-pane` — close a pane by ID
 
 ```json
