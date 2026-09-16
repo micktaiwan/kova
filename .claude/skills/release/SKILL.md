@@ -31,6 +31,8 @@ Argument: `$ARGUMENTS` must be one of `major`, `minor`, or `patch`. If missing o
 
 7. **Update version** in both `Cargo.toml` and `Info.plist` (CFBundleVersion + CFBundleShortVersionString).
 
+   **Write `RELEASE_NOTES.md`**: replace its whole content with `# X.Y.Z`, a blank line, then 1-5 bullets written for a Kova user from the commits since the last tag (what changes for them, not the internals). Kova embeds this file and shows it once on the first launch of the new version, and a test fails the release if its heading does not match `Cargo.toml`.
+
 8. **Update `Cargo.lock`** by running `cargo check`. This updates the lockfile as a side effect without regenerating it from scratch.
 
 9. **Build and test** (warnings are errors):
@@ -47,7 +49,7 @@ Argument: `$ARGUMENTS` must be one of `major`, `minor`, or `patch`. If missing o
     ```
     Keep it concise (1-5 bullet points).
 
-11. **Commit all modified files** — specifically `Cargo.toml`, `Cargo.lock`, and `Info.plist` (plus anything else changed by previous steps). Use `git add` with explicit file names, then verify with `git status` that `Cargo.lock` is staged before committing.
+11. **Commit all modified files** — specifically `Cargo.toml`, `Cargo.lock`, `Info.plist`, and `RELEASE_NOTES.md` (plus anything else changed by previous steps). Use `git add` with explicit file names, then verify with `git status` that `Cargo.lock` is staged before committing.
 
 12. **Tag** as `vX.Y.Z`.
 
@@ -58,9 +60,10 @@ Argument: `$ARGUMENTS` must be one of `major`, `minor`, or `patch`. If missing o
     git push --atomic origin main vX.Y.Z
     ```
 
-15. **Create GitHub release** with auto-generated notes:
+15. **Create GitHub release** with the same notes, without their heading line:
     ```bash
-    gh release create vX.Y.Z --generate-notes
+    tail -n +2 RELEASE_NOTES.md > /tmp/kova-notes.md
+    gh release create vX.Y.Z --notes-file /tmp/kova-notes.md
     ```
 
 16. Confirm success to the user with the tag name and release URL.
