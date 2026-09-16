@@ -583,7 +583,15 @@ define_class!(
                 let has_alt = modifiers.contains(NSEventModifierFlags::Option);
                 let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
 
-                if kitty_flags > 0 && (has_ctrl || has_alt) && !has_cmd {
+                // Option alone on a printable key composes a character on macOS
+                // layouts (French: Option+$ = €, Option+( = {). It must go through
+                // text input, otherwise kitty mode sends Alt+$ and the char is lost.
+                let option_composes_text = has_alt && !has_ctrl && event
+                    .charactersIgnoringModifiers()
+                    .and_then(|s| s.to_string().chars().next())
+                    .is_some_and(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(&c));
+
+                if kitty_flags > 0 && (has_ctrl || has_alt) && !has_cmd && !option_composes_text {
                     // Kitty mode: bypass macOS text input for modified keys
                     pane.terminal.write().reset_scroll();
                     pane.clear_awaiting();
