@@ -386,70 +386,83 @@ mod tests {
         assert_eq!(nothing_to_show_status(4), "Nothing to show (4 thinking)");
     }
 
-    /// Candidate panes all sitting in the tab under the eye — the shape most of
-    /// these cases care about, where only the id walk is under test.
-    fn here(ids: &[PaneId]) -> Vec<(PaneLocality, PaneId)> {
-        ids.iter().map(|&id| (PaneLocality::CurrentTab, id)).collect()
+    /// Candidate panes all sitting in the tab under the eye, given as
+    /// `(last_seen, id)` — the shape most of these cases care about, where only
+    /// the visit order is under test. `last_seen` is 0 for a pane never looked
+    /// at, and grows with how recently the eye landed on it.
+    fn here(panes: &[(u64, PaneId)]) -> Vec<Candidate> {
+        panes.iter().map(|&(seen, id)| (PaneLocality::CurrentTab, seen, id)).collect()
     }
 
     /// An empty tier. A fresh Vec per call, since each one is borrowed mutably.
-    fn nothing() -> Vec<(PaneLocality, PaneId)> {
+    fn nothing() -> Vec<Candidate> {
         Vec::new()
     }
 
     /// The landing pane alone: the walk-order cases below do not care which
     /// tier answered, only where the key lands.
     fn jump_to(
-        unread: &mut Vec<(PaneLocality, PaneId)>,
-        idle_agent: &mut Vec<(PaneLocality, PaneId)>,
+        unread: &mut Vec<Candidate>,
+        idle_agent: &mut Vec<Candidate>,
         current: Option<PaneId>,
     ) -> Option<PaneId> {
         next_attention_pane(unread, idle_agent, current).map(|(_, id)| id)
     }
 
     #[test]
-    fn next_attention_walks_unread_panes_in_id_order() {
-        let unread = || here(&[7, 2, 5]);
-        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(2)), Some(5));
-        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(5)), Some(7));
-        // Past the highest id, wrap back to the lowest.
-        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(7)), Some(2));
-        // From a pane that is not itself unread, take the next id above it.
-        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(3)), Some(5));
-        // Unfocused window: start at the lowest unread id.
-        assert_eq!(jump_to(&mut unread(), &mut nothing(), None), Some(2));
+    fn next_attention_goes_to_the_pane_left_alone_the_longest() {
+        // Pane 5 was read ages ago, 2 a moment ago, 7 never: 7 first, then 5.
+        let unread = || here(&[(90, 2), (10, 5), (0, 7)]);
+        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(2)), Some(7));
+        // Standing on the never-seen one, the next oldest comes up — not the id
+        // above it, and never the pane just read.
+        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(7)), Some(5));
+        // Unfocused window: same order, nothing to exclude.
+        assert_eq!(jump_to(&mut unread(), &mut nothing(), None), Some(7));
+    }
+
+    #[test]
+    fn a_noisy_pane_no_longer_pins_the_walk_to_its_id_neighbour() {
+        // The shape that stranded 40 panes: pane 150 keeps pulling the eye back
+        // with fresh output, and every trip out of it used to restart at its id,
+        // so 161 came up again and again. Ordered by visit, the walk moves on.
+        let quiet = || here(&[(0, 3), (0, 23), (99, 161)]);
+        assert_eq!(jump_to(&mut nothing(), &mut quiet(), Some(150)), Some(3));
+        // Once 3 has been seen, the next untouched pane comes up, not 3 again.
+        let after_3 = || here(&[(100, 3), (0, 23), (99, 161)]);
+        assert_eq!(jump_to(&mut nothing(), &mut after_3(), Some(150)), Some(23));
     }
 
     #[test]
     fn next_attention_visits_idle_agent_sessions_last() {
-        // An idle session loses to unread output, whatever the ids...
-        assert_eq!(jump_to(&mut here(&[9]), &mut here(&[3]), Some(1)), Some(9));
-        // ...and comes up only once the unread tier is dry, in id order.
-        assert_eq!(jump_to(&mut nothing(), &mut here(&[3, 8]), Some(4)), Some(8));
-        assert_eq!(jump_to(&mut nothing(), &mut here(&[3, 8]), Some(8)), Some(3));
+        // An idle session loses to unread output, however long ago it was read...
+        assert_eq!(jump_to(&mut here(&[(99, 9)]), &mut here(&[(0, 3)]), Some(1)), Some(9));
+        // ...and comes up only once the unread tier is dry, oldest visit first.
+        assert_eq!(jump_to(&mut nothing(), &mut here(&[(5, 3), (0, 8)]), Some(4)), Some(8));
+        assert_eq!(jump_to(&mut nothing(), &mut here(&[(0, 3), (5, 8)]), Some(4)), Some(3));
         // The focused pane being the only unread one: fall through to the idle
         // tier rather than re-focusing where the cursor already is.
-        assert_eq!(jump_to(&mut here(&[4]), &mut here(&[6]), Some(4)), Some(6));
+        assert_eq!(jump_to(&mut here(&[(9, 4)]), &mut here(&[(9, 6)]), Some(4)), Some(6));
         // The last idle session being the focused one: the tour is over.
-        assert_eq!(jump_to(&mut nothing(), &mut here(&[4]), Some(4)), None);
+        assert_eq!(jump_to(&mut nothing(), &mut here(&[(9, 4)]), Some(4)), None);
     }
 
     #[test]
-    fn the_session_loop_walks_every_session_wherever_it_lives() {
-        // Two idle sessions in the focused tab used to hand each other back for
-        // ever, since the loop drains nothing and the nearest locality won: the
-        // sessions in the other tab and the other window were never reached.
-        let ring = || vec![4, 6, 8, 2];
-        assert_eq!(next_pane_in_loop(&mut ring(), Some(4)), Some(6));
-        assert_eq!(next_pane_in_loop(&mut ring(), Some(6)), Some(8));
-        // Past the highest id, wrap back to the lowest.
-        assert_eq!(next_pane_in_loop(&mut ring(), Some(8)), Some(2));
-        // From a pane that is not itself an idle session, take the next id above.
-        assert_eq!(next_pane_in_loop(&mut ring(), Some(5)), Some(6));
-        // Unfocused window: start at the lowest id.
-        assert_eq!(next_pane_in_loop(&mut ring(), None), Some(2));
-        // The only idle session is the one under the eye: nothing to hand over.
-        assert_eq!(next_pane_in_loop(&mut vec![4], Some(4)), None);
+    fn the_session_loop_walks_every_session_before_repeating_one() {
+        // The ring drains nothing, so only the visit order keeps it moving: each
+        // jump takes the session left alone the longest, which is what makes a
+        // full tour of 39 sessions before any of them comes up twice.
+        let ring = || vec![(30u64, 4), (10, 6), (0, 8), (20, 2)];
+        assert_eq!(next_pane_in_loop(&mut ring(), Some(4)), Some(8));
+        assert_eq!(next_pane_in_loop(&mut ring(), Some(8)), Some(6));
+        // Landing back on a noisy pane does not restart the tour where it was:
+        // the sessions already seen stay behind the ones that were not.
+        let seen_8 = || vec![(30u64, 4), (10, 6), (40, 8), (20, 2)];
+        assert_eq!(next_pane_in_loop(&mut seen_8(), Some(8)), Some(6));
+        // Unfocused window: same order, nothing to exclude.
+        assert_eq!(next_pane_in_loop(&mut ring(), None), Some(8));
+        // The only session is the one under the eye: nothing to hand over.
+        assert_eq!(next_pane_in_loop(&mut vec![(0, 4)], Some(4)), None);
         assert_eq!(next_pane_in_loop(&mut Vec::new(), Some(4)), None);
     }
 
@@ -457,11 +470,11 @@ mod tests {
     fn next_attention_names_the_tier_it_answered_from() {
         use AttentionTier::{IdleAgent, Unread};
         assert_eq!(
-            next_attention_pane(&mut here(&[3]), &mut here(&[4]), Some(1)),
+            next_attention_pane(&mut here(&[(0, 3)]), &mut here(&[(0, 4)]), Some(1)),
             Some((Unread, 3))
         );
         assert_eq!(
-            next_attention_pane(&mut nothing(), &mut here(&[4]), Some(1)),
+            next_attention_pane(&mut nothing(), &mut here(&[(0, 4)]), Some(1)),
             Some((IdleAgent, 4))
         );
     }
@@ -469,29 +482,30 @@ mod tests {
     #[test]
     fn next_attention_walks_the_current_tab_before_leaving_it() {
         use PaneLocality::{CurrentTab, CurrentWindow, OtherWindow};
-        // A lower id in another window loses to the tab under the eye...
-        let mut spread = vec![(OtherWindow, 2), (CurrentWindow, 3), (CurrentTab, 9)];
+        // A pane nobody has seen in another window loses to the tab under the
+        // eye, even one read a second ago...
+        let mut spread = vec![(OtherWindow, 0, 2), (CurrentWindow, 0, 3), (CurrentTab, 99, 9)];
         assert_eq!(jump_to(&mut spread, &mut Vec::new(), Some(1)), Some(9));
-        // ...and the current tab wraps onto itself rather than crossing over,
-        // since a pane leaves the set once read and the group drains.
-        let mut two_here = vec![(CurrentWindow, 8), (CurrentTab, 4), (CurrentTab, 6)];
-        assert_eq!(jump_to(&mut two_here, &mut Vec::new(), Some(6)), Some(4));
+        // ...and the current tab is walked by visit order rather than crossing
+        // over, since a pane leaves the set once read and the group drains.
+        let mut two_here = vec![(CurrentWindow, 0, 8), (CurrentTab, 50, 4), (CurrentTab, 20, 6)];
+        assert_eq!(jump_to(&mut two_here, &mut Vec::new(), Some(4)), Some(6));
         // Nothing left in the current tab: the rest of the window comes next,
         // and only then another window.
-        let mut away = vec![(OtherWindow, 2), (CurrentWindow, 8)];
+        let mut away = vec![(OtherWindow, 0, 2), (CurrentWindow, 80, 8)];
         assert_eq!(jump_to(&mut away, &mut Vec::new(), Some(6)), Some(8));
         // Locality never outranks the tier: an idle session in the current tab
         // still waits behind unread output in another window.
-        let mut far_unread = vec![(OtherWindow, 2)];
-        assert_eq!(jump_to(&mut far_unread, &mut here(&[7]), Some(1)), Some(2));
+        let mut far_unread = vec![(OtherWindow, 90, 2)];
+        assert_eq!(jump_to(&mut far_unread, &mut here(&[(0, 7)]), Some(1)), Some(2));
     }
 
     #[test]
     fn next_attention_handles_empty_and_lone_candidates() {
         assert_eq!(jump_to(&mut vec![], &mut nothing(), Some(4)), None);
         // Nothing else unread or idle: no jump at all.
-        assert_eq!(jump_to(&mut here(&[4]), &mut nothing(), Some(4)), None);
+        assert_eq!(jump_to(&mut here(&[(0, 4)]), &mut nothing(), Some(4)), None);
         // Duplicates (same pane seen twice) collapse instead of stalling.
-        assert_eq!(jump_to(&mut here(&[4, 4, 9]), &mut nothing(), Some(4)), Some(9));
+        assert_eq!(jump_to(&mut here(&[(0, 4), (0, 4), (0, 9)]), &mut nothing(), Some(4)), Some(9));
     }
 }
