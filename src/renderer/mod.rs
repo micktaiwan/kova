@@ -275,6 +275,9 @@ struct FlashLabelLayout {
     parent_scale: f32,
     parent_x: f32,
     parent_y: f32,
+    session_scale: f32,
+    session_x: f32,
+    session_y: f32,
     box_x: f32,
     box_y: f32,
     box_w: f32,
@@ -284,18 +287,22 @@ struct FlashLabelLayout {
 /// Lay out the flash label inside a pane rectangle: the directory name is
 /// blown up as far as it fits (never past `FLASH_NAME_MAX_SCALE`, where the
 /// upscaled atlas bitmap starts to smear), the path above it sits underneath
-/// at a fixed small scale, and the whole block is centered behind a padded
-/// backdrop. Pure geometry, so it can be checked without a GPU.
+/// at a fixed small scale, the conversation name under that, and the whole
+/// block is centered behind a padded backdrop. `session_chars` is 0 when the
+/// pane holds no agent conversation, and that line then takes no space. Pure
+/// geometry, so it can be checked without a GPU.
 fn flash_label_layout(
     pane: (f32, f32, f32, f32),
     name_chars: usize,
     parent_chars: usize,
+    session_chars: usize,
     cell_w: f32,
     cell_h: f32,
 ) -> FlashLabelLayout {
     const FLASH_NAME_MAX_SCALE: f32 = 3.0;
     const FLASH_NAME_MIN_SCALE: f32 = 1.0;
     const FLASH_PARENT_SCALE: f32 = 1.1;
+    const FLASH_SESSION_SCALE: f32 = 1.4;
     /// Fraction of the pane width the name is allowed to span.
     const FLASH_WIDTH_RATIO: f32 = 0.8;
 
@@ -317,11 +324,21 @@ fn flash_label_layout(
     let parent_h = if parent_chars == 0 { 0.0 } else { cell_h * parent_scale };
     let gap = if parent_chars == 0 { 0.0 } else { name_h * 0.15 };
 
-    let block_h = name_h + gap + parent_h;
+    // Same shrink-rather-than-clip rule as the path line.
+    let session_scale = if session_chars == 0 {
+        FLASH_SESSION_SCALE
+    } else {
+        FLASH_SESSION_SCALE.min((pw * FLASH_WIDTH_RATIO) / (session_chars as f32 * cell_w)).max(0.6)
+    };
+    let session_w = session_chars as f32 * cell_w * session_scale;
+    let session_h = if session_chars == 0 { 0.0 } else { cell_h * session_scale };
+    let session_gap = if session_chars == 0 { 0.0 } else { name_h * 0.15 };
+
+    let block_h = name_h + gap + parent_h + session_gap + session_h;
     let top = py + (ph - block_h) / 2.0;
     let pad_x = cell_w * name_scale;
     let pad_y = name_h * 0.35;
-    let box_w = (name_w.max(parent_w) + pad_x * 2.0).min(pw);
+    let box_w = (name_w.max(parent_w).max(session_w) + pad_x * 2.0).min(pw);
 
     FlashLabelLayout {
         name_scale,
@@ -330,6 +347,9 @@ fn flash_label_layout(
         parent_scale,
         parent_x: px + (pw - parent_w) / 2.0,
         parent_y: top + name_h + gap,
+        session_scale,
+        session_x: px + (pw - session_w) / 2.0,
+        session_y: top + name_h + gap + parent_h + session_gap,
         box_x: px + (pw - box_w) / 2.0,
         box_y: top - pad_y,
         box_w,
@@ -503,7 +523,7 @@ pub struct Renderer {
     pub pane_flash: Option<(f32, f32, f32, f32, f32)>,
     /// Big label drawn inside the flashing pane: (directory name, path above
     /// it). Set on Cmd+J jumps so a landing far from the eye names itself.
-    pub pane_flash_label: Option<(String, String)>,
+    pub pane_flash_label: Option<(String, String, String)>,
     /// Loading progress: (ready_panes, total_panes). None when all loaded.
     pub loading_progress: Option<(u32, u32)>,
     /// Pane ID of the hovered URL (to show URL only in that pane's status bar)
@@ -1072,13 +1092,14 @@ impl Renderer {
 
             // The directory name in big over the pane, when the jump asked for
             // it (Cmd+J): the border alone does not say where the eye landed.
-            if let Some((name, parent)) = self.pane_flash_label.clone() {
+            if let Some((name, parent, session)) = self.pane_flash_label.clone() {
                 self.build_flash_label_vertices(
                     &mut overlay_vertices,
                     (x, y, w, h),
                     alpha,
                     &name,
                     &parent,
+                    &session,
                 );
             }
         }
@@ -2477,6 +2498,8 @@ impl Renderer {
                     ("Global Search", kc.open_search.as_str(), "panes + closed Claude sessions"),
                     ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "quick switcher + bookmarks"),
                     ("Bookmark Pane", kc.toggle_bookmark.as_str(), "keep this conversation"),
+                    ("Anchor Pane", kc.toggle_anchor.as_str(), "what today is for"),
+                    ("Go To Anchor", kc.focus_anchor.as_str(), "back to the first anchor"),
                     ("Unread Panes", kc.open_unread_switcher.as_str(), "switcher, attention only"),
                 ]),
                 ("TERMINAL", vec![
@@ -2702,10 +2725,12 @@ impl Renderer {
         let subtitle = if data.filtered {
             "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{23ce} Focus  click to focus  u All panes  esc Cancel"
         } else {
-            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next unread  \u{23ce} Focus  \u{2318}\u{2191}\u{2193} Move  \u{2318}\u{232b} Remove bookmark  u Unread only  esc Cancel"
+            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next unread  \u{23ce} Focus  \u{2318}\u{2191}\u{2193} Move  \u{2318}B Bookmark  \u{2318}\u{21e7}A Anchor  \u{2318}\u{232b} Remove bookmark  u Unread only  esc Cancel"
         };
         let sub_chars = subtitle.chars().count() as f32;
-        let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
+        // Clamped: this hint line grew with each key added to the overlay, and a
+        // centred line wider than the window would start off its left edge.
+        let sub_x = ((viewport_w - sub_chars * scaled_cell_w) / 2.0).max(0.0);
         self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
 
         let geom = self.overlay_list_geometry(viewport_h);
@@ -3192,8 +3217,10 @@ impl Renderer {
     }
 
     /// Draw the big directory label of a pane flash: the directory name, the
-    /// path above it, and a padded backdrop so the terminal content underneath
-    /// does not fight the text. Both lines fade with `alpha`.
+    /// path above it, the name of the agent conversation living in the pane
+    /// (empty when there is none), and a padded backdrop so the terminal
+    /// content underneath does not fight the text. Every line fades with
+    /// `alpha`.
     fn build_flash_label_vertices(
         &mut self,
         vertices: &mut Vec<Vertex>,
@@ -3201,6 +3228,7 @@ impl Renderer {
         alpha: f32,
         name: &str,
         parent: &str,
+        session: &str,
     ) {
         let cell_w = self.atlas.overlay_cell_width;
         let cell_h = self.atlas.overlay_cell_height;
@@ -3208,6 +3236,7 @@ impl Renderer {
             pane,
             name.chars().count(),
             parent.chars().count(),
+            session.chars().count(),
             cell_w,
             cell_h,
         );
@@ -3245,6 +3274,20 @@ impl Renderer {
                 parent_fg,
                 no_bg,
                 layout.parent_scale,
+            );
+        }
+        if !session.is_empty() {
+            // Blue, so the conversation name never reads as part of the path.
+            let session_fg = [0.55, 0.78, 1.0, alpha];
+            self.render_overlay_text(
+                vertices,
+                session,
+                layout.session_x,
+                layout.session_y,
+                right,
+                session_fg,
+                no_bg,
+                layout.session_scale,
             );
         }
     }
@@ -3487,7 +3530,7 @@ mod tests {
     fn flash_label_fills_the_pane_without_overflowing_it() {
         // Wide pane, short name: capped at the max scale, centered, and the
         // backdrop stays inside the pane.
-        let l = flash_label_layout((100.0, 200.0, 800.0, 400.0), 4, 16, 10.0, 20.0);
+        let l = flash_label_layout((100.0, 200.0, 800.0, 400.0), 4, 16, 0, 10.0, 20.0);
         assert_eq!(l.name_scale, 3.0);
         let name_w = 4.0 * 10.0 * l.name_scale;
         assert!((l.name_x - (100.0 + (800.0 - name_w) / 2.0)).abs() < 0.01);
@@ -3497,17 +3540,33 @@ mod tests {
     }
 
     #[test]
+    fn flash_label_stacks_the_session_name_under_the_path() {
+        let l = flash_label_layout((0.0, 0.0, 800.0, 400.0), 4, 16, 12, 10.0, 20.0);
+        assert!(l.session_y > l.parent_y + 20.0 * l.parent_scale - 0.01);
+        // The block stays centered: session line included, it fits the pane.
+        assert!(l.box_y >= 0.0 && l.box_y + l.box_h <= 400.0 + 0.01);
+    }
+
+    #[test]
+    fn flash_label_without_a_session_takes_no_room_for_it() {
+        let with_session = flash_label_layout((0.0, 0.0, 800.0, 400.0), 4, 16, 12, 10.0, 20.0);
+        let without = flash_label_layout((0.0, 0.0, 800.0, 400.0), 4, 16, 0, 10.0, 20.0);
+        assert!(without.box_h < with_session.box_h);
+        assert_eq!(without.session_y, without.parent_y + 20.0 * without.parent_scale);
+    }
+
+    #[test]
     fn flash_label_shrinks_a_long_name_to_the_pane_width() {
-        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 40, 0, 10.0, 20.0);
+        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 40, 0, 0, 10.0, 20.0);
         assert_eq!(l.name_scale, 1.0, "never shrinks below the overlay size");
-        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 12, 0, 10.0, 20.0);
+        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 12, 0, 0, 10.0, 20.0);
         assert!(l.name_scale < 3.0 && l.name_scale > 1.0);
         assert!(12.0 * 10.0 * l.name_scale <= 300.0, "name must fit the pane");
     }
 
     #[test]
     fn flash_label_without_a_path_line_centers_the_name_alone() {
-        let l = flash_label_layout((0.0, 0.0, 400.0, 100.0), 1, 0, 10.0, 20.0);
+        let l = flash_label_layout((0.0, 0.0, 400.0, 100.0), 1, 0, 0, 10.0, 20.0);
         let name_h = 20.0 * l.name_scale;
         assert!((l.name_y - (100.0 - name_h) / 2.0).abs() < 0.01);
     }

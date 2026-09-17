@@ -341,6 +341,23 @@ impl KovaView {
         false
     }
 
+    /// IPC: take a new anchor list into this window. The status bars repaint,
+    /// and an open Cmd+P is rebuilt around it: the overlay is a snapshot, so a
+    /// list pushed while it is up would otherwise stay on screen out of date.
+    pub fn ipc_refresh_anchors(&self, anchors: &crate::anchors::Anchors) {
+        self.refresh_anchor_keys(anchors);
+        let filtered = self.ivars().pane_switcher.borrow().as_ref().map(|s| s.filtered);
+        if let Some(filtered) = filtered {
+            self.open_pane_switcher(filtered);
+        }
+    }
+
+    /// IPC: what `pane_id` would be saved as, if this window holds it. Lets
+    /// `set-anchor` name a live pane instead of repeating what Kova knows.
+    pub fn ipc_pane_as_saved(&self, pane_id: PaneId) -> Option<crate::bookmarks::Bookmark> {
+        self.pane_as_saved(pane_id)
+    }
+
     /// IPC: apply a freshly read config to this window's renderer. Only the
     /// appearance half travels (see `Renderer::apply_config`); the config this
     /// window was built with keeps driving font, keys and geometry.

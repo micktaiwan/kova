@@ -17,57 +17,55 @@ pub(super) enum PaneLocality {
     OtherWindow,
 }
 
+/// A pane Cmd+J could land on: how far it sits from the eye, when the eye last
+/// landed on it (0 = never), and which pane it is. Tuple order *is* the walk
+/// order — nearest locality first, then least recently seen, then lowest id.
+pub(super) type Candidate = (PaneLocality, u64, PaneId);
+
 /// Next pane to land on among `candidates`, all of the same attention tier.
 ///
 /// The nearest locality present wins outright: the tab under the eye is walked
 /// dry before the key crosses a tab boundary, and that window before it hops to
 /// another one. Nothing is stranded by this — a pane leaves the candidate set
 /// the moment it has been read, so the near group drains and the far ones come
-/// up next. Within the chosen locality the walk is by ascending pane id,
-/// wrapping around to the lowest.
+/// up next.
+///
+/// Within the chosen locality the walk goes to the pane the eye has been away
+/// from the longest, never-visited panes first. Ordering by pane id instead is
+/// what used to strand 40 panes: the walk restarted from the id of whatever
+/// pane pulled the eye back, so a single noisy pane made the key hand back its
+/// id-neighbour over and over while the rest of the panes never came up.
 ///
 /// `candidates` arrives in any order and is sorted, deduped and stripped of
 /// `current` in place first, so the pane being looked at is never the answer.
-fn next_pane_in_cycle(
-    candidates: &mut Vec<(PaneLocality, PaneId)>,
-    current: Option<PaneId>,
-) -> Option<PaneId> {
+fn next_pane_in_cycle(candidates: &mut Vec<Candidate>, current: Option<PaneId>) -> Option<PaneId> {
     candidates.sort_unstable();
-    candidates.dedup();
+    candidates.dedup_by_key(|&mut (_, _, id)| id);
     if let Some(c) = current {
-        candidates.retain(|&(_, id)| id != c);
+        candidates.retain(|&(_, _, id)| id != c);
     }
-    let nearest = candidates.first()?.0;
-    let ids: Vec<PaneId> =
-        candidates.iter().filter(|(loc, _)| *loc == nearest).map(|&(_, id)| id).collect();
-    next_id_after(&ids, current)
+    candidates.first().map(|&(_, _, id)| id)
 }
 
-/// Next pane in the non-draining loop over every open idle session.
+/// Next pane in the non-draining loop over every open session.
 ///
 /// Locality is deliberately ignored here, unlike in the draining tiers: nothing
 /// leaves this set by being looked at, so favouring the nearest group would pin
-/// the walk to it for good — two idle sessions in the focused tab would hand
-/// each other back and forth, and the sessions sitting in other tabs or other
-/// windows would never come up at all. One global ring by ascending pane id.
+/// the walk to it for good — two sessions in the focused tab would hand each
+/// other back and forth, and the sessions sitting in other tabs or other windows
+/// would never come up at all. One global ring, least recently seen first, which
+/// is what makes it a real tour: every session comes up once before any of them
+/// comes up twice.
 ///
 /// `candidates` arrives in any order and is sorted, deduped and stripped of
 /// `current` in place first, so the pane being looked at is never the answer.
-fn next_pane_in_loop(candidates: &mut Vec<PaneId>, current: Option<PaneId>) -> Option<PaneId> {
+fn next_pane_in_loop(candidates: &mut Vec<(u64, PaneId)>, current: Option<PaneId>) -> Option<PaneId> {
     candidates.sort_unstable();
-    candidates.dedup();
+    candidates.dedup_by_key(|&mut (_, id)| id);
     if let Some(c) = current {
-        candidates.retain(|&id| id != c);
+        candidates.retain(|&(_, id)| id != c);
     }
-    next_id_after(candidates, current)
-}
-
-/// Walk `ids` — ascending, `current` already removed — to the first id above
-/// `current`, wrapping around to the lowest. With no focused pane the walk
-/// starts at the lowest id. `None` when the set is empty.
-fn next_id_after(ids: &[PaneId], current: Option<PaneId>) -> Option<PaneId> {
-    let after = current.unwrap_or(0);
-    ids.iter().find(|&&id| current.is_none() || id > after).or_else(|| ids.first()).copied()
+    candidates.first().map(|&(_, id)| id)
 }
 
 /// Which of Cmd+J's tiers a jump landed in — what the banner across the focused
@@ -114,8 +112,8 @@ impl AttentionTier {
 /// orders the walk *within* a tier. Returns the tier alongside the pane, since
 /// the banner has to name it.
 fn next_attention_pane(
-    unread: &mut Vec<(PaneLocality, PaneId)>,
-    idle_agent: &mut Vec<(PaneLocality, PaneId)>,
+    unread: &mut Vec<Candidate>,
+    idle_agent: &mut Vec<Candidate>,
     current: Option<PaneId>,
 ) -> Option<(AttentionTier, PaneId)> {
     next_pane_in_cycle(unread, current)
@@ -160,7 +158,8 @@ fn focus_pane_in_any_window(pane_id: PaneId) {
             let label = view.pane_cwd(pane_id).map(|cwd| {
                 let home = std::env::var("HOME").unwrap_or_default();
                 let (name, parent) = flash_label_parts(&cwd, &home);
-                PaneFlashLabel { name, parent }
+                let session = view.pane_session_name(pane_id).unwrap_or_default();
+                PaneFlashLabel { name, parent, session }
             });
             view.set_pane_flash(pane_id, 54, label);
             return;
@@ -278,13 +277,13 @@ impl KovaView {
             tabs.get(active_tab).map(|t| t.focused_pane)
         };
 
-        let mut unread: Vec<(PaneLocality, PaneId)> = Vec::new();
-        let mut idle_agent: Vec<(PaneLocality, PaneId)> = Vec::new();
+        let mut unread: Vec<Candidate> = Vec::new();
+        let mut idle_agent: Vec<Candidate> = Vec::new();
         // Every open session — idle or working, looked at or not: what the
         // post-message loop walks once the draining tiers are empty. No locality
         // here, that ring never drains and a nearest-first rule would trap it in
         // one tab.
-        let mut session_ring: Vec<PaneId> = Vec::new();
+        let mut session_ring: Vec<(u64, PaneId)> = Vec::new();
         // Claude sessions actively working: what the dead-end message counts,
         // for the two spots the ring never reaches (the focused pane and the
         // minimized ones).
@@ -330,7 +329,7 @@ impl KovaView {
                             || term.unread_completion()
                     };
                     if has_unread {
-                        unread.push((locality, pane.id));
+                        unread.push((locality, pane.last_seen(), pane.id));
                         return;
                     }
                     if pane.has_agent_session() {
@@ -340,15 +339,19 @@ impl KovaView {
                         // print. Only the draining tier stays idle-only, so a
                         // working session is never announced as something to
                         // deal with now.
-                        session_ring.push(pane.id);
+                        session_ring.push((pane.last_seen(), pane.id));
                         if pane.is_idle_agent_unseen() {
-                            idle_agent.push((locality, pane.id));
+                            idle_agent.push((locality, pane.last_seen(), pane.id));
                         }
                     }
                 });
             }
         }
 
+        // Why the key landed where it landed: the sets are drained in place by
+        // the walk, so they are counted first. Without this, a jump back onto a
+        // pane read seconds ago is indistinguishable from a stale unread flag.
+        let (n_unread, n_idle, n_ring) = (unread.len(), idle_agent.len(), session_ring.len());
         let hit = next_attention_pane(&mut unread, &mut idle_agent, current);
         let (tier, target) = match hit {
             Some(hit) => hit,
@@ -361,6 +364,10 @@ impl KovaView {
                 }
             },
         };
+        log::info!(
+            "Cmd+J: {:?} from pane {:?} to pane {} (unread {}, idle {}, ring {}, thinking {})",
+            tier, current, target, n_unread, n_idle, n_ring, thinking
+        );
         focus_pane_in_any_window(target);
         show_attention_banner(target, tier);
     }

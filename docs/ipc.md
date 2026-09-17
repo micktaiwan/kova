@@ -232,6 +232,52 @@ drops the banner.
 
 ---
 
+### `set-anchor` — put a conversation at the head of the anchors
+
+```json
+{ "cmd": "set-anchor", "pane_id": 42 }
+{ "cmd": "set-anchor", "cwd": "/Users/x/projects/prez", "session_id": "abc123", "agent": "claude", "label": "Prez steerco" }
+```
+
+The anchors are the few conversations today is for: they open `Cmd+P` in their
+own section and `Cmd+A` goes to the first of them. This command puts one at the
+head, which is how an outside tool that knows the day's work (a task manager, a
+calendar) says "today is this one". Kova never calls out: it holds the list and
+answers this.
+
+Either name a pane of this Kova with `pane_id` — its conversation, directory and
+title are read from the pane — or name the conversation outright with `cwd`,
+plus `session_id` and `agent` (`"claude"` or `"codex"`) for Kova to be able to
+reopen it, and `label` for the row (the directory's name otherwise). A
+`session_id` without an `agent` is dropped: nothing could resume it. A
+conversation already anchored moves to the head rather than gaining a second
+row, so pushing the same anchor twice is harmless. The list is capped at 8; past
+that the last anchor of the list falls off and comes back in `dropped` — a push
+from outside always lands, where `Cmd+Shift+A` on a full list refuses instead
+(you are there to drop one). An anchored conversation stops appearing among
+the bookmarks below, even when it is bookmarked too.
+
+Response: `{ "ok": true, "data": { "label": "Prez steerco", "anchors": 3, "dropped": null } }`.
+
+Errors rather than a surprise: a `pane_id` that is not open (or holds neither a
+conversation nor a directory), and a `session_id` the agent could not resume.
+
+---
+
+### `clear-anchors` — empty the anchor list
+
+```json
+{ "cmd": "clear-anchors" }
+```
+
+Kova has no notion of a day and never clears the anchors on its own: this is how
+the outside says the day is over. Bookmarks are untouched — a conversation that
+was in both lists is simply a bookmark again.
+
+Response: `{ "ok": true, "data": { "removed": 3 } }`.
+
+---
+
 ### `reload-config` — re-read the config file without restarting
 
 ```json
@@ -381,6 +427,8 @@ detach-tab  break-pane  merge-tab  merge-window
 rename-tab  rename-pane            (open the inline rename editor)
 open-recent-project  open-search  open-pane-switcher   (open an overlay)
 open-unread-switcher               (the pane switcher, listing only panes with a bell, an unread completion or a question)
+toggle-bookmark                    (bookmark the focused pane's conversation)
+toggle-anchor  focus-anchor         (anchor the focused pane; jump to the first anchor)
 copy  copy-raw  paste  toggle-filter
 toggle-help  mem-report
 ```

@@ -68,6 +68,10 @@ pub enum Action {
     /// Save the focused pane's conversation to the bookmark list, or drop it if
     /// it is already there.
     ToggleBookmark,
+    /// Anchor or un-anchor the focused pane's conversation.
+    ToggleAnchor,
+    /// Jump to the first anchor, reopening it when no pane holds it.
+    FocusAnchor,
     Equalize,
     RepaintPane,
     NextAttention,
@@ -266,6 +270,8 @@ impl Keybindings {
         bind(&keys.open_pane_switcher, Action::OpenPaneSwitcher);
         bind(&keys.open_unread_switcher, Action::OpenUnreadSwitcher);
         bind(&keys.toggle_bookmark, Action::ToggleBookmark);
+        bind(&keys.toggle_anchor, Action::ToggleAnchor);
+        bind(&keys.focus_anchor, Action::FocusAnchor);
         bind(&keys.equalize, Action::Equalize);
         bind(&keys.repaint_pane, Action::RepaintPane);
         bind(&keys.next_attention, Action::NextAttention);
@@ -366,6 +372,8 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "open-pane-switcher" => Action::OpenPaneSwitcher,
         "open-unread-switcher" => Action::OpenUnreadSwitcher,
         "toggle-bookmark" => Action::ToggleBookmark,
+        "toggle-anchor" => Action::ToggleAnchor,
+        "focus-anchor" => Action::FocusAnchor,
         "equalize" => Action::Equalize,
         "repaint-pane" => Action::RepaintPane,
         "next-attention" => Action::NextAttention,

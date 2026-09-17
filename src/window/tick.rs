@@ -329,7 +329,7 @@ impl KovaView {
                     r.pane_flash_label = flash
                         .label
                         .as_ref()
-                        .map(|l| (l.name.clone(), l.parent.clone()));
+                        .map(|l| (l.name.clone(), l.parent.clone(), l.session.clone()));
                 } else {
                     // Pane disappeared (e.g. closed) — drop the flash.
                     *flash_slot = None;
@@ -377,6 +377,10 @@ impl KovaView {
                 // A bookmark row borrows the pane row's shape: its title on the
                 // left, the project and agent dim on the right.
                 SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false },
+                // An anchor row is the same shape, painted like a saved
+                // conversation: it is one, and its section header is what says
+                // it is today's.
+                SwitcherRow::Anchor { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: true },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -719,6 +723,10 @@ impl KovaView {
                 if let Some(pane) = tab.pane(tab.focused_pane) {
                     pane.mark_awaiting_seen();
                     pane.mark_idle_agent_seen();
+                    // The visit stamp Cmd+J orders its candidates by: stamped
+                    // every frame the pane is under the eye, so the freshest
+                    // stamp is always the pane being looked at right now.
+                    pane.mark_seen_now();
                 }
             }
         }
@@ -812,6 +820,7 @@ impl KovaView {
                 let mut pane_data: Vec<crate::renderer::PaneRenderData> = Vec::new();
                 // Cached set, not the file: this runs for every pane of every frame.
                 let bookmark_keys = ivars.bookmark_keys.borrow();
+                let anchor_keys = ivars.anchor_keys.borrow();
                 let cell_h = renderer.read().cell_size().1;
                 tab.cell_h.set(cell_h);
                 let tab_bar_h = (cell_h * 2.0).round();
@@ -849,9 +858,16 @@ impl KovaView {
                         fg_process: pane.fg_process().map(|p| p.name),
                         // Same key a bookmark is stored under: the conversation
                         // id when the pane runs an agent, its directory otherwise.
+                        // An anchored pane is painted like a bookmarked one:
+                        // both mean "this conversation is one you asked to keep",
+                        // and the status bar has room for one band, not two.
                         bookmarked: match pane.agent_session.borrow().as_ref() {
-                            Some(session) => bookmark_keys.contains(&session.id),
-                            None => pane.cwd().is_some_and(|cwd| bookmark_keys.contains(&cwd)),
+                            Some(session) => {
+                                bookmark_keys.contains(&session.id) || anchor_keys.contains(&session.id)
+                            }
+                            None => pane.cwd().is_some_and(|cwd| {
+                                bookmark_keys.contains(&cwd) || anchor_keys.contains(&cwd)
+                            }),
                         },
                     });
                 });

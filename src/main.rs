@@ -1,3 +1,4 @@
+mod anchors;
 mod app;
 mod agent_session;
 mod bookmarks;

@@ -341,6 +341,44 @@ pub fn write_owner_only(path: &std::path::Path, json: &str) -> std::io::Result<(
     file.write_all(json.as_bytes())
 }
 
+/// Read one of the small owner-only json files next to the session (bookmarks,
+/// anchors). Missing or unreadable reads as the default: these lists are
+/// conveniences, never a reason to refuse to open an overlay or to start.
+pub fn load_owner_only<T: Default + serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+    what: &str,
+) -> T {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return T::default();
+    };
+    match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("Failed to parse {} ({}); starting from an empty {}", path.display(), e, what);
+            T::default()
+        }
+    }
+}
+
+/// Write one of those lists back, creating its directory, owner-readable only:
+/// they hold working directories and conversation ids, same as the session file.
+pub fn save_owner_only<T: serde::Serialize>(path: &std::path::Path, what: &str, value: &T) {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("Failed to create {}: {}", parent.display(), e);
+            return;
+        }
+    }
+    match serde_json::to_string_pretty(value) {
+        Ok(json) => {
+            if let Err(e) = write_owner_only(path, &json) {
+                log::warn!("Failed to write {}: {}", path.display(), e);
+            }
+        }
+        Err(e) => log::warn!("Failed to serialize {}: {}", what, e),
+    }
+}
+
 /// Rotate session.json -> session.1.json -> session.2.json -> ...
 fn rotate_session_backups(path: &std::path::Path, new_content: &[u8]) {
     if !path.exists() {

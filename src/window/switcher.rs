@@ -24,9 +24,19 @@ pub(super) enum SwitcherRow {
         /// title already *is* that name — no row should say "vim … vim".
         process: Option<String>,
         /// This pane holds a bookmarked conversation. The row is painted so it
-        /// stands out, and the Bookmarks section leaves the conversation out:
+        /// stands out, and the bookmark groups leave the conversation out:
         /// a bookmark that is already open is this row, not a second one.
         bookmarked: bool,
+    },
+    /// An anchored conversation — selectable, and always listed, even when a
+    /// pane still holds it: the anchors are what today is for, so the section
+    /// stays the same whether or not the work is currently open.
+    Anchor {
+        /// Index into the saved anchors.
+        index: usize,
+        title: String,
+        /// Agent holding the conversation, shown dim at the end of the row.
+        detail: Option<String>,
     },
     /// A bookmarked conversation — selectable. Enter jumps to the pane that
     /// still holds it, or reopens it where it belongs when nothing does.
@@ -138,6 +148,7 @@ fn nearest_pane_row(col: &[SwitcherRow], target: usize) -> usize {
 enum SwitcherTarget {
     Pane(PaneId),
     Bookmark(usize),
+    Anchor(usize),
 }
 
 pub(super) struct PaneSwitcherState {
@@ -158,47 +169,118 @@ pub(super) struct PaneSwitcherState {
     pub(super) filtered: bool,
 }
 
-/// The dim right-hand half of a bookmark row: the project it belongs to, and
-/// the agent holding the conversation. `None` when there is neither, which
-/// keeps the row from ending in a stray separator.
+/// The dim right-hand half of a bookmark row: the agent holding the
+/// conversation. The directory is not repeated here — it is the header of the
+/// group the row sits in. `None` for a bookmarked shell.
 pub(super) fn bookmark_detail(bm: &crate::bookmarks::Bookmark) -> Option<String> {
-    let project = std::path::Path::new(&bm.cwd)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty());
-    let agent = bm.agent.map(|a| a.as_str());
-    match (project, agent) {
-        (Some(p), Some(a)) => Some(format!("{} · {}", p, a)),
-        (Some(p), None) => Some(p.to_string()),
-        (None, Some(a)) => Some(a.to_string()),
-        (None, None) => None,
+    bm.agent.map(|a| a.as_str().to_string())
+}
+
+/// The header naming a directory of bookmarks: its last component ("cto"),
+/// or the whole path with `~` for home when another saved directory ends the
+/// same way, so two `app` folders never share one name.
+pub(super) fn bookmark_dir_header(cwd: &str, all_cwds: &[&str], home: Option<&str>) -> String {
+    let base = |p: &str| {
+        std::path::Path::new(p)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+    };
+    let name = base(cwd);
+    let clashes = name.is_some() && all_cwds.iter().any(|&other| other != cwd && base(other) == name);
+    match name {
+        Some(n) if !clashes => n,
+        _ => match home.filter(|h| !h.is_empty()).and_then(|h| cwd.strip_prefix(h)) {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{}", rest),
+            _ => cwd.to_string(),
+        },
     }
 }
 
-/// The Bookmarks section of the list: one row per saved conversation that is
-/// *not* already open, newest first, headed by its title. A bookmark whose pane
-/// is open is up in its tab, painted as a bookmark — repeating it here would
-/// offer two rows for one conversation. Empty when nothing is left to reopen,
-/// and the section then disappears entirely.
-pub(super) fn bookmark_rows(
+/// The anchors, as the one group that opens the list. Unlike the bookmarks
+/// below they are not split by directory and an open one is not left out: a
+/// short, stable section is the point — you should find today's work in the
+/// same place whatever else is running.
+///
+/// Empty list, no group: a section headed "Anchors" with nothing under it would
+/// take a line to say nothing.
+pub(super) fn anchor_groups(saved: &[crate::anchors::Anchor]) -> Vec<Vec<SwitcherRow>> {
+    if saved.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = vec![SwitcherRow::TabHeader("\u{2693} Anchors".to_string())];
+    for (index, anchor) in saved.iter().enumerate() {
+        rows.push(SwitcherRow::Anchor {
+            index,
+            title: anchor.label.clone(),
+            detail: bookmark_detail(anchor),
+        });
+    }
+    vec![rows]
+}
+
+/// The whole list, in the order it is read: the anchors, then the tabs with
+/// their panes, then the bookmarks. Today's work opens the list — whatever is
+/// running below is what happened to the day, not what it was for.
+///
+/// `hidden` is the bookmark filter (open, or anchored); the anchors are not
+/// filtered at all, which is the difference between the two sections.
+pub(super) fn saved_sections(
+    anchors: &[crate::anchors::Anchor],
+    bookmarks: &[crate::bookmarks::Bookmark],
+    tabs: Vec<Vec<SwitcherRow>>,
+    hidden: impl Fn(&crate::bookmarks::Bookmark) -> bool,
+) -> Vec<Vec<SwitcherRow>> {
+    let mut groups = anchor_groups(anchors);
+    groups.extend(tabs);
+    groups.extend(bookmark_groups(bookmarks, hidden));
+    groups
+}
+
+/// The bookmark part of the list: one group per directory, each headed by that
+/// directory, holding the saved conversations that are *not* already open. A
+/// bookmark whose pane is open is up in its tab, painted as a bookmark —
+/// repeating it here would offer two rows for one conversation.
+///
+/// Groups come in the order of their newest bookmark, and rows keep the saved
+/// order (newest first) inside a group. A directory whose bookmarks are all
+/// open has no group; with nothing left to reopen the result is empty.
+/// `hidden` also covers the anchored conversations: an anchor is already a row
+/// up in its own section, and one conversation never gets two rows.
+pub(super) fn bookmark_groups(
     saved: &[crate::bookmarks::Bookmark],
-    is_open: impl Fn(&crate::bookmarks::Bookmark) -> bool,
-) -> Vec<SwitcherRow> {
-    let mut rows: Vec<SwitcherRow> = Vec::new();
+    hidden: impl Fn(&crate::bookmarks::Bookmark) -> bool,
+) -> Vec<Vec<SwitcherRow>> {
+    let home = std::env::var("HOME").ok();
+    let mut dirs: Vec<&str> = Vec::new();
+    let mut groups: Vec<Vec<SwitcherRow>> = Vec::new();
     for (index, bm) in saved.iter().enumerate() {
-        if is_open(bm) {
+        if hidden(bm) {
             continue;
         }
-        rows.push(SwitcherRow::Bookmark {
+        let row = SwitcherRow::Bookmark {
             index,
             title: bm.label.clone(),
             detail: bookmark_detail(bm),
-        });
+        };
+        match dirs.iter().position(|d| *d == bm.cwd) {
+            Some(g) => groups[g].push(row),
+            None => {
+                dirs.push(&bm.cwd);
+                groups.push(vec![row]);
+            }
+        }
     }
-    if !rows.is_empty() {
-        rows.insert(0, SwitcherRow::TabHeader("Bookmarks".to_string()));
+    // Only the directories that end up on screen: a name is ambiguous when two
+    // *visible* groups share it, and spelling out a path to avoid a clash with a
+    // row nobody sees reads as a bug.
+    let all_cwds: Vec<&str> = dirs.clone();
+    for (dir, group) in dirs.iter().zip(groups.iter_mut()) {
+        let header = bookmark_dir_header(dir, &all_cwds, home.as_deref());
+        group.insert(0, SwitcherRow::TabHeader(format!("★ {}", header)));
     }
-    rows
+    groups
 }
 
 /// Where the selection lands once the bookmark at `removed` (its index in the
@@ -228,7 +310,7 @@ pub(super) fn bookmark_row_after_removal(
 impl KovaView {
     /// The pane of this window still running a bookmarked conversation, if one
     /// does — jumping to it beats opening a second pane on the same session.
-    fn pane_holding_session(&self, bm: &crate::bookmarks::Bookmark) -> Option<PaneId> {
+    pub(super) fn pane_holding_session(&self, bm: &crate::bookmarks::Bookmark) -> Option<PaneId> {
         let session_id = bm.session_id.as_deref()?;
         let tabs = self.ivars().tabs.borrow();
         let mut found = None;
@@ -248,9 +330,58 @@ impl KovaView {
     fn open_bookmark(&self, index: usize) {
         let saved = crate::bookmarks::load();
         let Some(bm) = saved.items.get(index) else { return };
-        if let Some(pane_id) = self.pane_holding_session(bm) {
-            self.ipc_focus_pane(pane_id);
-            self.set_pane_flash(pane_id, 30, None);
+        self.open_saved_conversation(bm);
+    }
+
+    /// Act on an anchor row: same gesture as a bookmark row, on the other list.
+    fn open_anchor(&self, index: usize) {
+        let saved = crate::anchors::load();
+        let Some(anchor) = saved.items.get(index) else { return };
+        self.open_saved_conversation(anchor);
+    }
+
+    /// The pane of this window this saved conversation is already in: the one
+    /// running its session, or — for a shell, which has no session to match on —
+    /// a bare shell sitting in its directory. Without the second case, going
+    /// back to a shell anchor would split a new pane every single time.
+    pub(super) fn pane_holding_saved(&self, bm: &crate::bookmarks::Bookmark) -> Option<PaneId> {
+        if bm.session_id.is_some() {
+            return self.pane_holding_session(bm);
+        }
+        let tabs = self.ivars().tabs.borrow();
+        let mut found = None;
+        for tab in tabs.iter() {
+            tab.for_each_pane(&mut |pane| {
+                if found.is_none()
+                    && pane.agent_session_id().is_none()
+                    && pane.cwd().as_deref() == Some(bm.cwd.as_str())
+                {
+                    found = Some(pane.id);
+                }
+            });
+        }
+        found
+    }
+
+    /// Bring a saved conversation back: focus the pane that still holds it,
+    /// wherever it lives, or put it where it belongs and run its resume line.
+    /// Shared by the bookmark rows, the anchor rows and Cmd+A — picking any of
+    /// them already said which conversation to bring back.
+    ///
+    /// Every window is searched, not just this one: a conversation open in
+    /// another window is open, and reopening it would run a second `resume` on
+    /// a live session.
+    pub(super) fn open_saved_conversation(&self, bm: &crate::bookmarks::Bookmark) {
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+        let windows = app.windows();
+        for i in 0..windows.count() {
+            let win = windows.objectAtIndex(i);
+            let Some(view) = crate::app::kova_view(&win) else { continue };
+            let Some(pane_id) = view.pane_holding_saved(bm) else { continue };
+            view.ipc_focus_pane(pane_id);
+            win.makeKeyAndOrderFront(None);
+            view.set_pane_flash(pane_id, 30, None);
             return;
         }
         self.open_conversation_in_project(bm.resume_command(), &bm.cwd);
@@ -280,6 +411,12 @@ impl KovaView {
         if !confirm_action(mtm, "Remove this bookmark?", &informative, "Remove") {
             return;
         }
+        self.pane_switcher_drop_bookmark(index, &bm);
+    }
+
+    /// Drop a bookmark and rebuild the open switcher around the gap. Shared by
+    /// Cmd+Backspace (after its alert) and Cmd+B (no alert, like on a pane).
+    fn pane_switcher_drop_bookmark(&self, index: usize, bm: &crate::bookmarks::Bookmark) {
         // Read the file again rather than reuse the copy from before the alert:
         // another window may have changed the list meanwhile, which is also why
         // the bookmark is found by its key and not by its old index.
@@ -315,15 +452,23 @@ impl KovaView {
     /// unread pane, so it is not in here either.
     pub(super) fn open_pane_switcher(&self, filtered: bool) {
         // Read once, up front: the same list marks the open panes below and
-        // fills the Bookmarks section at the end.
+        // fills the bookmark groups at the end.
         let saved = crate::bookmarks::load();
-        // Also the moment to refresh the cache the status bars read: another
-        // window may have bookmarked something since this one last did.
+        let anchors = crate::anchors::load();
+        // Also the moment to refresh both caches the status bars read: another
+        // window — or track, through `set-anchor` — may have changed either list
+        // since this one last did.
         *self.ivars().bookmark_keys.borrow_mut() = crate::bookmarks::keys(&saved.items);
+        *self.ivars().anchor_keys.borrow_mut() = crate::anchors::keys(&anchors.items);
+        let anchored = crate::anchors::keys(&anchors.items);
+        // Anchored conversations count as saved here too: the pane's own status
+        // bar paints them, and a row that contradicted the pane it points at
+        // would be the worse of the two answers.
         let bookmarked_sessions: std::collections::HashSet<&str> = saved
             .items
             .iter()
             .filter_map(|b| b.session_id.as_deref())
+            .chain(anchors.items.iter().filter_map(|a| a.session_id.as_deref()))
             .collect();
         // Build one row group per tab (header followed by its pane rows).
         let mut groups: Vec<Vec<SwitcherRow>> = Vec::new();
@@ -370,14 +515,14 @@ impl KovaView {
         if !filtered && groups.iter().all(|g| g.iter().all(|r| !r.is_pane())) {
             return; // nothing to switch to
         }
-        // Saved conversations, as their own group at the end of the list. Only
-        // on the full list: the attention-only one answers "what is asking for
-        // something", and a bookmark never asks for anything.
+        // Saved conversations, one group per directory at the end of the list.
+        // Only on the full list: the attention-only one answers "what is asking
+        // for something", and a bookmark never asks for anything. Neither does
+        // an anchor — same reason it is left out of the filtered list.
         if !filtered {
-            let rows = bookmark_rows(&saved.items, |bm| self.pane_holding_session(bm).is_some());
-            if !rows.is_empty() {
-                groups.push(rows);
-            }
+            groups = saved_sections(&anchors.items, &saved.items, groups, |bm| {
+                anchored.contains(bm.key()) || self.pane_holding_session(bm).is_some()
+            });
         }
         // An empty filtered list still opens: the answer "nothing is unread" is
         // one the overlay has to give out loud, and `u` from there shows all the
@@ -524,6 +669,31 @@ impl KovaView {
             return;
         }
 
+        // Cmd+B (the toggle-bookmark binding) → same toggle as in a pane: a pane
+        // row gains or loses its bookmark, a bookmark row is dropped.
+        let toggles_bookmark = KeyCombo::from_event(event);
+        let toggles_bookmark = self.ivars().keybindings.get().is_some_and(|kb| {
+            matches!(kb.window_map.get(&toggles_bookmark), Some(Action::ToggleBookmark))
+        });
+        if toggles_bookmark {
+            self.pane_switcher_toggle_selected_bookmark();
+            return;
+        }
+
+        // Cmd+Shift+A (the toggle-anchor binding) → the same gesture on the
+        // other list: a pane row is anchored or un-anchored, an anchor row is
+        // dropped. No alert on either: an anchor is a claim about today, and
+        // taking it back costs one keystroke, unlike a bookmark you may have
+        // been keeping for weeks.
+        let toggles_anchor = KeyCombo::from_event(event);
+        let toggles_anchor = self.ivars().keybindings.get().is_some_and(|kb| {
+            matches!(kb.window_map.get(&toggles_anchor), Some(Action::ToggleAnchor))
+        });
+        if toggles_anchor {
+            self.pane_switcher_toggle_selected_anchor();
+            return;
+        }
+
         // Arrow keys: ↑↓ move within a column (headers skipped), ←→ between columns.
         {
             let mut guard = self.ivars().pane_switcher.borrow_mut();
@@ -571,6 +741,112 @@ impl KovaView {
                     }
                 }
                 _ => return,
+            }
+        }
+        self.pane_switcher_clamp_scroll();
+        self.mark_dirty();
+    }
+
+    /// Cmd+B inside the switcher. A pane row toggles its bookmark and the list
+    /// is rebuilt with the selection kept on that pane, so the band appears or
+    /// goes away under the eye; a bookmark row is removed without an alert.
+    fn pane_switcher_toggle_selected_bookmark(&self) {
+        let target = {
+            let guard = self.ivars().pane_switcher.borrow();
+            match guard.as_ref().and_then(|s| s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row))) {
+                Some(SwitcherRow::Pane { pane_id, .. }) => SwitcherTarget::Pane(*pane_id),
+                Some(SwitcherRow::Bookmark { index, .. }) => SwitcherTarget::Bookmark(*index),
+                _ => return,
+            }
+        };
+        match target {
+            SwitcherTarget::Bookmark(index) => {
+                let Some(bm) = crate::bookmarks::load().items.get(index).cloned() else { return };
+                self.pane_switcher_drop_bookmark(index, &bm);
+            }
+            // An anchor row has its own key (Cmd+Shift+A); Cmd+B on it would
+            // bookmark what is already saved under a stronger promise.
+            SwitcherTarget::Anchor(_) => {}
+            SwitcherTarget::Pane(pane_id) => {
+                self.toggle_pane_bookmark(pane_id);
+                let filtered = self.ivars().pane_switcher.borrow().as_ref().is_some_and(|s| s.filtered);
+                self.open_pane_switcher(filtered);
+                if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
+                    for (c, col) in state.columns.iter().enumerate() {
+                        if let Some(r) = col.iter().position(
+                            |row| matches!(row, SwitcherRow::Pane { pane_id: id, .. } if *id == pane_id),
+                        ) {
+                            state.selected_col = c;
+                            state.selected_row = r;
+                            break;
+                        }
+                    }
+                }
+                self.pane_switcher_clamp_scroll();
+                self.mark_dirty();
+            }
+        }
+    }
+
+    /// Cmd+Shift+A inside the switcher: anchor or un-anchor the pane on the
+    /// selected row, or drop the selected anchor. The list is rebuilt either
+    /// way, so the Anchors section grows or shrinks under the eye.
+    fn pane_switcher_toggle_selected_anchor(&self) {
+        let target = {
+            let guard = self.ivars().pane_switcher.borrow();
+            match guard.as_ref().and_then(|s| s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row))) {
+                Some(SwitcherRow::Pane { pane_id, .. }) => SwitcherTarget::Pane(*pane_id),
+                Some(SwitcherRow::Anchor { index, .. }) => SwitcherTarget::Anchor(*index),
+                _ => return,
+            }
+        };
+        match target {
+            SwitcherTarget::Anchor(index) => {
+                let mut anchors = crate::anchors::load();
+                let Some(anchor) = anchors.items.get(index).cloned() else { return };
+                crate::anchors::remove(&mut anchors.items, anchor.key());
+                crate::anchors::save(&anchors);
+                self.refresh_anchor_keys(&anchors);
+                self.set_transient_status(&format!("Removed anchor {}", anchor.label));
+            }
+            SwitcherTarget::Pane(pane_id) => self.toggle_pane_anchor(pane_id),
+            // A bookmark row is promoted rather than ignored: it is the row you
+            // are most likely to be pointing at when you decide what today is
+            // for. It stays bookmarked, and moves up under the anchors.
+            SwitcherTarget::Bookmark(index) => {
+                let Some(bm) = crate::bookmarks::load().items.get(index).cloned() else { return };
+                let mut anchors = crate::anchors::load();
+                let label = bm.label.clone();
+                if crate::anchors::toggle(&mut anchors.items, bm) == crate::anchors::Toggled::Full {
+                    self.set_transient_status(&format!(
+                        "Already {} anchors — drop one first",
+                        crate::anchors::MAX_ANCHORS
+                    ));
+                    return;
+                }
+                crate::anchors::save(&anchors);
+                self.refresh_anchor_keys(&anchors);
+                self.set_transient_status(&format!("Anchored {}", label));
+            }
+        }
+        if self.ivars().pane_switcher.borrow().is_none() {
+            return;
+        }
+        let filtered = self.ivars().pane_switcher.borrow().as_ref().is_some_and(|s| s.filtered);
+        self.open_pane_switcher(filtered);
+        // Put the selection back where the eye is: on the pane just anchored,
+        // which the rebuild moved — it gained or lost a row above it.
+        if let SwitcherTarget::Pane(pane_id) = target {
+            if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
+                for (c, col) in state.columns.iter().enumerate() {
+                    if let Some(r) = col.iter().position(
+                        |row| matches!(row, SwitcherRow::Pane { pane_id: id, .. } if *id == pane_id),
+                    ) {
+                        state.selected_col = c;
+                        state.selected_row = r;
+                        break;
+                    }
+                }
             }
         }
         self.pane_switcher_clamp_scroll();
@@ -633,6 +909,9 @@ impl KovaView {
                     Some(SwitcherRow::Bookmark { index, .. }) => {
                         Some(SwitcherTarget::Bookmark(*index))
                     }
+                    Some(SwitcherRow::Anchor { index, .. }) => {
+                        Some(SwitcherTarget::Anchor(*index))
+                    }
                     _ => None,
                 }
             })
@@ -643,6 +922,7 @@ impl KovaView {
                 self.ipc_focus_pane(pid);
             }
             Some(SwitcherTarget::Bookmark(index)) => self.open_bookmark(index),
+            Some(SwitcherTarget::Anchor(index)) => self.open_anchor(index),
             None => {}
         }
         self.mark_dirty();
@@ -723,6 +1003,9 @@ impl KovaView {
                         Some(SwitcherRow::Bookmark { index, .. }) => {
                             Some(SwitcherTarget::Bookmark(*index))
                         }
+                        Some(SwitcherRow::Anchor { index, .. }) => {
+                            Some(SwitcherTarget::Anchor(*index))
+                        }
                         _ => None,
                     }
                 }
@@ -734,6 +1017,7 @@ impl KovaView {
                 self.ipc_focus_pane(pid);
             }
             Some(SwitcherTarget::Bookmark(index)) => self.open_bookmark(index),
+            Some(SwitcherTarget::Anchor(index)) => self.open_anchor(index),
             None => {}
         }
         self.mark_dirty();
@@ -789,6 +1073,7 @@ mod tests {
                         SwitcherRow::Pane { has_completion: true, .. } => 'c',
                         SwitcherRow::Pane { .. } => '.',
                         SwitcherRow::Bookmark { .. } => 'k',
+                        SwitcherRow::Anchor { .. } => 'a',
                     })
                     .collect()
             })
@@ -805,17 +1090,105 @@ mod tests {
     }
 
     #[test]
-    fn an_open_bookmark_leaves_the_bookmarks_section() {
+    fn the_list_reads_anchors_then_panes_then_bookmarks() {
+        // The order is the whole point of the section: today's work first, what
+        // is actually running second, the rest after.
+        let tabs = switcher_grid(&["h.."]);
+        let groups = saved_sections(&[saved("a")], &[saved("b")], tabs, |_| false);
+        assert_eq!(switcher_spec(&groups), vec!["ha".to_string(), "h..".into(), "hk".into()]);
+    }
+
+    #[test]
+    fn an_anchor_stays_listed_while_its_pane_is_open_and_its_bookmark_does_not() {
+        // Same conversation in both lists, and open in a pane: one row, under
+        // the anchors. This is the difference between the two sections.
+        let hidden = |bm: &crate::bookmarks::Bookmark| bm.session_id.as_deref() == Some("a");
+        let groups = saved_sections(&[saved("a")], &[saved("a")], Vec::new(), hidden);
+        assert_eq!(switcher_spec(&groups), vec!["ha".to_string()]);
+    }
+
+    #[test]
+    fn the_anchor_section_lists_every_anchor_it_is_given() {
+        // The counterpart of the bookmark rule right below: a bookmark whose
+        // pane is open leaves its group, an anchor never does — the section is
+        // what today is for, not what is missing from the screen.
+        let groups = anchor_groups(&[saved("a"), saved("b")]);
+        assert_eq!(switcher_spec(&groups), vec!["haa".to_string()]);
+        match &groups[0][0] {
+            SwitcherRow::TabHeader(h) => assert!(h.starts_with('\u{2693}'), "headed by the anchor"),
+            _ => panic!("the section opens with its header"),
+        }
+    }
+
+    #[test]
+    fn no_anchor_means_no_section_at_all() {
+        assert!(anchor_groups(&[]).is_empty(), "an empty section would cost a line to say nothing");
+    }
+
+    #[test]
+    fn an_anchored_conversation_is_not_offered_a_second_time_as_a_bookmark() {
         let items = vec![saved("a"), saved("b")];
-        let rows = bookmark_rows(&items, |bm| bm.session_id.as_deref() == Some("a"));
-        assert_eq!(switcher_spec(&[rows]), vec!["hk".to_string()]);
+        let anchored = crate::anchors::keys(&[saved("a")]);
+        let groups = bookmark_groups(&items, |bm| anchored.contains(bm.key()));
+        assert_eq!(switcher_spec(&groups), vec!["hk".to_string()]);
+        match &groups[0][1] {
+            SwitcherRow::Bookmark { index, .. } => assert_eq!(*index, 1, "the row left is the other one"),
+            _ => panic!("expected the bookmark row"),
+        }
+    }
+
+    #[test]
+    fn an_anchor_row_is_selectable_but_is_not_a_pane() {
+        let row = SwitcherRow::Anchor { index: 0, title: "conv".into(), detail: None };
+        assert!(row.is_selectable());
+        assert!(!row.is_pane());
+        assert!(!row.needs_attention(), "an anchor asks for nothing, like a bookmark");
+    }
+
+    #[test]
+    fn an_open_bookmark_leaves_its_directory_group() {
+        let items = vec![saved("a"), saved("b")];
+        let groups = bookmark_groups(&items, |bm| bm.session_id.as_deref() == Some("a"));
+        assert_eq!(switcher_spec(&groups), vec!["hk".to_string()]);
         // The row still points at the bookmark's own index in the saved list,
         // not at its position in the filtered rows.
-        let rows = bookmark_rows(&items, |bm| bm.session_id.as_deref() == Some("a"));
-        match &rows[1] {
+        match &groups[0][1] {
             SwitcherRow::Bookmark { index, .. } => assert_eq!(*index, 1),
             _ => panic!("expected a bookmark row"),
         }
+    }
+
+    #[test]
+    fn bookmarks_are_grouped_by_directory_in_order_of_their_newest() {
+        let at = |id: &str, cwd: &str| crate::bookmarks::Bookmark { cwd: cwd.into(), ..saved(id) };
+        let items = vec![at("a", "/h/cto"), at("b", "/h/self"), at("c", "/h/cto")];
+        let groups = bookmark_groups(&items, |_| false);
+        assert_eq!(switcher_spec(&groups), vec!["hkk".to_string(), "hk".to_string()]);
+        let indexes: Vec<usize> = groups[0]
+            .iter()
+            .filter_map(|r| match r {
+                SwitcherRow::Bookmark { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indexes, vec![0, 2]);
+        match (&groups[0][0], &groups[1][0]) {
+            (SwitcherRow::TabHeader(first), SwitcherRow::TabHeader(second)) => {
+                assert_eq!(first, "★ cto");
+                assert_eq!(second, "★ self");
+            }
+            _ => panic!("each group starts with its directory"),
+        }
+    }
+
+    #[test]
+    fn a_directory_header_shows_the_path_only_when_names_clash() {
+        let cwds = ["/Users/x/a/app", "/Users/x/b/app", "/Users/x/cto"];
+        assert_eq!(bookmark_dir_header("/Users/x/cto", &cwds, Some("/Users/x")), "cto");
+        assert_eq!(bookmark_dir_header("/Users/x/a/app", &cwds, Some("/Users/x")), "~/a/app");
+        assert_eq!(bookmark_dir_header("/opt/app", &["/opt/app", "/srv/app"], Some("/Users/x")), "/opt/app");
+        // "/Users/xy" is not under "/Users/x".
+        assert_eq!(bookmark_dir_header("/Users/xy/app", &["/Users/xy/app", "/app"], Some("/Users/x")), "/Users/xy/app");
     }
 
     #[test]
@@ -835,10 +1208,10 @@ mod tests {
     }
 
     #[test]
-    fn the_bookmarks_section_disappears_when_every_bookmark_is_open() {
+    fn bookmark_groups_disappear_when_every_bookmark_is_open() {
         let items = vec![saved("a"), saved("b")];
-        assert!(bookmark_rows(&items, |_| true).is_empty(), "no header without rows");
-        assert!(bookmark_rows(&[], |_| false).is_empty());
+        assert!(bookmark_groups(&items, |_| true).is_empty(), "no header without rows");
+        assert!(bookmark_groups(&[], |_| false).is_empty());
     }
 
     #[test]
@@ -858,21 +1231,21 @@ mod tests {
     }
 
     #[test]
-    fn a_bookmark_row_names_its_project_and_agent() {
+    fn a_bookmark_row_names_its_agent_only() {
         let bm = crate::bookmarks::Bookmark {
             agent: Some(crate::agent_session::Agent::Codex),
             session_id: Some("id".into()),
             cwd: "/Users/x/projects/kova".into(),
             label: "the split refactor".into(),
         };
-        assert_eq!(bookmark_detail(&bm).as_deref(), Some("kova · codex"));
+        assert_eq!(bookmark_detail(&bm).as_deref(), Some("codex"));
         let shell = crate::bookmarks::Bookmark {
             agent: None,
             session_id: None,
             cwd: "/Users/x/projects/kova".into(),
             label: "shell".into(),
         };
-        assert_eq!(bookmark_detail(&shell).as_deref(), Some("kova"));
+        assert_eq!(bookmark_detail(&shell), None);
     }
 
     #[test]

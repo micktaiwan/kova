@@ -626,6 +626,10 @@ fn handle_ipc_command_sync(
         IpcCommand::Notify { pane_id, title, message, sound } => {
             handle_ipc_notify(pane_id, &title, &message, sound)
         }
+        IpcCommand::SetAnchor { pane_id, cwd, session_id, agent, label } => {
+            handle_ipc_set_anchor(windows, pane_id, cwd, session_id, agent, label)
+        }
+        IpcCommand::ClearAnchors => handle_ipc_clear_anchors(windows),
         IpcCommand::ReloadConfig => {
             handle_ipc_reload_config(windows)
         }
@@ -1291,6 +1295,80 @@ fn handle_ipc_rename_pane(
     }
 
     IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: put a conversation at the head of the anchors, and repaint the windows
+/// that show them. A pane of this Kova is described by its own state; a
+/// conversation named from outside is taken as given — Kova has no way to check
+/// that a session id still exists, and refusing on a guess would make the
+/// command useless the day an agent changes how it stores its transcripts.
+fn handle_ipc_set_anchor(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: Option<u32>,
+    cwd: Option<String>,
+    session_id: Option<String>,
+    agent: Option<String>,
+    label: Option<String>,
+) -> crate::ipc::IpcResponse {
+    let from_pane = pane_id.and_then(|id| {
+        windows
+            .borrow()
+            .iter()
+            .filter_map(|win| kova_view(win))
+            .find_map(|view| view.ipc_pane_as_saved(id as crate::pane::PaneId))
+    });
+    let anchor = match (from_pane, cwd) {
+        (Some(saved), _) => saved,
+        (None, Some(cwd)) => crate::anchors::from_named(
+            cwd,
+            session_id,
+            match agent.as_deref() {
+                Some("claude") => Some(crate::agent_session::Agent::Claude),
+                Some("codex") => Some(crate::agent_session::Agent::Codex),
+                _ => None,
+            },
+            label,
+        ),
+        (None, None) => {
+            return crate::ipc::IpcResponse::Error {
+                message: format!("pane {} not found", pane_id.unwrap_or(0)),
+            }
+        }
+    };
+    let label = anchor.label.clone();
+    let mut anchors = crate::anchors::load();
+    let dropped = crate::anchors::promote(&mut anchors.items, anchor);
+    crate::anchors::save(&anchors);
+    for win in windows.borrow().iter() {
+        if let Some(view) = kova_view(win) {
+            view.ipc_refresh_anchors(&anchors);
+        }
+    }
+    log::info!("IPC: anchored {}", label);
+    crate::ipc::IpcResponse::Ok {
+        data: Some(serde_json::json!({
+            "label": label,
+            "anchors": anchors.items.len(),
+            "dropped": dropped.map(|a| a.label),
+        })),
+    }
+}
+
+/// IPC: empty the anchor list — the outside saying the day is over.
+fn handle_ipc_clear_anchors(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+) -> crate::ipc::IpcResponse {
+    let mut anchors = crate::anchors::load();
+    let removed = anchors.items.len();
+    anchors.items.clear();
+    crate::anchors::save(&anchors);
+    for win in windows.borrow().iter() {
+        if let Some(view) = kova_view(win) {
+            view.ipc_refresh_anchors(&anchors);
+        }
+    }
+    log::info!("IPC: cleared {} anchor(s)", removed);
+    crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "removed": removed })) }
 }
 
 /// IPC: re-read the config file and push its appearance half into every open

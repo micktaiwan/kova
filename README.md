@@ -41,6 +41,7 @@ Kova tracks which panes have something you have not seen — a bell, or a comman
 - Cmd+P opens the tab/pane switcher: every tab with its panes, arrows or click to pick, Enter to focus. `u` flips it to the panes asking for something; Cmd+Shift+J opens that filtered list directly.
 - Inside the switcher, Cmd+Up/Down moves the selected pane up or down its tab's order, and Cmd+Backspace on a bookmark row removes that bookmark after a confirmation.
 - Cmd+B bookmarks the conversation in the focused pane (press again to drop it); bookmarks no pane holds are listed in Cmd+P, and picking one reopens the conversation and runs its resume line.
+- Cmd+Shift+A anchors the focused pane's conversation — the few things today is for. Anchors open Cmd+P in their own section, listed whether or not a pane still holds them, and Cmd+A goes straight to the first one, reopening it when nothing does. A conversation that is both only shows up under the anchors. The list is Kova's own; an outside tool can push into it with the `set-anchor` IPC command.
 - The status bar counts working Claude sessions (`✳N`) and unread panes (`●N`).
 - Cmd+Shift+Option+Left/Right walks the panes you visited, back then forward.
 - Desktop notifications are posted by Kova itself, so clicking one focuses the pane it came from.
@@ -133,6 +134,8 @@ focus_border_color = [0.4, 0.6, 1.0]
 | Cmd+P | Tab/pane switcher |
 | Cmd+Shift+J | Pane switcher, unread panes only |
 | Cmd+B | Bookmark the focused pane's conversation (toggle) |
+| Cmd+Shift+A | Anchor the focused pane's conversation (toggle) |
+| Cmd+A | Go to the first anchor |
 | Cmd+J | Jump to the next unread pane |
 | Cmd+Shift+Option+Left/Right | Walk the panes you visited, back and forward |
 | Cmd+O | Reopen a closed tab |

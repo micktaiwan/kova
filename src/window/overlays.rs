@@ -97,6 +97,24 @@ impl KovaView {
         true
     }
 
+    /// Cmd+V while the filter is open: the clipboard goes into the query, not
+    /// into the pane's PTY behind it.
+    pub(super) fn paste_into_filter(&self, text: &str) {
+        let pasted = filter_paste_text(text);
+        if pasted.is_empty() {
+            return;
+        }
+        let mut filter = self.ivars().filter.borrow_mut();
+        let Some(state) = filter.as_mut() else { return };
+        state.query.push_str(&pasted);
+        state.history_pos = None;
+        if let Some(pane) = self.focused_pane() {
+            let term = pane.terminal.read();
+            state.matches = term.search_lines(&state.query);
+            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub(super) fn handle_filter_key(&self, event: &NSEvent) {
         let key_code = event.keyCode();
         let chars = event.charactersIgnoringModifiers();
@@ -383,5 +401,28 @@ impl KovaView {
                 term.scroll_to_abs_line(abs_line);
             }
         }
+    }
+}
+
+/// The part of a clipboard that can go into the single-line filter query: its
+/// first line, without the control chars a line search could never match.
+fn filter_paste_text(text: &str) -> String {
+    text.lines().next().unwrap_or("").chars().filter(|&c| is_typed_char(c)).collect()
+}
+
+#[cfg(test)]
+mod filter_paste_tests {
+    use super::filter_paste_text;
+
+    #[test]
+    fn keeps_first_line_only() {
+        assert_eq!(filter_paste_text("foo bar\nbaz"), "foo bar");
+        assert_eq!(filter_paste_text("foo\r\nbaz"), "foo");
+    }
+
+    #[test]
+    fn drops_control_chars() {
+        assert_eq!(filter_paste_text("a\tb\x1b[c"), "ab[c");
+        assert_eq!(filter_paste_text(""), "");
     }
 }

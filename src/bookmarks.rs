@@ -1,5 +1,5 @@
-//! Conversations the user wants back — the list Cmd+P offers under
-//! "Bookmarks", kept apart from the session file on purpose.
+//! Conversations the user wants back — the list Cmd+P offers, grouped by
+//! directory, kept apart from the session file on purpose.
 //!
 //! The session file answers "what was open when Kova quit"; it is a safety net
 //! and it forgets a tab as soon as it is closed. A bookmark answers a different
@@ -68,37 +68,13 @@ fn path() -> PathBuf {
 /// Read the list from disk. A missing or unreadable file is an empty list —
 /// never a reason to refuse to open the switcher.
 pub fn load() -> Bookmarks {
-    let path = path();
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return Bookmarks::default();
-    };
-    match serde_json::from_str(&data) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("Failed to parse {} ({}); starting from an empty list", path.display(), e);
-            Bookmarks::default()
-        }
-    }
+    crate::session::load_owner_only(&path(), "bookmark list")
 }
 
 /// Write the list back, owner-readable only: it holds working directories and
 /// conversation ids, same as the session file.
 pub fn save(bookmarks: &Bookmarks) {
-    let path = path();
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            log::warn!("Failed to create {}: {}", parent.display(), e);
-            return;
-        }
-    }
-    match serde_json::to_string_pretty(bookmarks) {
-        Ok(json) => {
-            if let Err(e) = crate::session::write_owner_only(&path, &json) {
-                log::warn!("Failed to write {}: {}", path.display(), e);
-            }
-        }
-        Err(e) => log::warn!("Failed to serialize bookmarks: {}", e),
-    }
+    crate::session::save_owner_only(&path(), "bookmarks", bookmarks);
 }
 
 /// The keys of every saved bookmark, for the per-frame "is this pane

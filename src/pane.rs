@@ -1688,6 +1688,11 @@ pub struct Pane {
     /// an open session nobody is using is a candidate exactly once, then drops
     /// out until it works again — the same drain rule as the waiting flag.
     idle_agent_seen: Cell<bool>,
+    /// When the eye last landed on this pane, as a global visit sequence number
+    /// (0 = never looked at since Kova started). This — not the pane id — is
+    /// what orders every Cmd+J walk: the least recently seen pane comes first,
+    /// so a tour visits all of them before handing any of them back.
+    last_seen: Cell<u64>,
     /// Name of the binary running in the foreground (`claude`, `nvim`, `ssh`…),
     /// `None` at a bare shell prompt. Cached because the status bar reads it on
     /// every frame while resolving it costs two syscalls: it is refreshed on the
@@ -1833,6 +1838,7 @@ impl Pane {
             awaiting: Cell::new(AwaitingFlag::default()),
             agent_session: RefCell::new(None),
             idle_agent_seen: Cell::new(false),
+            last_seen: Cell::new(0),
             fg_process: RefCell::new(None),
         })
     }
@@ -1865,6 +1871,7 @@ impl Pane {
             awaiting: Cell::new(AwaitingFlag::default()),
             agent_session: RefCell::new(None),
             idle_agent_seen: Cell::new(false),
+            last_seen: Cell::new(0),
             fg_process: RefCell::new(None),
         })
     }
@@ -2071,6 +2078,21 @@ impl Pane {
     /// frame loop on the focused pane, alongside `mark_awaiting_seen`).
     pub fn mark_idle_agent_seen(&self) {
         self.idle_agent_seen.set(true);
+    }
+
+    /// Stamp the pane as just looked at, with a number no other pane will get
+    /// again. Called by the frame loop on the focused pane of the key window,
+    /// alongside `mark_awaiting_seen`.
+    pub fn mark_seen_now(&self) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.last_seen.set(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Visit stamp of this pane: 0 for a pane the eye has never landed on, and
+    /// otherwise the higher the more recently it was looked at. What Cmd+J
+    /// sorts its candidates by.
+    pub fn last_seen(&self) -> u64 {
+        self.last_seen.get()
     }
 
     /// Put this pane back in the idle-Claude tier next time it falls idle.

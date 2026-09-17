@@ -145,6 +145,23 @@ pub enum IpcCommand {
         message: String,
         sound: bool,
     },
+    /// Put a conversation at the head of the anchors — the list Cmd+P opens
+    /// with and Cmd+A jumps to. Either a pane of this Kova (`pane_id`), or a
+    /// conversation named outright (`cwd`, plus `session_id`/`agent` to reopen
+    /// it). Already anchored, it moves to the head rather than appearing twice.
+    ///
+    /// This is the whole of what an outside tool needs to say "today is this
+    /// one". Kova never calls out: it holds its own list and answers this.
+    SetAnchor {
+        pane_id: Option<u32>,
+        cwd: Option<String>,
+        session_id: Option<String>,
+        agent: Option<String>,
+        label: Option<String>,
+    },
+    /// Empty the anchor list. What a day-boundary looks like from outside —
+    /// Kova has no notion of one and never clears the list on its own.
+    ClearAnchors,
     /// Re-read `~/.config/kova/config.toml` and apply what can change without
     /// a restart (colors, pane fade, focus outline). Font, keybindings and
     /// terminal geometry keep the values they were started with.
@@ -410,6 +427,8 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "dispatch-action" => &["action", "pane_id"],
         "merge-window" => &["source_window", "target_window"],
         "notify" => &["pane_id", "title", "message", "sound"],
+        "set-anchor" => &["pane_id", "cwd", "session_id", "agent", "label"],
+        "clear-anchors" => &[],
         "reload-config" => &[],
         "subscribe" => &["events"],
         _ => return None,
@@ -737,6 +756,40 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             };
             Ok(IpcCommand::Notify { pane_id, title, message, sound })
         }
+        "set-anchor" => {
+            let text = |key: &str| -> Result<Option<String>, String> {
+                match v.get(key) {
+                    None | Some(serde_json::Value::Null) => Ok(None),
+                    Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
+                    Some(_) => Err(format!("\"{key}\" must be a non-empty string")),
+                }
+            };
+            let pane_id = match v.get("pane_id") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Number(n)) => {
+                    Some(n.as_u64().ok_or("\"pane_id\" must be a number")? as u32)
+                }
+                Some(_) => return Err("\"pane_id\" must be a number".to_string()),
+            };
+            let cwd = text("cwd")?;
+            let agent = text("agent")?;
+            if let Some(a) = agent.as_deref() {
+                if a != "claude" && a != "codex" {
+                    return Err("\"agent\" must be \"claude\" or \"codex\"".to_string());
+                }
+            }
+            if pane_id.is_none() && cwd.is_none() {
+                return Err("set-anchor needs \"pane_id\" or \"cwd\"".to_string());
+            }
+            Ok(IpcCommand::SetAnchor {
+                pane_id,
+                cwd,
+                session_id: text("session_id")?,
+                agent,
+                label: text("label")?,
+            })
+        }
+        "clear-anchors" => Ok(IpcCommand::ClearAnchors),
         "reload-config" => Ok(IpcCommand::ReloadConfig),
         "subscribe" => {
             // Omitted / null = every topic. An explicit list is validated name by
@@ -1078,6 +1131,43 @@ mod tests {
             }
             _ => panic!("notify should parse with only a message"),
         }
+    }
+
+    #[test]
+    fn set_anchor_takes_a_pane_or_a_named_conversation() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"set-anchor","pane_id":3}"#),
+            Ok(IpcCommand::SetAnchor { pane_id: Some(3), .. })
+        ));
+        match parse_command(
+            r#"{"cmd":"set-anchor","cwd":"/w","session_id":"abc","agent":"codex","label":"prez"}"#,
+        ) {
+            Ok(IpcCommand::SetAnchor { cwd, session_id, agent, label, .. }) => {
+                assert_eq!(cwd.as_deref(), Some("/w"));
+                assert_eq!(session_id.as_deref(), Some("abc"));
+                assert_eq!(agent.as_deref(), Some("codex"));
+                assert_eq!(label.as_deref(), Some("prez"));
+            }
+            _ => panic!("expected a named conversation"),
+        }
+    }
+
+    #[test]
+    fn set_anchor_refuses_what_it_cannot_make_sense_of() {
+        // Nothing to anchor at all, an agent Kova cannot resume, an empty string
+        // where a path was expected, and a field nobody reads. A session id with
+        // no agent is not here: it parses, and the handler drops the id (see
+        // `anchors::from_named`), because the directory alone is still an anchor.
+        assert_eq!(err(r#"{"cmd":"set-anchor"}"#), "set-anchor needs \"pane_id\" or \"cwd\"");
+        assert!(parse_command(r#"{"cmd":"set-anchor","cwd":"/w","agent":"aider"}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"set-anchor","cwd":""}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"set-anchor","cwd":"/w","project":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn clear_anchors_takes_no_argument() {
+        assert!(matches!(parse_command(r#"{"cmd":"clear-anchors"}"#), Ok(IpcCommand::ClearAnchors)));
+        assert!(parse_command(r#"{"cmd":"clear-anchors","all":true}"#).is_err());
     }
 
     #[test]

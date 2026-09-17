@@ -130,6 +130,11 @@ pub struct KovaViewIvars {
     /// pane apart without reading `bookmarks.json` on every frame. Refreshed
     /// when the list changes (Cmd+B) — the file is only written from here.
     bookmark_keys: RefCell<std::collections::HashSet<String>>,
+    /// Keys of the saved anchors, read by the same per-frame test as
+    /// `bookmark_keys`. Kept apart because the two lists mean different things
+    /// and are written by different gestures — an anchor also arrives from
+    /// outside, through the `set-anchor` IPC command.
+    anchor_keys: RefCell<std::collections::HashSet<String>>,
     /// Banner painted across the focused pane's status bar (text, colour,
     /// remaining frames): says which attention tier the last Cmd+J landed in.
     attention_banner: RefCell<Option<(String, [f32; 3], u32)>>,
@@ -223,12 +228,14 @@ struct PaneFlash {
     label: Option<PaneFlashLabel>,
 }
 
-/// The two lines of a flash label: the directory the pane sits in, and the
-/// path above it.
+/// The three lines of a flash label: the directory the pane sits in, the path
+/// above it, and the name of the agent conversation it holds (empty when the
+/// pane has none).
 #[derive(Clone)]
 struct PaneFlashLabel {
     name: String,
     parent: String,
+    session: String,
 }
 
 /// Split a working directory into the big line (the directory's own name) and
@@ -1329,6 +1336,7 @@ impl KovaView {
             resize_feedback: Cell::new(None),
             transient_status: RefCell::new(None),
             bookmark_keys: RefCell::new(crate::bookmarks::keys(&crate::bookmarks::load().items)),
+            anchor_keys: RefCell::new(crate::anchors::keys(&crate::anchors::load().items)),
             attention_banner: RefCell::new(None),
             deferred_tabs: RefCell::new(Vec::new()),
             loading_total_panes: Cell::new(0),
@@ -1709,30 +1717,113 @@ impl KovaView {
         cwd
     }
 
+    /// The name of the agent conversation held by a pane of this window, if it
+    /// holds one and it has been named.
+    fn pane_session_name(&self, pane_id: PaneId) -> Option<String> {
+        let tabs = self.ivars().tabs.borrow();
+        let tab = tabs.iter().find(|t| t.contains(pane_id))?;
+        tab.pane(pane_id)?.agent_session_name()
+    }
+
     /// Keep the focused pane's conversation in the bookmark list, or drop it if
-    /// it is already there. The list is what Cmd+P offers under "Bookmarks".
+    /// it is already there. The list is what Cmd+P offers, grouped by directory.
     ///
     /// Unlike the session file, this survives closing the pane: it is the answer
     /// to "I want this conversation back tomorrow", not to "put back what was
     /// open when Kova quit".
     fn do_toggle_bookmark(&self) {
-        let candidate = {
+        let focused = {
             let tabs = self.ivars().tabs.borrow();
-            let idx = self.ivars().active_tab.get();
-            let Some(tab) = tabs.get(idx) else { return };
-            let Some(pane) = tab.pane(tab.focused_pane) else { return };
-            let session = pane.agent_session.borrow().clone();
-            crate::bookmarks::Bookmark {
-                agent: session.as_ref().map(|s| s.agent),
-                session_id: session.as_ref().map(|s| s.id.clone()),
-                cwd: pane.cwd().unwrap_or_default(),
-                label: pane.display_title("shell"),
-            }
+            let Some(tab) = tabs.get(self.ivars().active_tab.get()) else { return };
+            tab.focused_pane
         };
-        if candidate.cwd.is_empty() && candidate.session_id.is_none() {
-            self.set_transient_status("Nothing to bookmark in this pane");
+        self.toggle_pane_bookmark(focused);
+    }
+
+    /// What a pane would be saved as, in either list: the conversation it runs,
+    /// or its directory alone at a bare shell. `None` when the pane holds
+    /// neither — there would be nothing to bring back.
+    pub(super) fn pane_as_saved(&self, pane_id: PaneId) -> Option<crate::bookmarks::Bookmark> {
+        let tabs = self.ivars().tabs.borrow();
+        let pane = tabs.iter().find_map(|t| t.pane(pane_id))?;
+        let session = pane.agent_session.borrow().clone();
+        let saved = crate::bookmarks::Bookmark {
+            agent: session.as_ref().map(|s| s.agent),
+            session_id: session.as_ref().map(|s| s.id.clone()),
+            cwd: pane.cwd().unwrap_or_default(),
+            label: pane.display_title("shell"),
+        };
+        (!saved.cwd.is_empty() || saved.session_id.is_some()).then_some(saved)
+    }
+
+    /// Keep the focused pane's conversation among today's anchors, or drop it.
+    /// Cmd+Shift+A — the deliberate gesture, next to Cmd+B, one modifier apart
+    /// because the two lists are neighbours.
+    fn do_toggle_anchor(&self) {
+        let focused = {
+            let tabs = self.ivars().tabs.borrow();
+            let Some(tab) = tabs.get(self.ivars().active_tab.get()) else { return };
+            tab.focused_pane
+        };
+        self.toggle_pane_anchor(focused);
+    }
+
+    /// Anchor or un-anchor the conversation of `pane_id`. Cmd+Shift+A on the
+    /// focused pane, and on a pane row of Cmd+P.
+    pub(super) fn toggle_pane_anchor(&self, pane_id: PaneId) {
+        let Some(candidate) = self.pane_as_saved(pane_id) else {
+            self.set_transient_status("Nothing to anchor in this pane");
+            return;
+        };
+        let label = candidate.label.clone();
+        let mut anchors = crate::anchors::load();
+        let outcome = crate::anchors::toggle(&mut anchors.items, candidate);
+        if outcome == crate::anchors::Toggled::Full {
+            self.set_transient_status(&format!(
+                "Already {} anchors — drop one first",
+                crate::anchors::MAX_ANCHORS
+            ));
             return;
         }
+        crate::anchors::save(&anchors);
+        self.refresh_anchor_keys(&anchors);
+        self.set_transient_status(&if outcome == crate::anchors::Toggled::Added {
+            format!("Anchored {}", label)
+        } else {
+            format!("Removed anchor {}", label)
+        });
+    }
+
+    /// Cmd+A: back to the first anchor — the pane still running it, or the
+    /// conversation reopened where it belongs when none does. One key, one
+    /// target, nothing to pick: that is the whole point of an ordered list.
+    fn do_focus_anchor(&self) {
+        // Cmd+A is "select all" everywhere else on this Mac, so while a text
+        // field of Kova's own is up it must not jump the window somewhere else.
+        if self.ivars().filter.borrow().is_some() {
+            return;
+        }
+        let anchors = crate::anchors::load();
+        let Some(first) = anchors.items.first() else {
+            self.set_transient_status("No anchor yet — Cmd+Shift+A anchors this pane");
+            return;
+        };
+        self.open_saved_conversation(first);
+    }
+
+    /// Re-read the anchor cache the status bars paint from, and repaint.
+    pub(super) fn refresh_anchor_keys(&self, anchors: &crate::anchors::Anchors) {
+        *self.ivars().anchor_keys.borrow_mut() = crate::anchors::keys(&anchors.items);
+        self.mark_dirty();
+    }
+
+    /// Bookmark or un-bookmark the conversation of `pane_id`, whichever tab of
+    /// this window holds it. Cmd+B on the focused pane, and on a pane row of Cmd+P.
+    pub(super) fn toggle_pane_bookmark(&self, pane_id: PaneId) {
+        let Some(candidate) = self.pane_as_saved(pane_id) else {
+            self.set_transient_status("Nothing to bookmark in this pane");
+            return;
+        };
         let mut bookmarks = crate::bookmarks::load();
         let label = candidate.label.clone();
         let kept = crate::bookmarks::toggle(&mut bookmarks.items, candidate);
@@ -1893,6 +1984,8 @@ impl KovaView {
             Action::OpenPaneSwitcher => self.open_pane_switcher(false),
             Action::OpenUnreadSwitcher => self.open_pane_switcher(true),
             Action::ToggleBookmark => self.do_toggle_bookmark(),
+            Action::ToggleAnchor => self.do_toggle_anchor(),
+            Action::FocusAnchor => self.do_focus_anchor(),
             Action::Equalize => {
                 let mut tabs = self.ivars().tabs.borrow_mut();
                 let idx = self.ivars().active_tab.get();
@@ -2010,7 +2103,12 @@ impl KovaView {
                 }
             }
             Action::Paste => {
-                if let Some(pane) = self.focused_pane() {
+                if self.ivars().filter.borrow().is_some() {
+                    let pasteboard = NSPasteboard::generalPasteboard();
+                    if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+                        self.paste_into_filter(&text.to_string());
+                    }
+                } else if let Some(pane) = self.focused_pane() {
                     let pasteboard = NSPasteboard::generalPasteboard();
                     let pasted_image = unsafe { pasteboard.dataForType(objc2_app_kit::NSPasteboardTypePNG) }
                         .and_then(|data| {
