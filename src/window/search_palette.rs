@@ -368,6 +368,39 @@ fn open_pane_in_tab_for_cwd(cwd: &str, config: &crate::config::Config, command: 
     false
 }
 
+/// Focus the pane running Claude conversation `session_id`, in whichever window
+/// holds it, and pulse its border. False when no pane in this process has it.
+fn focus_pane_with_claude_session(session_id: &str) -> bool {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let ns_windows = app.windows();
+    for i in 0..ns_windows.count() {
+        let win = ns_windows.objectAtIndex(i);
+        let Some(view) = crate::app::kova_view(&win) else { continue };
+        let found = {
+            let tabs = view.ivars().tabs.borrow();
+            let mut found = None;
+            for tab in tabs.iter() {
+                tab.for_each_pane(&mut |pane| {
+                    if found.is_none() && pane.claude_session_id().as_deref() == Some(session_id) {
+                        found = Some(pane.id);
+                    }
+                });
+                if found.is_some() {
+                    break;
+                }
+            }
+            found
+        };
+        let Some(pane_id) = found else { continue };
+        win.makeKeyAndOrderFront(None);
+        view.ipc_focus_pane(pane_id);
+        view.set_pane_flash(pane_id, 30, None);
+        return true;
+    }
+    false
+}
+
 /// Bring the right window/tab/pane to focus and trigger the highlight flash.
 /// Walks every Kova window in the process to find the hit's tab_id.
 fn jump_to_search_hit(hit: &SearchHit) {
@@ -419,6 +452,13 @@ impl KovaView {
     /// The `--resume` line is typed and run: picking the hit already said which
     /// conversation to bring back.
     fn open_archived_claude_session(&self, session_id: &str, cwd: &str) {
+        // The rows were built a moment ago, off the main thread: the pick can
+        // land on a conversation that has been reopened since, in Kova or
+        // elsewhere. Focusing the pane that holds it beats running a second
+        // `--resume` on a live id, which Claude Code accepts without a word.
+        if focus_pane_with_claude_session(session_id) {
+            return;
+        }
         // Reopening one conversation out of hundreds is a vote for it, and the
         // only one the user never has to think about casting.
         crate::claude_history::record_resume(session_id);
@@ -545,9 +585,12 @@ impl KovaView {
     fn collect_search_snapshot() -> (Vec<SearchTabSnapshot>, Vec<SearchPaneSnapshot>, Vec<String>) {
         let mut tabs_snap = Vec::new();
         let mut panes_snap = Vec::new();
-        // Claude sessions currently running in a pane. They are already listed
-        // in the panes section, so the archived section leaves them out.
-        let mut live_sessions = Vec::new();
+        // Claude conversations that must not show up as closed. Every live
+        // session file on the machine is the seed rather than only what the
+        // panes report: a pane that Kova has not yet linked to its conversation
+        // would otherwise offer it as closed, and resuming it would put the same
+        // conversation in two panes (see `claude_session::live_session_ids`).
+        let mut live_sessions = crate::claude_session::live_session_ids();
 
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let app = NSApplication::sharedApplication(mtm);

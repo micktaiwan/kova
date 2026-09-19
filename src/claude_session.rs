@@ -32,7 +32,18 @@ const START_TIME_TOLERANCE_SECS: u64 = 30;
 /// of times per save for no reason.
 const CACHE_TTL: Duration = Duration::from_secs(1);
 
-static CACHE: Mutex<Option<(Instant, HashMap<u32, Session>)>> = Mutex::new(None);
+static CACHE: Mutex<Option<(Instant, Scan)>> = Mutex::new(None);
+
+/// One pass over `~/.claude/sessions/`, seen from the two angles that matter.
+#[derive(Default)]
+struct Scan {
+    /// Ancestor PID → the session running under it, for "which conversation
+    /// does this pane hold?".
+    by_ancestor: HashMap<u32, Session>,
+    /// Every conversation alive on this machine, whatever its process tree
+    /// looks like, for "is this conversation already running somewhere?".
+    live_ids: Vec<String>,
+}
 
 /// What a live Claude Code session file tells us about the session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,12 +113,13 @@ fn parse_session_file(data: &str) -> Option<(u32, u64, Session)> {
     Some((pid, started_at, Session { id, name }))
 }
 
-/// Build a map of "ancestor PID → Claude session" from `~/.claude/sessions/`.
-/// A pane then finds its session by looking up its own shell PID.
-fn scan_uncached() -> HashMap<u32, Session> {
-    let mut map = HashMap::new();
+/// Read `~/.claude/sessions/` once into a `Scan`: a map of "ancestor PID →
+/// Claude session", so a pane finds its session by looking up its own shell
+/// PID, plus the flat list of every live conversation id.
+fn scan_uncached() -> Scan {
+    let mut scan = Scan::default();
     let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
-        return map;
+        return scan;
     };
     let own_pid = std::process::id();
 
@@ -131,23 +143,25 @@ fn scan_uncached() -> HashMap<u32, Session> {
             continue;
         }
 
+        // The id goes in before the ancestry walk: a conversation is alive
+        // whether or not any pane turns out to own it.
+        scan.live_ids.push(session.id.clone());
+
         let mut current = pid;
         for _ in 0..MAX_ANCESTRY_DEPTH {
             let Some((parent, _)) = proc_info(current) else { break };
             if parent <= 1 || parent == own_pid {
                 break;
             }
-            map.insert(parent, session.clone());
+            scan.by_ancestor.insert(parent, session.clone());
             current = parent;
         }
     }
-    map
+    scan
 }
 
-/// The Claude Code session running under `shell_pid`, if any. Shared by the
-/// session snapshot (which wants the id) and the pane title (which wants the
-/// name), so both ride the same cached scan.
-pub fn session_for_shell(shell_pid: u32) -> Option<Session> {
+/// Run the scan if the cached one has aged out, then hand `f` the current one.
+fn with_scan<T>(f: impl FnOnce(&Scan) -> T) -> T {
     let mut cache = CACHE.lock();
     let fresh = match cache.as_ref() {
         Some((at, _)) => at.elapsed() < CACHE_TTL,
@@ -156,7 +170,28 @@ pub fn session_for_shell(shell_pid: u32) -> Option<Session> {
     if !fresh {
         *cache = Some((Instant::now(), scan_uncached()));
     }
-    cache.as_ref().and_then(|(_, map)| map.get(&shell_pid).cloned())
+    // Just refreshed above, so the entry is there.
+    f(cache.as_ref().map(|(_, scan)| scan).expect("a scan was just stored"))
+}
+
+/// Ids of every Claude Code conversation running on this machine right now.
+///
+/// Read straight from the session files rather than from what the panes report:
+/// a pane only knows its conversation once the ancestry walk has linked the two
+/// (`MAX_ANCESTRY_DEPTH` deep at most, and not at all during the first moments
+/// of a session), and a conversation Kova failed to link is exactly the one it
+/// must not offer to resume a second time. Two `claude --resume` on the same id
+/// are not refused by Claude Code: both processes adopt the id and append to
+/// the same transcript.
+pub fn live_session_ids() -> Vec<String> {
+    with_scan(|scan| scan.live_ids.clone())
+}
+
+/// The Claude Code session running under `shell_pid`, if any. Shared by the
+/// session snapshot (which wants the id) and the pane title (which wants the
+/// name), so both ride the same cached scan.
+pub fn session_for_shell(shell_pid: u32) -> Option<Session> {
+    with_scan(|scan| scan.by_ancestor.get(&shell_pid).cloned())
 }
 
 /// True if `id` is safe to splice into a command line.
@@ -244,11 +279,16 @@ mod tests {
     #[test]
     #[ignore]
     fn claude_sessions_are_detected_on_this_machine() {
-        let map = scan_uncached();
-        for (pid, session) in &map {
+        let scan = scan_uncached();
+        for (pid, session) in &scan.by_ancestor {
             println!("  pid {} → {} ({:?})", pid, session.id, session.name);
         }
-        assert!(!map.is_empty(), "no live Claude Code session found");
+        println!("  live ids: {:?}", scan.live_ids);
+        assert!(!scan.by_ancestor.is_empty(), "no live Claude Code session found");
+        assert!(
+            scan.live_ids.len() >= scan.by_ancestor.values().count().min(1),
+            "a scan with panes attached must list live ids too"
+        );
     }
 
     /// Shape of a real file, taken from a live session on 2026-08-09.
