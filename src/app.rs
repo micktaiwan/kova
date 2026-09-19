@@ -1317,6 +1317,14 @@ fn handle_ipc_set_anchor(
             .filter_map(|win| kova_view(win))
             .find_map(|view| view.ipc_pane_as_saved(id as crate::pane::PaneId))
     });
+    // A pane that was named and could not be used is an error, never a silent
+    // fallback onto `cwd`: anchoring something other than what was asked for,
+    // under an `ok: true`, is the answer that costs the most to debug.
+    if let (Some(id), None) = (pane_id, &from_pane) {
+        return crate::ipc::IpcResponse::Error {
+            message: format!("pane {} is not open, or holds neither a conversation nor a directory", id),
+        };
+    }
     let anchor = match (from_pane, cwd) {
         (Some(saved), _) => saved,
         (None, Some(cwd)) => crate::anchors::from_named(
@@ -1329,12 +1337,22 @@ fn handle_ipc_set_anchor(
             },
             label,
         ),
+        // Unreachable through `parse_command`, which already refuses a request
+        // naming neither. Kept as a message that says what is missing, since a
+        // "pane 0 not found" would send the reader looking for a pane.
         (None, None) => {
             return crate::ipc::IpcResponse::Error {
-                message: format!("pane {} not found", pane_id.unwrap_or(0)),
+                message: "set-anchor needs either \"pane_id\" or \"cwd\"".to_string(),
             }
         }
     };
+    // An id Kova would refuse to type into a shell would anchor a bare shell
+    // under a conversation's name. Said out loud rather than shipped as an `ok`.
+    if anchor.session_id.is_some() && anchor.resume_command().is_none() {
+        return crate::ipc::IpcResponse::Error {
+            message: "\"session_id\" is not an id this agent can resume".to_string(),
+        };
+    }
     let label = anchor.label.clone();
     let mut anchors = crate::anchors::load();
     let dropped = crate::anchors::promote(&mut anchors.items, anchor);

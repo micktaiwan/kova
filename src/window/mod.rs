@@ -625,6 +625,19 @@ define_class!(
                 None => return objc2::runtime::Bool::NO,
             };
 
+            // Same routing as the three overlays below, and for the same reason:
+            // these two pick a target tab and read `active_tab` at Enter, so a
+            // shortcut falling through to the global map (Cmd+A, a tab switch)
+            // would act on one tab while the overlay names another.
+            if self.ivars().send_to_window.borrow().is_some() {
+                self.handle_send_to_window_key(event);
+                return objc2::runtime::Bool::YES;
+            }
+            if self.ivars().merge_tab.borrow().is_some() {
+                self.handle_merge_tab_key(event);
+                return objc2::runtime::Bool::YES;
+            }
+
             // When recent projects overlay is shown, route keys through the overlay handler
             if self.ivars().recent_projects.borrow().is_some() {
                 self.handle_recent_projects_key(event);

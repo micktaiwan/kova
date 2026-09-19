@@ -252,15 +252,16 @@ reopen it, and `label` for the row (the directory's name otherwise). A
 `session_id` without an `agent` is dropped: nothing could resume it. A
 conversation already anchored moves to the head rather than gaining a second
 row, so pushing the same anchor twice is harmless. The list is capped at 8; past
-that the last anchor of the list falls off and comes back in `dropped` — a push
+that the last anchor of the list falls off and its label comes back in `dropped` — a push
 from outside always lands, where `Cmd+Shift+A` on a full list refuses instead
 (you are there to drop one). An anchored conversation stops appearing among
 the bookmarks below, even when it is bookmarked too.
 
 Response: `{ "ok": true, "data": { "label": "Prez steerco", "anchors": 3, "dropped": null } }`.
 
-Errors rather than a surprise: a `pane_id` that is not open (or holds neither a
-conversation nor a directory), and a `session_id` the agent could not resume.
+Errors rather than a surprise: a request naming neither `pane_id` nor `cwd`, a
+`pane_id` that is not open (or holds neither a conversation nor a directory), and
+a `session_id` the agent could not resume.
 
 ---
 

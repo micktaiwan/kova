@@ -275,7 +275,7 @@ pub(super) fn bookmark_groups(
     // Only the directories that end up on screen: a name is ambiguous when two
     // *visible* groups share it, and spelling out a path to avoid a clash with a
     // row nobody sees reads as a bug.
-    let all_cwds: Vec<&str> = dirs.clone();
+    let all_cwds: &[&str] = &dirs;
     for (dir, group) in dirs.iter().zip(groups.iter_mut()) {
         let header = bookmark_dir_header(dir, &all_cwds, home.as_deref());
         group.insert(0, SwitcherRow::TabHeader(format!("★ {}", header)));
@@ -797,9 +797,14 @@ impl KovaView {
             match guard.as_ref().and_then(|s| s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row))) {
                 Some(SwitcherRow::Pane { pane_id, .. }) => SwitcherTarget::Pane(*pane_id),
                 Some(SwitcherRow::Anchor { index, .. }) => SwitcherTarget::Anchor(*index),
+                Some(SwitcherRow::Bookmark { index, .. }) => SwitcherTarget::Bookmark(*index),
                 _ => return,
             }
         };
+        // The conversation this ran on, by the key both lists store it under:
+        // the rebuild below looks the row up again, and it may have changed
+        // section in between.
+        let mut acted_key: Option<String> = None;
         match target {
             SwitcherTarget::Anchor(index) => {
                 let mut anchors = crate::anchors::load();
@@ -807,6 +812,7 @@ impl KovaView {
                 crate::anchors::remove(&mut anchors.items, anchor.key());
                 crate::anchors::save(&anchors);
                 self.refresh_anchor_keys(&anchors);
+                acted_key = Some(anchor.key().to_string());
                 self.set_transient_status(&format!("Removed anchor {}", anchor.label));
             }
             SwitcherTarget::Pane(pane_id) => self.toggle_pane_anchor(pane_id),
@@ -817,16 +823,29 @@ impl KovaView {
                 let Some(bm) = crate::bookmarks::load().items.get(index).cloned() else { return };
                 let mut anchors = crate::anchors::load();
                 let label = bm.label.clone();
-                if crate::anchors::toggle(&mut anchors.items, bm) == crate::anchors::Toggled::Full {
-                    self.set_transient_status(&format!(
-                        "Already {} anchors — drop one first",
-                        crate::anchors::MAX_ANCHORS
-                    ));
-                    return;
+                acted_key = Some(bm.key().to_string());
+                // The row on screen can be one push behind the file — another
+                // window, or track, may have anchored this conversation since
+                // Cmd+P was opened — so the message follows what the toggle did,
+                // not what the row led us to expect.
+                match crate::anchors::toggle(&mut anchors.items, bm) {
+                    crate::anchors::Toggled::Full => {
+                        self.set_transient_status(&format!(
+                            "Already {} anchors — drop one first",
+                            crate::anchors::MAX_ANCHORS
+                        ));
+                        return;
+                    }
+                    outcome => {
+                        crate::anchors::save(&anchors);
+                        self.refresh_anchor_keys(&anchors);
+                        self.set_transient_status(&if outcome == crate::anchors::Toggled::Added {
+                            format!("Anchored {}", label)
+                        } else {
+                            format!("Removed anchor {}", label)
+                        });
+                    }
                 }
-                crate::anchors::save(&anchors);
-                self.refresh_anchor_keys(&anchors);
-                self.set_transient_status(&format!("Anchored {}", label));
             }
         }
         if self.ivars().pane_switcher.borrow().is_none() {
@@ -834,18 +853,35 @@ impl KovaView {
         }
         let filtered = self.ivars().pane_switcher.borrow().as_ref().is_some_and(|s| s.filtered);
         self.open_pane_switcher(filtered);
-        // Put the selection back where the eye is: on the pane just anchored,
-        // which the rebuild moved — it gained or lost a row above it.
-        if let SwitcherTarget::Pane(pane_id) = target {
-            if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
-                for (c, col) in state.columns.iter().enumerate() {
-                    if let Some(r) = col.iter().position(
-                        |row| matches!(row, SwitcherRow::Pane { pane_id: id, .. } if *id == pane_id),
-                    ) {
-                        state.selected_col = c;
-                        state.selected_row = r;
-                        break;
-                    }
+        // Put the selection back where the eye is: the rebuild moved every row
+        // below the Anchors section, which just gained or lost a line. A pane is
+        // found again by its id; an anchored or un-anchored conversation by the
+        // key it is saved under, since its row changed section on the way.
+        if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
+            let anchors = crate::anchors::load();
+            let bookmarks = crate::bookmarks::load();
+            let row_matches = |row: &SwitcherRow| match (row, &target) {
+                (SwitcherRow::Pane { pane_id, .. }, SwitcherTarget::Pane(id)) => pane_id == id,
+                // Un-anchoring a conversation a pane still runs: its row is that
+                // pane's, up in its tab, since the bookmark section leaves out
+                // what is open.
+                (SwitcherRow::Pane { pane_id, .. }, _) => {
+                    acted_key.is_some()
+                        && self.pane_as_saved(*pane_id).map(|s| s.key().to_string()) == acted_key
+                }
+                (SwitcherRow::Anchor { index, .. }, _) => {
+                    anchors.items.get(*index).map(|a| a.key()) == acted_key.as_deref()
+                }
+                (SwitcherRow::Bookmark { index, .. }, _) => {
+                    bookmarks.items.get(*index).map(|b| b.key()) == acted_key.as_deref()
+                }
+                _ => false,
+            };
+            for (c, col) in state.columns.iter().enumerate() {
+                if let Some(r) = col.iter().position(row_matches) {
+                    state.selected_col = c;
+                    state.selected_row = r;
+                    break;
                 }
             }
         }
