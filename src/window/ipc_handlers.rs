@@ -346,9 +346,10 @@ impl KovaView {
     /// list pushed while it is up would otherwise stay on screen out of date.
     pub fn ipc_refresh_anchors(&self, anchors: &crate::anchors::Anchors) {
         self.refresh_anchor_keys(anchors);
-        let filtered = self.ivars().pane_switcher.borrow().as_ref().map(|s| s.filtered);
-        if let Some(filtered) = filtered {
-            self.open_pane_switcher(filtered);
+        let open = self.ivars().pane_switcher.borrow().is_some();
+        if open {
+            let (filtered, show_bookmarks) = self.pane_switcher_modes();
+            self.open_pane_switcher(filtered, show_bookmarks);
         }
     }
 

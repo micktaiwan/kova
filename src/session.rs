@@ -369,13 +369,27 @@ pub fn save_owner_only<T: serde::Serialize>(path: &std::path::Path, what: &str, 
             return;
         }
     }
-    match serde_json::to_string_pretty(value) {
-        Ok(json) => {
-            if let Err(e) = write_owner_only(path, &json) {
-                log::warn!("Failed to write {}: {}", path.display(), e);
-            }
+    let json = match serde_json::to_string_pretty(value) {
+        Ok(json) => json,
+        Err(e) => {
+            log::warn!("Failed to serialize {}: {}", what, e);
+            return;
         }
-        Err(e) => log::warn!("Failed to serialize {}: {}", what, e),
+    };
+    // Keep the version being replaced one file away, then land the new bytes
+    // through a temporary file. These lists are hand-curated and nothing else
+    // on this machine records them: a write interrupted halfway used to leave a
+    // truncated file, which reads back as an empty list and takes the whole list
+    // with it on the next save.
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("list");
+    let _ = std::fs::copy(path, path.with_file_name(format!("{}.1.json", stem)));
+    let tmp = path.with_file_name(format!("{}.tmp.json", stem));
+    if let Err(e) = write_owner_only(&tmp, &json) {
+        log::warn!("Failed to write {}: {}", tmp.display(), e);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        log::warn!("Failed to replace {}: {}", path.display(), e);
     }
 }
 

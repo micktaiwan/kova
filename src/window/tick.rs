@@ -158,6 +158,8 @@ impl KovaView {
             None => return true,
         };
 
+        self.ask_about_duplicate_session();
+
         self.inject_pending_commands();
 
         self.restore_deferred_tabs();
@@ -394,6 +396,7 @@ impl KovaView {
             selected_col: state.selected_col,
             selected_row: state.selected_row,
             filtered: state.filtered,
+            show_bookmarks: state.show_bookmarks,
         });
 
         // Update resize feedback (decrement frames, build text)
@@ -915,6 +918,22 @@ impl KovaView {
                     if i != active_idx {
                         t.check_completion();
                     }
+                }
+                // One conversation in two panes: raised here, where the ids
+                // have just been refreshed, and asked about at the top of the
+                // next tick — an alert cannot run with the tabs borrowed.
+                if refresh_fg && ivars.duplicate_session.get().is_none() {
+                    let mut sessions: Vec<(PaneId, Option<String>)> = Vec::new();
+                    for t in tabs.iter() {
+                        t.for_each_pane(&mut |p| sessions.push((p.id, p.agent_session_id())));
+                    }
+                    let alive: std::collections::HashSet<PaneId> =
+                        sessions.iter().map(|(id, _)| *id).collect();
+                    let mut accepted = ivars.accepted_duplicates.borrow_mut();
+                    accepted.retain(|id| alive.contains(id));
+                    ivars
+                        .duplicate_session
+                        .set(crate::window::duplicates::duplicate_session(&sessions, &accepted));
                 }
                 tabs[active_idx].clear_bell();
                 // Derive active tab's completion from pane_data (avoids double atomic read)

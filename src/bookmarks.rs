@@ -16,10 +16,6 @@ use std::path::PathBuf;
 
 use crate::agent_session::Agent;
 
-/// Cap on the list. Past this it stops being a shortlist and becomes a second
-/// history, which the search palette already is.
-pub const MAX_BOOKMARKS: usize = 32;
-
 /// One saved conversation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bookmark {
@@ -94,7 +90,6 @@ pub fn toggle(items: &mut Vec<Bookmark>, candidate: Bookmark) -> bool {
         return false;
     }
     items.insert(0, candidate);
-    items.truncate(MAX_BOOKMARKS);
     true
 }
 
@@ -197,13 +192,13 @@ mod tests {
     }
 
     #[test]
-    fn the_list_never_grows_past_its_cap() {
+    fn the_list_has_no_cap_and_never_drops_a_bookmark() {
         let mut items = Vec::new();
-        for i in 0..MAX_BOOKMARKS + 5 {
+        for i in 0..50 {
             toggle(&mut items, claude(&format!("id-{}", i), "/a"));
         }
-        assert_eq!(items.len(), MAX_BOOKMARKS);
-        // The cap drops the oldest, not the newest.
-        assert_eq!(items[0].session_id.as_deref(), Some(format!("id-{}", MAX_BOOKMARKS + 4).as_str()));
+        assert_eq!(items.len(), 50, "nothing is evicted to make room");
+        assert_eq!(items[0].session_id.as_deref(), Some("id-49"), "the newest is on top");
+        assert_eq!(items[49].session_id.as_deref(), Some("id-0"), "the oldest is still there");
     }
 }

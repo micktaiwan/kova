@@ -313,6 +313,43 @@ impl KovaView {
         self.resize_all_panes();
     }
 
+    /// Close one pane by id, wherever it sits, with no confirmation: the caller
+    /// already asked. Unlike `do_close_pane_or_tab` this one does not assume the
+    /// pane is focused, and only moves the focus when it was the pane that left.
+    pub(super) fn close_pane_by_id(&self, pane_id: PaneId) {
+        let idx = {
+            let tabs = self.ivars().tabs.borrow();
+            match tabs.iter().position(|t| t.contains(pane_id)) {
+                Some(i) => i,
+                None => return,
+            }
+        };
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        if tabs[idx].is_single_pane() {
+            drop(tabs);
+            self.remove_tab(idx);
+            return;
+        }
+        let old_columns = tabs[idx].num_visible_columns();
+        if !tabs[idx].remove_pane(pane_id) {
+            drop(tabs);
+            self.remove_tab(idx);
+            return;
+        }
+        tabs[idx].minimized_stack.retain(|&pid| pid != pane_id);
+        let restored = tabs[idx].ensure_visible_pane();
+        if tabs[idx].focused_pane == pane_id {
+            tabs[idx].focused_pane = restored
+                .or_else(|| tabs[idx].first_visible_pane())
+                .unwrap_or_else(|| tabs[idx].first_pane().id);
+        }
+        let new_columns = tabs[idx].num_visible_columns();
+        tabs[idx].scale_virtual_width(old_columns, new_columns);
+        drop(tabs);
+        self.resize_all_panes();
+        self.mark_dirty();
+    }
+
     /// Close focused pane. If it's the last pane in the tab, close the tab.
     pub(super) fn do_close_pane_or_tab(&self) {
         // Collect info for confirmation dialog BEFORE holding the borrow,

@@ -255,6 +255,9 @@ pub struct PaneSwitcherRenderData<'a> {
     /// the panes that are not have been left out. Changes the title and the
     /// hint, so the list never looks like a truncated version of the full one.
     pub filtered: bool,
+    /// The bookmark half is up: the saved conversations in place of the open
+    /// panes (`b`). Changes the title and the hint line, for the same reason.
+    pub show_bookmarks: bool,
 }
 
 /// Vertical geometry of a list overlay (title + subtitle + scrolling rows),
@@ -551,6 +554,16 @@ pub struct Renderer {
     tooltip_visible: Option<ActiveTooltip>,
     /// Animation progress: 0 = hidden, TOOLTIP_ANIM_FRAMES = fully visible.
     tooltip_anim: u8,
+}
+
+/// Width, in cells, of the switcher's hint line: each pair is drawn as
+/// "<key> <what>" with two spaces before the next one, and the trailing gap
+/// after the last pair is not part of the line. Kept apart from the drawing so
+/// the centring can be checked without a GPU.
+fn hint_line_width(hints: &[(&str, &str)]) -> usize {
+    let total: usize =
+        hints.iter().map(|(k, w)| k.chars().count() + 1 + w.chars().count() + 2).sum();
+    total.saturating_sub(2)
 }
 
 impl Renderer {
@@ -2672,6 +2685,8 @@ impl Renderer {
         let header_fg = [0.55, 0.75, 1.0, 1.0];
         let label_fg = [0.85, 0.85, 0.9, 1.0];
         let dim_fg = [0.45, 0.45, 0.5, 1.0];
+        // The keys of the hint line, warmer than the words they go with.
+        let key_fg = [0.95, 0.7, 0.35, 1.0];
         let selected_bg = [0.25, 0.35, 0.55];
         // Bookmarked panes wear a band of their own, from `[bookmarks]` in the
         // config — the selected variant included, so selection still reads on a
@@ -2708,6 +2723,17 @@ impl Renderer {
                 1 => "Unread Panes  —  1".to_string(),
                 n => format!("Unread Panes  —  {}", n),
             }
+        } else if data.show_bookmarks {
+            let saved = data
+                .columns
+                .iter()
+                .flat_map(|c| c.rows.iter())
+                .filter(|r| !r.is_header)
+                .count();
+            match saved {
+                0 => "Bookmarks  —  none saved".to_string(),
+                n => format!("Bookmarks  —  {}", n),
+            }
         } else {
             match unread {
                 0 => "Switch Tab / Pane".to_string(),
@@ -2721,17 +2747,48 @@ impl Renderer {
         self.render_text(vertices, &title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
         y += cell_h * title_scale * 2.0;
 
-        // Subtitle
-        let subtitle = if data.filtered {
-            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{23ce} Focus  click to focus  u All panes  esc Cancel"
+        // Subtitle: the keys the overlay answers, each one a (key, what it does)
+        // pair. The key is drawn in its own colour — read as a line of grey the
+        // hints ran together, and the eye had to parse where each one started.
+        let hints: &[(&str, &str)] = if data.filtered {
+            &[
+                ("\u{2191}\u{2193}\u{2190}\u{2192}", "Navigate"),
+                ("\u{23ce}", "Focus"),
+                ("u", "All panes"),
+                ("esc", "Cancel"),
+            ]
+        } else if data.show_bookmarks {
+            &[
+                ("\u{2191}\u{2193}\u{2190}\u{2192}", "Navigate"),
+                ("\u{23ce}", "Open"),
+                ("b", "Open panes"),
+                ("\u{2318}\u{21e7}A", "Anchor"),
+                ("\u{2318}\u{232b}", "Remove bookmark"),
+                ("esc", "Cancel"),
+            ]
         } else {
-            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next unread  \u{23ce} Focus  \u{2318}\u{2191}\u{2193} Move  \u{2318}B Bookmark  \u{2318}\u{21e7}A Anchor  \u{2318}\u{232b} Remove bookmark  u Unread only  esc Cancel"
+            &[
+                ("\u{2191}\u{2193}\u{2190}\u{2192}", "Navigate"),
+                ("\u{21e5}", "Next unread"),
+                ("\u{23ce}", "Focus"),
+                ("\u{2318}\u{2191}\u{2193}", "Move"),
+                ("b", "Bookmarks"),
+                ("\u{2318}B", "Bookmark"),
+                ("\u{2318}\u{21e7}A", "Anchor"),
+                ("u", "Unread only"),
+                ("esc", "Cancel"),
+            ]
         };
-        let sub_chars = subtitle.chars().count() as f32;
+        let sub_chars = hint_line_width(hints) as f32;
         // Clamped: this hint line grew with each key added to the overlay, and a
         // centred line wider than the window would start off its left edge.
-        let sub_x = ((viewport_w - sub_chars * scaled_cell_w) / 2.0).max(0.0);
-        self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        let mut sub_x = ((viewport_w - sub_chars * scaled_cell_w) / 2.0).max(0.0);
+        for (key, what) in hints {
+            self.render_text(vertices, key, sub_x, y, viewport_w, key_fg, no_bg, body_scale);
+            sub_x += (key.chars().count() + 1) as f32 * scaled_cell_w;
+            self.render_text(vertices, what, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+            sub_x += (what.chars().count() + 2) as f32 * scaled_cell_w;
+        }
 
         let geom = self.overlay_list_geometry(viewport_h);
         let content_top = geom.content_top;
@@ -3433,6 +3490,13 @@ fn format_key_combo(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_hint_line_measures_what_it_draws() {
+        // "\u{23ce} Focus  esc Cancel" — 7 + 2 + 10, no trailing gap.
+        assert_eq!(super::hint_line_width(&[("\u{23ce}", "Focus"), ("esc", "Cancel")]), 19);
+        assert_eq!(super::hint_line_width(&[]), 0);
+    }
     use super::*;
 
     /// Bottom of the last row of a help column laid out at `scale`, walking

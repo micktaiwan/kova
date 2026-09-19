@@ -1,5 +1,6 @@
 mod attention;
 use attention::{do_history_step, pane_history_state};
+mod duplicates;
 mod geometry;
 mod ipc_handlers;
 mod overlays;
@@ -135,6 +136,14 @@ pub struct KovaViewIvars {
     /// and are written by different gestures — an anchor also arrives from
     /// outside, through the `set-anchor` IPC command.
     anchor_keys: RefCell<std::collections::HashSet<String>>,
+    /// Two panes found running the same agent conversation, newest first:
+    /// (duplicate, original). Raised by the session poll, answered by an alert
+    /// at the top of the next tick — the poll runs with the tabs borrowed, and
+    /// a modal there would re-enter them.
+    duplicate_session: Cell<Option<(PaneId, PaneId)>>,
+    /// Duplicates the user chose to keep, by the pane that carries them. Without
+    /// it the poll would ask again every half-second, forever.
+    accepted_duplicates: RefCell<std::collections::HashSet<PaneId>>,
     /// Banner painted across the focused pane's status bar (text, colour,
     /// remaining frames): says which attention tier the last Cmd+J landed in.
     attention_banner: RefCell<Option<(String, [f32; 3], u32)>>,
@@ -882,7 +891,7 @@ define_class!(
             if let Some(renderer) = self.ivars().renderer.get() {
                 if let Some((zx, zy, zw, zh)) = renderer.read().minimized_counter_zone {
                     if px >= zx && px < zx + zw && py >= zy && py < zy + zh {
-                        self.open_pane_switcher(false);
+                        self.open_pane_switcher(false, false);
                         return;
                     }
                 }
@@ -1350,6 +1359,8 @@ impl KovaView {
             transient_status: RefCell::new(None),
             bookmark_keys: RefCell::new(crate::bookmarks::keys(&crate::bookmarks::load().items)),
             anchor_keys: RefCell::new(crate::anchors::keys(&crate::anchors::load().items)),
+            duplicate_session: Cell::new(None),
+            accepted_duplicates: RefCell::new(std::collections::HashSet::new()),
             attention_banner: RefCell::new(None),
             deferred_tabs: RefCell::new(Vec::new()),
             loading_total_panes: Cell::new(0),
@@ -1994,8 +2005,8 @@ impl KovaView {
             Action::CloseTab => self.do_close_tab(),
             Action::OpenRecentProject => self.do_open_recent_projects(),
             Action::OpenSearchPalette => self.do_open_search_palette(),
-            Action::OpenPaneSwitcher => self.open_pane_switcher(false),
-            Action::OpenUnreadSwitcher => self.open_pane_switcher(true),
+            Action::OpenPaneSwitcher => self.open_pane_switcher(false, false),
+            Action::OpenUnreadSwitcher => self.open_pane_switcher(true, false),
             Action::ToggleBookmark => self.do_toggle_bookmark(),
             Action::ToggleAnchor => self.do_toggle_anchor(),
             Action::FocusAnchor => self.do_focus_anchor(),
@@ -2444,12 +2455,24 @@ pub fn confirm_running_processes(mtm: MainThreadMarker, procs: &[(String, String
 /// `confirm_button`. The caller must hold no `RefCell` borrow on the view:
 /// `runModal` spins a run loop that dispatches events, which borrow again.
 pub fn confirm_action(mtm: MainThreadMarker, message: &str, informative: &str, confirm_button: &str) -> bool {
+    confirm_choice(mtm, message, informative, confirm_button, "Cancel")
+}
+
+/// Same alert with both buttons named: for a question whose second answer is a
+/// choice of its own ("Keep both") rather than backing out.
+pub fn confirm_choice(
+    mtm: MainThreadMarker,
+    message: &str,
+    informative: &str,
+    first_button: &str,
+    second_button: &str,
+) -> bool {
     let alert = NSAlert::new(mtm);
     alert.setAlertStyle(NSAlertStyle::Warning);
     alert.setMessageText(&NSString::from_str(message));
     alert.setInformativeText(&NSString::from_str(informative));
-    alert.addButtonWithTitle(&NSString::from_str(confirm_button));
-    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    alert.addButtonWithTitle(&NSString::from_str(first_button));
+    alert.addButtonWithTitle(&NSString::from_str(second_button));
     alert.runModal() == 1000 // NSAlertFirstButtonReturn
 }
 
