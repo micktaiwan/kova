@@ -114,26 +114,6 @@ pub(super) fn pending_session_id(last_command: Option<&str>) -> Option<&str> {
     None
 }
 
-/// Drop the pane rows whose conversation is already an anchor, and the tab
-/// groups left with nothing but their header.
-///
-/// The anchors section lists a conversation whether or not a pane still holds
-/// it, so the pane row below would be a second row for the same conversation —
-/// exactly what the bookmark groups avoid by leaving an open bookmark out.
-/// Nothing is lost: the anchor row focuses that pane.
-pub(super) fn drop_anchored_panes(groups: Vec<Vec<SwitcherRow>>) -> Vec<Vec<SwitcherRow>> {
-    groups
-        .into_iter()
-        .filter_map(|group| {
-            let kept: Vec<SwitcherRow> = group
-                .into_iter()
-                .filter(|r| !matches!(r, SwitcherRow::Pane { anchored: true, .. }))
-                .collect();
-            kept.iter().any(|r| r.is_pane()).then_some(kept)
-        })
-        .collect()
-}
-
 /// What a pane switcher row says about the binary running in the pane.
 ///
 /// Titles come from the app itself (Claude Code names the session, an editor
@@ -250,29 +230,27 @@ pub(super) fn bookmark_dir_header(cwd: &str, all_cwds: &[&str], home: Option<&st
 /// projects, and a flat list says nothing about which one a row belongs to.
 /// Each header carries the anchor mark and the directory name.
 ///
-/// What still sets them apart from the bookmarks: an anchor is listed whether
-/// or not a pane holds it, because the section is what today is for, not what
-/// is missing from the screen.
+/// `hidden` leaves out the anchors a pane already holds, exactly as the
+/// bookmark groups leave out an open bookmark: that pane row wears the anchor
+/// mark itself, so the conversation is listed once, where it actually is.
 ///
-/// Empty list, no group: a section with nothing under it would take a line to
-/// say nothing.
-///
-/// `detail` is what the row says at its right end: the binary running in the
-/// pane that holds the conversation ("2.1.278"), or the agent's name when
-/// nothing holds it — an anchor is listed either way, so the right end is where
-/// it says which of the two it is.
+/// Nothing left to list, no group: a section with nothing under it would take a
+/// line to say nothing.
 pub(super) fn anchor_groups(
     saved: &[crate::anchors::Anchor],
-    detail: impl Fn(&crate::anchors::Anchor) -> Option<String>,
+    hidden: impl Fn(&crate::anchors::Anchor) -> bool,
 ) -> Vec<Vec<SwitcherRow>> {
     let home = std::env::var("HOME").ok();
     let mut dirs: Vec<&str> = Vec::new();
     let mut groups: Vec<Vec<SwitcherRow>> = Vec::new();
     for (index, anchor) in saved.iter().enumerate() {
+        if hidden(anchor) {
+            continue;
+        }
         let row = SwitcherRow::Anchor {
             index,
             title: anchor.label.clone(),
-            detail: detail(anchor),
+            detail: bookmark_detail(anchor),
         };
         match dirs.iter().position(|d| *d == anchor.cwd) {
             Some(g) => groups[g].push(row),
@@ -301,9 +279,9 @@ pub(super) fn saved_sections(
     bookmarks: &[crate::bookmarks::Bookmark],
     tabs: Vec<Vec<SwitcherRow>>,
     hidden: impl Fn(&crate::bookmarks::Bookmark) -> bool,
-    anchor_detail: impl Fn(&crate::anchors::Anchor) -> Option<String>,
+    anchor_hidden: impl Fn(&crate::anchors::Anchor) -> bool,
 ) -> Vec<Vec<SwitcherRow>> {
-    let mut groups = anchor_groups(anchors, anchor_detail);
+    let mut groups = anchor_groups(anchors, anchor_hidden);
     groups.extend(tabs);
     groups.extend(bookmark_groups(bookmarks, hidden));
     groups
@@ -556,9 +534,10 @@ impl KovaView {
             .chain(anchors.items.iter().filter_map(|a| a.session_id.as_deref()))
             .collect();
         // Build one row group per tab (header followed by its pane rows).
-        // The binaries found on the way are kept by session id: an anchor row
-        // borrows the one from the pane holding its conversation.
-        let mut open_processes: std::collections::HashMap<String, String> = Default::default();
+        // The conversations the panes hold, live or pre-typed: an anchor among
+        // them is left out of the anchors section, since its pane row carries
+        // the anchor mark.
+        let mut open_sessions: std::collections::HashSet<String> = Default::default();
         let mut groups: Vec<Vec<SwitcherRow>> = Vec::new();
         {
             let tabs = self.ivars().tabs.borrow();
@@ -593,8 +572,15 @@ impl KovaView {
                         None => pending_session_id(last_command.as_deref())
                             .is_some_and(|id| anchored_sessions.contains(id)),
                     };
-                    if let (Some(id), Some(p)) = (session.as_ref(), process.as_ref()) {
-                        open_processes.insert(id.clone(), p.clone());
+                    match session.as_ref() {
+                        Some(id) => {
+                            open_sessions.insert(id.clone());
+                        }
+                        None => {
+                            if let Some(id) = pending_session_id(last_command.as_deref()) {
+                                open_sessions.insert(id.to_string());
+                            }
+                        }
                     }
                     rows.push(SwitcherRow::Pane {
                         pane_id: pane.id,
@@ -620,7 +606,6 @@ impl KovaView {
         // for something", and a bookmark never asks for anything. Neither does
         // an anchor — same reason it is left out of the filtered list.
         if !filtered {
-            groups = drop_anchored_panes(groups);
             let tabs = if show_bookmarks { Vec::new() } else { groups };
             // On the bookmark half, an open conversation keeps its row: the pane
             // that holds it is not on screen to stand for it. Only an anchored
@@ -635,12 +620,7 @@ impl KovaView {
                     anchored.contains(bm.key())
                         || (!show_bookmarks && self.pane_holding_session(bm).is_some())
                 },
-                |a| {
-                    a.session_id
-                        .as_deref()
-                        .and_then(|id| open_processes.get(id).cloned())
-                        .or_else(|| bookmark_detail(a))
-                },
+                |a| a.session_id.as_deref().is_some_and(|id| open_sessions.contains(id)),
             );
         }
         // An empty filtered list still opens: the answer "nothing is unread" is
@@ -1261,25 +1241,31 @@ mod tests {
         // The order is the whole point of the section: today's work first, what
         // is actually running second, the rest after.
         let tabs = switcher_grid(&["h.."]);
-        let groups = saved_sections(&[saved("a")], &[saved("b")], tabs, |_| false, bookmark_detail);
+        let groups = saved_sections(&[saved("a")], &[saved("b")], tabs, |_| false, |_| false);
         assert_eq!(switcher_spec(&groups), vec!["ha".to_string(), "h..".into(), "hk".into()]);
     }
 
     #[test]
-    fn an_anchor_stays_listed_while_its_pane_is_open_and_its_bookmark_does_not() {
-        // Same conversation in both lists, and open in a pane: one row, under
-        // the anchors. This is the difference between the two sections.
-        let hidden = |bm: &crate::bookmarks::Bookmark| bm.session_id.as_deref() == Some("a");
-        let groups = saved_sections(&[saved("a")], &[saved("a")], Vec::new(), hidden, bookmark_detail);
-        assert_eq!(switcher_spec(&groups), vec!["ha".to_string()]);
+    fn an_open_conversation_leaves_both_saved_sections() {
+        // Same conversation in both lists, and open in a pane: no row in either
+        // section — the pane row up in its tab is the one, and it wears the
+        // anchor mark.
+        let open = |id: Option<&str>| id == Some("a");
+        let groups = saved_sections(
+            &[saved("a")],
+            &[saved("a")],
+            Vec::new(),
+            |bm| open(bm.session_id.as_deref()),
+            |a| open(a.session_id.as_deref()),
+        );
+        assert!(groups.is_empty());
     }
 
     #[test]
-    fn the_anchor_section_lists_every_anchor_it_is_given() {
-        // The counterpart of the bookmark rule right below: a bookmark whose
-        // pane is open leaves its group, an anchor never does — the section is
-        // what today is for, not what is missing from the screen.
-        let groups = anchor_groups(&[saved("a"), saved("b")], bookmark_detail);
+    fn the_anchor_section_lists_every_anchor_no_pane_holds() {
+        // What the section is for: today's work that is not on screen. The open
+        // ones are up in their tabs, under the anchor mark.
+        let groups = anchor_groups(&[saved("a"), saved("b")], |_| false);
         assert_eq!(switcher_spec(&groups), vec!["haa".to_string()]);
         match &groups[0][0] {
             SwitcherRow::TabHeader(h) => {
@@ -1291,7 +1277,7 @@ mod tests {
 
     #[test]
     fn no_anchor_means_no_section_at_all() {
-        assert!(anchor_groups(&[], bookmark_detail).is_empty(), "an empty section would cost a line to say nothing");
+        assert!(anchor_groups(&[], |_| false).is_empty(), "an empty section would cost a line to say nothing");
     }
 
     #[test]
@@ -1315,18 +1301,6 @@ mod tests {
         assert_eq!(pending_session_id(Some("codex resume xyz")), Some("xyz"));
         assert_eq!(pending_session_id(Some("npm run dev")), None);
         assert_eq!(pending_session_id(None), None);
-    }
-
-    #[test]
-    fn an_anchored_pane_is_not_repeated_under_its_tab() {
-        // The anchors section already names that conversation; the pane row
-        // below it would be a second row for the same thing.
-        let groups = switcher_grid(&["h.a", "haa"]);
-        assert_eq!(
-            switcher_spec(&drop_anchored_panes(groups)),
-            vec!["h.".to_string()],
-            "a tab whose panes are all anchored disappears, header included"
-        );
     }
 
     #[test]

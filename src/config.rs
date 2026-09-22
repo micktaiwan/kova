@@ -13,6 +13,7 @@ pub struct Config {
     pub splits: SplitsConfig,
     pub global_status_bar: GlobalStatusBarConfig,
     pub bookmarks: BookmarksConfig,
+    pub switcher: SwitcherConfig,
     pub keys: KeysConfig,
 }
 
@@ -102,11 +103,25 @@ impl Default for BookmarksConfig {
             // A light band, dark text on it. The selected variant is the same hue
             // pushed harder, so selection still reads on a row that already has a
             // background of its own.
-            row_bg: [0.62, 0.79, 0.95],
-            row_selected_bg: [0.40, 0.66, 0.95],
+            row_bg: [0.69, 0.78, 0.86],
+            row_selected_bg: [0.51, 0.64, 0.79],
             row_fg: [0.05, 0.07, 0.12, 1.0],
             row_dim_fg: [0.22, 0.30, 0.42, 1.0],
         }
+    }
+}
+
+/// The pane switcher (Cmd+P).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SwitcherConfig {
+    /// Band under the selected row — the cursor of the list.
+    pub selected_bg: [f32; 3],
+}
+
+impl Default for SwitcherConfig {
+    fn default() -> Self {
+        SwitcherConfig { selected_bg: [0.25, 0.35, 0.55] }
     }
 }
 
@@ -200,6 +215,7 @@ impl Default for Config {
             splits: SplitsConfig::default(),
             global_status_bar: GlobalStatusBarConfig::default(),
             bookmarks: BookmarksConfig::default(),
+            switcher: SwitcherConfig::default(),
             keys: KeysConfig::default(),
         }
     }

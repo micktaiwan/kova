@@ -111,6 +111,11 @@ use crate::pane::PaneId;
 /// Violet: distinct from the bell (orange) and completion (green) dots.
 const MINIMIZED_FG: [f32; 4] = [0.75, 0.55, 0.95, 1.0];
 
+/// Color of the anchor mark drawn on a pane row whose conversation is one of
+/// today's anchors. Gold, the colour the overlay's own title wears: an anchor
+/// is a claim about the day, not another kind of attention.
+const ANCHOR_FG: [f32; 4] = [1.0, 0.8, 0.25, 1.0];
+
 /// Color of the "Claude Code is working" marker (status-bar ✳ counter and
 /// switcher ✳ icon). Green: something is happening, nothing is owed.
 const WORKING_FG: [f32; 4] = [0.6, 0.85, 0.6, 1.0];
@@ -234,6 +239,10 @@ pub struct PaneSwitcherRowRender<'a> {
     /// This pane holds a bookmarked conversation — the row is painted light
     /// blue on black text so a tracked project is spotted without reading.
     pub bookmarked: bool,
+    /// This pane holds one of today's anchors — the row wears an \u{2693} in the
+    /// anchor colour, and the anchors section leaves it out: one row per
+    /// conversation, where the conversation actually is.
+    pub anchored: bool,
 }
 
 /// One column of the pane-switcher overlay: a vertical run of rows holding
@@ -510,6 +519,7 @@ pub struct Renderer {
     tab_bar_active_bg: [f32; 3],
     /// Colors of a bookmarked conversation (status bar and switcher row).
     bookmarks: crate::config::BookmarksConfig,
+    switcher_selected_bg: [f32; 3],
     /// Hovered URL: per-row segments [(visible_row, col_start, col_end)]
     pub hovered_url: Option<Vec<(usize, u16, u16)>>,
     /// Hovered URL text (for status bar display)
@@ -657,6 +667,7 @@ impl Renderer {
             tab_bar_fg: config.tab_bar.fg_color,
             tab_bar_active_bg: config.tab_bar.active_bg,
             bookmarks: config.bookmarks.clone(),
+            switcher_selected_bg: config.switcher.selected_bg,
             hovered_url: None,
             hovered_url_text: None,
             resize_feedback_text: None,
@@ -706,6 +717,7 @@ impl Renderer {
         self.tab_bar_fg = config.tab_bar.fg_color;
         self.tab_bar_active_bg = config.tab_bar.active_bg;
         self.bookmarks = config.bookmarks.clone();
+        self.switcher_selected_bg = config.switcher.selected_bg;
         // Every pane's vertices carry the old colors; drop the cache so the
         // next frame rebuilds them.
         self.pane_vertex_cache.clear();
@@ -2687,7 +2699,7 @@ impl Renderer {
         let dim_fg = [0.45, 0.45, 0.5, 1.0];
         // The keys of the hint line, warmer than the words they go with.
         let key_fg = [0.95, 0.7, 0.35, 1.0];
-        let selected_bg = [0.25, 0.35, 0.55];
+        let selected_bg = self.switcher_selected_bg;
         // Bookmarked panes wear a band of their own, from `[bookmarks]` in the
         // config — the selected variant included, so selection still reads on a
         // row that already has a background.
@@ -2834,7 +2846,10 @@ impl Renderer {
                     // per-pane status-bar dot (bell > completion). is_current panes
                     // are already suppressed upstream (has_bell/has_completion = false).
                     let attention = PaneAttention::from_flags(row.has_bell, row.has_completion);
-                    let text = format!("    {}", row.text);
+                    // The anchor mark is a wide glyph: on a row that wears one
+                    // the title starts a cell further right, or the two touch.
+                    let text =
+                        if row.anchored { format!("     {}", row.text) } else { format!("    {}", row.text) };
                     let (row_fg, row_dim_fg) = if row.bookmarked {
                         (if row.minimized { bookmark_dim_fg } else { bookmark_fg }, bookmark_dim_fg)
                     } else {
@@ -2853,6 +2868,13 @@ impl Renderer {
                     self.render_text(vertices, &text, left_margin, text_y, split.title_limit, row_fg, no_bg, body_scale);
                     if let (Some(process), Some(proc_x)) = (row.process, split.process_x) {
                         self.render_text(vertices, process, proc_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                    }
+                    if row.anchored {
+                        // Anchor mark in the 4th char slot, right before the
+                        // title: the three slots before it are taken by the
+                        // minimized, working and attention markers.
+                        let anchor_x = left_margin + 3.0 * scaled_cell_w;
+                        self.render_text(vertices, "\u{2693}", anchor_x, text_y, right_margin, ANCHOR_FG, no_bg, body_scale);
                     }
                     if row.minimized {
                         // Minimized marker in the 1st char slot, in a color of
@@ -2901,7 +2923,7 @@ impl Renderer {
         let title_fg = [1.0, 0.85, 0.3, 1.0];
         let label_fg = [0.85, 0.85, 0.9, 1.0];
         let dim_fg = [0.45, 0.45, 0.5, 1.0];
-        let selected_bg = [0.25, 0.35, 0.55];
+        let selected_bg = self.switcher_selected_bg;
         let new_window_fg = [0.5, 0.8, 0.5, 1.0];
 
         let title_scale = 1.8_f32;
@@ -2964,7 +2986,7 @@ impl Renderer {
         let label_fg = [0.85, 0.85, 0.9, 1.0];
         let dim_fg = [0.45, 0.45, 0.5, 1.0];
         let time_fg = [0.5, 0.5, 0.55, 1.0];
-        let selected_bg = [0.25, 0.35, 0.55];
+        let selected_bg = self.switcher_selected_bg;
         let invalid_fg = [0.4, 0.4, 0.42, 1.0];
 
         let title_scale = 1.8_f32;
@@ -3105,7 +3127,7 @@ impl Renderer {
         let label_fg = [0.85, 0.85, 0.9, 1.0];
         let dim_fg = [0.55, 0.55, 0.6, 1.0];
         let input_bg = [0.18, 0.18, 0.22];
-        let selected_bg = [0.25, 0.35, 0.55];
+        let selected_bg = self.switcher_selected_bg;
         let caret_fg = [1.0, 1.0, 1.0];
 
         let title_scale = 1.8_f32;
