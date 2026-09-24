@@ -538,3 +538,19 @@ et le hook appelle `kova-pane-status.sh done` au lieu d'écrire sur le tty. Mêm
 trois hooks qui écrivaient `\a` seul (`Stop`, `permission_prompt`, `idle_prompt`) : commande IPC
 `bell`, car un BEL au milieu d'un OSC de Claude (titre, lien) le terminerait aussi — ce cas-là
 n'a pas été vérifié dans les captures. Plus aucun hook n'écrit sur le tty.
+
+**Suite, 2026-09-24 — le fix n'était pas actif.** Même symptôme dans le pane #2 (« B✻Waiting »,
+espaces remplacés par les lettres de la ligne d'avant). `pty-capture-76193-2.raw`, offset ~1 758 061 :
+`CSI 1` coupé par `ESC ] 133;D BEL BEL`, le `B` part en texte. Cause : le fix des hooks n'était
+écrit que dans `dotfiles/claude/settings.json`, alors que `~/.claude/settings.json` n'était plus le
+symlink posé par `install.sh` mais un fichier ordinaire, resté sur les anciens
+`printf … > /dev/$PARENT_TTY`. Le lien a sauté le 27/08 à 18:44 : une session dans `self/` a fait
+`jq … > $TMP.out && mv "$TMP.out" ~/.claude/settings.json` (transcript `7a415d48…`), et `mv`
+remplace un symlink au lieu d'écrire à travers ; même geste le 30/08. Claude Code n'y est pour
+rien : Edit refuse d'écrire sur un symlink (testé en 2.1.281). Les quatre hooks ont été corrigés
+dans le fichier live. La phrase « plus aucun hook n'écrit sur le tty » n'était vraie qu'à partir de
+là. Leçon : après un fix de hook, vérifier le fichier que Claude Code lit
+(`grep PARENT_TTY ~/.claude/settings.json`), pas celui du repo dotfiles. Réparé le même jour : la
+version live recopiée dans dotfiles, symlink remis, et `no-auto-memory.py` refuse désormais tout
+`mv`/`rm`/`sed -i` qui viserait un symlink de `~/.claude`. Le skill `/summary` écrivait aussi un
+OSC 1 sur le tty pour renommer l'onglet (même collision possible) : il passe par `rename-pane`.
