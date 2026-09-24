@@ -617,6 +617,12 @@ fn handle_ipc_command_sync(
         IpcCommand::SetPaneStatus { pane_id, waiting } => {
             handle_ipc_set_pane_status(windows, pane_id, waiting)
         }
+        IpcCommand::MarkCompleted { pane_id } => {
+            handle_ipc_mark_completed(windows, pane_id, false)
+        }
+        IpcCommand::Bell { pane_id } => {
+            handle_ipc_mark_completed(windows, pane_id, true)
+        }
         IpcCommand::DispatchAction { action, pane_id } => {
             handle_ipc_dispatch_action(windows, &action, pane_id)
         }
@@ -1269,6 +1275,29 @@ fn handle_ipc_set_pane_status(
             None => continue,
         };
         if view.ipc_set_pane_status(pane_id, waiting) {
+            return IpcResponse::Ok { data: None };
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// `mark-completed` (`bell: false`) and `bell` (`bell: true`): both raise a
+/// pane's unread flag without writing to its tty.
+fn handle_ipc_mark_completed(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    bell: bool,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        if view.ipc_mark_completed(pane_id, bell) {
             return IpcResponse::Ok { data: None };
         }
     }

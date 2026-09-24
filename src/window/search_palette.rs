@@ -89,6 +89,22 @@ struct SearchPaneSnapshot {
     terminal: Arc<parking_lot::RwLock<crate::terminal::TerminalState>>,
 }
 
+/// A key pressed with Cmd or Ctrl held. Option stays typing: it composes
+/// characters on macOS layouts (French: Option+( = {).
+fn is_shortcut(event: &NSEvent) -> bool {
+    let flags = event.modifierFlags();
+    flags.contains(NSEventModifierFlags::Command) || flags.contains(NSEventModifierFlags::Control)
+}
+
+/// Insert `text` at the input caret and move the caret past it.
+fn insert_at_cursor(state: &mut SearchPaletteState, text: &str) {
+    let byte_idx = state.query.char_indices()
+        .nth(state.cursor).map(|(i, _)| i)
+        .unwrap_or(state.query.len());
+    state.query.insert_str(byte_idx, text);
+    state.cursor += text.chars().count();
+}
+
 /// Drop the recall list once the user starts typing a query of their own.
 ///
 /// The recall rows are only on screen while nothing has been searched yet
@@ -752,6 +768,22 @@ impl KovaView {
         self.mark_dirty();
     }
 
+    /// Cmd+V while the palette is open: the clipboard's first line goes in at
+    /// the caret, and a live search is queued as for typed text.
+    pub(super) fn paste_into_search_palette(&self, text: &str) {
+        let pasted = super::overlays::filter_paste_text(text);
+        if pasted.is_empty() {
+            return;
+        }
+        if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
+            insert_at_cursor(state, &pasted);
+            state.needs_search = true;
+            state.last_edit = Some(std::time::Instant::now());
+            drop_recall_rows(state);
+        }
+        self.mark_dirty();
+    }
+
     /// Handle key events while the search palette overlay is active.
     pub(super) fn handle_search_palette_key(&self, event: &NSEvent) {
         let key_code = event.keyCode();
@@ -884,7 +916,9 @@ impl KovaView {
                 drop(guard);
                 self.mark_dirty();
             }
-            c if is_typed_char(c) => {
+            // Cmd or Ctrl with a letter is a shortcut, not typing: without this
+            // guard Cmd+A would insert an "a".
+            c if is_typed_char(c) && !is_shortcut(event) => {
                 // Insert printable character; queue a live search.
                 let mut guard = self.ivars().search_palette.borrow_mut();
                 if let Some(state) = guard.as_mut() {
@@ -961,6 +995,15 @@ mod tests {
         let mut state = palette_state("de", "d", results);
         drop_recall_rows(&mut state);
         assert_eq!(state.rows.len(), 1);
+    }
+
+    #[test]
+    fn a_paste_lands_at_the_caret() {
+        let mut state = palette_state("héllo", "", Vec::new());
+        state.cursor = 2;
+        insert_at_cursor(&mut state, "XY");
+        assert_eq!(state.query, "héXYllo");
+        assert_eq!(state.cursor, 4);
     }
 
     #[test]

@@ -743,4 +743,22 @@ impl KovaView {
         }
         false
     }
+
+    pub fn ipc_mark_completed(&self, pane_id: PaneId, bell: bool) -> bool {
+        let tabs = self.ivars().tabs.borrow();
+        for tab in tabs.iter() {
+            let Some(pane) = tab.pane(pane_id) else { continue };
+            let term = pane.terminal.read();
+            if bell {
+                term.ring_bell();
+                log::info!("IPC: pane {} bell", pane_id);
+            } else {
+                term.mark_command_completed();
+                log::info!("IPC: pane {} marked completed", pane_id);
+            }
+            self.mark_dirty();
+            return true;
+        }
+        false
+    }
 }

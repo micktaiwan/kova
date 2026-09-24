@@ -122,6 +122,19 @@ pub enum IpcCommand {
         pane_id: u32,
         waiting: bool,
     },
+    /// Light the pane's "finished command" indicator, as OSC 133;D does.
+    /// For apps that must not print on the tty they share with a running
+    /// program (Claude Code's `Stop` hook): a write there lands in the middle
+    /// of the app's own escape sequences and corrupts the grid.
+    MarkCompleted {
+        pane_id: u32,
+    },
+    /// Raise the pane's bell flag, as a BEL on its tty does, without writing
+    /// to the tty (same reason as `MarkCompleted`: a BEL there can cut one of
+    /// the running app's OSC sequences short).
+    Bell {
+        pane_id: u32,
+    },
     /// Trigger any keyboard action by its stable name (see `action_from_ipc_name`).
     /// `pane_id` optionally targets (and focuses) a specific pane's window first;
     /// without it, the action runs against the key window.
@@ -424,6 +437,8 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "resize-pane" => &["pane_id", "axis", "direction", "amount_pct"],
         "rename-pane" => &["pane_id", "title"],
         "set-pane-status" => &["pane_id", "status"],
+        "mark-completed" => &["pane_id"],
+        "bell" => &["pane_id"],
         "dispatch-action" => &["action", "pane_id"],
         "merge-window" => &["source_window", "target_window"],
         "notify" => &["pane_id", "title", "message", "sound"],
@@ -696,6 +711,22 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 }
             };
             Ok(IpcCommand::SetPaneStatus { pane_id, waiting })
+        }
+        "mark-completed" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            Ok(IpcCommand::MarkCompleted { pane_id })
+        }
+        "bell" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            Ok(IpcCommand::Bell { pane_id })
         }
         "dispatch-action" => {
             let action = v
@@ -1206,6 +1237,28 @@ mod tests {
             err(r#"{"cmd":"notify","message":"x","pane":1}"#),
             "unknown field \"pane\" for command \"notify\""
         );
+    }
+
+    #[test]
+    fn mark_completed_takes_only_a_pane_id() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"mark-completed","pane_id":7}"#),
+            Ok(IpcCommand::MarkCompleted { pane_id: 7 })
+        ));
+        assert_eq!(err(r#"{"cmd":"mark-completed"}"#), "missing \"pane_id\" field");
+        assert_eq!(
+            err(r#"{"cmd":"mark-completed","pane_id":7,"status":"done"}"#),
+            "unknown field \"status\" for command \"mark-completed\""
+        );
+    }
+
+    #[test]
+    fn bell_takes_only_a_pane_id() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"bell","pane_id":7}"#),
+            Ok(IpcCommand::Bell { pane_id: 7 })
+        ));
+        assert_eq!(err(r#"{"cmd":"bell"}"#), "missing \"pane_id\" field");
     }
 
     #[test]

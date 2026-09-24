@@ -1600,6 +1600,29 @@ impl TerminalState {
         }
     }
 
+    /// Raise the pane's bell flag. Reached by a BEL in the byte stream and by
+    /// the IPC `bell` command — the hook-side twin of `mark_command_completed`,
+    /// for the same reason: a BEL printed on a tty the app is writing to can
+    /// terminate one of the app's OSC sequences (title, hyperlink) early.
+    pub fn ring_bell(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.bell.store(true, Relaxed);
+        self.dirty.store(true, Relaxed);
+    }
+
+    /// Light the "finished command" indicator: unread until the pane is
+    /// looked at. Reached by OSC 133;D from the shell and by the IPC
+    /// `mark-completed` command, which Claude Code's `Stop` hook uses instead
+    /// of printing 133;D on the tty — a byte stream written there interleaves
+    /// with the app's own output and can split one of its escape sequences.
+    pub fn mark_command_completed(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.command_completed.store(true, Relaxed);
+        self.completion_seen.store(false, Relaxed);
+        self.command_running.store(false, Relaxed);
+        self.dirty.store(true, Relaxed);
+    }
+
     /// Soft reset: restore rendering-critical state to sane defaults without
     /// clearing grid content or scrollback. Fixes persistent display corruption
     /// (wrong scroll region, hidden cursor, stuck SGR attributes).

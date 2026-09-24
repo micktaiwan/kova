@@ -656,7 +656,14 @@ define_class!(
             // When the search palette is open, route keys through its handler so
             // shortcuts like Cmd+V/Cmd+P don't fall through to the global map.
             if self.ivars().search_palette.borrow().is_some() {
-                self.handle_search_palette_key(event);
+                if matches!(keybindings.window_map.get(&combo), Some(Action::Paste)) {
+                    let pasteboard = NSPasteboard::generalPasteboard();
+                    if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+                        self.paste_into_search_palette(&text.to_string());
+                    }
+                } else {
+                    self.handle_search_palette_key(event);
+                }
                 return objc2::runtime::Bool::YES;
             }
 

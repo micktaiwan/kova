@@ -516,3 +516,25 @@ Redémarrer Kova (le binaire en cours est d'avant le fix), relancer le mouchard 
 zéro doublon de motion attendu, puis rescroller vers le haut dans une session
 Claude Code bien remplie. Si le trou revient malgré tout, suspect suivant : la
 rafale d'un événement par ligne de molette.
+
+---
+
+# Round 7 (2026-09-23) : lettres mélangées (« Les 1410Gmide ») — un hook écrivait sur le tty
+
+Symptôme : quelques caractères faux au milieu d'une ligne Claude Code (`Les 1410Gmide trajet`
+pour `Les 14 min de trajet`), réparés dès qu'on surligne le texte à la souris.
+
+Cause (VÉRIFIÉE, `pty-capture-4025-106.raw`, offset ~164 000) : le flux contient
+`ESC [ 7G 14 ESC [` **`ESC ] 133;D BEL BEL`** `10G min`. Le hook `Stop` de Claude Code faisait
+`printf '\033]133;D\007\a' > /dev/$PARENT_TTY` pendant que Claude Code écrivait encore sa frame :
+deux écrivains sur le même tty, l'`ESC` de l'OSC avorte le CSI en cours et `10G` part en texte.
+Kova parse correctement (c'est la sémantique VT) ; la grille est vraiment fausse, et le rendu
+différentiel de Claude ne repeint jamais la ligne. La sélection répare parce que Claude Code a le
+mouse reporting actif : il redessine lui-même la ligne sélectionnée (« copied 13 chars »).
+Mesure : 30 OSC 133;D tombés au milieu d'un CSI dans les captures d'une seule journée.
+
+Fix : commande IPC `mark-completed` (même effet que 133;D, `TerminalState::mark_command_completed`),
+et le hook appelle `kova-pane-status.sh done` au lieu d'écrire sur le tty. Même traitement pour les
+trois hooks qui écrivaient `\a` seul (`Stop`, `permission_prompt`, `idle_prompt`) : commande IPC
+`bell`, car un BEL au milieu d'un OSC de Claude (titre, lien) le terminerait aussi — ce cas-là
+n'a pas été vérifié dans les captures. Plus aucun hook n'écrit sur le tty.

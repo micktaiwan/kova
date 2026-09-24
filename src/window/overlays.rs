@@ -406,7 +406,7 @@ impl KovaView {
 
 /// The part of a clipboard that can go into the single-line filter query: its
 /// first line, without the control chars a line search could never match.
-fn filter_paste_text(text: &str) -> String {
+pub(super) fn filter_paste_text(text: &str) -> String {
     text.lines().next().unwrap_or("").chars().filter(|&c| is_typed_char(c)).collect()
 }
 

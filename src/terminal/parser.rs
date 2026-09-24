@@ -261,10 +261,7 @@ impl VteHandler {
                     TermOp::Tab => term.tab(),
                     TermOp::Newline => term.newline(),
                     TermOp::CarriageReturn => term.carriage_return(),
-                    TermOp::Bell => {
-                        term.bell.store(true, std::sync::atomic::Ordering::Relaxed);
-                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    TermOp::Bell => term.ring_bell(),
                     TermOp::CursorUp(n) => term.cursor_up(n),
                     TermOp::CursorDown(n) => term.cursor_down(n),
                     TermOp::CursorForward(n) => term.cursor_forward(n),
@@ -425,17 +422,14 @@ impl VteHandler {
                         log::debug!("OSC 133;D command completed (terminal {})", term.terminal_id);
                         // The first D with no prior C is the shell's startup
                         // precmd — swallow it (no command actually completed).
-                        // Later D-without-C (e.g. Claude Code's Stop hook)
+                        // Later D-without-C (a program printing 133;D itself)
                         // must still fire: the startup D already primed us.
                         if term.osc133_primed {
-                            term.command_completed.store(true, std::sync::atomic::Ordering::Relaxed);
-                            // Fresh completion — unread until the pane is looked at.
-                            term.completion_seen.store(false, std::sync::atomic::Ordering::Relaxed);
-                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                            term.mark_command_completed();
                         } else {
                             term.osc133_primed = true;
+                            term.command_running.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
-                        term.command_running.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                     TermOp::KittyKeyboardPush(flags) => {
                         term.kitty_keyboard_flags.push(flags);

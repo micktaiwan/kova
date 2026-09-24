@@ -191,6 +191,32 @@ There is intentionally **no time-based expiry**. A question left unanswered for 
 
 ---
 
+### `mark-completed` — light a pane's "finished" indicator
+
+```json
+{ "cmd": "mark-completed", "pane_id": 42 }
+```
+
+Does what OSC 133;D does: the pane gets the unread "finished command" dot that `Cmd+P`'s `Tab`, the `●N` counter and `Cmd+J` walk. Unlike the shell's own 133;D, it is never swallowed as a startup marker.
+
+It exists for hooks of an app that owns the tty. Claude Code's `Stop` hook used to print `ESC ] 133;D BEL` straight to the pane's tty; those bytes interleave with Claude Code's output at any point, and landing inside one of its CSI sequences (`ESC [ 10 G`) aborts it, so the parameters are printed as text — `Les 1410Gmide` for `Les 14 min de`. Claude Code's differential renderer never repaints the line, so the garbage stays until something makes it redraw (a mouse selection does). Captures from one day held 30 such splits. Over the socket, nothing reaches the tty.
+
+Response: `{ "ok": true }`.
+
+---
+
+### `bell` — raise a pane's bell flag
+
+```json
+{ "cmd": "bell", "pane_id": 42 }
+```
+
+Same effect as a BEL in the pane's output (the unread bell marker), for the same reason as `mark-completed`: a BEL printed on the tty by a hook can land inside one of the app's OSC sequences (a title, a hyperlink) and terminate it early, spilling the rest as text. Claude Code's `Notification` and `Stop` hooks use it.
+
+Response: `{ "ok": true }`.
+
+---
+
 ### `focus-pane` — bring a pane into focus
 
 ```json
