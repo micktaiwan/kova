@@ -748,13 +748,17 @@ impl KovaView {
         let tabs = self.ivars().tabs.borrow();
         for tab in tabs.iter() {
             let Some(pane) = tab.pane(pane_id) else { continue };
-            let term = pane.terminal.read();
-            if bell {
-                term.ring_bell();
-                log::info!("IPC: pane {} bell", pane_id);
-            } else {
-                term.mark_command_completed();
-                log::info!("IPC: pane {} marked completed", pane_id);
+            {
+                // Scope the read guard: mark_dirty() re-locks the focused pane's terminal,
+                // and a recursive parking_lot read deadlocks if a pty-reader write is queued.
+                let term = pane.terminal.read();
+                if bell {
+                    term.ring_bell();
+                    log::info!("IPC: pane {} bell", pane_id);
+                } else {
+                    term.mark_command_completed();
+                    log::info!("IPC: pane {} marked completed", pane_id);
+                }
             }
             self.mark_dirty();
             return true;
