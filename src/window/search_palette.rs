@@ -126,6 +126,18 @@ fn drop_recall_rows(state: &mut SearchPaletteState) {
 /// characters in the Unicode private-use block (U+F700…U+F8FF). Those are
 /// neither control chars nor below ' ', so the plain "printable" test lets them
 /// through and they land in the query as an invisible char that matches nothing.
+/// The text a key event types, composed by the keyboard layout (Option and
+/// dead keys applied), keeping only characters an input field accepts.
+pub(super) fn typed_text(event: &NSEvent) -> String {
+    event
+        .characters()
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+        .chars()
+        .filter(|&c| is_typed_char(c))
+        .collect()
+}
+
 pub(super) fn is_typed_char(c: char) -> bool {
     // Only AppKit's own range (NSUpArrowFunctionKey…NSModeSwitchFunctionKey).
     // The rest of the private-use block is real typing: U+F8FF is the Apple
@@ -919,14 +931,16 @@ impl KovaView {
             // Cmd or Ctrl with a letter is a shortcut, not typing: without this
             // guard Cmd+A would insert an "a".
             c if is_typed_char(c) && !is_shortcut(event) => {
-                // Insert printable character; queue a live search.
+                // Insert what the layout produced, not the bare key: Option
+                // composes characters (French: Option+( = {), and
+                // charactersIgnoringModifiers would turn them back into the key.
+                let text = typed_text(event);
+                if text.is_empty() {
+                    return; // a dead key waiting for its second stroke
+                }
                 let mut guard = self.ivars().search_palette.borrow_mut();
                 if let Some(state) = guard.as_mut() {
-                    let byte_idx = state.query.char_indices()
-                        .nth(state.cursor).map(|(i, _)| i)
-                        .unwrap_or(state.query.len());
-                    state.query.insert(byte_idx, c);
-                    state.cursor += 1;
+                    insert_at_cursor(state, &text);
                     state.needs_search = true;
                     state.last_edit = Some(std::time::Instant::now());
                     drop_recall_rows(state);
