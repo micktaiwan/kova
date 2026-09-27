@@ -678,8 +678,14 @@ impl KovaView {
                 Some(s) => s,
                 None => return,
             };
+            // A worker still running keeps the search owed: the poll tick fires
+            // it once that worker's rows land, instead of showing them under
+            // a query they do not answer.
+            if state.searching {
+                return;
+            }
             state.needs_search = false;
-            if state.query.is_empty() || state.searching {
+            if state.query.is_empty() {
                 return;
             }
             state.query_id = state.query_id.wrapping_add(1);
@@ -807,7 +813,8 @@ impl KovaView {
         if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
             insert_at_cursor(state, &pasted);
             state.needs_search = true;
-            state.last_edit = Some(std::time::Instant::now());
+            // A paste is a complete edit, like a recalled query: no debounce.
+            state.last_edit = None;
             drop_recall_rows(state);
         }
         self.mark_dirty();
@@ -896,8 +903,18 @@ impl KovaView {
                         Some(s) => s,
                         None => return,
                     };
+                    // Rows that answer an older query (a paste or a keystroke
+                    // still inside the debounce) must not be opened: search the
+                    // query on screen instead, and let the next Enter open.
+                    let stale = state.needs_search
+                        || state.searching
+                        || state.query != state.submitted_query;
                     match state.rows.get(state.selected) {
-                        Some(SearchRow::Hit(hit)) => Some(hit.clone()),
+                        Some(SearchRow::Hit(hit))
+                            if !stale || matches!(hit.target, SearchTarget::Recall { .. }) =>
+                        {
+                            Some(hit.clone())
+                        }
                         _ => None,
                     }
                 };
