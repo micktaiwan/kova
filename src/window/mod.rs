@@ -2386,7 +2386,9 @@ impl KovaView {
 
     fn mark_dirty(&self) {
         if let Some(pane) = self.focused_pane() {
-            pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            // read_recursive: callers may already hold a read guard on this terminal,
+            // and a plain read() queued behind a waiting writer would deadlock.
+            pane.terminal.read_recursive().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
