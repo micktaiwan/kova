@@ -172,6 +172,23 @@ fn recent_search_rows() -> Vec<SearchRow> {
 /// the line is found on `lower` (no per-line allocation over a 10k-line dump) and
 /// shown from `text`. ASCII lowercasing leaves byte lengths untouched, so an
 /// offset into one indexes the other.
+/// Unicode lowercase that keeps every byte offset: `split_terms` lowercases
+/// the query with `to_lowercase`, so an ASCII-only fold here would never match
+/// "État". A char whose lowercase changes its UTF-8 length (İ, ẞ, the Kelvin
+/// sign) is left as is, since `content_snippet` maps offsets from the lowered
+/// text back onto the original.
+fn lowercase_same_len(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(l), None) if l.len_utf8() == c.len_utf8() => l,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
 fn content_snippet(text: &str, lower: &str, term: &str) -> Option<String> {
     const MAX_SNIPPET_CHARS: usize = 90;
     /// Chars of context kept before the match, so it does not sit on the edge.
@@ -242,7 +259,7 @@ fn run_search_worker(
     // Section 1: matching panes, grouped by tab.
     let mut current_tab: Option<TabId> = None;
     for p in panes {
-        let title = p.pane_title.to_ascii_lowercase();
+        let title = lowercase_same_len(&p.pane_title);
         // Terms the title already covers need no scrollback: dumping a pane's
         // whole buffer is the expensive part, so it only happens for what is
         // left, and only once.
@@ -257,7 +274,7 @@ fn run_search_worker(
                 let term = p.terminal.read();
                 term.dump_text(crate::terminal::DumpMode::All, true).text
             };
-            let lower = text.to_ascii_lowercase();
+            let lower = lowercase_same_len(&text);
             let all = unmatched.iter().all(|t| lower.contains(t.as_str()));
             if all {
                 // The first term the title did not carry is the one whose line
@@ -289,7 +306,7 @@ fn run_search_worker(
     // Section 2: tabs whose title matches.
     let mut tab_section_open = false;
     for tab in tabs {
-        let title = tab.title.to_ascii_lowercase();
+        let title = lowercase_same_len(&tab.title);
         if terms.iter().all(|t| title.contains(t.as_str())) {
             if !tab_section_open {
                 rows.push(SearchRow::Header("Tabs".to_string()));
@@ -960,7 +977,27 @@ mod tests {
     /// Call `content_snippet` the way the worker does: the dump and its
     /// lowercased twin.
     fn snippet_of(text: &str, term: &str) -> Option<String> {
-        content_snippet(text, &text.to_ascii_lowercase(), term)
+        content_snippet(text, &lowercase_same_len(text), term)
+    }
+
+    #[test]
+    fn lowercase_same_len_folds_accented_capitals() {
+        assert_eq!(lowercase_same_len("État des lieux"), "état des lieux");
+        assert_eq!(lowercase_same_len("ÇA À Ω"), "ça à ω");
+    }
+
+    #[test]
+    fn lowercase_same_len_keeps_byte_offsets() {
+        // İ lowercases to two chars, the Kelvin sign to a 1-byte 'k'.
+        for s in ["İstanbul", "\u{212A}elvin", "ẞtraße", "État"] {
+            assert_eq!(lowercase_same_len(s).len(), s.len(), "{s}");
+        }
+    }
+
+    #[test]
+    fn snippet_matches_an_accented_capital() {
+        let text = "noise\n  État des lieux signé\nmore";
+        assert_eq!(snippet_of(text, "état").as_deref(), Some("État des lieux signé"));
     }
 
     fn palette_state(query: &str, submitted: &str, rows: Vec<SearchRow>) -> SearchPaletteState {
