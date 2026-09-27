@@ -366,15 +366,6 @@ impl KovaView {
         self.refresh_open_pane_switcher();
     }
 
-    /// Rebuild the pane switcher if it is open: its rows are a snapshot taken
-    /// when it opened, so a change that arrives meanwhile would not show.
-    fn refresh_open_pane_switcher(&self) {
-        let open = self.ivars().pane_switcher.borrow().is_some();
-        if open {
-            let (filtered, show_bookmarks) = self.pane_switcher_modes();
-            self.open_pane_switcher(filtered, show_bookmarks);
-        }
-    }
 
     /// IPC: what `pane_id` would be saved as, if this window holds it. Lets
     /// `set-anchor` name a live pane instead of repeating what Kova knows.

@@ -194,6 +194,9 @@ pub(super) struct PaneSwitcherState {
     /// Cmd+P is asked for nine times out of ten, and the bookmarks used to push
     /// it off the screen.
     pub(super) show_bookmarks: bool,
+    /// Every pane's (bell, unread completion) when this snapshot was built,
+    /// so the tick can tell when a row's dot has gone stale.
+    pub(super) attention: Vec<(PaneId, bool, bool)>,
 }
 
 /// The dim right-hand half of a bookmark row: the agent holding the
@@ -497,6 +500,75 @@ impl KovaView {
         guard.as_ref().map_or((false, false), |s| (s.filtered, s.show_bookmarks))
     }
 
+    /// Each pane's (bell, unread completion), as the switcher rows show them:
+    /// the focused pane never asks for attention.
+    fn pane_attention(&self) -> Vec<(PaneId, bool, bool)> {
+        let mut out = Vec::new();
+        let tabs = self.ivars().tabs.borrow();
+        let active = self.ivars().active_tab.get();
+        for (ti, tab) in tabs.iter().enumerate() {
+            let focused_pane = tab.focused_pane;
+            tab.for_each_pane(&mut |pane| {
+                if ti == active && pane.id == focused_pane {
+                    out.push((pane.id, false, false));
+                } else {
+                    let term = pane.terminal.read();
+                    out.push((
+                        pane.id,
+                        term.bell.load(std::sync::atomic::Ordering::Relaxed),
+                        term.unread_completion(),
+                    ));
+                }
+            });
+        }
+        out
+    }
+
+    /// Rebuild the pane switcher if it is open, keeping the selected pane
+    /// selected: its rows are a snapshot taken when it opened, so a change
+    /// that arrives meanwhile would not show.
+    pub(super) fn refresh_open_pane_switcher(&self) {
+        let selected_pane = {
+            let guard = self.ivars().pane_switcher.borrow();
+            let Some(state) = guard.as_ref() else { return };
+            match state.columns.get(state.selected_col).and_then(|c| c.get(state.selected_row)) {
+                Some(SwitcherRow::Pane { pane_id, .. }) => Some(*pane_id),
+                _ => None,
+            }
+        };
+        let (filtered, show_bookmarks) = self.pane_switcher_modes();
+        self.open_pane_switcher(filtered, show_bookmarks);
+        let Some(target) = selected_pane else { return };
+        {
+            let mut guard = self.ivars().pane_switcher.borrow_mut();
+            let Some(state) = guard.as_mut() else { return };
+            let spot = state.columns.iter().enumerate().find_map(|(c, col)| {
+                col.iter()
+                    .position(|r| matches!(r, SwitcherRow::Pane { pane_id, .. } if *pane_id == target))
+                    .map(|r| (c, r))
+            });
+            if let Some((c, r)) = spot {
+                state.selected_col = c;
+                state.selected_row = r;
+            }
+        }
+        self.pane_switcher_clamp_scroll();
+    }
+
+    /// Called on each tick: rebuild an open switcher whose dots no longer
+    /// match the panes. A bell or a finished command arriving from a pane's
+    /// output (BEL, OSC 133;D) would otherwise stay invisible until reopening.
+    pub fn poll_pane_switcher(&self) {
+        let stale = {
+            let guard = self.ivars().pane_switcher.borrow();
+            let Some(state) = guard.as_ref() else { return };
+            state.attention != self.pane_attention()
+        };
+        if stale {
+            self.refresh_open_pane_switcher();
+        }
+    }
+
     /// Open the tab/pane switcher overlay: every tab with its panes, click or
     /// Enter to focus. Selection starts on the currently-focused pane.
     ///
@@ -678,6 +750,7 @@ impl KovaView {
         }
 
         let scroll = vec![0usize; columns.len()];
+        let attention = self.pane_attention();
         *self.ivars().pane_switcher.borrow_mut() = Some(PaneSwitcherState {
             columns,
             selected_col,
@@ -686,6 +759,7 @@ impl KovaView {
             scroll_acc: 0.0,
             filtered,
             show_bookmarks,
+            attention,
         });
         self.pane_switcher_clamp_scroll();
         self.mark_dirty();

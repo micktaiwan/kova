@@ -254,13 +254,15 @@ impl AppDelegate {
                     // so a command that just finished is reported on this tick.
                     poll_pending_waits(&ivars.pending_waits, &ivars.windows);
 
-                    // Drain any pending search-palette worker results so the UI
+                    // Drain any pending search-palette worker results, and bring
+                    // an open pane switcher's dots up to date, so the UI
                     // updates without the user pressing a key.
                     {
                         let windows = ivars.windows.borrow();
                         for win in windows.iter() {
                             if let Some(view) = kova_view(win) {
                                 view.poll_search_palette();
+                                view.poll_pane_switcher();
                             }
                         }
                     }
