@@ -699,25 +699,7 @@ define_class!(
                 if matches!(keybindings.window_map.get(&combo), Some(Action::Paste)) {
                     let pasteboard = NSPasteboard::generalPasteboard();
                     if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
-                        // A title is one line: no newline, tab or escape may
-                        // reach the tab bar or session.json.
-                        let text = overlays::line_paste_text(&text.to_string());
-                        if !text.is_empty() {
-                            if let Some(state) = self.ivars().rename_tab.borrow_mut().as_mut() {
-                                let byte_idx = state.input.char_indices()
-                                    .nth(state.cursor).map(|(i, _)| i)
-                                    .unwrap_or(state.input.len());
-                                state.input.insert_str(byte_idx, &text);
-                                state.cursor += text.chars().count();
-                            } else if let Some(state) = self.ivars().rename_pane.borrow_mut().as_mut() {
-                                let byte_idx = state.input.char_indices()
-                                    .nth(state.cursor).map(|(i, _)| i)
-                                    .unwrap_or(state.input.len());
-                                state.input.insert_str(byte_idx, &text);
-                                state.cursor += text.chars().count();
-                            }
-                            self.mark_dirty();
-                        }
+                        self.paste_into_rename(&text.to_string());
                     }
                     return objc2::runtime::Bool::YES;
                 }
@@ -2136,10 +2118,24 @@ impl KovaView {
                 }
             }
             Action::Paste => {
-                if self.ivars().filter.borrow().is_some() {
+                // Every overlay that owns the keyboard owns the paste too, so
+                // IPC `dispatch-action paste` lands where Cmd+V would, never in
+                // the PTY hidden behind it.
+                let palette_open = self.ivars().search_palette.borrow().is_some();
+                let rename_open = self.ivars().rename_tab.borrow().is_some()
+                    || self.ivars().rename_pane.borrow().is_some();
+                let filter_open = self.ivars().filter.borrow().is_some();
+                if palette_open || rename_open || filter_open {
                     let pasteboard = NSPasteboard::generalPasteboard();
                     if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
-                        self.paste_into_filter(&text.to_string());
+                        let text = text.to_string();
+                        if palette_open {
+                            self.paste_into_search_palette(&text);
+                        } else if rename_open {
+                            self.paste_into_rename(&text);
+                        } else {
+                            self.paste_into_filter(&text);
+                        }
                     }
                 } else if let Some(pane) = self.focused_pane() {
                     let pasteboard = NSPasteboard::generalPasteboard();
@@ -2385,6 +2381,27 @@ impl KovaView {
 
 
 
+
+    /// Paste into whichever rename editor is open, as one sanitized line.
+    fn paste_into_rename(&self, text: &str) {
+        // A title is one line: no newline, tab or escape may reach the tab bar
+        // or session.json.
+        let text = overlays::line_paste_text(text);
+        if text.is_empty() {
+            return;
+        }
+        let insert = |input: &mut String, cursor: &mut usize| {
+            let byte_idx = input.char_indices().nth(*cursor).map(|(i, _)| i).unwrap_or(input.len());
+            input.insert_str(byte_idx, &text);
+            *cursor += text.chars().count();
+        };
+        if let Some(state) = self.ivars().rename_tab.borrow_mut().as_mut() {
+            insert(&mut state.input, &mut state.cursor);
+        } else if let Some(state) = self.ivars().rename_pane.borrow_mut().as_mut() {
+            insert(&mut state.input, &mut state.cursor);
+        }
+        self.mark_dirty();
+    }
 
     fn mark_dirty(&self) {
         if let Some(pane) = self.focused_pane() {
