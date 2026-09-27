@@ -380,6 +380,13 @@ fn flash_label_layout(
 /// rounding and is invisible on screen.
 const GLYPH_FIT_EPSILON: f32 = 0.25;
 
+/// First char of a single-line input to draw when only `visible` chars fit:
+/// zero until the caret would leave the box, then just enough to keep it on
+/// the last visible column.
+fn input_scroll(cursor: usize, visible: usize) -> usize {
+    (cursor + 1).saturating_sub(visible.max(1))
+}
+
 /// Whether a glyph cell starting at `x` still fits before `max_x`.
 fn glyph_fits(x: f32, cell_w: f32, max_x: f32) -> bool {
     x + cell_w <= max_x + GLYPH_FIT_EPSILON
@@ -3161,10 +3168,14 @@ impl Renderer {
         let text_y = y + (input_h - scaled_cell_h) / 2.0;
         self.render_text(vertices, prompt, left_margin, text_y, right_margin, dim_fg, no_bg, body_scale);
         let prompt_w = prompt.chars().count() as f32 * scaled_cell_w;
-        self.render_text(vertices, data.query, left_margin + prompt_w, text_y, right_margin, label_fg, no_bg, body_scale);
+        // A query wider than the box scrolls so the caret stays in view.
+        let visible_chars = ((right_margin - left_margin - prompt_w) / scaled_cell_w).floor().max(1.0) as usize;
+        let scroll = input_scroll(data.cursor, visible_chars);
+        let shown: String = data.query.chars().skip(scroll).collect();
+        self.render_text(vertices, &shown, left_margin + prompt_w, text_y, right_margin, label_fg, no_bg, body_scale);
 
         // Caret as a thin vertical bar at the cursor position.
-        let caret_x = left_margin + prompt_w + (data.cursor as f32) * scaled_cell_w;
+        let caret_x = left_margin + prompt_w + ((data.cursor - scroll) as f32) * scaled_cell_w;
         Self::push_bg_quad(vertices, caret_x, text_y, 1.5, scaled_cell_h, caret_fg);
 
         y += input_h + scaled_cell_h * 0.75;
@@ -3512,6 +3523,16 @@ fn format_key_combo(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn input_scroll_keeps_the_caret_in_the_box() {
+        use super::input_scroll;
+        assert_eq!(input_scroll(0, 10), 0);
+        assert_eq!(input_scroll(9, 10), 0); // caret on the last column
+        assert_eq!(input_scroll(10, 10), 1);
+        assert_eq!(input_scroll(150, 10), 141);
+        assert_eq!(input_scroll(3, 0), 3);
+    }
 
     #[test]
     fn the_hint_line_measures_what_it_draws() {
