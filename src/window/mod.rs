@@ -10,7 +10,7 @@ mod recent_projects_overlay;
 use recent_projects_overlay::RecentProjectsState;
 mod resize;
 mod search_palette;
-use search_palette::{is_typed_char, SearchPaletteState, SearchRow};
+use search_palette::{is_shortcut, is_typed_char, typed_text, SearchPaletteState, SearchRow};
 mod switcher;
 mod tabs;
 mod tick;

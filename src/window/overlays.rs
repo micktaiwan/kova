@@ -121,6 +121,17 @@ impl KovaView {
         let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
         let ch = ch_str.chars().next().unwrap_or('\0');
 
+        // Ctrl+F closes the filter it opened: keyDown routes here before the
+        // window's own Ctrl+F toggle, which would otherwise never see it.
+        let flags = event.modifierFlags();
+        if ch == 'f'
+            && flags.contains(NSEventModifierFlags::Control)
+            && !flags.contains(NSEventModifierFlags::Command)
+        {
+            self.toggle_filter();
+            return;
+        }
+
         let mut filter = self.ivars().filter.borrow_mut();
         let state = match filter.as_mut() {
             Some(s) => s,
@@ -174,8 +185,12 @@ impl KovaView {
                 // not throw the edit away.
                 state.history_pos = None;
             }
-            c if is_typed_char(c) => {
-                state.query.push(c);
+            c if is_typed_char(c) && !is_shortcut(event) => {
+                let text = typed_text(event);
+                if text.is_empty() {
+                    return; // a dead key waiting for its second stroke
+                }
+                state.query.push_str(&text);
                 state.history_pos = None;
             }
             _ => return,
@@ -261,12 +276,15 @@ impl KovaView {
                         }
                     }
                 }
-                c if is_typed_char(c) => {
+                // Cmd or Ctrl with a letter is a shortcut, not typing; Option
+                // composes, so the text comes from the layout, not the bare key.
+                c if is_typed_char(c) && !is_shortcut(event) => {
+                    let text = typed_text(event);
                     let byte_idx = state.input.char_indices()
                         .nth(state.cursor).map(|(i, _)| i)
                         .unwrap_or(state.input.len());
-                    state.input.insert(byte_idx, c);
-                    state.cursor += 1;
+                    state.input.insert_str(byte_idx, &text);
+                    state.cursor += text.chars().count();
                 }
                 _ => return,
             }
@@ -355,12 +373,15 @@ impl KovaView {
                         }
                     }
                 }
-                c if is_typed_char(c) => {
+                // Cmd or Ctrl with a letter is a shortcut, not typing; Option
+                // composes, so the text comes from the layout, not the bare key.
+                c if is_typed_char(c) && !is_shortcut(event) => {
+                    let text = typed_text(event);
                     let byte_idx = state.input.char_indices()
                         .nth(state.cursor).map(|(i, _)| i)
                         .unwrap_or(state.input.len());
-                    state.input.insert(byte_idx, c);
-                    state.cursor += 1;
+                    state.input.insert_str(byte_idx, &text);
+                    state.cursor += text.chars().count();
                 }
                 _ => return,
             }

@@ -91,7 +91,7 @@ struct SearchPaneSnapshot {
 
 /// A key pressed with Cmd or Ctrl held. Option stays typing: it composes
 /// characters on macOS layouts (French: Option+( = {).
-fn is_shortcut(event: &NSEvent) -> bool {
+pub(super) fn is_shortcut(event: &NSEvent) -> bool {
     let flags = event.modifierFlags();
     flags.contains(NSEventModifierFlags::Command) || flags.contains(NSEventModifierFlags::Control)
 }
