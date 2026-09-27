@@ -618,10 +618,13 @@ fn handle_ipc_command_sync(
             handle_ipc_set_pane_status(windows, pane_id, waiting)
         }
         IpcCommand::MarkCompleted { pane_id } => {
-            handle_ipc_mark_completed(windows, pane_id, false)
+            handle_ipc_pane_signal(windows, pane_id, crate::window::PaneSignal::Completed)
         }
         IpcCommand::Bell { pane_id } => {
-            handle_ipc_mark_completed(windows, pane_id, true)
+            handle_ipc_pane_signal(windows, pane_id, crate::window::PaneSignal::Bell)
+        }
+        IpcCommand::MarkStarted { pane_id } => {
+            handle_ipc_pane_signal(windows, pane_id, crate::window::PaneSignal::Started)
         }
         IpcCommand::DispatchAction { action, pane_id } => {
             handle_ipc_dispatch_action(windows, &action, pane_id)
@@ -775,7 +778,7 @@ fn handle_ipc_count_pane_content(
     }
 }
 
-/// IPC: wait for OSC 133;D on a pane.
+/// IPC: wait for a pane to be marked completed (OSC 133;D or `mark-completed`).
 ///
 /// If the flag is already set when the request arrives, reply immediately
 /// (don't make the client wait an extra tick for the obvious answer).
@@ -816,7 +819,7 @@ fn handle_ipc_wait_for_completion(
 }
 
 /// On each main-thread tick, resolve any `wait-for-completion` requests
-/// whose pane fired OSC 133;D, hit their deadline, or got closed.
+/// whose pane was marked completed, hit their deadline, or got closed.
 fn poll_pending_waits(
     pending: &RefCell<Vec<PendingWait>>,
     windows: &RefCell<Vec<Retained<NSWindow>>>,
@@ -1284,10 +1287,10 @@ fn handle_ipc_set_pane_status(
 
 /// `mark-completed` (`bell: false`) and `bell` (`bell: true`): both raise a
 /// pane's unread flag without writing to its tty.
-fn handle_ipc_mark_completed(
+fn handle_ipc_pane_signal(
     windows: &RefCell<Vec<Retained<NSWindow>>>,
     pane_id: u32,
-    bell: bool,
+    signal: crate::window::PaneSignal,
 ) -> crate::ipc::IpcResponse {
     use crate::ipc::IpcResponse;
 
@@ -1297,7 +1300,7 @@ fn handle_ipc_mark_completed(
             Some(v) => v,
             None => continue,
         };
-        if view.ipc_mark_completed(pane_id, bell) {
+        if view.ipc_pane_signal(pane_id, signal) {
             return IpcResponse::Ok { data: None };
         }
     }

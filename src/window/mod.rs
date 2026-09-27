@@ -5,7 +5,7 @@ mod geometry;
 mod ipc_handlers;
 mod overlays;
 use overlays::{FilterState, RenamePaneState, RenameTabState};
-pub use ipc_handlers::{IpcCloseTabResult, IpcMergeTabResult, IpcSwapPaneResult};
+pub use ipc_handlers::{IpcCloseTabResult, IpcMergeTabResult, IpcSwapPaneResult, PaneSignal};
 mod recent_projects_overlay;
 use recent_projects_overlay::RecentProjectsState;
 mod resize;

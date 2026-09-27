@@ -77,8 +77,8 @@ pub enum IpcCommand {
         mode: String,
         trim_trailing_blank_lines: bool,
     },
-    /// Block until a shell command in `pane_id` reports completion via OSC 133;D,
-    /// or until `timeout_ms` elapses. Returns immediately if the flag is already set.
+    /// Block until `pane_id` is marked completed (OSC 133;D from the shell, or
+    /// the `mark-completed` command), or until `timeout_ms` elapses. Returns immediately if the flag is already set.
     WaitForCompletion {
         pane_id: u32,
         timeout_ms: u64,
@@ -133,6 +133,15 @@ pub enum IpcCommand {
     /// to the tty (same reason as `MarkCompleted`: a BEL there can cut one of
     /// the running app's OSC sequences short).
     Bell {
+        pane_id: u32,
+    },
+    /// Clear the pane's "finished" flag, as OSC 133;C does when a command
+    /// starts. Claude Code's `UserPromptSubmit` hook sends it, so a
+    /// `wait-for-completion` issued after a prompt waits for that turn's
+    /// `mark-completed` instead of answering at once with the previous one.
+    /// Leaves the running indicator to the foreground-process probe: a turn
+    /// cut short with Esc fires no `Stop` hook and would strand it.
+    MarkStarted {
         pane_id: u32,
     },
     /// Trigger any keyboard action by its stable name (see `action_from_ipc_name`).
@@ -439,6 +448,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "set-pane-status" => &["pane_id", "status"],
         "mark-completed" => &["pane_id"],
         "bell" => &["pane_id"],
+        "mark-started" => &["pane_id"],
         "dispatch-action" => &["action", "pane_id"],
         "merge-window" => &["source_window", "target_window"],
         "notify" => &["pane_id", "title", "message", "sound"],
@@ -682,6 +692,10 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
         "bell" => {
             let pane_id = required_u32(&v, "pane_id")?;
             Ok(IpcCommand::Bell { pane_id })
+        }
+        "mark-started" => {
+            let pane_id = required_u32(&v, "pane_id")?;
+            Ok(IpcCommand::MarkStarted { pane_id })
         }
         "dispatch-action" => {
             let action = v
@@ -1198,6 +1212,15 @@ mod tests {
             err(r#"{"cmd":"bell","pane_id":7,"status":"done"}"#),
             "unknown field \"status\" for command \"bell\""
         );
+    }
+
+    #[test]
+    fn mark_started_takes_only_a_pane_id() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"mark-started","pane_id":7}"#),
+            Ok(IpcCommand::MarkStarted { pane_id: 7 })
+        ));
+        assert_eq!(err(r#"{"cmd":"mark-started"}"#), "missing \"pane_id\" field");
     }
 
     #[test]

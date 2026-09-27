@@ -1623,6 +1623,13 @@ impl TerminalState {
         self.dirty.store(true, Relaxed);
     }
 
+    /// A new command or turn began: the previous "finished" no longer answers
+    /// `wait-for-completion`. What OSC 133;C does to the flag, reached by the
+    /// IPC `mark-started` command.
+    pub fn mark_command_started(&self) {
+        self.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Soft reset: restore rendering-critical state to sane defaults without
     /// clearing grid content or scrollback. Fixes persistent display corruption
     /// (wrong scroll region, hidden cursor, stuck SGR attributes).

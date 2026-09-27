@@ -4,6 +4,15 @@
 
 use super::*;
 
+/// What `ipc_pane_signal` does to a pane: the IPC stand-ins for BEL,
+/// OSC 133;D and OSC 133;C, for hooks that must not write on the tty.
+#[derive(Debug, Clone, Copy)]
+pub enum PaneSignal {
+    Bell,
+    Completed,
+    Started,
+}
+
 /// Outcome of `KovaView::ipc_close_tab`. Lets the caller distinguish "not in this window"
 /// (keep scanning) from "last tab — refuse" (final answer).
 pub enum IpcCloseTabResult {
@@ -334,6 +343,14 @@ impl KovaView {
             if let Some(pane) = tab.pane(pane_id) {
                 // Same rule as a keystroke: someone answered this pane.
                 pane.clear_awaiting();
+                // A submitted line starts a command or a turn: the finished
+                // flag of the last one must not answer the wait that usually
+                // follows. Cleared here rather than on the shell's 133;C or
+                // Claude's UserPromptSubmit hook, both of which can arrive
+                // after that wait does.
+                if text.contains(['\r', '\n']) {
+                    pane.terminal.read().mark_command_started();
+                }
                 pane.pty.write(text.as_bytes());
                 return true;
             }
@@ -750,25 +767,24 @@ impl KovaView {
         false
     }
 
-    pub fn ipc_mark_completed(&self, pane_id: PaneId, bell: bool) -> bool {
+    pub fn ipc_pane_signal(&self, pane_id: PaneId, signal: PaneSignal) -> bool {
         let found = {
             let tabs = self.ivars().tabs.borrow();
             let pane = tabs.iter().find_map(|tab| tab.pane(pane_id));
             if let Some(pane) = pane {
                 let term = pane.terminal.read();
-                if bell {
-                    term.ring_bell();
-                    log::info!("IPC: pane {} bell", pane_id);
-                } else {
-                    term.mark_command_completed();
-                    log::info!("IPC: pane {} marked completed", pane_id);
+                match signal {
+                    PaneSignal::Bell => term.ring_bell(),
+                    PaneSignal::Completed => term.mark_command_completed(),
+                    PaneSignal::Started => term.mark_command_started(),
                 }
+                log::info!("IPC: pane {} {:?}", pane_id, signal);
             }
             pane.is_some()
         };
         if found {
             self.mark_dirty();
-            // An open switcher would otherwise keep this pane's row without its dot.
+            // An open switcher would otherwise keep this pane's row as it was.
             self.refresh_open_pane_switcher();
         }
         found

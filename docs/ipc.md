@@ -197,9 +197,21 @@ There is intentionally **no time-based expiry**. A question left unanswered for 
 { "cmd": "mark-completed", "pane_id": 42 }
 ```
 
-Does what OSC 133;D does: the pane gets the unread "finished command" dot that `Cmd+P`'s `Tab`, the `●N` counter and `Cmd+J` walk. Unlike the shell's own 133;D, it is never swallowed as a startup marker.
+Does what OSC 133;D does: the pane gets the unread "finished command" dot that `Cmd+P`'s `Tab`, the `●N` counter and `Cmd+J` walk, and a pending `wait-for-completion` on the pane returns. Unlike the shell's own 133;D, it is never swallowed as a startup marker, so it works on a pane with no shell integration.
 
 It exists for hooks of an app that owns the tty. Claude Code's `Stop` hook used to print `ESC ] 133;D BEL` straight to the pane's tty; those bytes interleave with Claude Code's output at any point, and landing inside one of its CSI sequences (`ESC [ 10 G`) aborts it, so the parameters are printed as text — `Les 1410Gmide` for `Les 14 min de`. Claude Code's differential renderer never repaints the line, so the garbage stays until something makes it redraw (a mouse selection does). Captures from one day held 30 such splits. Over the socket, nothing reaches the tty.
+
+Response: `{ "ok": true }`.
+
+---
+
+### `mark-started` — clear a pane's "finished" flag
+
+```json
+{ "cmd": "mark-started", "pane_id": 42 }
+```
+
+Does to the flag what OSC 133;C does: the last completion no longer answers `wait-for-completion`. Claude Code's `UserPromptSubmit` hook sends it, so a Claude pane marked done by one turn's `Stop` does not look done for the whole next turn. It leaves the running indicator alone: a turn interrupted with Esc fires no `Stop`, and the foreground-process probe already tracks it.
 
 Response: `{ "ok": true }`.
 
@@ -564,7 +576,7 @@ Use this **before** `get-pane-content` to decide whether the payload is worth fe
 | `pane_id` | required | — | pane to watch |
 | `timeout_ms` | `30000` | `300000` | give up after this many ms |
 
-Returns when the shell emits **OSC 133;D** (command-completed marker) for that pane, or when the deadline passes.
+Returns when the pane is marked completed — by the shell's **OSC 133;D** or by the IPC `mark-completed` command (Claude Code's `Stop` hook) — or when the deadline passes.
 
 Response:
 
@@ -574,9 +586,9 @@ Response:
 { "ok": false, "error": "pane 42 closed during wait" }
 ```
 
-**Requires shell integration.** The shell must emit OSC 133 sequences. Most modern prompt frameworks (Starship, Powerlevel10k, fig/atuin, vscode-shell-integration) do this automatically. Without it, this command always times out.
+**Requires something to mark completion.** For a shell, that is shell integration emitting OSC 133 sequences; most modern prompt frameworks (Starship, Powerlevel10k, fig/atuin, vscode-shell-integration) do this automatically. For a Claude Code session, the `Stop` hook's `mark-completed`. With neither, this command always times out.
 
-**Semantics — sticky flag.** Kova's `command_completed` flag is set on OSC 133;D and stays set until the shell starts the next command (OSC 133;A). Implications:
+**Semantics — sticky flag.** Kova's `command_completed` flag is set on OSC 133;D or `mark-completed`, and stays set until the next command or turn starts: OSC 133;C, `mark-started`, or a `send-keys` whose text contains a newline or carriage return. Implications:
 
 - If the wait arrives **after** the command already finished, it returns `completed: true` immediately.
 - Calling `wait-for-completion` twice in a row without sending a new command in between returns `completed: true` both times. The flag isn't consumed by observation. The intended pattern is `send-keys` → `wait-for-completion`, never two waits without a send in between.

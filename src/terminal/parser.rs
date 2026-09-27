@@ -1101,6 +1101,16 @@ mod tests {
     }
 
     #[test]
+    fn mark_started_clears_a_completion_like_osc133_c() {
+        // Claude's Stop hook marks each turn done; the next prompt's
+        // mark-started must reset it, or wait-for-completion answers at once.
+        let t = drive(20, 5, &[]);
+        t.read().mark_command_completed();
+        t.read().mark_command_started();
+        assert!(!t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
     fn osc133_c_then_d_sets_completed() {
         let t = drive(20, 5, &[b"\x1b]133;C\x07\x1b]133;D\x07"]);
         assert!(t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
