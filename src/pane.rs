@@ -759,8 +759,9 @@ impl Tab {
 
     /// Check if any pane in the tab is running a command. Two sources, OR'd:
     /// - OSC 133;C/D from shell integration (precise prompt cycles) — note
-    ///   that Claude Code emits a 133;D at the end of each of its turns, so
-    ///   this flag alone dies while claude is still open;
+    ///   that Claude Code's `Stop` hook sends `mark-completed` at the end of
+    ///   each turn, which clears it too, so this flag alone dies while claude
+    ///   is still open;
     /// - a foreground process group other than the shell (tcgetpgrp) — covers
     ///   claude, vim, any TUI, no shell integration needed. Only re-probed
     ///   when `refresh_fg` is true (one ioctl per pane); the same probe caches

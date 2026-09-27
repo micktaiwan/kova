@@ -1095,7 +1095,7 @@ mod tests {
         // it must not light the completion indicator.
         let t = drive(20, 5, &[b"\x1b]133;D\x07"]);
         assert!(!t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
-        // A later D without C (Claude Code Stop hook) must fire.
+        // A later D without C (any program printing 133;D itself) must fire.
         let t = drive(20, 5, &[b"\x1b]133;D\x07", b"\x1b]133;D\x07"]);
         assert!(t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
     }
