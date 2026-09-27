@@ -451,6 +451,25 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
 }
 
 /// Parse a JSON line into an IpcCommand.
+/// A required id field. Absent is "missing"; present but not a u32 (a string,
+/// a negative, a float, or a number past u32::MAX that `as` would wrap onto
+/// another pane) says so instead of pretending the field was not sent.
+fn required_u32(v: &serde_json::Value, key: &str) -> Result<u32, String> {
+    optional_u32(v, key)?.ok_or_else(|| format!("missing \"{key}\" field"))
+}
+
+/// An optional id field: absent or null is `None`, anything but a u32 is an error.
+fn optional_u32(v: &serde_json::Value, key: &str) -> Result<Option<u32>, String> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(n) => n
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| format!("\"{key}\" must be a non-negative integer up to {}", u32::MAX)),
+    }
+}
+
 fn parse_command(line: &str) -> Result<IpcCommand, String> {
     let v: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("invalid JSON: {}", e))?;
@@ -503,19 +522,11 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
         }
         "list-panes" => Ok(IpcCommand::ListPanes),
         "close-pane" => {
-            let pane_id = v
-                .get("pane_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
-                as u32;
+            let pane_id = required_u32(&v, "pane_id")?;
             Ok(IpcCommand::ClosePaneById(pane_id))
         }
         "send-keys" => {
-            let pane_id = v
-                .get("pane_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
-                as u32;
+            let pane_id = required_u32(&v, "pane_id")?;
             let text = v
                 .get("text")
                 .and_then(|t| t.as_str())
@@ -524,11 +535,7 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             Ok(IpcCommand::SendKeys { pane_id, text })
         }
         "focus-pane" => {
-            let pane_id = v
-                .get("pane_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
-                as u32;
+            let pane_id = required_u32(&v, "pane_id")?;
             Ok(IpcCommand::FocusPane(pane_id))
         }
         "new-tab" => {
@@ -537,11 +544,7 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             Ok(IpcCommand::NewTab { cwd, cmd: cmd_str })
         }
         "set-tab-title" => {
-            let pane_id = v
-                .get("pane_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
-                as u32;
+            let pane_id = required_u32(&v, "pane_id")?;
             let title = match v.get("title") {
                 None | Some(serde_json::Value::Null) => None,
                 Some(serde_json::Value::String(s)) => Some(s.clone()),
@@ -550,11 +553,7 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             Ok(IpcCommand::SetTabTitle { pane_id, title })
         }
         "set-tab-color" => {
-            let pane_id = v
-                .get("pane_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
-                as u32;
+            let pane_id = required_u32(&v, "pane_id")?;
             let color = match v.get("color") {
                 None | Some(serde_json::Value::Null) => None,
                 Some(serde_json::Value::Number(n)) => {
@@ -582,11 +581,7 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             Ok(IpcCommand::CountPaneContent { panes, mode, trim_trailing_blank_lines: trim })
         }
         "wait-for-completion" => {
-            let pane_id = v
-                .get("pane_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
-                as u32;
+            let pane_id = required_u32(&v, "pane_id")?;
             // Default 30s, capped at 5 min — keeps the connection thread from
             // sitting on a half-dead client indefinitely.
             let timeout_ms = match v.get("timeout_ms") {
@@ -606,51 +601,27 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
         }
         "list-tabs" => Ok(IpcCommand::ListTabs),
         "close-tab" => {
-            let tab_id = v
-                .get("tab_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"tab_id\" field".to_string())?
-                as u32;
+            let tab_id = required_u32(&v, "tab_id")?;
             Ok(IpcCommand::CloseTab(tab_id))
         }
         "merge-tab" => {
-            let source_tab_id = v
-                .get("source_tab_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"source_tab_id\" field".to_string())?
-                as u32;
-            let target_tab_id = v
-                .get("target_tab_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"target_tab_id\" field".to_string())?
-                as u32;
+            let source_tab_id = required_u32(&v, "source_tab_id")?;
+            let target_tab_id = required_u32(&v, "target_tab_id")?;
             if source_tab_id == target_tab_id {
                 return Err("source_tab_id and target_tab_id must differ".to_string());
             }
             Ok(IpcCommand::MergeTab { source_tab_id, target_tab_id })
         }
         "swap-pane" => {
-            let pane_id_a = v
-                .get("pane_id_a")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id_a\" field".to_string())?
-                as u32;
-            let pane_id_b = v
-                .get("pane_id_b")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id_b\" field".to_string())?
-                as u32;
+            let pane_id_a = required_u32(&v, "pane_id_a")?;
+            let pane_id_b = required_u32(&v, "pane_id_b")?;
             if pane_id_a == pane_id_b {
                 return Err("pane_id_a and pane_id_b must differ".to_string());
             }
             Ok(IpcCommand::SwapPane { pane_id_a, pane_id_b })
         }
         "resize-pane" => {
-            let pane_id = v
-                .get("pane_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
-                as u32;
+            let pane_id = required_u32(&v, "pane_id")?;
             let axis = v
                 .get("axis")
                 .and_then(|a| a.as_str())
@@ -683,11 +654,7 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             Ok(IpcCommand::ResizePane { pane_id, axis, direction, amount_pct })
         }
         "rename-pane" => {
-            let pane_id = v
-                .get("pane_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
-                as u32;
+            let pane_id = required_u32(&v, "pane_id")?;
             let title = match v.get("title") {
                 None | Some(serde_json::Value::Null) => None,
                 Some(serde_json::Value::String(s)) => Some(s.clone()),
@@ -696,11 +663,7 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             Ok(IpcCommand::RenamePane { pane_id, title })
         }
         "set-pane-status" => {
-            let pane_id = v
-                .get("pane_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
-                as u32;
+            let pane_id = required_u32(&v, "pane_id")?;
             let waiting = match v.get("status").and_then(|s| s.as_str()) {
                 Some("waiting") => true,
                 Some("none") => false,
@@ -713,19 +676,11 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             Ok(IpcCommand::SetPaneStatus { pane_id, waiting })
         }
         "mark-completed" => {
-            let pane_id = v
-                .get("pane_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
-                as u32;
+            let pane_id = required_u32(&v, "pane_id")?;
             Ok(IpcCommand::MarkCompleted { pane_id })
         }
         "bell" => {
-            let pane_id = v
-                .get("pane_id")
-                .and_then(|p| p.as_u64())
-                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
-                as u32;
+            let pane_id = required_u32(&v, "pane_id")?;
             Ok(IpcCommand::Bell { pane_id })
         }
         "dispatch-action" => {
@@ -734,14 +689,7 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 .and_then(|a| a.as_str())
                 .ok_or_else(|| "missing \"action\" field".to_string())?
                 .to_string();
-            let pane_id = match v.get("pane_id") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(p) => Some(
-                    p.as_u64()
-                        .ok_or_else(|| "\"pane_id\" must be a non-negative integer".to_string())?
-                        as u32,
-                ),
-            };
+            let pane_id = optional_u32(&v, "pane_id")?;
             Ok(IpcCommand::DispatchAction { action, pane_id })
         }
         "merge-window" => {
@@ -772,14 +720,7 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 .unwrap_or("Kova")
                 .to_string();
             // Optional: a notification with no pane just brings Kova to the front.
-            let pane_id = match v.get("pane_id") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(p) => Some(
-                    p.as_u64()
-                        .ok_or_else(|| "\"pane_id\" must be a number".to_string())?
-                        as u32,
-                ),
-            };
+            let pane_id = optional_u32(&v, "pane_id")?;
             let sound = match v.get("sound") {
                 None | Some(serde_json::Value::Null) => false,
                 Some(serde_json::Value::Bool(b)) => *b,
@@ -795,13 +736,7 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                     Some(_) => Err(format!("\"{key}\" must be a non-empty string")),
                 }
             };
-            let pane_id = match v.get("pane_id") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::Number(n)) => {
-                    Some(n.as_u64().ok_or("\"pane_id\" must be a number")? as u32)
-                }
-                Some(_) => return Err("\"pane_id\" must be a number".to_string()),
-            };
+            let pane_id = optional_u32(&v, "pane_id")?;
             let cwd = text("cwd")?;
             let agent = text("agent")?;
             if let Some(a) = agent.as_deref() {
@@ -876,10 +811,10 @@ fn parse_pane_content_args(
         Some(serde_json::Value::Array(arr)) => {
             let mut ids = Vec::with_capacity(arr.len());
             for (i, item) in arr.iter().enumerate() {
-                let id = item.as_u64().ok_or_else(|| {
+                let id = item.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| {
                     format!("\"panes\"[{}] must be a non-negative integer", i)
                 })?;
-                ids.push(id as u32);
+                ids.push(id);
             }
             PaneFilter::Ids(ids)
         }
@@ -1259,6 +1194,24 @@ mod tests {
             Ok(IpcCommand::Bell { pane_id: 7 })
         ));
         assert_eq!(err(r#"{"cmd":"bell"}"#), "missing \"pane_id\" field");
+        assert_eq!(
+            err(r#"{"cmd":"bell","pane_id":7,"status":"done"}"#),
+            "unknown field \"status\" for command \"bell\""
+        );
+    }
+
+    #[test]
+    fn ids_out_of_u32_or_of_the_wrong_type_are_rejected_not_wrapped() {
+        let bad = "\"pane_id\" must be a non-negative integer up to 4294967295";
+        // 2^32 + 7 used to wrap onto pane 7.
+        assert_eq!(err(r#"{"cmd":"bell","pane_id":4294967303}"#), bad);
+        assert_eq!(err(r#"{"cmd":"bell","pane_id":"7"}"#), bad);
+        assert_eq!(err(r#"{"cmd":"focus-pane","pane_id":-1}"#), bad);
+        assert_eq!(err(r#"{"cmd":"notify","message":"m","pane_id":7.5}"#), bad);
+        assert!(matches!(
+            parse_command(r#"{"cmd":"bell","pane_id":4294967295}"#),
+            Ok(IpcCommand::Bell { pane_id: 4294967295 })
+        ));
     }
 
     #[test]
