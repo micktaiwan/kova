@@ -346,6 +346,12 @@ impl KovaView {
     /// list pushed while it is up would otherwise stay on screen out of date.
     pub fn ipc_refresh_anchors(&self, anchors: &crate::anchors::Anchors) {
         self.refresh_anchor_keys(anchors);
+        self.refresh_open_pane_switcher();
+    }
+
+    /// Rebuild the pane switcher if it is open: its rows are a snapshot taken
+    /// when it opened, so a change that arrives meanwhile would not show.
+    fn refresh_open_pane_switcher(&self) {
         let open = self.ivars().pane_switcher.borrow().is_some();
         if open {
             let (filtered, show_bookmarks) = self.pane_switcher_modes();
@@ -745,12 +751,10 @@ impl KovaView {
     }
 
     pub fn ipc_mark_completed(&self, pane_id: PaneId, bell: bool) -> bool {
-        let tabs = self.ivars().tabs.borrow();
-        for tab in tabs.iter() {
-            let Some(pane) = tab.pane(pane_id) else { continue };
-            {
-                // Scope the read guard: mark_dirty() re-locks the focused pane's terminal,
-                // and a recursive parking_lot read deadlocks if a pty-reader write is queued.
+        let found = {
+            let tabs = self.ivars().tabs.borrow();
+            let pane = tabs.iter().find_map(|tab| tab.pane(pane_id));
+            if let Some(pane) = pane {
                 let term = pane.terminal.read();
                 if bell {
                     term.ring_bell();
@@ -760,9 +764,13 @@ impl KovaView {
                     log::info!("IPC: pane {} marked completed", pane_id);
                 }
             }
+            pane.is_some()
+        };
+        if found {
             self.mark_dirty();
-            return true;
+            // An open switcher would otherwise keep this pane's row without its dot.
+            self.refresh_open_pane_switcher();
         }
-        false
+        found
     }
 }
