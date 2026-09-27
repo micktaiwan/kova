@@ -806,7 +806,7 @@ impl KovaView {
     /// Cmd+V while the palette is open: the clipboard's first line goes in at
     /// the caret, and a live search is queued as for typed text.
     pub(super) fn paste_into_search_palette(&self, text: &str) {
-        let pasted = super::overlays::filter_paste_text(text);
+        let pasted = super::overlays::line_paste_text(text);
         if pasted.is_empty() {
             return;
         }

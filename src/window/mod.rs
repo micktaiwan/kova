@@ -699,7 +699,9 @@ define_class!(
                 if matches!(keybindings.window_map.get(&combo), Some(Action::Paste)) {
                     let pasteboard = NSPasteboard::generalPasteboard();
                     if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
-                        let text = text.to_string();
+                        // A title is one line: no newline, tab or escape may
+                        // reach the tab bar or session.json.
+                        let text = overlays::line_paste_text(&text.to_string());
                         if !text.is_empty() {
                             if let Some(state) = self.ivars().rename_tab.borrow_mut().as_mut() {
                                 let byte_idx = state.input.char_indices()

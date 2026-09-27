@@ -425,15 +425,38 @@ impl KovaView {
     }
 }
 
+/// A clipboard's first line. Unicode line and paragraph separators end it too:
+/// they are not control chars, so the typed-char filter would let them through.
+fn first_line(text: &str) -> &str {
+    text.split(['\n', '\r', '\u{2028}', '\u{2029}']).next().unwrap_or("")
+}
+
 /// The part of a clipboard that can go into the single-line filter query: its
 /// first line, without the control chars a line search could never match.
 pub(super) fn filter_paste_text(text: &str) -> String {
-    text.lines().next().unwrap_or("").chars().filter(|&c| is_typed_char(c)).collect()
+    first_line(text).chars().filter(|&c| is_typed_char(c)).collect()
+}
+
+/// Longest paste a single-line input keeps. A search term or a title has no
+/// use for more, and every extra char is redrawn on each frame.
+const MAX_LINE_PASTE_CHARS: usize = 500;
+
+/// A clipboard pasted into a single-line input whose words matter one by one
+/// (search palette terms, a tab or pane title): the first line, tabs turned
+/// into spaces so the words around them stay apart, other control chars
+/// dropped, and the length capped.
+pub(super) fn line_paste_text(text: &str) -> String {
+    first_line(text)
+        .chars()
+        .map(|c| if c == '\t' { ' ' } else { c })
+        .filter(|&c| is_typed_char(c))
+        .take(MAX_LINE_PASTE_CHARS)
+        .collect()
 }
 
 #[cfg(test)]
 mod filter_paste_tests {
-    use super::filter_paste_text;
+    use super::{filter_paste_text, line_paste_text, MAX_LINE_PASTE_CHARS};
 
     #[test]
     fn keeps_first_line_only() {
@@ -445,5 +468,22 @@ mod filter_paste_tests {
     fn drops_control_chars() {
         assert_eq!(filter_paste_text("a\tb\x1b[c"), "ab[c");
         assert_eq!(filter_paste_text(""), "");
+    }
+
+    #[test]
+    fn unicode_line_separators_end_the_first_line() {
+        assert_eq!(filter_paste_text("foo\u{2028}bar"), "foo");
+        assert_eq!(line_paste_text("foo\u{2029}bar"), "foo");
+    }
+
+    #[test]
+    fn line_paste_keeps_tab_separated_words_apart() {
+        assert_eq!(line_paste_text("deploy\tfailed\x1b"), "deploy failed");
+    }
+
+    #[test]
+    fn line_paste_is_capped() {
+        let long = "x".repeat(MAX_LINE_PASTE_CHARS * 3);
+        assert_eq!(line_paste_text(&long).chars().count(), MAX_LINE_PASTE_CHARS);
     }
 }
