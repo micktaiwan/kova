@@ -42,7 +42,11 @@ struct Scan {
     by_ancestor: HashMap<u32, Session>,
     /// Every conversation alive on this machine, whatever its process tree
     /// looks like, for "is this conversation already running somewhere?".
+    /// Orphans are not in it.
     live_ids: Vec<String>,
+    /// Conversation id → PID of the interactive sessions that lost their
+    /// terminal: still running, but nobody can type into them or see them.
+    orphans: HashMap<String, u32>,
 }
 
 /// What a live Claude Code session file tells us about the session.
@@ -64,6 +68,16 @@ fn sessions_dir() -> PathBuf {
 
 /// Parent PID and start time (epoch seconds) of a live process.
 fn proc_info(pid: u32) -> Option<(u32, u64)> {
+    proc_bsdinfo(pid).map(|info| (info.pbi_ppid, info.pbi_start_tvsec))
+}
+
+/// True if `pid` still has a controlling terminal. `NODEV` (all bits set) is
+/// what the kernel reports once the terminal is gone — `ps` prints it `??`.
+fn has_terminal(pid: u32) -> bool {
+    proc_bsdinfo(pid).is_some_and(|info| info.e_tdev != u32::MAX)
+}
+
+fn proc_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
     unsafe {
         let mut info: libc::proc_bsdinfo = std::mem::zeroed();
         let ret = libc::proc_pidinfo(
@@ -76,8 +90,18 @@ fn proc_info(pid: u32) -> Option<(u32, u64)> {
         if ret <= 0 {
             return None;
         }
-        Some((info.pbi_ppid, info.pbi_start_tvsec))
+        Some(info)
     }
+}
+
+/// True if the session file describes an interactive session — one that
+/// needs a terminal to be of any use. Headless runs (`claude -p`, the SDK)
+/// never had one, so a missing terminal says nothing about them.
+fn is_interactive_file(data: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()
+        .and_then(|json| json.get("kind").and_then(|v| v.as_str()).map(|k| k == "interactive"))
+        .unwrap_or(false)
 }
 
 /// Read one `~/.claude/sessions/<pid>.json` body into the PID that owns it, the
@@ -143,6 +167,15 @@ fn scan_uncached() -> Scan {
             continue;
         }
 
+        // An interactive session without a terminal outlived the pane it ran
+        // in: nothing shows it and nothing can reach it any more. It counts as
+        // closed, so the search palette offers it, and reopening it ends the
+        // stranded process first (`end_orphan`).
+        if !has_terminal(pid) && is_interactive_file(&data) {
+            scan.orphans.insert(session.id.clone(), pid);
+            continue;
+        }
+
         // The id goes in before the ancestry walk: a conversation is alive
         // whether or not any pane turns out to own it.
         scan.live_ids.push(session.id.clone());
@@ -185,6 +218,39 @@ fn with_scan<T>(f: impl FnOnce(&Scan) -> T) -> T {
 /// the same transcript.
 pub fn live_session_ids() -> Vec<String> {
     with_scan(|scan| scan.live_ids.clone())
+}
+
+/// Ids of the interactive conversations still running without a terminal.
+pub fn orphan_session_ids() -> Vec<String> {
+    with_scan(|scan| scan.orphans.keys().cloned().collect())
+}
+
+/// How long a stranded session gets to exit on SIGHUP before it is killed.
+const ORPHAN_GRACE: Duration = Duration::from_millis(500);
+
+/// End the process still holding `session_id` without a terminal, so that
+/// reopening the conversation does not put two writers on its transcript.
+/// Blocks for at most `ORPHAN_GRACE`. No-op when the session is not an orphan.
+///
+/// The scan is redone rather than read from the cache: the PID must be the one
+/// that holds the conversation right now, not one recycled since.
+pub fn end_orphan(session_id: &str) {
+    let scan = scan_uncached();
+    let Some(&pid) = scan.orphans.get(session_id) else { return };
+    *CACHE.lock() = Some((Instant::now(), scan));
+    let pid = pid as i32;
+    let alive = || unsafe { libc::kill(pid, 0) } == 0;
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+    let deadline = Instant::now() + ORPHAN_GRACE;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+        if !alive() {
+            log::info!("Stranded Claude session (pid {}) exited on SIGHUP", pid);
+            return;
+        }
+    }
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    log::info!("Stranded Claude session (pid {}) killed before being reopened", pid);
 }
 
 /// The Claude Code session running under `shell_pid`, if any. Shared by the
@@ -295,6 +361,22 @@ mod tests {
     const LIVE_FILE: &str = r#"{"pid":10487,"sessionId":"430e0c8f","cwd":"/Users/x/vigie",
         "startedAt":1786280230040,"version":"2.1.226","kind":"interactive",
         "entrypoint":"cli","name":"images","nameSource":"user","status":"busy"}"#;
+
+    #[test]
+    fn only_an_interactive_session_can_be_stranded() {
+        assert!(is_interactive_file(LIVE_FILE));
+        assert!(!is_interactive_file(r#"{"pid":1,"kind":"print"}"#));
+        assert!(!is_interactive_file(r#"{"pid":1}"#));
+        assert!(!is_interactive_file("not json"));
+    }
+
+    #[test]
+    fn this_test_process_is_seen_with_or_without_a_terminal() {
+        // Whatever runs the tests, the answer must come from the kernel, and
+        // a PID that does not exist has no terminal.
+        let _ = has_terminal(std::process::id());
+        assert!(!has_terminal(u32::MAX / 2));
+    }
 
     #[test]
     fn session_file_yields_pid_start_and_name() {

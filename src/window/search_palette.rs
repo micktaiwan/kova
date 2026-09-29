@@ -327,6 +327,7 @@ fn run_search_worker(
     // sessions, and the rest of them would bury the open panes above. What was
     // cut is named in the header rather than dropped silently.
     let archived = crate::claude_history::search(query, live_sessions, focus_cwd);
+    let orphans = crate::claude_session::orphan_session_ids();
     if !archived.hits.is_empty() {
         let header = if archived.total > archived.hits.len() {
             format!(
@@ -339,8 +340,14 @@ fn run_search_worker(
         };
         rows.push(SearchRow::Header(header));
         for hit in archived.hits {
+            let mut label = crate::claude_history::hit_label(&hit);
+            if orphans.contains(&hit.id) {
+                // Its pane is gone but the process lives on: say so, since
+                // reopening it ends that process.
+                label.push_str(" · stranded");
+            }
             rows.push(SearchRow::Hit(SearchHit {
-                label: crate::claude_history::hit_label(&hit),
+                label,
                 target: SearchTarget::Archived {
                     session_id: hit.id,
                     cwd: hit.cwd,
@@ -507,6 +514,9 @@ impl KovaView {
         // Reopening one conversation out of hundreds is a vote for it, and the
         // only one the user never has to think about casting.
         crate::claude_history::record_resume(session_id);
+        // A conversation stranded by a closed pane still has a process writing
+        // to its transcript: end it before a second one takes over.
+        crate::claude_session::end_orphan(session_id);
         // Same guard as the restore path: an id that cannot make a safe command
         // line never reaches a PTY.
         let command = match crate::claude_session::resume_command(None, session_id) {

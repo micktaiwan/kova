@@ -269,14 +269,20 @@ impl Pty {
         let shutdown = Arc::new(AtomicBool::new(false));
         PTY_REGISTRY.lock().push(PtyEntry { child_pid, master_fd: master_fd.as_raw_fd(), shutdown: shutdown.clone() });
 
-        let dup_fd = unsafe { libc::dup(master_fd.as_raw_fd()) };
+        // Every copy of the master must be close-on-exec. A plain `dup` is not,
+        // so each shell spawned later inherited the masters of every pane open
+        // at the time: closing a pane then left its master open in those other
+        // shells, the terminal was never hung up, and whatever ran in it (a
+        // Claude session, typically) lived on with no pane — stuck in exit,
+        // even after SIGKILL, waiting for output nobody would ever read.
+        let dup_fd = dup_cloexec(master_fd.as_raw_fd());
         if dup_fd < 0 {
             return Err("dup() failed".into());
         }
         let reader_fd = unsafe { OwnedFd::from_raw_fd(dup_fd) };
 
         // Dup for VteHandler write-back (CSI responses)
-        let writer_dup = unsafe { libc::dup(master_fd.as_raw_fd()) };
+        let writer_dup = dup_cloexec(master_fd.as_raw_fd());
         if writer_dup < 0 {
             return Err("dup() failed for writer".into());
         }
@@ -587,6 +593,12 @@ impl Pty {
     }
 }
 
+/// `dup` with close-on-exec set atomically, so no child spawned meanwhile on
+/// another thread can inherit the copy. -1 on failure, like `dup`.
+fn dup_cloexec(fd: i32) -> i32 {
+    unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) }
+}
+
 /// Escalate signals to reap a child process: SIGHUP → SIGTERM → SIGKILL.
 /// Each step waits `step_ms` before checking with `waitpid(WNOHANG)`.
 fn reap_child(pid: i32, step_ms: u64) {
@@ -611,6 +623,46 @@ fn reap_child(pid: i32, step_ms: u64) {
         }
     }
     log::warn!("reap_child: pid {} still alive after SIGKILL (should not happen)", pid);
+}
+
+/// How long the job a pane was running gets to exit on its own once its pane
+/// is closed, before it is killed. Long enough for Claude Code to finish
+/// writing its transcript, short enough that nothing outlives its pane.
+const JOB_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Make sure the foreground job of a closed pane dies with it.
+///
+/// The hangup only reaches the shell, which may be killed before it passes it
+/// on, and a program can ignore it anyway: Claude Code survived its pane that
+/// way, with nothing left to show it and nothing left to type into it. The
+/// job's process group gets SIGHUP, then SIGKILL if it is still there after
+/// `JOB_GRACE`.
+fn reap_foreground_job(pgid: i32) {
+    if !is_foreign_job(pgid, unsafe { libc::getpgrp() }) {
+        return;
+    }
+    let gone = || unsafe { libc::killpg(pgid, 0) } != 0;
+    if gone() {
+        return;
+    }
+    unsafe { libc::killpg(pgid, libc::SIGHUP) };
+    let deadline = std::time::Instant::now() + JOB_GRACE;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if gone() {
+            log::info!("Foreground job {} of a closed pane exited on SIGHUP", pgid);
+            return;
+        }
+    }
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    log::info!("Foreground job {} outlived its pane by {:?}: killed", pgid, JOB_GRACE);
+}
+
+/// True if `pgid` names a process group that is safe to signal: a real group,
+/// and not Kova's own. `killpg(0)` would hit Kova's group and `killpg(1)` the
+/// init process — a stale answer from `tcgetpgrp` must never turn into either.
+fn is_foreign_job(pgid: i32, own_pgrp: i32) -> bool {
+    pgid > 1 && pgid != own_pgrp
 }
 
 /// Count how many PTYs have a foreground process that differs from the shell.
@@ -648,6 +700,8 @@ impl Drop for Pty {
             return;
         }
         self.shutdown.store(true, Ordering::Relaxed);
+        // Read before anything closes: the question needs the master open.
+        let job = foreground_pgid(self.master_fd.as_raw_fd(), self.child_pid);
         // Send SIGHUP to the child so it exits, which causes EOF on the reader fd.
         // Without this, the reader thread could block indefinitely on read().
         let kill_rc = unsafe { libc::kill(self.child_pid as i32, libc::SIGHUP) };
@@ -671,12 +725,18 @@ impl Drop for Pty {
         }
         let pid = self.child_pid;
         PTY_REGISTRY.lock().retain(|e| e.child_pid != pid);
+        let reap = move || {
+            reap_child(pid as i32, 50);
+            if let Some(pgid) = job {
+                reap_foreground_job(pgid);
+            }
+        };
         let result = std::thread::Builder::new()
             .name(format!("pty-reaper-{}", pid))
-            .spawn(move || reap_child(pid as i32, 50));
+            .spawn(reap.clone());
         if let Err(e) = result {
             log::warn!("Failed to spawn reaper for pid {}: {}, reaping synchronously", pid, e);
-            reap_child(pid as i32, 50);
+            reap();
         }
         log::info!("PTY child {} cleanup delegated to reaper thread", pid);
     }
@@ -696,6 +756,24 @@ mod tests {
             buf.push(0);
         }
         buf
+    }
+
+    #[test]
+    fn only_a_real_foreign_process_group_is_signalled() {
+        assert!(is_foreign_job(4242, 100));
+        assert!(!is_foreign_job(100, 100), "never Kova's own group");
+        assert!(!is_foreign_job(0, 100));
+        assert!(!is_foreign_job(1, 100));
+        assert!(!is_foreign_job(-1, 100));
+    }
+
+    #[test]
+    fn a_duplicated_fd_is_close_on_exec() {
+        let fd = dup_cloexec(1);
+        assert!(fd >= 0);
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        unsafe { libc::close(fd) };
+        assert!(flags & libc::FD_CLOEXEC != 0);
     }
 
     #[test]
