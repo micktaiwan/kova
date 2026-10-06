@@ -387,6 +387,14 @@ fn input_scroll(cursor: usize, visible: usize) -> usize {
     (cursor + 1).saturating_sub(visible.max(1))
 }
 
+/// Where the session name starts in the attention banner: flush right, unless
+/// that would run into the tier label, in which case it starts two cells after
+/// the label and gets clipped at the right edge instead.
+fn banner_title_x(title_chars: usize, label_end: f32, right_edge: f32, cell_w: f32) -> f32 {
+    let flush_right = right_edge - title_chars as f32 * cell_w;
+    flush_right.max(label_end + cell_w * 2.0)
+}
+
 /// Whether a glyph cell starting at `x` still fits before `max_x`.
 fn glyph_fits(x: f32, cell_w: f32, max_x: f32) -> bool {
     x + cell_w <= max_x + GLYPH_FIT_EPSILON
@@ -1063,7 +1071,10 @@ impl Renderer {
         if let (Some((text, color)), Some(focused)) =
             (self.pane_banner.clone(), panes.iter().find(|p| p.is_focused))
         {
-            self.build_pane_banner_vertices(&mut overlay_vertices, &focused.viewport, &text, color);
+            // The banner hides the bar's right-hand title, which is the only
+            // place an unrenamed session shows its name: carry it over.
+            let title = focused.custom_title.clone().or_else(|| focused.terminal.read().title.clone());
+            self.build_pane_banner_vertices(&mut overlay_vertices, &focused.viewport, &text, title.as_deref(), color);
         }
 
         // Draw filter overlay on focused pane
@@ -1789,12 +1800,14 @@ impl Renderer {
     /// background — the pane's own bar is hidden underneath for as long as it
     /// lasts, so the message cannot be mistaken for one more field in the bar.
     /// The text sits one cell in from the left, and is clipped at the right edge
-    /// like every other status-bar string.
+    /// like every other status-bar string. `title` — the pane's session name —
+    /// goes at the right end in bold, where the bar it hides would show it.
     fn build_pane_banner_vertices(
         &mut self,
         vertices: &mut Vec<Vertex>,
         vp: &PaneViewport,
         text: &str,
+        title: Option<&str>,
         color: [f32; 3],
     ) {
         let cell_h = self.atlas.cell_height;
@@ -1804,7 +1817,15 @@ impl Renderer {
         let fg = [1.0, 1.0, 1.0, 1.0];
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let text_x = vp.x + self.h_padding() + cell_w;
-        self.render_status_text(vertices, text, text_x, bar_y, vp.x + vp.width - cell_w, fg, no_bg);
+        let right_edge = vp.x + vp.width - cell_w;
+        let label_end = self.render_status_text(vertices, text, text_x, bar_y, right_edge, fg, no_bg);
+        if let Some(title) = title.filter(|t| !t.is_empty()) {
+            let title_x = banner_title_x(title.chars().count(), label_end, right_edge, cell_w);
+            // Faux-bold, as for terminal cells: the same glyphs again, 1px right.
+            for dx in [0.0, 1.0] {
+                self.render_status_text(vertices, title, title_x + dx, bar_y, right_edge + dx, fg, no_bg);
+            }
+        }
     }
 
     fn build_global_status_bar_vertices(
@@ -3523,6 +3544,15 @@ fn format_key_combo(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn banner_title_sits_flush_right_unless_it_would_hit_the_label() {
+        use super::banner_title_x;
+        // Room to spare: ends exactly on the right edge.
+        assert_eq!(banner_title_x(5, 100.0, 500.0, 10.0), 450.0);
+        // Too long: starts two cells after the label, clipped later.
+        assert_eq!(banner_title_x(50, 100.0, 500.0, 10.0), 120.0);
+    }
 
     #[test]
     fn input_scroll_keeps_the_caret_in_the_box() {
