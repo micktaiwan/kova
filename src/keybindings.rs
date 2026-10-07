@@ -108,6 +108,7 @@ impl KeyCombo {
         // For all other keys, use charactersIgnoringModifiers which respects the
         // active keyboard layout (AZERTY, QWERTZ, etc.).
         let key = keycode_to_special(event.keyCode())
+            .or_else(|| keycode_to_digit(event.keyCode()))
             .unwrap_or_else(|| {
                 let chars = event.charactersIgnoringModifiers();
                 let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
@@ -132,6 +133,27 @@ fn keycode_to_special(code: u16) -> Option<Key> {
         0x7C => Some(Key::Right),
         _ => None,
     }
+}
+
+/// Map the number-row keycodes to their digit. On AZERTY the unshifted
+/// characters of that row are `&é"'(§è!çà`, so charactersIgnoringModifiers
+/// would turn Cmd+1 into Cmd+& and the `cmd+1` binding would never match.
+/// Keycodes are physical positions, identical on every layout.
+fn keycode_to_digit(code: u16) -> Option<Key> {
+    let digit = match code {
+        0x12 => '1',
+        0x13 => '2',
+        0x14 => '3',
+        0x15 => '4',
+        0x17 => '5',
+        0x16 => '6',
+        0x1A => '7',
+        0x1C => '8',
+        0x19 => '9',
+        0x1D => '0',
+        _ => return None,
+    };
+    Some(Key::Char(digit))
 }
 
 /// Parse a string like "cmd+shift+d" into a KeyCombo.
@@ -383,4 +405,31 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         _ => return None,
     };
     Some(action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn number_row_keycodes_map_to_digits() {
+        let expected = [
+            (0x12, '1'), (0x13, '2'), (0x14, '3'), (0x15, '4'), (0x17, '5'),
+            (0x16, '6'), (0x1A, '7'), (0x1C, '8'), (0x19, '9'), (0x1D, '0'),
+        ];
+        for (code, digit) in expected {
+            assert_eq!(keycode_to_digit(code), Some(Key::Char(digit)));
+        }
+        // 'A' on QWERTY / 'Q' on AZERTY: not a digit key.
+        assert_eq!(keycode_to_digit(0x00), None);
+    }
+
+    #[test]
+    fn cmd_digit_binding_matches_number_row_combo() {
+        let combo = KeyCombo {
+            cmd: true, ctrl: false, option: false, shift: false,
+            key: keycode_to_digit(0x12).unwrap(),
+        };
+        assert_eq!(parse_key_combo("cmd+1"), combo);
+    }
 }
