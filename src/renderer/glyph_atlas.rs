@@ -81,6 +81,36 @@ fn round_metric_in_points(physical: f64, scale: f64) -> f32 {
     ((physical / scale).ceil() * scale) as f32
 }
 
+/// Horizontal room a glyph's advance may overflow its box before it gets
+/// shrunk: a quarter pixel, the same tolerance as `glyph_fits`.
+const OVERFLOW_TOLERANCE_PX: f64 = 0.25;
+
+/// Scale that makes a glyph of `advance` pixels fit a bitmap `box_w` pixels
+/// wide. A fallback font is sized for its own design, not our cell: circled
+/// digits (② ③) come from a font whose advance is a full em, wider than a
+/// monospace cell, and drawing them unscaled cut off their right side.
+fn fit_scale(advance: f64, box_w: f64) -> f64 {
+    if advance > box_w + OVERFLOW_TOLERANCE_PX && advance > 0.0 {
+        box_w / advance
+    } else {
+        1.0
+    }
+}
+
+/// Draw one glyph into `ctx` on the primary baseline, shrunk uniformly
+/// around its baseline origin when its advance would overflow `box_w`.
+unsafe fn draw_glyph_fitted(font: &CTFont, mut glyph: CGGlyph, ctx: &CGContext, descent: f64, box_w: f64) {
+    let mut advance = CGSize { width: 0.0, height: 0.0 };
+    unsafe { font.advances_for_glyphs(CTFontOrientation::Horizontal, NonNull::new(&mut glyph).unwrap(), &mut advance, 1) };
+    let scale = fit_scale(advance.width, box_w);
+    CGContext::save_g_state(Some(ctx));
+    CGContext::translate_ctm(Some(ctx), 0.0, descent);
+    CGContext::scale_ctm(Some(ctx), scale, scale);
+    let mut pos = CGPoint { x: 0.0, y: 0.0 };
+    unsafe { font.draw_glyphs(NonNull::new(&mut glyph).unwrap(), NonNull::new(&mut pos).unwrap(), 1, ctx) };
+    CGContext::restore_g_state(Some(ctx));
+}
+
 #[cfg(test)]
 mod tests {
     use super::round_metric_in_points;
@@ -106,6 +136,20 @@ mod tests {
     #[test]
     fn a_zero_or_negative_scale_falls_back_to_one() {
         assert_eq!(round_metric_in_points(7.2, 0.0), 8.0);
+    }
+
+    #[test]
+    fn a_glyph_wider_than_its_cell_is_shrunk_to_fit() {
+        let s = super::fit_scale(26.0, 16.0);
+        assert!((26.0 * s - 16.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_glyph_that_fits_is_left_alone() {
+        assert_eq!(super::fit_scale(16.0, 16.0), 1.0);
+        assert_eq!(super::fit_scale(16.2, 16.0), 1.0);
+        assert_eq!(super::fit_scale(9.0, 16.0), 1.0);
+        assert_eq!(super::fit_scale(0.0, 16.0), 1.0);
     }
 }
 
@@ -905,7 +949,7 @@ impl GlyphAtlas {
             return self.insert_bitmap(c, &builtin_buf, bmp_w, bmp_h, false);
         }
 
-        let (mut glyph_id, draw_font) = self.resolve_glyph(c)?;
+        let (glyph_id, draw_font) = self.resolve_glyph(c)?;
 
         // Detect if the resolved font is a color (emoji) font via symbolic traits
         let is_color = unsafe {
@@ -939,16 +983,7 @@ impl GlyphAtlas {
         }
 
         // Draw with the resolved font (primary or fallback) but keep primary baseline
-        let mut pos = CGPoint { x: 0.0, y: self.descent };
-        unsafe {
-            let font_ref = &*draw_font;
-            font_ref.draw_glyphs(
-                NonNull::new(&mut glyph_id).unwrap(),
-                NonNull::new(&mut pos).unwrap(),
-                1,
-                &bmp_ctx,
-            );
-        }
+        unsafe { draw_glyph_fitted(&*draw_font, glyph_id, &bmp_ctx, self.descent, bmp_w as f64) };
 
         // For color emoji, un-premultiply alpha so the straight-alpha blend mode works
         if is_color {
@@ -999,7 +1034,7 @@ impl GlyphAtlas {
                 count as isize,
             )
         };
-        let (mut glyph_id, draw_font): (CGGlyph, *const CTFont) = if ok && glyph_buf[0] != 0 {
+        let (glyph_id, draw_font): (CGGlyph, *const CTFont) = if ok && glyph_buf[0] != 0 {
             (glyph_buf[0], &**italic as *const CTFont)
         } else {
             if !self.italic_fallback_fonts.contains_key(&c) {
@@ -1051,15 +1086,7 @@ impl GlyphAtlas {
         };
         CGContext::set_rgb_fill_color(Some(&bmp_ctx), 1.0, 1.0, 1.0, 1.0);
 
-        let mut pos = CGPoint { x: 0.0, y: self.descent };
-        unsafe {
-            (&*draw_font).draw_glyphs(
-                NonNull::new(&mut glyph_id).unwrap(),
-                NonNull::new(&mut pos).unwrap(),
-                1,
-                &bmp_ctx,
-            );
-        }
+        unsafe { draw_glyph_fitted(&*draw_font, glyph_id, &bmp_ctx, self.descent, bmp_w as f64) };
 
         let info = self.insert_bitmap_raw(&bmp_buf, bmp_w, bmp_h, false)?;
         self.italic_glyphs.insert(c, info);
