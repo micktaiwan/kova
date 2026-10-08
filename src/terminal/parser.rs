@@ -484,6 +484,10 @@ impl VteHandler {
                     }
                 }
             }
+            // The renderer redraws a pane only when it is dirty (clean panes
+            // are drawn from their cached vertices), so any batch that touched
+            // the terminal marks it here rather than trusting every mutator to.
+            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         // Write lock released — now send PTY responses without holding any lock
         for response in &pty_responses {

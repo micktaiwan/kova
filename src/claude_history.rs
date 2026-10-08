@@ -21,43 +21,19 @@ use serde::{Deserialize, Serialize};
 
 /// Cap on the searchable text kept per session. A long session's prompts fit in
 /// far less; the cap only bounds the pathological case so the index file cannot
-/// grow without limit.
-const MAX_TEXT_PER_SESSION: usize = 64 * 1024;
+/// grow without limit. Past it the oldest prompts go, not the newest: the
+/// conversation just had is the one most likely to be searched for.
+const MAX_TEXT_PER_SESSION: usize = 256 * 1024;
 
 /// Chars of the first prompt kept as the row's title.
 const MAX_TITLE_CHARS: usize = 100;
 
-/// Archived rows shown for one query. Deliberately small: a common word matches
-/// hundreds of sessions here ("oui" matches 379 of 1365), and a section that
-/// long buries the open panes above it. The list is sorted by `score`, so the
-/// cut falls on the sessions least likely to be the one wanted; the count of
-/// what was cut is shown instead, as an invitation to type one more word.
+/// Archived rows shown per section for one query. Deliberately small: a common
+/// word matches hundreds of sessions here ("oui" matches 379 of 1365), and a
+/// section that long buries the open panes above it. The list is sorted by
+/// date, so the cut falls on the oldest sessions; the count of what was cut is
+/// shown instead, as an invitation to type one more word.
 const MAX_RESULTS: usize = 8;
-
-/// How the five ranking signals weigh against each other. They are summed, so
-/// the numbers compare directly: recency alone (max 1.0) cannot outrank a
-/// session that is older but was reopened, matches in its title, and sits in
-/// the project the focused pane is in.
-const W_RECENCY: f64 = 1.0;
-const W_INVESTMENT: f64 = 0.8;
-const W_RESUMED: f64 = 0.6;
-const W_SAME_PROJECT: f64 = 0.5;
-const W_MATCH: f64 = 0.9;
-
-/// Days after which recency counts half as much. Short enough that this
-/// morning's session leads, long enough that a fortnight-old conversation with
-/// every other signal in its favour still comes back.
-const RECENCY_HALF_LIFE_DAYS: f64 = 10.0;
-
-/// Prompt count at which a session counts as fully invested in; likewise for
-/// its transcript size in MB, the number of reopenings, and the number of term
-/// occurrences in its text. Saturating rather than linear: the difference
-/// between 3 and 40 prompts says something, the one between 200 and 400 does
-/// not.
-const FULL_PROMPTS: f64 = 40.0;
-const FULL_MEGABYTES: f64 = 20.0;
-const FULL_RESUMES: f64 = 3.0;
-const FULL_OCCURRENCES: f64 = 8.0;
 
 /// What the index remembers about one transcript file.
 #[derive(Clone, Serialize, Deserialize)]
@@ -77,21 +53,17 @@ pub struct IndexedSession {
     pub indexed_len: u64,
     /// Lowercased typed prompts, newline-separated: what a query matches on.
     pub text: String,
-    /// Number of prompts the user typed in this session — the cheapest proxy
-    /// for how much of the conversation is his rather than tool output.
+    /// Number of prompts the user typed in this session.
     #[serde(default)]
     pub prompts: u32,
-    /// How many times this session was reopened from the palette. The only
-    /// vote the user casts on a conversation, and it costs him nothing.
-    #[serde(default)]
-    pub resumes: u32,
 }
 
-/// Schema of the on-disk index. Bumped whenever a field the ranking needs is
-/// added: an entry already at its file's length is never re-read, so a new
-/// counter would otherwise stay at zero for every session already indexed.
-/// A bump costs one full pass (8 s here for 1.4 GB), once.
-const INDEX_VERSION: u32 = 2;
+/// Schema of the on-disk index. Bumped whenever what goes into an entry
+/// changes: an entry already at its file's length is never re-read, so the
+/// sessions indexed under the old rules would keep them. A bump costs one full
+/// pass (8 s here for 1.4 GB), once. Version 3 started indexing slash commands
+/// with their arguments and prompts sent with an image.
+const INDEX_VERSION: u32 = 3;
 
 /// The on-disk index, keyed by transcript path.
 #[derive(Default, Serialize, Deserialize)]
@@ -101,11 +73,15 @@ pub struct Index {
     pub sessions: HashMap<String, IndexedSession>,
 }
 
-/// What a query found in the archive: the rows to show, and how many sessions
-/// matched in total — the two differ as soon as the query is a common word.
+/// What a query found in the archive, most recent first. `hits` carry every
+/// term as a whole word; `inside` are the sessions where at least one term only
+/// shows up inside a longer word ("pitr" in "chapitre"). Each list is capped,
+/// and its total says how many matched before the cut.
 pub struct Results {
     pub hits: Vec<Hit>,
     pub total: usize,
+    pub inside: Vec<Hit>,
+    pub inside_total: usize,
 }
 
 /// One archived session matching a query.
@@ -178,6 +154,9 @@ fn save_index(index: &mut Index) {
 pub struct Prompt {
     pub text: String,
     pub cwd: Option<String>,
+    /// Whether the prompt can name the session in a row. A bare `/clear` or a
+    /// compaction summary is searchable but says nothing about the session.
+    pub titled: bool,
 }
 
 /// Pull a typed prompt out of one transcript line, or `None` if the record is
@@ -189,6 +168,13 @@ pub struct Prompt {
 /// (56 files out of 1364 here) have no such field, and there the tell is a
 /// string `content` that is not a machine-injected block — those all open with
 /// a `<` tag.
+///
+/// Two kinds of typed prompts do not fit that mould and are read apart:
+///   - a slash command (`/agent analyse la recherche`) is stored without
+///     `promptSource`, wrapped in `<command-name>`/`<command-args>` tags — 398
+///     of them in two weeks here, arguments often the whole request;
+///   - a prompt sent with an image has an array `content`, its text in the
+///     `text` parts.
 pub fn typed_prompt(line: &str) -> Option<Prompt> {
     // Cheap gate first: parsing every record of a 50 MB transcript as JSON to
     // discard 99% of them is what makes a full index slow.
@@ -202,23 +188,68 @@ pub fn typed_prompt(line: &str) -> Option<Prompt> {
     if v.get("isMeta").and_then(|m| m.as_bool()).unwrap_or(false) {
         return None;
     }
-    let content = v.get("message")?.get("content")?.as_str()?;
-    let accepted = match v.get("promptSource").and_then(|p| p.as_str()) {
-        Some("typed") => true,
-        Some(_) => false,
-        None => !content.trim_start().starts_with('<'),
+    let source = v.get("promptSource").and_then(|p| p.as_str());
+    let content = v.get("message")?.get("content")?;
+    let cwd = v.get("cwd").and_then(|c| c.as_str()).map(str::to_string);
+
+    let (text, titled) = if let Some(content) = content.as_str() {
+        if let Some(command) = slash_command(content) {
+            if !matches!(source, None | Some("typed")) {
+                return None;
+            }
+            // A command alone names nothing: `/clear` is not what the session
+            // was about.
+            let titled = command.contains(' ');
+            (command, titled)
+        } else {
+            let accepted = match source {
+                Some("typed") => true,
+                Some(_) => false,
+                None => !content.trim_start().starts_with('<'),
+            };
+            if !accepted {
+                return None;
+            }
+            let summary = v.get("isCompactSummary").and_then(|c| c.as_bool()).unwrap_or(false);
+            (content.trim().to_string(), !summary)
+        }
+    } else {
+        // Array content is a tool result unless the user typed it — only
+        // `promptSource` tells the two apart.
+        if source != Some("typed") {
+            return None;
+        }
+        let parts: Vec<&str> = content
+            .as_array()?
+            .iter()
+            .filter(|part| part.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+            .collect();
+        (parts.join("\n").trim().to_string(), true)
     };
-    if !accepted {
-        return None;
-    }
-    let text = content.trim();
     if text.is_empty() {
         return None;
     }
-    Some(Prompt {
-        text: text.to_string(),
-        cwd: v.get("cwd").and_then(|c| c.as_str()).map(str::to_string),
-    })
+    Some(Prompt { text, cwd, titled })
+}
+
+/// `/name args` out of a slash command record, or `None` if `content` is not
+/// one. The record carries the name and the arguments in their own tags.
+fn slash_command(content: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("<command-") {
+        return None;
+    }
+    let tag = |name: &str| -> Option<&str> {
+        let open = format!("<{}>", name);
+        let close = format!("</{}>", name);
+        let start = content.find(&open)? + open.len();
+        let end = start + content[start..].find(&close)?;
+        Some(content[start..end].trim())
+    };
+    let name = tag("command-name")?;
+    let args = tag("command-args").unwrap_or("");
+    Some(if args.is_empty() { name.to_string() } else { format!("{} {}", name, args) })
 }
 
 /// Cut a query into the terms a session must ALL carry.
@@ -237,9 +268,56 @@ pub fn split_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
-/// First line of a prompt, trimmed to a row-sized title.
+/// How well a term sits in a text: not at all, only inside a longer word
+/// ("pitr" in "chapitre"), or as a word of its own. Ordered, so the best of
+/// several sources is their `max` and the weakest of several terms their `min`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Fit {
+    Absent,
+    Inside,
+    Word,
+}
+
+/// Where `term` first sits in `hay` as a whole word, else where it first sits
+/// at all, with how it fits. Both are expected lowercased.
+///
+/// A whole word means no letter or digit right before or after the match. A
+/// term that itself starts or ends on punctuation (`/agent`, `rpo/rto`) is not
+/// held to that on that side, so typing the slash does not lose the hit.
+pub fn find_term(hay: &str, term: &str) -> Option<(usize, Fit)> {
+    if term.is_empty() {
+        return None;
+    }
+    let free_start = !term.chars().next().is_some_and(char::is_alphanumeric);
+    let free_end = !term.chars().next_back().is_some_and(char::is_alphanumeric);
+    let mut first = None;
+    for (pos, _) in hay.match_indices(term) {
+        let before = hay[..pos].chars().next_back();
+        let after = hay[pos + term.len()..].chars().next();
+        let left = free_start || !before.is_some_and(char::is_alphanumeric);
+        let right = free_end || !after.is_some_and(char::is_alphanumeric);
+        if left && right {
+            return Some((pos, Fit::Word));
+        }
+        first.get_or_insert(pos);
+    }
+    first.map(|pos| (pos, Fit::Inside))
+}
+
+/// How `term` fits in `hay` (see `find_term`).
+pub fn fit(hay: &str, term: &str) -> Fit {
+    find_term(hay, term).map_or(Fit::Absent, |(_, f)| f)
+}
+
+/// First line of a prompt, trimmed to a row-sized title. A line that is only a
+/// tag — the `<pasted_content id="…">` wrapping a paste — is skipped: the row
+/// would show the wrapper instead of what was pasted.
 pub fn title_from_prompt(prompt: &str) -> String {
-    let first_line = prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let first_line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !(l.starts_with('<') && l.ends_with('>')))
+        .unwrap_or("");
     let mut out: String = first_line.chars().take(MAX_TITLE_CHARS).collect();
     if first_line.chars().count() > MAX_TITLE_CHARS {
         out.push('…');
@@ -265,6 +343,7 @@ fn index_file(path: &std::path::Path, len: u64, mtime: u64, entry: &mut IndexedS
     let from = if len < entry.indexed_len {
         entry.text.clear();
         entry.title.clear();
+        entry.cwd.clear();
         entry.prompts = 0;
         0
     } else {
@@ -289,6 +368,9 @@ fn index_file(path: &std::path::Path, len: u64, mtime: u64, entry: &mut IndexedS
 
     let mut consumed = from;
     let mut buf = Vec::new();
+    // Title of last resort, for a session with nothing but bare commands or a
+    // compaction summary to show.
+    let mut fallback_title = None;
     loop {
         buf.clear();
         let n = match reader.read_until(b'\n', &mut buf) {
@@ -311,21 +393,55 @@ fn index_file(path: &std::path::Path, len: u64, mtime: u64, entry: &mut IndexedS
             None => continue,
         };
         if entry.title.is_empty() {
-            entry.title = title_from_prompt(&prompt.text);
+            if prompt.titled {
+                entry.title = title_from_prompt(&prompt.text);
+            } else if fallback_title.is_none() {
+                fallback_title = Some(title_from_prompt(&prompt.text));
+            }
         }
         if let Some(cwd) = prompt.cwd {
             entry.cwd = cwd;
         }
         entry.prompts = entry.prompts.saturating_add(1);
-        if entry.text.len() < MAX_TEXT_PER_SESSION {
-            entry.text.push_str(&prompt.text.to_lowercase());
-            entry.text.push('\n');
+        entry.text.push_str(&prompt.text.to_lowercase());
+        entry.text.push('\n');
+    }
+    if entry.title.is_empty() {
+        if let Some(title) = fallback_title {
+            entry.title = title;
         }
     }
+    trim_oldest(&mut entry.text, MAX_TEXT_PER_SESSION);
 
     entry.indexed_len = consumed;
     entry.last_active = mtime;
     true
+}
+
+/// Cut `text` down to at most `max` bytes by dropping whole lines from the
+/// front, so the newest prompts are the ones kept. A last line longer than
+/// `max` on its own is cut through, keeping its end.
+fn trim_oldest(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    // Bytes, not chars: a '\n' byte is never inside a multibyte char, so the
+    // cut always lands on a char boundary. Searching from one byte early keeps
+    // a line that already starts exactly at the cut.
+    let from = text.len() - max - 1;
+    let mut cut = text.as_bytes()[from..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(text.len(), |i| from + i + 1);
+    if cut == text.len() {
+        // One prompt longer than the whole cap: keep its tail rather than
+        // nothing at all.
+        cut = from + 1;
+        while !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+    }
+    text.drain(..cut);
 }
 
 /// Bring the index in line with what is on disk. Returns the number of
@@ -382,7 +498,6 @@ fn refresh(index: &mut Index) -> usize {
                 indexed_len: 0,
                 text: String::new(),
                 prompts: 0,
-                resumes: 0,
             });
             if index_file(&path, len, mtime, entry) {
                 changed += 1;
@@ -416,108 +531,21 @@ pub fn warm() {
     });
 }
 
-/// The five signals a session is ranked on, pulled out of the index so the
-/// arithmetic can be tested without a filesystem.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Signals {
-    /// Seconds since the transcript was last written.
-    pub age_secs: u64,
-    /// Typed prompts in the session.
-    pub prompts: u32,
-    /// Transcript size in bytes.
-    pub bytes: u64,
-    /// Times the session was reopened from the palette.
-    pub resumes: u32,
-    /// The focused pane sits in the same directory as the session.
-    pub same_project: bool,
-    /// Share of the query terms the title or the project path carries, 0..1.
-    pub title_share: f64,
-    /// Total occurrences of the query terms in the typed prompts.
-    pub occurrences: usize,
-}
-
-/// A saturating 0..1 curve: `full` maps to 1, and going further adds almost
-/// nothing. Logarithmic so the low end — where the real difference sits — is
-/// where the slope is.
-fn saturate(value: f64, full: f64) -> f64 {
-    if value <= 0.0 {
-        return 0.0;
-    }
-    ((1.0 + value).ln() / (1.0 + full).ln()).min(1.0)
-}
-
-/// Rank one session against a query. Higher is better; the palette shows the
-/// top `MAX_RESULTS`.
-///
-/// Date is one term among five, decayed rather than sorted on: sorting by date
-/// alone means the conversation of the day always buries the one actually
-/// wanted, which is the whole reason a bookmark feels needed in the first
-/// place.
-pub fn score(sig: &Signals) -> f64 {
-    let age_days = sig.age_secs as f64 / 86_400.0;
-    let recency = 0.5f64.powf(age_days / RECENCY_HALF_LIFE_DAYS);
-
-    // What the user put into the session. Prompts carry most of it; the
-    // transcript size only breaks ties, since it is mostly tool output.
-    let megabytes = sig.bytes as f64 / (1024.0 * 1024.0);
-    let investment =
-        0.7 * saturate(sig.prompts as f64, FULL_PROMPTS) + 0.3 * saturate(megabytes, FULL_MEGABYTES);
-
-    let resumed = saturate(sig.resumes as f64, FULL_RESUMES);
-    let project = if sig.same_project { 1.0 } else { 0.0 };
-
-    // A term in the title says the session is about it; a term buried in the
-    // prompts may be an aside. Repetition is the tiebreaker between asides.
-    let matched = 0.5 * sig.title_share.clamp(0.0, 1.0)
-        + 0.5 * saturate(sig.occurrences as f64, FULL_OCCURRENCES);
-
-    W_RECENCY * recency
-        + W_INVESTMENT * investment
-        + W_RESUMED * resumed
-        + W_SAME_PROJECT * project
-        + W_MATCH * matched
-}
-
-/// Non-overlapping occurrences of `needle` in `haystack`, both lowercased.
-fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    if needle.is_empty() {
-        return 0;
-    }
-    haystack.matches(needle).count()
-}
-
-/// Record that a session was reopened from the palette. Runs off the caller's
-/// thread: it takes the index lock, which the search worker may be holding.
-pub fn record_resume(session_id: &str) {
-    let id = session_id.to_string();
-    std::thread::spawn(move || {
-        let mut guard = INDEX.lock();
-        let index = guard.get_or_insert_with(load_index);
-        let mut touched = false;
-        for entry in index.sessions.values_mut() {
-            if entry.id == id {
-                entry.resumes = entry.resumes.saturating_add(1);
-                touched = true;
-            }
-        }
-        if touched {
-            save_index(index);
-        }
-    });
-}
-
-/// Refresh the index, then return the archived sessions matching `query`, best
-/// first (see `score`). Sessions listed in `live_ids` are left out: they are
+/// Refresh the index, then return the archived sessions matching `query`,
+/// most recent first. Sessions listed in `live_ids` are left out: they are
 /// already open in a pane, and the palette lists those in its own section.
-/// `focus_cwd` is the directory of the focused pane, so a session from the
-/// project being worked in ranks above one from elsewhere.
+///
+/// Sorted by date and nothing else: the session wanted is almost always one
+/// from the last days, and a ranking that mixes in other signals moves it
+/// around for reasons the row does not show.
 ///
 /// Called from the search worker thread — the first call after a cold start
 /// reads every transcript, which takes a moment.
-pub fn search(query: &str, live_ids: &[String], focus_cwd: &str) -> Results {
+pub fn search(query: &str, live_ids: &[String]) -> Results {
     let terms = split_terms(query);
+    let empty = Results { hits: Vec::new(), total: 0, inside: Vec::new(), inside_total: 0 };
     if terms.is_empty() {
-        return Results { hits: Vec::new(), total: 0 };
+        return empty;
     }
 
     let mut guard = INDEX.lock();
@@ -526,66 +554,61 @@ pub fn search(query: &str, live_ids: &[String], focus_cwd: &str) -> Results {
         save_index(index);
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let focus = focus_cwd.to_lowercase();
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut inside: Vec<Hit> = Vec::new();
+    for s in index.sessions.values() {
+        if s.title.is_empty() || live_ids.iter().any(|id| id == &s.id) {
+            continue;
+        }
+        // Per field rather than one concatenated haystack: `text` alone can
+        // reach 256 KB, and copying it for every session of every keystroke
+        // is the one thing that would make a live search feel slow.
+        let title = s.title.to_lowercase();
+        let cwd = s.cwd.to_lowercase();
+        let worst = terms
+            .iter()
+            .map(|t| fit(&title, t).max(fit(&cwd, t)).max(fit(&s.text, t)))
+            .min()
+            .unwrap_or(Fit::Absent);
+        let hit = Hit {
+            id: s.id.clone(),
+            cwd: s.cwd.clone(),
+            title: s.title.clone(),
+            last_active: s.last_active,
+        };
+        match worst {
+            Fit::Word => hits.push(hit),
+            Fit::Inside => inside.push(hit),
+            Fit::Absent => {}
+        }
+    }
 
-    let mut hits: Vec<(f64, Hit)> = index
-        .sessions
-        .values()
-        .filter(|s| !s.title.is_empty())
-        .filter(|s| !live_ids.iter().any(|id| id == &s.id))
-        .filter_map(|s| {
-            // Per field rather than one concatenated haystack: `text` alone can
-            // reach 64 KB, and copying it for every session of every keystroke
-            // is the one thing that would make a live search feel slow.
-            let title = s.title.to_lowercase();
-            let cwd = s.cwd.to_lowercase();
-            let mut in_title = 0usize;
-            let mut occurrences = 0usize;
-            for t in &terms {
-                let named = title.contains(t) || cwd.contains(t);
-                let body = count_occurrences(&s.text, t);
-                if !named && body == 0 {
-                    return None;
-                }
-                if named {
-                    in_title += 1;
-                }
-                occurrences += body;
-            }
-            let sig = Signals {
-                age_secs: now.saturating_sub(s.last_active),
-                prompts: s.prompts,
-                bytes: s.indexed_len,
-                resumes: s.resumes,
-                same_project: !focus.is_empty() && cwd == focus,
-                title_share: in_title as f64 / terms.len() as f64,
-                occurrences,
-            };
-            Some((
-                score(&sig),
-                Hit {
-                    id: s.id.clone(),
-                    cwd: s.cwd.clone(),
-                    title: s.title.clone(),
-                    last_active: s.last_active,
-                },
-            ))
-        })
-        .collect();
+    let newest_first = |list: &mut Vec<Hit>| -> usize {
+        list.sort_by(|a, b| b.last_active.cmp(&a.last_active).then_with(|| a.id.cmp(&b.id)));
+        let total = list.len();
+        list.truncate(MAX_RESULTS);
+        total
+    };
+    let total = newest_first(&mut hits);
+    let inside_total = newest_first(&mut inside);
+    Results { hits, total, inside, inside_total }
+}
 
-    // Ties (two sessions of the same project scored alike) fall back to date.
-    hits.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.1.last_active.cmp(&a.1.last_active))
-    });
-    let total = hits.len();
-    hits.truncate(MAX_RESULTS);
-    Results { hits: hits.into_iter().map(|(_, h)| h).collect(), total }
+/// The indexed prompts of the sessions in `ids`, keyed by session id. Lets the
+/// palette search a live Claude pane by what was said in it, not only by what
+/// its screen shows: Claude Code draws on the alternate screen, which keeps no
+/// scrollback, so a pane's terminal holds one screen of the conversation.
+///
+/// Reads the index as the last `search` left it, without refreshing it again.
+pub fn texts_of(ids: &[String]) -> HashMap<String, String> {
+    let mut guard = INDEX.lock();
+    let index = guard.get_or_insert_with(load_index);
+    // One id can have a transcript in two project directories: keep both.
+    let mut texts: HashMap<String, String> = HashMap::new();
+    for s in index.sessions.values().filter(|s| ids.iter().any(|id| id == &s.id)) {
+        texts.entry(s.id.clone()).or_default().push_str(&s.text);
+    }
+    texts
 }
 
 /// Row label for a hit: project, age, then the prompt that opened the session.
@@ -639,88 +662,74 @@ mod tests {
         assert!(typed_prompt(injected).is_none());
     }
 
-    /// A session with nothing going for it but its date, `days` old.
-    fn plain(days: f64) -> Signals {
-        Signals {
-            age_secs: (days * 86_400.0) as u64,
-            prompts: 10,
-            bytes: 1024 * 1024,
-            resumes: 0,
-            same_project: false,
-            title_share: 0.0,
-            occurrences: 1,
-        }
+    #[test]
+    fn a_slash_command_is_kept_with_its_arguments() {
+        let line = r#"{"type":"user","cwd":"/p","message":{"content":"<command-message>verify-claims</command-message>\n<command-name>/verify-claims</command-name>\n<command-args>on fait un PITR</command-args>"}}"#;
+        let p = typed_prompt(line).expect("a slash command");
+        assert_eq!(p.text, "/verify-claims on fait un PITR");
+        assert!(p.titled);
+        // A bare command is searchable but does not name the session.
+        let bare = r#"{"type":"user","message":{"content":"<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>"}}"#;
+        let p = typed_prompt(bare).expect("a bare command");
+        assert_eq!(p.text, "/clear");
+        assert!(!p.titled);
+        // The command's printed output is not a prompt.
+        let output = r#"{"type":"user","message":{"content":"<local-command-stdout>done</local-command-stdout>"}}"#;
+        assert!(typed_prompt(output).is_none());
     }
 
     #[test]
-    fn recency_decays_by_half_every_ten_days() {
-        // Only the recency term moves, so the gap between the two is exactly
-        // half of its weight.
-        let fresh = score(&plain(0.0));
-        let old = score(&plain(RECENCY_HALF_LIFE_DAYS));
-        assert!((fresh - old - W_RECENCY * 0.5).abs() < 1e-9, "{} vs {}", fresh, old);
-        // And it keeps halving rather than falling off a cliff.
-        let older = score(&plain(2.0 * RECENCY_HALF_LIFE_DAYS));
-        assert!((old - older - W_RECENCY * 0.25).abs() < 1e-9);
+    fn a_prompt_sent_with_an_image_keeps_its_text() {
+        let line = r#"{"type":"user","promptSource":"typed","message":{"content":[{"type":"text","text":"c'est faux [Image #1]"},{"type":"image","source":{"data":"AAAA"}}]}}"#;
+        assert_eq!(typed_prompt(line).unwrap().text, "c'est faux [Image #1]");
+        // The same shape without `promptSource` is a tool result.
+        let tool = r#"{"type":"user","message":{"content":[{"type":"text","text":"output"}]}}"#;
+        assert!(typed_prompt(tool).is_none());
     }
 
     #[test]
-    fn a_worked_session_outranks_a_three_turn_one_from_the_same_day() {
-        let mut short = plain(3.0);
-        short.prompts = 3;
-        short.bytes = 200 * 1024;
-        let mut long = plain(3.0);
-        long.prompts = 60;
-        long.bytes = 30 * 1024 * 1024;
-        assert!(score(&long) > score(&short));
+    fn a_compaction_summary_is_searchable_but_never_the_title() {
+        let line = r#"{"type":"user","isCompactSummary":true,"message":{"content":"This session is being continued. PITR takes 35 h"}}"#;
+        let p = typed_prompt(line).unwrap();
+        assert!(p.text.contains("PITR"));
+        assert!(!p.titled);
     }
 
     #[test]
-    fn reopening_a_session_is_worth_more_than_a_few_days_of_freshness() {
-        let mut reopened = plain(6.0);
-        reopened.resumes = 2;
-        // Never reopened, but three days newer.
-        let fresher = plain(3.0);
-        assert!(score(&reopened) > score(&fresher));
+    fn a_whole_word_beats_the_same_letters_inside_a_longer_one() {
+        assert_eq!(find_term("lis le chapitre 3", "pitr"), Some((10, Fit::Inside)));
+        // The whole word wins even when the longer one comes first.
+        assert_eq!(find_term("chapitre, puis le pitr", "pitr"), Some((18, Fit::Word)));
+        assert_eq!(fit("rto / rpo: pitr.", "pitr"), Fit::Word);
+        assert_eq!(fit("pitr", "pitr"), Fit::Word);
+        assert_eq!(fit("rien", "pitr"), Fit::Absent);
+        // Accented letters count as letters.
+        assert_eq!(fit("pitré", "pitr"), Fit::Inside);
+        // A term with its own punctuation is not held to a boundary there.
+        assert_eq!(fit("lance /agent sur ça", "/agent"), Fit::Word);
+        assert_eq!(fit("x/agent", "/agent"), Fit::Word);
     }
 
     #[test]
-    fn the_project_in_front_of_the_user_wins_a_tie() {
-        let elsewhere = plain(4.0);
-        let mut here = plain(4.0);
-        here.same_project = true;
-        assert!((score(&here) - score(&elsewhere) - W_SAME_PROJECT).abs() < 1e-9);
-    }
-
-    #[test]
-    fn a_term_in_the_title_beats_the_same_term_buried_in_the_prompts() {
-        let mut named = plain(4.0);
-        named.title_share = 1.0;
-        named.occurrences = 1;
-        let mut aside = plain(4.0);
-        aside.title_share = 0.0;
-        aside.occurrences = 3;
-        assert!(score(&named) > score(&aside));
-        // Repetition still separates two asides.
-        let mut repeated = aside;
-        repeated.occurrences = 8;
-        assert!(score(&repeated) > score(&aside));
-    }
-
-    #[test]
-    fn saturating_curves_stay_between_zero_and_one() {
-        assert_eq!(saturate(0.0, 10.0), 0.0);
-        assert_eq!(saturate(-5.0, 10.0), 0.0);
-        assert!((saturate(10.0, 10.0) - 1.0).abs() < 1e-9);
-        assert_eq!(saturate(1_000.0, 10.0), 1.0, "past `full` it is capped");
-        assert!(saturate(2.0, 10.0) < saturate(5.0, 10.0));
-    }
-
-    #[test]
-    fn occurrences_are_counted_per_term() {
-        assert_eq!(count_occurrences("dust dust mcp", "dust"), 2);
-        assert_eq!(count_occurrences("dust", "mcp"), 0);
-        assert_eq!(count_occurrences("dust", ""), 0);
+    fn trimming_drops_the_oldest_lines() {
+        let mut text = "old one\nmiddle\nnewest\n".to_string();
+        trim_oldest(&mut text, 15);
+        assert_eq!(text, "middle\nnewest\n");
+        // A cut that falls right at the start of a line keeps that line.
+        let mut aligned = "aaaa\nbbbb\n".to_string();
+        trim_oldest(&mut aligned, 5);
+        assert_eq!(aligned, "bbbb\n");
+        let mut short = "kept\n".to_string();
+        trim_oldest(&mut short, 15);
+        assert_eq!(short, "kept\n");
+        // A cut landing inside a multibyte char moves to the next line, not into it.
+        let mut accented = "ééééé\nfin\n".to_string();
+        trim_oldest(&mut accented, 7);
+        assert_eq!(accented, "fin\n");
+        // A last prompt bigger than the cap keeps its tail, cut on a char.
+        let mut huge = format!("{}\n", "é".repeat(20));
+        trim_oldest(&mut huge, 6);
+        assert_eq!(huge, "éé\n");
     }
 
     #[test]
@@ -734,6 +743,10 @@ mod tests {
     #[test]
     fn a_title_is_the_first_line_capped() {
         assert_eq!(title_from_prompt("\n\nfirst line\nsecond line"), "first line");
+        assert_eq!(
+            title_from_prompt("<pasted_content id=\"9d2a\">\nWeekly notes\n</pasted_content>"),
+            "Weekly notes"
+        );
         let long = "a".repeat(MAX_TITLE_CHARS + 10);
         let title = title_from_prompt(&long);
         assert_eq!(title.chars().count(), MAX_TITLE_CHARS + 1); // + the ellipsis
@@ -756,7 +769,6 @@ mod tests {
             indexed_len: 0,
             text: String::new(),
             prompts: 0,
-            resumes: 0,
         };
         assert!(index_file(&path, first.len() as u64, 10, &mut entry));
         assert_eq!(entry.title, "one");
@@ -791,10 +803,10 @@ mod tests {
     #[ignore]
     fn indexes_the_real_transcripts() {
         let t0 = std::time::Instant::now();
-        let found = search("dust", &[], "");
+        let found = search("dust", &[]);
         let cold = t0.elapsed();
         let t1 = std::time::Instant::now();
-        let again = search("dust", &[], "");
+        let again = search("dust", &[]);
         println!(
             "cold pass {:?}, warm pass {:?}, {} shown of {} matches",
             cold, t1.elapsed(), found.hits.len(), found.total
@@ -805,11 +817,11 @@ mod tests {
         // A word that matches hundreds of sessions must still show a short list,
         // and a second word must narrow it down.
         let t2 = std::time::Instant::now();
-        let common = search("oui", &[], "");
+        let common = search("oui", &[]);
         println!("\"oui\": {} shown of {} matches in {:?}", common.hits.len(), common.total, t2.elapsed());
         assert!(common.hits.len() <= MAX_RESULTS);
         let t3 = std::time::Instant::now();
-        let narrowed = search("dust mcp", &[], "");
+        let narrowed = search("dust mcp", &[]);
         println!("\"dust mcp\": {} matches in {:?}", narrowed.total, t3.elapsed());
         assert!(narrowed.total <= found.total);
         assert_eq!(found.total, again.total);

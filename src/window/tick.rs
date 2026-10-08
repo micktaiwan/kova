@@ -868,7 +868,7 @@ impl KovaView {
                             Some(session) => {
                                 bookmark_keys.contains(&session.id) || anchor_keys.contains(&session.id)
                             }
-                            None => pane.cwd().is_some_and(|cwd| {
+                            None => pane.cached_cwd().is_some_and(|cwd| {
                                 bookmark_keys.contains(&cwd) || anchor_keys.contains(&cwd)
                             }),
                         },

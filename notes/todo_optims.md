@@ -47,3 +47,42 @@ Baseline mesurée : ~116 MB RSS pour un seul pane (2026-02-24).
 - Les lignes identiques consécutives pourraient être dédupliquées
 - Plus ambitieux : compresser les vieilles lignes de scrollback (zstd)
 - **Tradeoff** : complexité significative, à faire seulement si le scrollback est le bottleneck confirmé
+
+# Perf d'affichage (revue du 2026-10-08)
+
+Revue du chemin de rendu d'un pane, vérifiée par agents (contradicteur + 3 tours d'audit).
+Rien n'est mesuré : aucun chiffre de temps de frame avant/après.
+
+## Fait le 2026-10-08
+
+- **Cache par pane hors rafale DEC 2026** : un pane propre dont la `PaneDrawKey` n'a pas
+  bougé est dessiné depuis son dernier build (`can_reuse_pane_cache`, `renderer/mod.rs`).
+  Avant, toute frame dessinée (sortie d'un seul pane, clignotement du curseur toutes les
+  0,5 s, RSS toutes les 2 s) reconstruisait tous les panes visibles. La clé couvre ce que la
+  barre de statut affiche sans poser `dirty` (focus, blink, URL survolée, compteurs, process,
+  bookmark…) ; `apply_ops` pose maintenant `dirty` après chaque lot, `reset_scroll` aussi.
+  **Piège** : toute nouvelle donnée lue par `build_vertices` / `build_status_bar_vertices`
+  qui change sans `dirty` doit entrer dans `PaneDrawKey`, sinon l'affichage se fige sans bruit.
+- **Fonds fusionnés** : une suite de cellules de même fond = un quad (`bg_runs`).
+- **Une copie de moins** : les vertices vont du cache au `MTLBuffer` sans `all_vertices`.
+- **`cwd` sans syscall par tick** : `Pane::cached_cwd`, re-sondé au plus toutes les ~0,5 s
+  ou quand l'OSC 7 change. Effet visible : la couleur bookmark d'un shell nu peut suivre un
+  `cd` avec ~0,5 s de retard (le zshrc n'émet pas d'OSC 7).
+
+## Reste à faire
+
+- **Instancing** : un vertex de 48 octets × 6 par glyphe ou fond (`renderer/vertex.rs`,
+  `drawPrimitives` sans `[[instance_id]]` dans `shaders/terminal.metal`). Une instance par
+  cellule diviserait le volume envoyé au GPU. Réécrit le shader et le build : gros chantier.
+- **Double lookup de glyphe** : 2 `HashMap<char>` SipHash par cellule non vide (passe de
+  collecte puis passe de build, `glyph_atlas.rs:447`). Tableau direct pour l'ASCII ou hasher
+  rapide.
+- **Allocations par build** : `paste_block::plain_text` alloue 2 `String` par ligne,
+  `visible_lines`, `bg_runs` et les `HashSet` de la passe 1 allouent par pane.
+- **Buffers de vertices sans garde GPU** : `vertex_bufs` alterne sur 2 buffers sans
+  sémaphore ni `addCompletedHandler` ; le CPU peut écrire dans un buffer que le GPU lit encore
+  (risque de frame corrompue, non observé). Le grow réalloue aussi les deux buffers en place.
+- **Capture PTY ON par défaut** : un `write_all` non bufferisé par lecture de 4 Ko sur le
+  thread lecteur (`terminal/pty.rs`), voir aussi `pane-open-perf.md`.
+- **Mesurer** : aucun bench ni test ne construit de `MTLDevice` ; un `GlyphAtlas` en test
+  semble faisable (il ne demande qu'un device), non essayé.

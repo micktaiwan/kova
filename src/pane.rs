@@ -800,6 +800,7 @@ impl Tab {
                     pane.rearm_idle_agent();
                 }
                 let fg = pane.refresh_fg_process();
+                pane.cached_cwd.replace(None);
                 if fg {
                     fg_any = true;
                 } else {
@@ -1699,6 +1700,13 @@ pub struct Pane {
     /// every frame while resolving it costs two syscalls: it is refreshed on the
     /// same ~0.5s throttle as the running-state probe, in `Tab::check_running`.
     fg_process: RefCell<Option<ProcessInfo>>,
+    /// Working directory as of the last probe, for readers that run on every
+    /// frame (the status bar's bookmark colour): the live `cwd()` is a
+    /// `proc_pidinfo` syscall, 60 times a second per pane. Stored with the
+    /// OSC 7 cwd seen at probe time, so a `cd` the shell reports re-probes on
+    /// the next frame; dropped every ~0.5s by `Tab::check_running` for shells
+    /// that report nothing. `None` = probe on next read.
+    cached_cwd: RefCell<Option<(Option<String>, Option<String>)>>,
 }
 
 /// True if `title` begins with a Claude Code *working* marker immediately
@@ -1841,6 +1849,7 @@ impl Pane {
             idle_agent_seen: Cell::new(false),
             last_seen: Cell::new(0),
             fg_process: RefCell::new(None),
+            cached_cwd: RefCell::new(None),
         })
     }
 
@@ -1874,11 +1883,27 @@ impl Pane {
             idle_agent_seen: Cell::new(false),
             last_seen: Cell::new(0),
             fg_process: RefCell::new(None),
+            cached_cwd: RefCell::new(None),
         })
     }
 
     pub fn cwd(&self) -> Option<String> {
         self.pty.cwd()
+    }
+
+    /// `cwd()` without a syscall per frame (see the `cached_cwd` field): at
+    /// most one probe per ~0.5s, plus one when the shell reports a `cd`.
+    pub fn cached_cwd(&self) -> Option<String> {
+        let osc_cwd = self.terminal.read().cwd.clone();
+        let mut slot = self.cached_cwd.borrow_mut();
+        match slot.as_ref() {
+            Some((seen, cwd)) if *seen == osc_cwd => cwd.clone(),
+            _ => {
+                let cwd = self.cwd();
+                *slot = Some((osc_cwd, cwd.clone()));
+                cwd
+            }
+        }
     }
 
     pub fn foreground_process_name(&self) -> Option<String> {

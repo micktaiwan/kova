@@ -87,6 +87,9 @@ struct SearchPaneSnapshot {
     pane_id: PaneId,
     pane_title: String,
     terminal: Arc<parking_lot::RwLock<crate::terminal::TerminalState>>,
+    /// Conversation the pane runs, if any: its indexed prompts are searched
+    /// along with the screen.
+    session_id: Option<String>,
 }
 
 /// A key pressed with Cmd or Ctrl held. Option stays typing: it composes
@@ -195,7 +198,7 @@ fn content_snippet(text: &str, lower: &str, term: &str) -> Option<String> {
     const LEAD_CHARS: usize = 20;
     debug_assert_eq!(text.len(), lower.len());
 
-    let pos = lower.find(term)?;
+    let (pos, _) = crate::claude_history::find_term(lower, term)?;
     let line_start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let line_end = text[pos..].find('\n').map(|i| pos + i).unwrap_or(text.len());
     let raw = &text[line_start..line_end];
@@ -225,22 +228,87 @@ fn content_snippet(text: &str, lower: &str, term: &str) -> Option<String> {
     Some(out)
 }
 
-/// Worker-thread search. Uses ASCII case-insensitive `contains` — good enough
-/// for terminal text, which is overwhelmingly ASCII.
+/// How a pane answers a query: how well its weakest term fits, and the line
+/// to show for it.
+struct PaneMatch {
+    fit: crate::claude_history::Fit,
+    snippet: Option<String>,
+}
+
+/// Match one pane against `terms`. A term counts if the pane's title, its
+/// screen or — for a Claude pane — its conversation's indexed prompts carry it;
+/// the best of the three is kept per term, and the pane fits as well as its
+/// weakest term.
+///
+/// The screen alone is not enough: Claude Code draws on the alternate screen,
+/// which keeps no scrollback, so a word typed an hour ago is nowhere in the
+/// terminal (measured: 0 chars of scrollback on 45 Claude panes of 48).
+fn match_pane(p: &SearchPaneSnapshot, terms: &[String], session_text: Option<&String>) -> PaneMatch {
+    use crate::claude_history::{fit, Fit};
+    let title = lowercase_same_len(&p.pane_title);
+    let title_fits: Vec<Fit> = terms.iter().map(|t| fit(&title, t)).collect();
+    // Dumping a pane's whole buffer is the expensive part: skip it when the
+    // title already carries every term as a word.
+    if title_fits.iter().all(|f| *f == Fit::Word) {
+        return PaneMatch { fit: Fit::Word, snippet: None };
+    }
+    let screen = {
+        let term = p.terminal.read();
+        term.dump_text(crate::terminal::DumpMode::All, true).text
+    };
+    let screen_lower = lowercase_same_len(&screen);
+    let empty = String::new();
+    let said = session_text.unwrap_or(&empty);
+
+    let mut worst = Fit::Word;
+    // The first term the title does not carry as a word is the one whose line
+    // says something the row does not already show.
+    let mut snippet_term: Option<(&String, Fit, Fit)> = None;
+    for (t, title_fit) in terms.iter().zip(&title_fits) {
+        let on_screen = fit(&screen_lower, t);
+        let in_prompts = fit(said, t);
+        let best = (*title_fit).max(on_screen).max(in_prompts);
+        worst = worst.min(best);
+        if *title_fit != Fit::Word && snippet_term.is_none() {
+            snippet_term = Some((t, on_screen, in_prompts));
+        }
+    }
+    if worst == Fit::Absent {
+        return PaneMatch { fit: worst, snippet: None };
+    }
+    // Show the line from where the term sits best, the screen on a tie: it
+    // keeps the original case, the index is lowercased.
+    let snippet = snippet_term.and_then(|(t, on_screen, in_prompts)| {
+        if on_screen >= in_prompts && on_screen != Fit::Absent {
+            content_snippet(&screen, &screen_lower, t)
+        } else {
+            content_snippet(said, said, t)
+        }
+    });
+    PaneMatch { fit: worst, snippet }
+}
+
+/// Worker-thread search, case-insensitive.
 ///
 /// The query is cut into terms on spaces and commas, and a pane or tab has to
 /// carry every one of them (see `claude_history::split_terms`): one word is too
 /// coarse once there are dozens of panes, and matching the whole query as a
 /// single string would make "dust mcp" find nothing.
 ///
-/// Produces a three-section row list:
-///   1. Panes whose title OR content matches, grouped under a per-tab header
-///      (one entry per pane — title and content matches are deduped).
+/// A term counts in full only as a whole word: "pitr" is the backup, not the
+/// middle of "chapitre". What matches only inside longer words is not dropped
+/// — the term may be a prefix still being typed — but moved to a last section
+/// of its own, so it never sits among the real hits.
+///
+/// Produces up to four sections:
+///   1. Panes whose title, screen or conversation matches, grouped under a
+///      per-tab header (one entry per pane).
 ///   2. A "Tabs" section listing tabs whose title matches.
 ///   3. A "Claude sessions (closed)" section: past conversations that match,
-///      ranked by `claude_history::score` rather than by date alone. This is
-///      what makes a session findable once its pane is gone — the whole point
-///      of `claude_history`.
+///      most recent first. This is what makes a session findable once its pane
+///      is gone — the whole point of `claude_history`.
+///   4. "Inside longer words": the panes, tabs and closed sessions of sections
+///      1–3 that only matched that way.
 /// `panes` arrives already ordered by tab (window → tab → pane), so consecutive
 /// grouping by `tab_id` reconstructs the per-tab groups without sorting.
 fn run_search_worker(
@@ -248,115 +316,114 @@ fn run_search_worker(
     tabs: &[SearchTabSnapshot],
     panes: &[SearchPaneSnapshot],
     live_sessions: &[String],
-    focus_cwd: &str,
 ) -> Vec<SearchRow> {
+    use crate::claude_history::{fit, Fit};
     let terms = crate::claude_history::split_terms(query);
     let mut rows: Vec<SearchRow> = Vec::new();
     if terms.is_empty() {
         return rows;
     }
 
+    // First, as it refreshes the index the live panes are then matched on.
+    let archived = crate::claude_history::search(query, live_sessions);
+    let pane_sessions: Vec<String> = panes.iter().filter_map(|p| p.session_id.clone()).collect();
+    let said = crate::claude_history::texts_of(&pane_sessions);
+    let mut inside: Vec<SearchHit> = Vec::new();
+
     // Section 1: matching panes, grouped by tab.
     let mut current_tab: Option<TabId> = None;
     for p in panes {
-        let title = lowercase_same_len(&p.pane_title);
-        // Terms the title already covers need no scrollback: dumping a pane's
-        // whole buffer is the expensive part, so it only happens for what is
-        // left, and only once.
-        let unmatched: Vec<&String> = terms.iter().filter(|t| !title.contains(t.as_str())).collect();
-        // Snippet of the scrollback line that matched, for the rows the title
-        // alone does not explain.
-        let mut snippet = None;
-        let matches = if unmatched.is_empty() {
-            true
-        } else {
-            let text = {
-                let term = p.terminal.read();
-                term.dump_text(crate::terminal::DumpMode::All, true).text
-            };
-            let lower = lowercase_same_len(&text);
-            let all = unmatched.iter().all(|t| lower.contains(t.as_str()));
-            if all {
-                // The first term the title did not carry is the one whose line
-                // says something the row does not already show.
-                snippet = content_snippet(&text, &lower, unmatched[0]);
-            }
-            all
+        let m = match_pane(p, &terms, p.session_id.as_ref().and_then(|id| said.get(id)));
+        let label = match m.snippet {
+            Some(s) => format!("{}  ·  {}", p.pane_title, s),
+            None => p.pane_title.clone(),
         };
-        if !matches {
-            continue;
+        let target = SearchTarget::Open { tab_id: p.tab_id, pane_id: Some(p.pane_id) };
+        match m.fit {
+            Fit::Absent => continue,
+            Fit::Inside => {
+                inside.push(SearchHit { target, label: format!("{} · {}", p.tab_title, label) });
+                continue;
+            }
+            Fit::Word => {}
         }
         if current_tab != Some(p.tab_id) {
             rows.push(SearchRow::Header(p.tab_title.clone()));
             current_tab = Some(p.tab_id);
         }
-        let label = match snippet {
-            Some(s) => format!("{}  ·  {}", p.pane_title, s),
-            None => p.pane_title.clone(),
-        };
-        rows.push(SearchRow::Hit(SearchHit {
-            target: SearchTarget::Open {
-                tab_id: p.tab_id,
-                pane_id: Some(p.pane_id),
-            },
-            label,
-        }));
+        rows.push(SearchRow::Hit(SearchHit { target, label }));
     }
 
     // Section 2: tabs whose title matches.
     let mut tab_section_open = false;
     for tab in tabs {
         let title = lowercase_same_len(&tab.title);
-        if terms.iter().all(|t| title.contains(t.as_str())) {
-            if !tab_section_open {
-                rows.push(SearchRow::Header("Tabs".to_string()));
-                tab_section_open = true;
+        let worst = terms.iter().map(|t| fit(&title, t)).min().unwrap_or(Fit::Absent);
+        let hit = SearchHit {
+            target: SearchTarget::Open { tab_id: tab.tab_id, pane_id: None },
+            label: tab.title.clone(),
+        };
+        match worst {
+            Fit::Absent => {}
+            Fit::Inside => inside.push(SearchHit { label: format!("Tab · {}", hit.label), ..hit }),
+            Fit::Word => {
+                if !tab_section_open {
+                    rows.push(SearchRow::Header("Tabs".to_string()));
+                    tab_section_open = true;
+                }
+                rows.push(SearchRow::Hit(hit));
             }
-            rows.push(SearchRow::Hit(SearchHit {
-                target: SearchTarget::Open {
-                    tab_id: tab.tab_id,
-                    pane_id: None,
-                },
-                label: tab.title.clone(),
-            }));
         }
     }
 
     // Section 3: Claude conversations that are not open anywhere any more.
-    // Only the best few are listed — a common word matches hundreds of
+    // Only the latest few are listed — a common word matches hundreds of
     // sessions, and the rest of them would bury the open panes above. What was
     // cut is named in the header rather than dropped silently.
-    let archived = crate::claude_history::search(query, live_sessions, focus_cwd);
     let orphans = crate::claude_session::orphan_session_ids();
-    if !archived.hits.is_empty() {
-        let header = if archived.total > archived.hits.len() {
-            format!(
-                "Claude sessions (closed) — best {} of {}",
-                archived.hits.len(),
-                archived.total
-            )
-        } else {
-            "Claude sessions (closed)".to_string()
-        };
-        rows.push(SearchRow::Header(header));
-        for hit in archived.hits {
-            let mut label = crate::claude_history::hit_label(&hit);
-            if orphans.contains(&hit.id) {
-                // Its pane is gone but the process lives on: say so, since
-                // reopening it ends that process.
-                label.push_str(" · stranded");
-            }
-            rows.push(SearchRow::Hit(SearchHit {
-                label,
-                target: SearchTarget::Archived {
-                    session_id: hit.id,
-                    cwd: hit.cwd,
-                },
-            }));
+    let archived_hit = |hit: crate::claude_history::Hit| {
+        let mut label = crate::claude_history::hit_label(&hit);
+        if orphans.contains(&hit.id) {
+            // Its pane is gone but the process lives on: say so, since
+            // reopening it ends that process.
+            label.push_str(" · stranded");
         }
+        SearchHit {
+            label,
+            target: SearchTarget::Archived { session_id: hit.id, cwd: hit.cwd },
+        }
+    };
+    if !archived.hits.is_empty() {
+        rows.push(SearchRow::Header(capped_header(
+            "Claude sessions (closed)",
+            archived.hits.len(),
+            archived.total,
+        )));
+        rows.extend(archived.hits.into_iter().map(|h| SearchRow::Hit(archived_hit(h))));
+    }
+
+    // Section 4: what only matched inside longer words, open things first.
+    let inside_shown = inside.len() + archived.inside.len();
+    if inside_shown > 0 {
+        rows.push(SearchRow::Header(capped_header(
+            "Inside longer words",
+            inside_shown,
+            inside.len() + archived.inside_total,
+        )));
+        rows.extend(inside.into_iter().map(SearchRow::Hit));
+        rows.extend(archived.inside.into_iter().map(|h| SearchRow::Hit(archived_hit(h))));
     }
 
     rows
+}
+
+/// A section title that says when the list below it was cut.
+fn capped_header(title: &str, shown: usize, total: usize) -> String {
+    if total > shown {
+        format!("{} — latest {} of {}", title, shown, total)
+    } else {
+        title.to_string()
+    }
 }
 
 /// Find a tab whose panes sit in `cwd`, bring it to the front and spawn a pane
@@ -511,9 +578,6 @@ impl KovaView {
         if focus_pane_with_claude_session(session_id) {
             return;
         }
-        // Reopening one conversation out of hundreds is a vote for it, and the
-        // only one the user never has to think about casting.
-        crate::claude_history::record_resume(session_id);
         // A conversation stranded by a closed pane still has a process writing
         // to its transcript: end it before a second one takes over.
         crate::claude_session::end_orphan(session_id);
@@ -670,6 +734,7 @@ impl KovaView {
                         pane_id: pane.id,
                         pane_title: pane.display_title("shell"),
                         terminal: pane.terminal.clone(),
+                        session_id: pane.claude_session_id(),
                     });
                 });
             }
@@ -705,9 +770,6 @@ impl KovaView {
         };
 
         let (tabs_snap, panes_snap, live_sessions) = Self::collect_search_snapshot();
-        // Where the user is working right now: a past session of this very
-        // project outranks one from elsewhere.
-        let focus_cwd = self.ipc_focused_cwd().unwrap_or_default();
         let (tx, rx) = std::sync::mpsc::channel();
 
         // Store rx into state before spawning, so the polling tick can pick it up
@@ -717,7 +779,7 @@ impl KovaView {
         }
 
         std::thread::spawn(move || {
-            let hits = run_search_worker(&query, &tabs_snap, &panes_snap, &live_sessions, &focus_cwd);
+            let hits = run_search_worker(&query, &tabs_snap, &panes_snap, &live_sessions);
             let _ = tx.send((query_id, hits));
         });
 

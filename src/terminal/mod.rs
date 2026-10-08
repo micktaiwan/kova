@@ -1584,6 +1584,7 @@ impl TerminalState {
     pub fn reset_scroll(&mut self) {
         self.scroll_offset = 0;
         self.user_scrolled = false;
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// Blank cell used by erase ops and scrolled-in lines. Per xterm BCE

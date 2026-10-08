@@ -17,6 +17,7 @@ const TOOLTIP_ANIM_FRAMES: u8 = 10; // ~166ms at 60fps
 const ITALIC_SHEAR: f32 = 0.213;
 
 /// A hoverable zone in a status bar, with associated tooltip text.
+#[derive(Clone)]
 struct TooltipZone {
     x: f32,
     y: f32,
@@ -153,7 +154,7 @@ impl PaneAttention {
         }
     }
 }
-use crate::terminal::{CellAttrs, CursorShape, FilterMatch, TerminalState};
+use crate::terminal::{Cell, CellAttrs, CursorShape, FilterMatch, TerminalState};
 
 /// Data passed to the renderer for drawing filter overlay.
 pub struct FilterRenderData {
@@ -455,14 +456,60 @@ pub struct PaneRenderData {
 
 /// Cached vertex list for one pane, with the conditions it was built under.
 /// Reused as the pane's "previous coherent frame" while the pane defers
-/// rendering inside a DEC-2026 sync burst — but only when the viewport is
-/// unchanged (vertices are absolute pixels), the build wasn't itself torn
-/// (mid_sync) and it wasn't the loading placeholder (ready).
+/// rendering inside a DEC-2026 sync burst, and on any frame where the pane
+/// is clean and its key unchanged — see `can_reuse_pane_cache`.
 struct PaneVertexEntry {
-    vp: PaneViewport,
     verts: Vec<Vertex>,
     mid_sync: bool,
     ready: bool,
+    /// Everything the build read besides the grid (which `dirty` covers).
+    key: PaneDrawKey,
+    /// Status-bar tooltip zones the build registered, replayed on reuse.
+    zones: Vec<TooltipZone>,
+}
+
+/// What a pane's vertices depend on apart from its terminal grid. These
+/// change without the pane being marked dirty (a cursor blink, a hovered
+/// URL, a focus change, the input counter…), so a cached build is only
+/// reused when the pane is clean AND this key is unchanged.
+#[derive(Clone, PartialEq)]
+struct PaneDrawKey {
+    vp: [f32; 4],
+    is_focused: bool,
+    show_blink: bool,
+    hover: Option<(Vec<(usize, u16, u16)>, Option<String>)>,
+    custom_title: Option<String>,
+    has_bell: bool,
+    has_completion: bool,
+    input_chars: u64,
+    printable_chars: u64,
+    last_activity: u64,
+    fg_process: Option<String>,
+    bookmarked: bool,
+    atlas_generation: u64,
+}
+
+/// Whether a pane can be drawn from its cached vertices this frame.
+/// Inside a DEC 2026 burst the previous coherent frame is drawn whatever
+/// changed (only the viewport must match: vertices are absolute pixels).
+/// Outside one, the pane must be clean and nothing it shows may have moved.
+/// A build made mid-burst or for the loading placeholder is never reused.
+fn can_reuse_pane_cache(
+    entry: Option<(&PaneDrawKey, bool, bool)>, // (key, mid_sync, ready)
+    key: &PaneDrawKey,
+    shell_ready: bool,
+    in_sync: bool,
+    dirty: bool,
+) -> bool {
+    let Some((cached, mid_sync, ready)) = entry else { return false };
+    if !shell_ready || !ready || mid_sync {
+        return false;
+    }
+    if in_sync {
+        cached.vp == key.vp
+    } else {
+        !dirty && cached == key
+    }
 }
 
 /// Sub-region of the drawable where a pane is rendered (in pixels).
@@ -579,6 +626,22 @@ pub struct Renderer {
     tooltip_visible: Option<ActiveTooltip>,
     /// Animation progress: 0 = hidden, TOOLTIP_ANIM_FRAMES = fully visible.
     tooltip_anim: u8,
+}
+
+/// Runs of consecutive cells sharing a background other than `default_bg`,
+/// as (first column, one past the last column, colour).
+fn bg_runs(line: &[Cell], default_bg: [u8; 3]) -> Vec<(usize, usize, [u8; 3])> {
+    let mut runs: Vec<(usize, usize, [u8; 3])> = Vec::new();
+    for (col, cell) in line.iter().enumerate() {
+        if cell.bg == default_bg {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((_, end, bg)) if *end == col && *bg == cell.bg => *end = col + 1,
+            _ => runs.push((col, col + 1, cell.bg)),
+        }
+    }
+    runs
 }
 
 /// Width, in cells, of the switcher's hint line: each pair is drawn as
@@ -751,6 +814,32 @@ impl Renderer {
             && t.sync_output_since.is_some_and(|s| s.elapsed().as_millis() < 150)
     }
 
+    /// Everything `pane`'s build reads besides its grid (see `PaneDrawKey`).
+    fn pane_draw_key(&self, pane: &PaneRenderData, blink_on: bool) -> PaneDrawKey {
+        let vp = &pane.viewport;
+        let hover = if self.hovered_url_pane_id == Some(pane.pane_id) {
+            self.hovered_url.clone().map(|segs| (segs, self.hovered_url_text.clone()))
+        } else {
+            None
+        };
+        let t = pane.terminal.read();
+        PaneDrawKey {
+            vp: [vp.x, vp.y, vp.width, vp.height],
+            is_focused: pane.is_focused,
+            show_blink: if pane.is_focused { blink_on } else { true },
+            hover,
+            custom_title: pane.custom_title.clone(),
+            has_bell: pane.has_bell,
+            has_completion: pane.has_completion,
+            input_chars: pane.input_chars.load(std::sync::atomic::Ordering::Relaxed),
+            printable_chars: t.printable_chars.load(std::sync::atomic::Ordering::Relaxed),
+            last_activity: t.last_activity_secs.load(std::sync::atomic::Ordering::Relaxed),
+            fg_process: pane.fg_process.clone(),
+            bookmarked: pane.bookmarked,
+            atlas_generation: self.atlas.generation,
+        }
+    }
+
     /// Build per-pane vertex lists into the cache and return the draw list
     /// (pane id + scissor). Retried (max 3 passes) when rasterizing new
     /// glyphs changes the atlas generation mid-loop: UVs computed before the
@@ -762,6 +851,8 @@ impl Renderer {
         viewport_h: f32,
         has_filter: bool,
         blink_on: bool,
+        dirty_panes: &[u32],
+        sync_panes: &[u32],
     ) -> Vec<(u32, MTLScissorRect)> {
         let mut pane_draws: Vec<(u32, MTLScissorRect)> = Vec::new();
         let (cell_w, cell_h) = self.cell_size();
@@ -783,36 +874,43 @@ impl Renderer {
                     self.pane_vertex_cache.remove(&pane.pane_id);
                     continue;
                 }
-                // Skip panes entirely off-screen (hidden by horizontal scroll)
+                // Skip panes entirely off-screen (hidden by horizontal scroll).
+                // Their dirty flag was consumed this frame without a rebuild:
+                // drop the cache entry so they are rebuilt when they come back.
                 if vp.x + vp.width <= 0.0 || vp.x >= viewport_w {
+                    self.pane_vertex_cache.remove(&pane.pane_id);
                     continue;
                 }
                 if pane.is_focused && has_filter {
-                    continue; // Skip: filter overlay covers focused pane
+                    // Filter overlay covers the focused pane; same as above.
+                    self.pane_vertex_cache.remove(&pane.pane_id);
+                    continue;
                 }
-                let in_sync = Self::in_sync_window(pane);
+                let in_sync = sync_panes.contains(&pane.pane_id);
+                let key = self.pane_draw_key(pane, blink_on);
+                let show_blink = key.show_blink;
+                let pin = key.input_chars;
                 // Sync-deferred pane: draw its previous coherent frame from
                 // the cache instead of rebuilding from the mid-update grid.
-                // Only valid while the viewport is unchanged (vertices are
-                // absolute pixels), the cached build itself wasn't torn
-                // (mid_sync) and it isn't the loading placeholder (ready).
-                let reuse_cached = pane.shell_ready
-                    && in_sync
-                    && self.pane_vertex_cache.get(&pane.pane_id).is_some_and(|e| {
-                        e.ready
-                            && !e.mid_sync
-                            && e.vp.x == vp.x
-                            && e.vp.y == vp.y
-                            && e.vp.width == vp.width
-                            && e.vp.height == vp.height
-                    });
-                if !reuse_cached {
+                // Clean pane whose inputs did not move: its last build is
+                // still exact, skip the rebuild (see `can_reuse_pane_cache`).
+                let reuse_cached = can_reuse_pane_cache(
+                    self.pane_vertex_cache.get(&pane.pane_id).map(|e| (&e.key, e.mid_sync, e.ready)),
+                    &key,
+                    pane.shell_ready,
+                    in_sync,
+                    dirty_panes.contains(&pane.pane_id),
+                );
+                if reuse_cached {
+                    if let Some(e) = self.pane_vertex_cache.get(&pane.pane_id) {
+                        self.tooltip_zones.extend(e.zones.iter().cloned());
+                    }
+                } else {
+                    let zones_before = self.tooltip_zones.len();
                     let pane_verts = {
                         let pane_attention = PaneAttention::from_flags(pane.has_bell, pane.has_completion);
                         let mut verts = if pane.shell_ready {
                             let t = pane.terminal.read();
-                            let show_blink = if pane.is_focused { blink_on } else { true };
-                            let pin = pane.input_chars.load(std::sync::atomic::Ordering::Relaxed);
                             self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin, pane.pane_id, pane.fg_process.as_deref(), pane.bookmarked)
                         } else {
                             self.build_loading_vertices(vp)
@@ -827,13 +925,14 @@ impl Renderer {
                         verts
                     };
                     self.pane_vertex_cache.insert(pane.pane_id, PaneVertexEntry {
-                        vp: *vp,
                         verts: pane_verts,
                         // A cache-miss build during a sync burst is possibly
                         // torn: never reuse it as a "coherent previous frame";
                         // it refreshes every tick until a clean build replaces it.
                         mid_sync: in_sync,
                         ready: pane.shell_ready,
+                        key,
+                        zones: self.tooltip_zones[zones_before..].to_vec(),
                     });
                 }
                 // Compute scissor rect clamped to drawable bounds. Ceil the
@@ -950,7 +1049,9 @@ impl Renderer {
             }
         };
 
-        // Check if any pane is dirty (consume ALL flags, no short-circuit)
+        // Check if any pane is dirty. Only peeked here: the flags are
+        // consumed once a drawable is in hand, so a frame dropped for lack of
+        // one cannot lose them (a clean pane is now drawn from its cache).
         // Sync-deferred panes keep their dirty flag and are drawn from the
         // vertex cache below (their previous, coherent frame).
         let mut any_dirty = false;
@@ -962,10 +1063,19 @@ impl Renderer {
                 any_sync_deferred = true;
                 continue; // Don't consume dirty flag — pane will render later
             }
-            if pane.terminal.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if pane.terminal.read().dirty.load(std::sync::atomic::Ordering::Relaxed) {
                 any_dirty = true;
             }
         }
+        // A clean pane whose status-bar inputs moved (input counter, fg
+        // process, bookmark…) must be redrawn too: those never mark it dirty.
+        let any_key_changed = panes.iter().any(|p| {
+            !p.minimized
+                && self
+                    .pane_vertex_cache
+                    .get(&p.pane_id)
+                    .is_some_and(|e| e.key != self.pane_draw_key(p, blink_on))
+        });
         // If only sync-deferred panes were dirty, still need to render the others
         let all_ready = !any_not_ready;
         let has_filter = filter.is_some();
@@ -975,7 +1085,7 @@ impl Renderer {
         let has_loading = self.loading_progress.is_some();
         let has_pane_flash = self.pane_flash.is_some();
         let has_status_text = self.resize_feedback_text.is_some();
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && !has_status_text && help_hint_remaining == 0 && !tooltip_animating && !has_loading {
+        if all_ready && !any_dirty && !any_key_changed && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && !has_status_text && help_hint_remaining == 0 && !tooltip_animating && !has_loading {
             return;
         }
 
@@ -988,10 +1098,26 @@ impl Renderer {
         let viewport_w = drawable_size.width as f32;
         let viewport_h = drawable_size.height as f32;
 
+        // Sync state is read once per frame: evaluated twice, a burst ending
+        // in between would leave a pane neither consumed nor sync-deferred.
+        let sync_panes: Vec<u32> = panes
+            .iter()
+            .filter(|p| Self::in_sync_window(p))
+            .map(|p| p.pane_id)
+            .collect();
+        // Consume the dirty flags now that this frame will be drawn; the
+        // panes that had one are rebuilt, the others may reuse their cache.
+        let dirty_panes: Vec<u32> = panes
+            .iter()
+            .filter(|p| !sync_panes.contains(&p.pane_id))
+            .filter(|p| p.terminal.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed))
+            .map(|p| p.pane_id)
+            .collect();
+
         // Build vertices for each pane with its own scissor rect for clipping.
         // pane_draws references the vertex cache by pane id (vertices live in
         // self.pane_vertex_cache).
-        let mut pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on);
+        let mut pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on, &dirty_panes, &sync_panes);
         let atlas_gen_after_panes = self.atlas.generation;
         let pane_zone_count = self.tooltip_zones.len();
         let mut overlay_vertices = Vec::new();
@@ -1164,9 +1290,11 @@ impl Renderer {
         }
         self.build_tooltip_vertices(&mut overlay_vertices, viewport_w);
 
-        // Flatten all pane vertices + overlay into a single buffer, tracking draw ranges
-        let mut all_vertices: Vec<Vertex> = Vec::new();
-        let mut draw_calls: Vec<(usize, usize, MTLScissorRect)> = Vec::new(); // (start, count, scissor)
+        // Lay every pane's vertices + the overlay end to end in the GPU
+        // buffer, tracking draw ranges. Copied straight from the cache into the
+        // buffer below: no intermediate Vec holding a second copy of the frame.
+        // (start, count, scissor, source pane — None for the overlay)
+        let mut draw_calls: Vec<(usize, usize, MTLScissorRect, Option<u32>)> = Vec::new();
         let global_scissor = MTLScissorRect {
             x: 0,
             y: 0,
@@ -1181,24 +1309,19 @@ impl Renderer {
         if self.atlas.generation != atlas_gen_after_panes {
             let overlay_zones: Vec<TooltipZone> = self.tooltip_zones.split_off(pane_zone_count);
             self.pane_vertex_cache.clear();
-            pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on);
+            pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on, &dirty_panes, &sync_panes);
             self.tooltip_zones.extend(overlay_zones);
         }
 
+        let mut total_vertices = 0usize;
         for (pane_id, scissor) in &pane_draws {
-            let verts = match self.pane_vertex_cache.get(pane_id) {
-                Some(entry) => &entry.verts,
-                None => continue,
-            };
-            let start = all_vertices.len();
-            all_vertices.extend_from_slice(verts);
-            draw_calls.push((start, verts.len(), *scissor));
+            let Some(entry) = self.pane_vertex_cache.get(pane_id) else { continue };
+            draw_calls.push((total_vertices, entry.verts.len(), *scissor, Some(*pane_id)));
+            total_vertices += entry.verts.len();
         }
         if !overlay_vertices.is_empty() {
-            let start = all_vertices.len();
-            let count = overlay_vertices.len();
-            all_vertices.extend(overlay_vertices);
-            draw_calls.push((start, count, global_scissor));
+            draw_calls.push((total_vertices, overlay_vertices.len(), global_scissor, None));
+            total_vertices += overlay_vertices.len();
         }
 
         // Update viewport buffer if changed
@@ -1248,23 +1371,18 @@ impl Renderer {
             None => { log::error!("Metal: failed to create render encoder, skipping frame"); return; }
         };
 
-        if !all_vertices.is_empty() {
-            let vertex_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    all_vertices.as_ptr() as *const u8,
-                    std::mem::size_of_val(all_vertices.as_slice()),
-                )
-            };
+        if total_vertices > 0 {
+            let total_bytes = total_vertices * std::mem::size_of::<Vertex>();
 
             let buf_idx = self.vertex_buf_idx;
             self.vertex_buf_idx = 1 - buf_idx;
 
             let current_capacity = self.vertex_buf_capacity;
-            if vertex_bytes.len() > current_capacity {
+            if total_bytes > current_capacity {
                 // Grow to next power-of-two that fits
-                let new_capacity = vertex_bytes.len().next_power_of_two();
+                let new_capacity = total_bytes.next_power_of_two();
                 log::warn!("Vertex data ({} bytes) exceeds buffer ({} bytes), growing to {} bytes",
-                    vertex_bytes.len(), current_capacity, new_capacity);
+                    total_bytes, current_capacity, new_capacity);
                 let device = layer.device().expect("no Metal device on layer");
                 for i in 0..2 {
                     self.vertex_bufs[i] = device.newBufferWithLength_options(
@@ -1279,9 +1397,19 @@ impl Renderer {
             }
 
             let vertex_buf = &self.vertex_bufs[buf_idx];
-            unsafe {
-                let ptr = vertex_buf.contents().as_ptr() as *mut u8;
-                std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), ptr, vertex_bytes.len());
+            let dst = vertex_buf.contents().as_ptr() as *mut Vertex;
+            for &(start, count, _, source) in &draw_calls {
+                let src: &[Vertex] = match source {
+                    Some(pane_id) => match self.pane_vertex_cache.get(&pane_id) {
+                        Some(entry) => &entry.verts,
+                        None => continue,
+                    },
+                    None => &overlay_vertices,
+                };
+                debug_assert_eq!(src.len(), count);
+                // SAFETY: the buffer holds at least total_vertices vertices
+                // (grown above) and the ranges in draw_calls are disjoint.
+                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.add(start), count) };
             }
 
             encoder.setRenderPipelineState(&self.pipeline);
@@ -1293,7 +1421,7 @@ impl Renderer {
             }
 
             // Draw each group with its own scissor rect
-            for &(start, count, ref scissor) in &draw_calls {
+            for &(start, count, ref scissor, _) in &draw_calls {
                 encoder.setScissorRect(MTLScissorRect {
                     x: scissor.x,
                     y: scissor.y,
@@ -1416,17 +1544,23 @@ impl Renderer {
             let abs_line = (abs_line_base + row_idx as i64) as usize;
             let y = (oy + y_offset + row_idx as f32 * cell_h).round();
 
-            for col_idx in 0..term.cols as usize {
-                let x = (ox + col_idx as f32 * cell_w).round();
+            // Cell backgrounds, one quad per run of same-colour cells: a TUI's
+            // coloured band is a single rectangle, not one per column. Covers
+            // exactly the union of the per-cell quads it replaces.
+            let cols = (term.cols as usize).min(line.len());
+            for (start, end, bg) in bg_runs(&line[..cols], self.bg_color_u8) {
+                let x = (ox + start as f32 * cell_w).round();
+                let x_end = (ox + (end - 1) as f32 * cell_w).round() + cell_w;
+                Self::push_bg_quad(&mut vertices, x, y, x_end - x, cell_h, crate::terminal::color_to_f32(bg));
+            }
 
-                // Cell background
-                if col_idx < line.len() && line[col_idx].bg != self.bg_color_u8 {
-                    Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, crate::terminal::color_to_f32(line[col_idx].bg));
-                }
-
-                // Selection highlight (rendered on top of cell bg, under glyphs)
-                if has_selection && term.is_selected(abs_line, col_idx as u16) {
-                    Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, self.selection_color);
+            // Selection highlight (on top of every cell bg of the row, under glyphs)
+            if has_selection {
+                for col_idx in 0..term.cols as usize {
+                    if term.is_selected(abs_line, col_idx as u16) {
+                        let x = (ox + col_idx as f32 * cell_w).round();
+                        Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, self.selection_color);
+                    }
                 }
             }
         }
@@ -2409,6 +2543,9 @@ impl Renderer {
         let device = self.atlas.device.clone();
         self.scale = scale as f32;
         self.atlas = GlyphAtlas::new(&device, self.font_size * scale, scale, &self.font_name);
+        // A new atlas restarts its generation count: cached UVs would point
+        // into the old texture with a key that still matches.
+        self.pane_vertex_cache.clear();
         // Update atlas size buffer
         let atlas_size = [self.atlas.atlas_width as f32, self.atlas.atlas_height as f32];
         self.last_atlas_size = atlas_size;
@@ -3544,6 +3681,103 @@ fn format_key_combo(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn draw_key() -> PaneDrawKey {
+        PaneDrawKey {
+            vp: [0.0, 0.0, 800.0, 600.0],
+            is_focused: false,
+            show_blink: true,
+            hover: None,
+            custom_title: None,
+            has_bell: false,
+            has_completion: false,
+            input_chars: 0,
+            printable_chars: 0,
+            last_activity: 0,
+            fg_process: None,
+            bookmarked: false,
+            atlas_generation: 0,
+        }
+    }
+
+    fn bg_line(bgs: &[[u8; 3]]) -> Vec<Cell> {
+        bgs.iter().map(|&bg| Cell { bg, ..Cell::default() }).collect()
+    }
+
+    #[test]
+    fn bg_runs_merge_neighbours_and_skip_the_default() {
+        let d = [0, 0, 0];
+        let (r, g) = ([255, 0, 0], [0, 255, 0]);
+        let line = bg_line(&[d, r, r, r, g, d, d, r]);
+        assert_eq!(bg_runs(&line, d), vec![(1, 4, r), (4, 5, g), (7, 8, r)]);
+    }
+
+    #[test]
+    fn bg_runs_of_a_default_line_is_empty() {
+        let d = [1, 2, 3];
+        assert!(bg_runs(&bg_line(&[d, d, d]), d).is_empty());
+    }
+
+    #[test]
+    fn a_clean_unchanged_pane_is_drawn_from_its_cache() {
+        let k = draw_key();
+        assert!(can_reuse_pane_cache(Some((&k, false, true)), &k, true, false, false));
+    }
+
+    #[test]
+    fn a_dirty_pane_is_rebuilt() {
+        let k = draw_key();
+        assert!(!can_reuse_pane_cache(Some((&k, false, true)), &k, true, false, true));
+    }
+
+    #[test]
+    fn a_pane_with_no_cache_is_built() {
+        assert!(!can_reuse_pane_cache(None, &draw_key(), true, false, false));
+    }
+
+    #[test]
+    fn anything_shown_outside_the_grid_forces_a_rebuild() {
+        // Each of these changes without the pane being marked dirty.
+        let cached = draw_key();
+        let changes: Vec<fn(&mut PaneDrawKey)> = vec![
+            |k| k.show_blink = false,
+            |k| k.is_focused = true,
+            |k| k.hover = Some((vec![(0, 1, 5)], Some("https://x".into()))),
+            |k| k.custom_title = Some("t".into()),
+            |k| k.has_bell = true,
+            |k| k.has_completion = true,
+            |k| k.input_chars = 1,
+            |k| k.printable_chars = 1,
+            |k| k.last_activity = 1,
+            |k| k.fg_process = Some("claude".into()),
+            |k| k.bookmarked = true,
+            |k| k.atlas_generation = 1,
+            |k| k.vp[2] = 801.0,
+        ];
+        for change in changes {
+            let mut now = cached.clone();
+            change(&mut now);
+            assert!(!can_reuse_pane_cache(Some((&cached, false, true)), &now, true, false, false));
+        }
+    }
+
+    #[test]
+    fn inside_a_sync_burst_only_the_viewport_matters() {
+        let cached = draw_key();
+        let mut now = cached.clone();
+        now.input_chars = 42;
+        assert!(can_reuse_pane_cache(Some((&cached, false, true)), &now, true, true, true));
+        now.vp[3] = 500.0;
+        assert!(!can_reuse_pane_cache(Some((&cached, false, true)), &now, true, true, true));
+    }
+
+    #[test]
+    fn a_torn_or_placeholder_build_is_never_reused() {
+        let k = draw_key();
+        assert!(!can_reuse_pane_cache(Some((&k, true, true)), &k, true, false, false));
+        assert!(!can_reuse_pane_cache(Some((&k, false, false)), &k, true, false, false));
+        assert!(!can_reuse_pane_cache(Some((&k, false, true)), &k, false, false, false));
+    }
 
     #[test]
     fn banner_title_sits_flush_right_unless_it_would_hit_the_label() {
