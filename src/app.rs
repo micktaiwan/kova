@@ -12,6 +12,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::ptr::NonNull;
 
 use crate::config::Config;
+use crate::ipc::host::{Disposition, IpcHost, PendingWait};
 use crate::window;
 
 pub struct AppDelegateIvars {
@@ -37,13 +38,6 @@ pub struct AppDelegateIvars {
     /// methods rather than polled: the tick has no `MainThreadMarker` to ask
     /// `NSApplication` with, and an edge-driven flag is exact anyway.
     app_active: Cell<bool>,
-}
-
-/// A `wait-for-completion` request the main thread is still polling.
-struct PendingWait {
-    pane_id: u32,
-    response_tx: std::sync::mpsc::Sender<crate::ipc::IpcResponse>,
-    deadline: std::time::Instant,
 }
 
 define_class!(
@@ -252,7 +246,10 @@ impl AppDelegate {
 
                     // Resolve any pending `wait-for-completion` requests first,
                     // so a command that just finished is reported on this tick.
-                    poll_pending_waits(&ivars.pending_waits, &ivars.windows);
+                    crate::ipc::host::poll_pending_waits(
+                        &KovaAppHost { windows: &ivars.windows },
+                        &mut ivars.pending_waits.borrow_mut(),
+                    );
 
                     // Drain any pending search-palette worker results, and bring
                     // an open pane switcher's dots up to date, so the UI
@@ -318,7 +315,7 @@ impl AppDelegate {
                     // point where the main thread is free to borrow the windows.
                     for pane_id in crate::notification::take_pending_focus() {
                         if let crate::ipc::IpcResponse::Error { message } =
-                            handle_ipc_focus_pane(&ivars.windows, pane_id)
+                            crate::ipc::host::focus_pane(&KovaAppHost { windows: &ivars.windows }, pane_id)
                         {
                             log::warn!("Notifications: click ignored: {}", message);
                         }
@@ -526,36 +523,141 @@ pub fn kova_view(window: &NSWindow) -> Option<&crate::window::KovaView> {
     Some(unsafe { &*(ptr as *const crate::window::KovaView) })
 }
 
-/// What `handle_ipc_command` decided to do with the request.
-enum Disposition {
-    /// Reply to the client now with this response.
-    Reply(crate::ipc::IpcResponse),
-    /// Defer the response — the main thread keeps polling until the wait
-    /// resolves (or its deadline passes), at which point it sends back.
-    Pending(DeferredWait),
+/// Kova.app as an IPC host: every pane and tab of every window, in the order
+/// of the window list. A window whose content view is not a `KovaView` is
+/// skipped, as everywhere else.
+struct KovaAppHost<'a> {
+    windows: &'a RefCell<Vec<Retained<NSWindow>>>,
 }
 
-/// A wait that the main thread has accepted but not yet resolved.
-struct DeferredWait {
-    pane_id: u32,
-    deadline: std::time::Instant,
+impl KovaAppHost<'_> {
+    /// The first window's answer to `ask`, in window-list order.
+    fn find_map<T>(&self, mut ask: impl FnMut(&crate::window::KovaView) -> Option<T>) -> Option<T> {
+        self.windows.borrow().iter().filter_map(|win| kova_view(win)).find_map(|view| ask(view))
+    }
 }
 
-/// Dispatch an IPC command. Most commands reply synchronously; only
-/// `wait-for-completion` returns `Pending` so the main thread can defer the reply.
+impl IpcHost for KovaAppHost<'_> {
+    fn collect_panes(&self, out: &mut Vec<serde_json::Value>) {
+        for (win_idx, win) in self.windows.borrow().iter().enumerate() {
+            let view = match kova_view(win) {
+                Some(v) => v,
+                None => continue,
+            };
+            let is_key = win.isKeyWindow();
+            view.ipc_collect_panes(win_idx, is_key, out);
+        }
+    }
+
+    fn collect_pane_ids(&self, out: &mut Vec<u32>) {
+        for win in self.windows.borrow().iter() {
+            if let Some(view) = kova_view(win) {
+                view.ipc_collect_pane_ids(out);
+            }
+        }
+    }
+
+    fn send_keys(&self, pane_id: u32, text: &str) -> bool {
+        self.find_map(|view| view.ipc_send_keys(pane_id, text).then_some(())).is_some()
+    }
+
+    fn dump_pane_text(
+        &self,
+        pane_id: u32,
+        mode: crate::terminal::DumpMode,
+        trim: bool,
+    ) -> Option<serde_json::Value> {
+        self.find_map(|view| view.ipc_dump_pane_text(pane_id, mode, trim))
+    }
+
+    fn measure_pane_text(
+        &self,
+        pane_id: u32,
+        mode: crate::terminal::DumpMode,
+        trim: bool,
+    ) -> Option<(usize, usize)> {
+        self.find_map(|view| view.ipc_measure_pane_text(pane_id, mode, trim))
+    }
+
+    fn check_completion(&self, pane_id: u32) -> Option<bool> {
+        self.find_map(|view| view.ipc_check_completion(pane_id))
+    }
+
+    /// Switches tab inside the window, then raises the window and activates the app.
+    fn focus_pane(&self, pane_id: u32) -> bool {
+        let wins = self.windows.borrow();
+        for win in wins.iter() {
+            let view = match kova_view(win) {
+                Some(v) => v,
+                None => continue,
+            };
+            if view.ipc_focus_pane(pane_id) {
+                win.makeKeyAndOrderFront(None);
+                let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+                app.activate();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Refuses only the sole pane of the sole tab of a window.
+    fn close_pane(&self, pane_id: u32) -> Option<bool> {
+        self.find_map(|view| view.ipc_close_pane(pane_id))
+    }
+
+    fn set_pane_status(&self, pane_id: u32, waiting: bool) -> bool {
+        self.find_map(|view| view.ipc_set_pane_status(pane_id, waiting).then_some(())).is_some()
+    }
+
+    fn pane_signal(&self, pane_id: u32, signal: crate::ipc::host::PaneSignal) -> bool {
+        self.find_map(|view| view.ipc_pane_signal(pane_id, signal).then_some(())).is_some()
+    }
+
+    /// Kova posts it itself because it is the only process that can act on the
+    /// click — see `crate::notification`.
+    fn notify(&self, pane_id: Option<u32>, title: &str, message: &str, sound: bool) -> Result<(), String> {
+        crate::notification::post(title, message, pane_id, sound)
+    }
+
+    fn collect_tabs(&self, out: &mut Vec<crate::ipc::host::TabInfo>) {
+        for (win_idx, win) in self.windows.borrow().iter().enumerate() {
+            let view = match kova_view(win) {
+                Some(v) => v,
+                None => continue,
+            };
+            let is_key = win.isKeyWindow();
+            view.ipc_collect_tabs(win_idx, is_key, out);
+        }
+    }
+
+    /// Refuses to close the last tab of its window (would terminate the app).
+    fn close_tab(&self, tab_id: u32) -> crate::ipc::host::IpcCloseTabResult {
+        use crate::ipc::host::IpcCloseTabResult;
+        self.find_map(|view| match view.ipc_close_tab(tab_id) {
+            IpcCloseTabResult::NotFound => None,
+            found => Some(found),
+        })
+        .unwrap_or(IpcCloseTabResult::NotFound)
+    }
+}
+
+/// Dispatch an IPC command: the pane commands, `list-tabs` and `close-tab` go
+/// through `crate::ipc::host::dispatch` against Kova.app's windows; windows,
+/// layout, anchors and config are Kova.app's own (`handle_ipc_command_sync`).
 fn handle_ipc_command(
     cmd: crate::ipc::IpcCommand,
     windows: &RefCell<Vec<Retained<NSWindow>>>,
     config_cell: &OnceCell<Config>,
 ) -> Disposition {
-    use crate::ipc::IpcCommand;
-    if let IpcCommand::WaitForCompletion { pane_id, timeout_ms } = cmd {
-        return handle_ipc_wait_for_completion(windows, pane_id, timeout_ms);
+    match crate::ipc::host::dispatch(&KovaAppHost { windows }, cmd) {
+        Ok(disposition) => disposition,
+        Err(cmd) => Disposition::Reply(handle_ipc_command_sync(cmd, windows, config_cell)),
     }
-    Disposition::Reply(handle_ipc_command_sync(cmd, windows, config_cell))
 }
 
-/// Synchronous handler for every command except `wait-for-completion`.
+/// Synchronous handler for the commands that are Kova.app's own: windows,
+/// tabs other than `list-tabs`/`close-tab`, layout, anchors, config.
 fn handle_ipc_command_sync(
     cmd: crate::ipc::IpcCommand,
     windows: &RefCell<Vec<Retained<NSWindow>>>,
@@ -567,18 +669,6 @@ fn handle_ipc_command_sync(
         IpcCommand::Split { direction, cmd: command, cwd } => {
             handle_ipc_split(windows, config_cell, &direction, command, cwd)
         }
-        IpcCommand::ListPanes => {
-            handle_ipc_list_panes(windows)
-        }
-        IpcCommand::ClosePaneById(pane_id) => {
-            handle_ipc_close_pane(windows, pane_id)
-        }
-        IpcCommand::SendKeys { pane_id, text } => {
-            handle_ipc_send_keys(windows, pane_id, &text)
-        }
-        IpcCommand::FocusPane(pane_id) => {
-            handle_ipc_focus_pane(windows, pane_id)
-        }
         IpcCommand::NewTab { cwd, cmd } => {
             handle_ipc_new_tab(windows, config_cell, cwd, cmd)
         }
@@ -587,22 +677,6 @@ fn handle_ipc_command_sync(
         }
         IpcCommand::SetTabColor { pane_id, color } => {
             handle_ipc_set_tab_color(windows, pane_id, color)
-        }
-        IpcCommand::GetPaneContent { panes, mode, trim_trailing_blank_lines } => {
-            handle_ipc_get_pane_content(windows, panes, &mode, trim_trailing_blank_lines)
-        }
-        IpcCommand::CountPaneContent { panes, mode, trim_trailing_blank_lines } => {
-            handle_ipc_count_pane_content(windows, panes, &mode, trim_trailing_blank_lines)
-        }
-        IpcCommand::WaitForCompletion { .. } => {
-            // Routed in `handle_ipc_command` before this fn is called.
-            unreachable!("WaitForCompletion handled by handle_ipc_command, not the sync path");
-        }
-        IpcCommand::ListTabs => {
-            handle_ipc_list_tabs(windows)
-        }
-        IpcCommand::CloseTab(tab_id) => {
-            handle_ipc_close_tab(windows, tab_id)
         }
         IpcCommand::MergeTab { source_tab_id, target_tab_id } => {
             handle_ipc_merge_tab(windows, source_tab_id, target_tab_id)
@@ -616,26 +690,11 @@ fn handle_ipc_command_sync(
         IpcCommand::RenamePane { pane_id, title } => {
             handle_ipc_rename_pane(windows, pane_id, title)
         }
-        IpcCommand::SetPaneStatus { pane_id, waiting } => {
-            handle_ipc_set_pane_status(windows, pane_id, waiting)
-        }
-        IpcCommand::MarkCompleted { pane_id } => {
-            handle_ipc_pane_signal(windows, pane_id, crate::window::PaneSignal::Completed)
-        }
-        IpcCommand::Bell { pane_id } => {
-            handle_ipc_pane_signal(windows, pane_id, crate::window::PaneSignal::Bell)
-        }
-        IpcCommand::MarkStarted { pane_id } => {
-            handle_ipc_pane_signal(windows, pane_id, crate::window::PaneSignal::Started)
-        }
         IpcCommand::DispatchAction { action, pane_id } => {
             handle_ipc_dispatch_action(windows, &action, pane_id)
         }
         IpcCommand::MergeWindow { source_window, target_window } => {
             handle_ipc_merge_window(windows, source_window, target_window)
-        }
-        IpcCommand::Notify { pane_id, title, message, sound } => {
-            handle_ipc_notify(pane_id, &title, &message, sound)
         }
         IpcCommand::SetAnchor { pane_id, cwd, session_id, agent, label } => {
             handle_ipc_set_anchor(windows, pane_id, cwd, session_id, agent, label)
@@ -643,6 +702,27 @@ fn handle_ipc_command_sync(
         IpcCommand::ClearAnchors => handle_ipc_clear_anchors(windows),
         IpcCommand::ReloadConfig => {
             handle_ipc_reload_config(windows)
+        }
+        // Run by `crate::ipc::host::dispatch` before this dispatcher. Reaching
+        // here means that routing was lost in a refactor.
+        IpcCommand::ListPanes
+        | IpcCommand::ClosePaneById(_)
+        | IpcCommand::SendKeys { .. }
+        | IpcCommand::FocusPane(_)
+        | IpcCommand::GetPaneContent { .. }
+        | IpcCommand::CountPaneContent { .. }
+        | IpcCommand::WaitForCompletion { .. }
+        | IpcCommand::ListTabs
+        | IpcCommand::CloseTab(_)
+        | IpcCommand::SetPaneStatus { .. }
+        | IpcCommand::MarkCompleted { .. }
+        | IpcCommand::Bell { .. }
+        | IpcCommand::MarkStarted { .. }
+        | IpcCommand::Notify { .. } => {
+            log::error!("IPC: a host command reached Kova.app's own dispatcher");
+            crate::ipc::IpcResponse::Error {
+                message: "internal: host command was not dispatched".to_string(),
+            }
         }
         // Intercepted in the tick, before this dispatcher — it needs the event
         // state, which lives on the delegate. Reaching here means that branch was
@@ -654,173 +734,6 @@ fn handle_ipc_command_sync(
             }
         }
     }
-}
-
-/// Translate an IPC mode string into a `DumpMode`. Caller has already validated
-/// the value, but we map defensively to keep the boundary explicit.
-fn parse_dump_mode(mode: &str) -> crate::terminal::DumpMode {
-    use crate::terminal::DumpMode;
-    match mode {
-        "scrollback" => DumpMode::Scrollback,
-        "all" => DumpMode::All,
-        _ => DumpMode::Visible,
-    }
-}
-
-/// Resolve a `PaneFilter` into the concrete list of pane IDs to act on.
-/// For `All`, walks every window in order; for `Ids`, returns the list as-is.
-fn resolve_pane_filter(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-    filter: crate::ipc::PaneFilter,
-) -> Vec<u32> {
-    use crate::ipc::PaneFilter;
-    match filter {
-        PaneFilter::Ids(ids) => ids,
-        PaneFilter::All => {
-            let wins = windows.borrow();
-            let mut ids = Vec::new();
-            for win in wins.iter() {
-                if let Some(view) = kova_view(win) {
-                    view.ipc_collect_pane_ids(&mut ids);
-                }
-            }
-            ids
-        }
-    }
-}
-
-/// IPC: return the rendered text of the requested panes.
-fn handle_ipc_get_pane_content(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-    filter: crate::ipc::PaneFilter,
-    mode_str: &str,
-    trim: bool,
-) -> crate::ipc::IpcResponse {
-    let mode = parse_dump_mode(mode_str);
-    let ids = resolve_pane_filter(windows, filter);
-    let wins = windows.borrow();
-    crate::ipc::pane_content_response(ids, |pane_id| {
-        wins.iter()
-            .filter_map(|win| kova_view(win))
-            .find_map(|view| view.ipc_dump_pane_text(pane_id, mode, trim))
-    })
-}
-
-/// IPC: return only the size (chars/bytes) of what `get-pane-content` would return.
-fn handle_ipc_count_pane_content(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-    filter: crate::ipc::PaneFilter,
-    mode_str: &str,
-    trim: bool,
-) -> crate::ipc::IpcResponse {
-    let mode = parse_dump_mode(mode_str);
-    let ids = resolve_pane_filter(windows, filter);
-    let wins = windows.borrow();
-    crate::ipc::pane_count_response(ids, |pane_id| {
-        wins.iter()
-            .filter_map(|win| kova_view(win))
-            .find_map(|view| view.ipc_measure_pane_text(pane_id, mode, trim))
-    })
-}
-
-/// IPC: wait for a pane to be marked completed (OSC 133;D or `mark-completed`).
-///
-/// If the flag is already set when the request arrives, reply immediately
-/// (don't make the client wait an extra tick for the obvious answer).
-/// Otherwise return `Pending` so the main thread keeps polling on each tick.
-fn handle_ipc_wait_for_completion(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-    pane_id: u32,
-    timeout_ms: u64,
-) -> Disposition {
-    use crate::ipc::IpcResponse;
-
-    let wins = windows.borrow();
-    for win in wins.iter() {
-        if let Some(view) = kova_view(win) {
-            match view.ipc_check_completion(pane_id) {
-                Some(true) => {
-                    return Disposition::Reply(IpcResponse::Ok {
-                        data: Some(serde_json::json!({
-                            "completed": true,
-                            "pane_id": pane_id,
-                            "timed_out": false,
-                        })),
-                    });
-                }
-                Some(false) => {
-                    let deadline = std::time::Instant::now()
-                        + std::time::Duration::from_millis(timeout_ms);
-                    return Disposition::Pending(DeferredWait { pane_id, deadline });
-                }
-                None => continue, // pane not in this window
-            }
-        }
-    }
-
-    Disposition::Reply(IpcResponse::Error {
-        message: format!("pane {} not found", pane_id),
-    })
-}
-
-/// On each main-thread tick, resolve any `wait-for-completion` requests
-/// whose pane was marked completed, hit their deadline, or got closed.
-fn poll_pending_waits(
-    pending: &RefCell<Vec<PendingWait>>,
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-) {
-    let mut waits = pending.borrow_mut();
-    if waits.is_empty() {
-        return;
-    }
-
-    let now = std::time::Instant::now();
-    let wins = windows.borrow();
-
-    waits.retain(|wait| {
-        let mut completion: Option<bool> = None;
-        let mut found = false;
-        for win in wins.iter() {
-            if let Some(view) = kova_view(win) {
-                if let Some(c) = view.ipc_check_completion(wait.pane_id) {
-                    completion = Some(c);
-                    found = true;
-                    break;
-                }
-            }
-        }
-
-        if !found {
-            let _ = wait.response_tx.send(crate::ipc::IpcResponse::Error {
-                message: format!("pane {} closed during wait", wait.pane_id),
-            });
-            return false;
-        }
-
-        if completion == Some(true) {
-            let _ = wait.response_tx.send(crate::ipc::IpcResponse::Ok {
-                data: Some(serde_json::json!({
-                    "completed": true,
-                    "pane_id": wait.pane_id,
-                    "timed_out": false,
-                })),
-            });
-            return false;
-        }
-
-        if now >= wait.deadline {
-            let _ = wait.response_tx.send(crate::ipc::IpcResponse::Ok {
-                data: Some(serde_json::json!({
-                    "completed": false,
-                    "pane_id": wait.pane_id,
-                    "timed_out": true,
-                })),
-            });
-            return false;
-        }
-
-        true // still waiting
-    });
 }
 
 /// IPC: set the custom title of the tab containing `pane_id`.
@@ -913,115 +826,6 @@ fn handle_ipc_split(
     }
 }
 
-/// IPC: list all panes across all windows.
-fn handle_ipc_list_panes(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-) -> crate::ipc::IpcResponse {
-    use crate::ipc::IpcResponse;
-
-    let wins = windows.borrow();
-    let mut panes = Vec::new();
-    for (win_idx, win) in wins.iter().enumerate() {
-        let view = match kova_view(win) {
-            Some(v) => v,
-            None => continue,
-        };
-        let is_key = win.isKeyWindow();
-        view.ipc_collect_panes(win_idx, is_key, &mut panes);
-    }
-
-    IpcResponse::Ok {
-        data: Some(serde_json::Value::Array(panes)),
-    }
-}
-
-/// IPC: close a pane by ID.
-fn handle_ipc_close_pane(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-    pane_id: u32,
-) -> crate::ipc::IpcResponse {
-    use crate::ipc::IpcResponse;
-
-    let wins = windows.borrow();
-    for win in wins.iter() {
-        let view = match kova_view(win) {
-            Some(v) => v,
-            None => continue,
-        };
-        match view.ipc_close_pane(pane_id) {
-            Some(true) => return IpcResponse::Ok { data: None },
-            Some(false) => return IpcResponse::Error { message: format!("pane {} is the last pane — cannot close", pane_id) },
-            None => continue,
-        }
-    }
-
-    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
-}
-
-/// IPC: send keystrokes to a pane's PTY.
-fn handle_ipc_send_keys(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-    pane_id: u32,
-    text: &str,
-) -> crate::ipc::IpcResponse {
-    use crate::ipc::IpcResponse;
-
-    let wins = windows.borrow();
-    for win in wins.iter() {
-        let view = match kova_view(win) {
-            Some(v) => v,
-            None => continue,
-        };
-        if view.ipc_send_keys(pane_id, text) {
-            return IpcResponse::Ok { data: None };
-        }
-    }
-
-    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
-}
-
-/// IPC: focus a pane by ID (switch tab/window if needed).
-fn handle_ipc_focus_pane(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-    pane_id: u32,
-) -> crate::ipc::IpcResponse {
-    use crate::ipc::IpcResponse;
-
-    let wins = windows.borrow();
-    for win in wins.iter() {
-        let view = match kova_view(win) {
-            Some(v) => v,
-            None => continue,
-        };
-        if view.ipc_focus_pane(pane_id) {
-            win.makeKeyAndOrderFront(None);
-            let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
-            app.activate();
-            return IpcResponse::Ok { data: None };
-        }
-    }
-
-    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
-}
-
-/// IPC: post a desktop notification whose click focuses `pane_id`.
-///
-/// Nothing is checked about `pane_id` here: the pane may legitimately be gone by
-/// the time the user clicks, and that case is reported then, not now.
-fn handle_ipc_notify(
-    pane_id: Option<u32>,
-    title: &str,
-    message: &str,
-    sound: bool,
-) -> crate::ipc::IpcResponse {
-    use crate::ipc::IpcResponse;
-
-    match crate::notification::post(title, message, pane_id, sound) {
-        Ok(()) => IpcResponse::Ok { data: None },
-        Err(e) => IpcResponse::Error { message: e },
-    }
-}
-
 /// IPC: create a new tab in the key window.
 fn handle_ipc_new_tab(
     windows: &RefCell<Vec<Retained<NSWindow>>>,
@@ -1055,57 +859,6 @@ fn handle_ipc_new_tab(
         },
         None => IpcResponse::Error { message: "failed to create tab".to_string() },
     }
-}
-
-/// IPC: list all tabs across all windows.
-fn handle_ipc_list_tabs(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-) -> crate::ipc::IpcResponse {
-    use crate::ipc::IpcResponse;
-
-    let wins = windows.borrow();
-    let mut tabs_json = Vec::new();
-    for (win_idx, win) in wins.iter().enumerate() {
-        let view = match kova_view(win) {
-            Some(v) => v,
-            None => continue,
-        };
-        let is_key = win.isKeyWindow();
-        view.ipc_collect_tabs(win_idx, is_key, &mut tabs_json);
-    }
-
-    IpcResponse::Ok {
-        data: Some(serde_json::Value::Array(tabs_json)),
-    }
-}
-
-/// IPC: close a tab by ID. Refuses to close the last tab of its window
-/// (would terminate the app — use a dedicated shutdown path for that).
-fn handle_ipc_close_tab(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-    tab_id: u32,
-) -> crate::ipc::IpcResponse {
-    use crate::ipc::IpcResponse;
-    use crate::window::IpcCloseTabResult;
-
-    let wins = windows.borrow();
-    for win in wins.iter() {
-        let view = match kova_view(win) {
-            Some(v) => v,
-            None => continue,
-        };
-        match view.ipc_close_tab(tab_id) {
-            IpcCloseTabResult::Closed => return IpcResponse::Ok { data: None },
-            IpcCloseTabResult::WouldTerminate => {
-                return IpcResponse::Error {
-                    message: format!("tab {} is the last tab in its window — refusing to close (would terminate app)", tab_id),
-                };
-            }
-            IpcCloseTabResult::NotFound => continue,
-        }
-    }
-
-    IpcResponse::Error { message: format!("tab {} not found", tab_id) }
 }
 
 /// IPC: merge a source tab into a target tab.
@@ -1209,50 +962,6 @@ fn handle_ipc_resize_pane(
 }
 
 /// IPC: rename a pane (set sticky custom title, like OSC 1).
-fn handle_ipc_set_pane_status(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-    pane_id: u32,
-    waiting: bool,
-) -> crate::ipc::IpcResponse {
-    use crate::ipc::IpcResponse;
-
-    let wins = windows.borrow();
-    for win in wins.iter() {
-        let view = match kova_view(win) {
-            Some(v) => v,
-            None => continue,
-        };
-        if view.ipc_set_pane_status(pane_id, waiting) {
-            return IpcResponse::Ok { data: None };
-        }
-    }
-
-    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
-}
-
-/// `mark-completed` (`bell: false`) and `bell` (`bell: true`): both raise a
-/// pane's unread flag without writing to its tty.
-fn handle_ipc_pane_signal(
-    windows: &RefCell<Vec<Retained<NSWindow>>>,
-    pane_id: u32,
-    signal: crate::window::PaneSignal,
-) -> crate::ipc::IpcResponse {
-    use crate::ipc::IpcResponse;
-
-    let wins = windows.borrow();
-    for win in wins.iter() {
-        let view = match kova_view(win) {
-            Some(v) => v,
-            None => continue,
-        };
-        if view.ipc_pane_signal(pane_id, signal) {
-            return IpcResponse::Ok { data: None };
-        }
-    }
-
-    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
-}
-
 fn handle_ipc_rename_pane(
     windows: &RefCell<Vec<Retained<NSWindow>>>,
     pane_id: u32,

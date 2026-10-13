@@ -43,6 +43,9 @@ donc ce n'est pas un frein.
   chacune d'une ligne qui délègue : aucun code de saisie en double, et Kana n'en écrit aucun.
   Ghostty sépare de la même façon la logique (dans le cœur : `ghostty_surface_text`,
   `ghostty_surface_preedit`) de la vue macOS.
+  État à l'étape 2 (13/10/2026) : `key`, `text`, `mouse`, `scroll` sont sur `Surface`
+  (`src/input.rs`) ; le texte en composition reste dans le composant de saisie partagé
+  (`src/appkit_input.rs`), parce que rien dans le terminal ne le lit encore.
 - **Le dessin : un contexte partagé et un dessinateur par pane.** Un `RenderContext` (device
   Metal, pipeline, atlas de glyphes par échelle d'écran) et un `PaneRenderer` qui dessine un pane
   dans le rectangle que l'hôte lui donne. Kova.app garde un seul layer par fenêtre et dessine
@@ -57,6 +60,15 @@ donc ce n'est pas un frein.
   un pane qui ne change pas quand on fait défiler les colonnes, s'obtient aussi : le cache
   contient aujourd'hui la position du pane (`mod.rs:827`), il suffit de dessiner en coordonnées
   locales et de passer la position à part.
+  **Corrigé le 13/10/2026 (étape 2)** : pas aussi simple. Le build arrondit chaque position
+  au pixel entier dans l'espace du drawable (`(ox + col_idx as f32 * cell_w).round()`,
+  `src/renderer/pane_renderer.rs`), et la position d'un pane peut être fractionnaire (largeurs
+  de colonnes en poids, défilement au trackpad). Un build fait à l'origine puis translaté place
+  les glyphes jusqu'à un demi-pixel à côté ; le test `a_shifted_build_is_not_a_build_in_place`
+  fige ce contre-exemple. Le cache reste donc indexé sur le rectangle absolu. Variante non
+  évaluée : construire avec la partie fractionnaire de la position et translater de la partie
+  entière, ce qui garde les arrondis ; restent les sommes non arrondies (texte de la barre de
+  statut, inclinaison de l'italique) qui tomberaient sur d'autres f32, effet à l'écran non mesuré.
 - **L'horloge reste à l'hôte** : le pane dit s'il doit être redessiné, l'hôte décide quand.
   Kova.app garde son timer (`kova/src/app.rs:226-232`). Le clignotement du curseur, compté en
   images aujourd'hui (`mod.rs:1002`), passe en temps réel pour ne pas dépendre de l'hôte.
@@ -65,6 +77,8 @@ donc ce n'est pas un frein.
   la bibliothèque, écrites une fois contre une interface d'hôte (« donne-moi les panes, ce
   pane, mets-le au premier plan »). Le transport n'est pas tout à fait autonome : il lit une
   constante du rendu, `crate::renderer::TAB_COLORS` (`kova/src/ipc.rs:24`), à déplacer avec lui.
+  Fait à l'étape 2 : elle vit dans `src/tab_colors.rs`, et l'interface d'hôte est le trait
+  `IpcHost` (`src/ipc/host.rs`).
   Les commandes d'onglets et de fenêtres restent à Kova.app, sauf deux que Kite envoie à
   l'instance qui tient le pane : `list-tabs` et `close-tab` (`kite/daemon/src/api.rs:655-664`,
   fermeture d'un projet depuis Kite). Kana y répond avec « un onglet par note », et `close-tab`

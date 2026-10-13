@@ -1,6 +1,14 @@
-use objc2_app_kit::NSEvent;
+//! The typed input API of a terminal surface: keys, text, mouse and scroll
+//! as plain Rust values, and every rule that turns them into PTY bytes or
+//! terminal state — which bytes a key sends, Ctrl+L, kitty direct routing,
+//! the compose-or-send-Option choice, selection on click and drag, SGR mouse
+//! reports, scroll stepping. Written once here; a host translates its own
+//! platform events into these values (Kova.app: `crate::appkit_input`) and
+//! calls the `Surface` methods at the bottom of this file, in the spirit of
+//! Ghostty's `ghostty_surface_key/text/mouse/scroll`.
 
 use crate::keybindings::{Keybindings, KeyCombo, TerminalAction};
+use crate::surface::Surface;
 use crate::terminal::pty::Pty;
 
 /// Write raw UTF-8 text to PTY (used by insertText: from NSTextInputClient).
@@ -45,11 +53,10 @@ fn modified_tilde(code: u32, ctrl: bool, alt: bool, shift: bool) -> Vec<u8> {
     }
 }
 
-pub fn handle_key_event(event: &NSEvent, pty: &Pty, cursor_keys_app: bool, keybindings: &Keybindings, kitty_flags: u8) {
-    let combo = KeyCombo::from_event(event);
-    let unmod_str = event.charactersIgnoringModifiers().map(|s| s.to_string()).unwrap_or_default();
-    let chars_str = event.characters().map(|s| s.to_string());
-    let bytes = key_bytes(&combo, chars_str.as_deref(), &unmod_str, cursor_keys_app, keybindings, kitty_flags);
+/// Write the bytes of a key press to the PTY; nothing when the key sends nothing.
+pub fn write_key(key: &KeyEvent, pty: &Pty, cursor_keys_app: bool, keybindings: &Keybindings, kitty_flags: u8) {
+    let unmod_str = key.unmod.as_deref().unwrap_or_default();
+    let bytes = key_bytes(&key.combo, key.chars.as_deref(), unmod_str, cursor_keys_app, keybindings, kitty_flags);
     if !bytes.is_empty() {
         pty.write(&bytes);
     }
@@ -184,7 +191,7 @@ pub enum PaneKeyAction {
         /// Ctrl+L: wipe Kova's scrollback first (the caller skips it in alt-screen),
         /// then let the key through so the app redraws.
         wipe_scrollback: bool,
-        /// True: straight to `handle_key_event` (kitty mode, modified key that does
+        /// True: straight to the PTY (kitty mode, modified key that does
         /// not compose text). False: through macOS text input (dead keys, IME).
         direct: bool,
     },
@@ -264,14 +271,339 @@ pub fn wheel_reports(lines: i32) -> (u8, usize) {
     (if lines > 0 { 64 } else { 65 }, lines.unsigned_abs() as usize)
 }
 
+/// A key press, as a host's platform hands it over.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyEvent {
+    /// Modifiers and the layout-resolved key, what terminal keybindings match on.
+    pub combo: KeyCombo,
+    /// The text the key produces with its modifiers (macOS `characters`);
+    /// `None` when the platform gives none, empty for a dead key.
+    pub chars: Option<String>,
+    /// The text the key produces without modifiers (macOS
+    /// `charactersIgnoringModifiers`).
+    pub unmod: Option<String>,
+}
+
+/// Keys that belong to the host, not the terminal: nothing reaches the PTY.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HostKey {
+    /// Ctrl+F: toggle the filter bar.
+    ToggleFilter,
+    /// Ctrl+Option+Left/Right: grow or shrink the virtual width.
+    AdjustVirtualWidth(f32),
+}
+
+/// What [`Surface::key`] did with a key.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KeyResult {
+    /// A host shortcut; the surface did nothing with it.
+    Host(HostKey),
+    /// Encoded and written to the PTY (kitty mode, modified key that does not
+    /// compose text).
+    Sent,
+    /// Must go through the platform's text input (dead keys, IME), which ends
+    /// in [`Surface::text`] or [`Surface::send_key`].
+    Compose,
+}
+
+/// The host shortcut a key is, if any — answerable without a surface, so a
+/// host whose window has no pane under focus still handles it.
+pub fn host_key(key: &KeyEvent) -> Option<HostKey> {
+    match pane_key_action(key.combo.ctrl, key.combo.option, key.combo.cmd, key.unmod.as_deref(), 0) {
+        PaneKeyAction::ToggleFilter => Some(HostKey::ToggleFilter),
+        PaneKeyAction::AdjustVirtualWidth(dir) => Some(HostKey::AdjustVirtualWidth(dir)),
+        PaneKeyAction::Send { .. } => None,
+    }
+}
+
+/// Modifier keys held during a mouse or scroll event (the ones SGR reports carry).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Mods {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub option: bool,
+}
+
+/// What the pointer did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MouseAction {
+    Press,
+    Drag,
+    Release,
+    /// Moved with no button held.
+    Move,
+}
+
+/// A mouse event over a surface. `x`, `y` are pixels from the pane's text
+/// origin: the pane's left edge plus its horizontal padding, and its top edge
+/// (the same frame as [`TerminalState::grid_pos_at`](crate::terminal::TerminalState::grid_pos_at)).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MouseEvent {
+    pub action: MouseAction,
+    /// SGR base button code: 0, 1 or 2. Ignored by `Move`, which reports
+    /// "no button".
+    pub button: u8,
+    pub mods: Mods,
+    pub x: f32,
+    pub y: f32,
+    /// 1 for a click, 2 to select a word, 3 or more for the whole row.
+    pub click_count: isize,
+}
+
+/// What [`Surface::mouse`] did with an event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MouseResult {
+    /// The app in the pane asked for mouse reports: the event is its own (sent
+    /// as an SGR report when it lands on the grid), the host does nothing else.
+    Reported,
+    /// Not reported. A press started a selection if it landed on the grid; a
+    /// release or a move did nothing, the host may use it.
+    Local,
+    /// A drag without reporting: lines per host tick to auto-scroll the
+    /// selection (0 = the pointer is on the grid, stop). See
+    /// [`Surface::autoscroll_selection`].
+    Autoscroll(i32),
+}
+
+/// A vertical scroll over a surface. `x`, `y` as in [`MouseEvent`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollEvent {
+    /// Delta, positive toward older output.
+    pub dy: f64,
+    /// Precise deltas (trackpad): accumulated into whole lines. A mouse wheel
+    /// scrolls the truncated delta.
+    pub precise: bool,
+    pub mods: Mods,
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Surface {
+    /// A key press. Host shortcuts come back untouched; otherwise Ctrl+L wipes
+    /// the scrollback (not in alt-screen), then the key is either written to
+    /// the PTY or handed back for the platform's text input.
+    pub fn key(&self, key: &KeyEvent, keybindings: &Keybindings) -> KeyResult {
+        let route = |kitty_flags: u8| pane_key_action(
+            key.combo.ctrl,
+            key.combo.option,
+            key.combo.cmd,
+            key.unmod.as_deref(),
+            kitty_flags,
+        );
+        let wipe_scrollback = match route(0) {
+            PaneKeyAction::ToggleFilter => return KeyResult::Host(HostKey::ToggleFilter),
+            PaneKeyAction::AdjustVirtualWidth(dir) => return KeyResult::Host(HostKey::AdjustVirtualWidth(dir)),
+            PaneKeyAction::Send { wipe_scrollback, .. } => wipe_scrollback,
+        };
+
+        if wipe_scrollback {
+            let mut term = self.terminal.write();
+            if !term.in_alt_screen {
+                term.clear_scrollback_and_screen();
+            }
+        }
+
+        let (kitty_flags, cursor_keys_app) = {
+            let term = self.terminal.read();
+            (term.kitty_flags(), term.cursor_keys_application)
+        };
+
+        let direct = matches!(route(kitty_flags), PaneKeyAction::Send { direct: true, .. });
+        if direct {
+            // Kitty mode: bypass macOS text input for modified keys
+            self.write_key_answering(key, keybindings, cursor_keys_app, kitty_flags);
+            KeyResult::Sent
+        } else {
+            KeyResult::Compose
+        }
+    }
+
+    /// A key the platform's text input did not turn into text (macOS
+    /// `doCommandBySelector:`): encode it for the PTY.
+    pub fn send_key(&self, key: &KeyEvent, keybindings: &Keybindings) {
+        let (cursor_keys_app, kitty_flags) = {
+            let term = self.terminal.read();
+            (term.cursor_keys_application, term.kitty_flags())
+        };
+        self.write_key_answering(key, keybindings, cursor_keys_app, kitty_flags);
+    }
+
+    /// Back to the live screen, the pane is answered, then the key's bytes.
+    fn write_key_answering(&self, key: &KeyEvent, keybindings: &Keybindings, cursor_keys_app: bool, kitty_flags: u8) {
+        self.terminal.write().reset_scroll();
+        // Typing into a pane answers it: it is no longer waiting on us.
+        self.clear_awaiting();
+        write_key(key, &self.pty, cursor_keys_app, keybindings, kitty_flags);
+    }
+
+    /// Text committed by the platform's text input (macOS `insertText:`):
+    /// typed characters, a composed accent, an IME result.
+    pub fn text(&self, text: &str) {
+        self.terminal.write().reset_scroll();
+        // Typing into a pane answers it: it is no longer waiting on us.
+        self.clear_awaiting();
+        write_text(text, &self.pty);
+    }
+
+    /// A paste: wrapped in bracketed-paste markers when the app asked for them.
+    /// Does not scroll back to the live screen nor answer the pane.
+    pub fn paste(&self, text: &str) {
+        let mut text = text.to_string();
+        let bracketed = self.terminal.read().bracketed_paste;
+        if bracketed {
+            // A paste containing the bracketed-paste
+            // terminator would break out of the paste
+            // and inject keystrokes into the app.
+            // Loop to a fixpoint: a single replace can
+            // re-form the terminator from its halves.
+            while text.contains("\x1b[201~") {
+                text = text.replace("\x1b[201~", "");
+            }
+            self.pty.write(b"\x1b[200~");
+        }
+        self.pty.write(text.as_bytes());
+        if bracketed { self.pty.write(b"\x1b[201~"); }
+    }
+
+    /// A mouse event at a point of this surface; `cell` is the cell size in
+    /// pixels. Reported to the app when it asked (press and release from mode
+    /// 1000, drag from 1002, bare moves from 1003, SGR encoding only);
+    /// otherwise a press starts a selection and a drag extends it.
+    pub fn mouse(&self, ev: &MouseEvent, cell: (f32, f32)) -> MouseResult {
+        let (cell_w, cell_h) = cell;
+        let min_mode = match ev.action {
+            MouseAction::Press | MouseAction::Release => 1000,
+            MouseAction::Drag => 1002,
+            MouseAction::Move => 1003,
+        };
+        {
+            let term = self.terminal.read();
+            if term.mouse_mode >= min_mode && term.sgr_mouse {
+                let at = term.sgr_cell_at(ev.x, ev.y, cell_w, cell_h);
+                drop(term);
+                if let Some((col, row)) = at {
+                    let mods = mouse_modifiers(ev.mods.shift, ev.mods.option, ev.mods.ctrl);
+                    let bytes = match ev.action {
+                        MouseAction::Press => sgr_mouse_bytes(ev.button, mods, col, row, true, false),
+                        MouseAction::Drag => sgr_mouse_bytes(ev.button, mods, col, row, true, true),
+                        MouseAction::Release => sgr_mouse_bytes(ev.button, mods, col, row, false, false),
+                        // No button pressed during move → button code 3 (no button) + motion flag
+                        MouseAction::Move => sgr_mouse_bytes(3, mods, col, row, true, true),
+                    };
+                    self.pty.write(&bytes);
+                }
+                return MouseResult::Reported;
+            }
+        }
+        match ev.action {
+            MouseAction::Press => {
+                let pos = self.terminal.read().grid_pos_at(ev.x, ev.y, cell_w, cell_h);
+                if let Some(pos) = pos {
+                    self.terminal.write().start_selection(pos, ev.click_count);
+                }
+                MouseResult::Local
+            }
+            MouseAction::Drag => {
+                let pos = self.terminal.read().grid_pos_at(ev.x, ev.y, cell_w, cell_h);
+                if let Some(pos) = pos {
+                    // Pointer inside the grid — normal drag
+                    self.terminal.write().extend_selection(pos);
+                    MouseResult::Autoscroll(0)
+                } else {
+                    // Pointer outside the grid — auto-scroll speed
+                    MouseResult::Autoscroll(self.terminal.read().drag_autoscroll_speed(ev.y, cell_h))
+                }
+            }
+            MouseAction::Release | MouseAction::Move => MouseResult::Local,
+        }
+    }
+
+    /// End of a selection gesture: a click that did not move clears its empty
+    /// selection; otherwise the selected text, for the host to copy.
+    pub fn finish_selection(&self) -> Option<String> {
+        self.terminal.write().finish_selection()
+    }
+
+    /// One host tick of a selection dragged past the pane's edge: scroll by
+    /// `speed` lines (negative = up, toward older output) and stretch the
+    /// selection to the first or last visible row.
+    pub fn autoscroll_selection(&self, speed: i32) {
+        let mut term = self.terminal.write();
+        if term.selection.is_some() {
+            term.scroll(-speed);
+            let sb_len = term.scrollback_len();
+            let scroll_off = term.scroll_offset();
+            if speed < 0 {
+                let first_visible = (sb_len as i64 - scroll_off as i64) as usize;
+                if let Some(ref mut sel) = term.selection {
+                    sel.end = crate::terminal::GridPos { line: first_visible, col: 0 };
+                }
+            } else {
+                let last_visible = (sb_len as i64 - scroll_off as i64 + term.rows as i64 - 1) as usize;
+                let last_col = term.cols.saturating_sub(1);
+                if let Some(ref mut sel) = term.selection {
+                    sel.end = crate::terminal::GridPos { line: last_visible, col: last_col };
+                }
+            }
+            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A vertical scroll at a point of this surface. Whole lines go to the app
+    /// as SGR wheel reports when it asked for mouse reports, otherwise they
+    /// move the scrollback. `log_tab` is the host's index for this surface,
+    /// only printed in the SCROLL-EVENT / SCROLL-BEGIN log lines.
+    pub fn scroll(&self, ev: &ScrollEvent, cell: (f32, f32), sensitivity: f64, log_tab: usize) {
+        let (lines, acc) = scroll_lines(self.scroll_accumulator.get(), ev.dy, ev.precise, sensitivity);
+        self.scroll_accumulator.set(acc);
+        if lines == 0 {
+            return;
+        }
+        // Forward scroll to PTY if mouse reporting is active
+        let mouse_mode = self.terminal.read().mouse_mode;
+        let sgr = self.terminal.read().sgr_mouse;
+        if mouse_mode >= 1000 && sgr {
+            let at = self.terminal.read().sgr_cell_at(ev.x, ev.y, cell.0, cell.1);
+            if let Some((col, row)) = at {
+                // Each discrete line = one scroll event
+                let (button, count) = wheel_reports(lines);
+                let mods = mouse_modifiers(ev.mods.shift, ev.mods.option, ev.mods.ctrl);
+                for _ in 0..count {
+                    self.pty.write(&sgr_mouse_bytes(button, mods, col, row, true, false));
+                }
+            }
+        } else {
+            let mut term = self.terminal.write();
+            log::debug!("SCROLL-EVENT tab={} pane={} term_id={} lines={} offset_before={}",
+                log_tab, self.id, term.terminal_id, lines, term.scroll_offset());
+            // One info line per scroll session (offset 0 → >0), to pair
+            // tab/pane with the SCROLL-START line for the cross-tab
+            // scrollback bug — without needing RUST_LOG=debug.
+            if term.scroll_offset() == 0 && lines > 0 {
+                log::info!("SCROLL-BEGIN tab={} pane={} term_id={}",
+                    log_tab, self.id, term.terminal_id);
+            }
+            term.scroll(lines);
+            // Reset accumulator when hitting bounds to avoid residual drift
+            let at_bound = term.scroll_offset() == 0
+                || term.scroll_offset() == term.scrollback_len() as i32;
+            if at_bound {
+                self.scroll_accumulator.set(0.0);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     //! Characterization of the key → bytes table as of 13/10/2026, before the
-    //! embedding refactor (docs/embedding.md). Every case is played through the
-    //! real `handle_key_event` with a synthetic NSEvent and a capture PTY.
+    //! embedding refactor (docs/embedding.md). Every case is played from a
+    //! synthetic NSEvent through the real translation (`appkit_input::key_event`)
+    //! and the real writers (`write_key`, `Surface::send_key`, `Surface::key`)
+    //! into a capture PTY.
     use super::*;
     use crate::config::KeysConfig;
-    use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
     use objc2_foundation::{NSPoint, NSString};
     use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -461,7 +793,7 @@ pub(crate) mod tests {
         let mut failures = Vec::new();
         for k in TABLE {
             let ev = key_event(k.chars, k.unmod, k.keycode, k.mods);
-            handle_key_event(&ev, &pty, k.app_cursor, &kb, k.kitty);
+            write_key(&crate::appkit_input::key_event(&ev), &pty, k.app_cursor, &kb, k.kitty);
             let got = drain(&reader);
             if got != k.out {
                 failures.push(format!("{}: expected {:?}, got {:?}",
@@ -647,5 +979,346 @@ pub(crate) mod tests {
         assert_eq!(drain(&reader), b"");
         write_text("héllo ✓", &pty);
         assert_eq!(drain(&reader), "héllo ✓".as_bytes());
+    }
+
+    // The typed Surface API: the same table and the same gestures, played
+    // through `Surface::key/send_key/text/mouse/scroll` on a capture PTY.
+
+    use crate::appkit_input;
+    use crate::terminal::{GridPos, SelectionMode};
+
+    /// A surface whose screen shows `lines` (cursor on the last one).
+    fn surface(cols: u16, rows: u16, lines: &[&str]) -> (Surface, OwnedFd) {
+        let (s, fd) = Surface::capture(cols, rows);
+        {
+            let mut t = s.terminal.write();
+            for (i, l) in lines.iter().enumerate() {
+                if i > 0 {
+                    t.newline();
+                    t.carriage_return();
+                }
+                for c in l.chars() {
+                    t.put_char(c);
+                }
+            }
+        }
+        (s, fd)
+    }
+
+    fn set_key_modes(s: &Surface, app_cursor: bool, kitty: u8) {
+        let mut t = s.terminal.write();
+        t.cursor_keys_application = app_cursor;
+        t.kitty_keyboard_flags = if kitty > 0 { vec![kitty] } else { Vec::new() };
+    }
+
+    fn typed(chars: &str, unmod: &str, keycode: u16, mods: &str) -> KeyEvent {
+        appkit_input::key_event(&key_event(chars, unmod, keycode, mods))
+    }
+
+    #[test]
+    fn surface_send_key_matches_the_frozen_table() {
+        let kb = keybindings();
+        let (s, reader) = Surface::capture(20, 4);
+        let mut failures = Vec::new();
+        for k in TABLE {
+            set_key_modes(&s, k.app_cursor, k.kitty);
+            s.send_key(&typed(k.chars, k.unmod, k.keycode, k.mods), &kb);
+            let got = drain(&reader);
+            if got != k.out {
+                failures.push(format!("{}: expected {:?}, got {:?}",
+                    k.name, String::from_utf8_lossy(k.out), String::from_utf8_lossy(&got)));
+            }
+        }
+        assert!(failures.is_empty(), "{} case(s) moved:\n{}", failures.len(), failures.join("\n"));
+    }
+
+    #[test]
+    fn surface_key_sends_direct_keys_as_the_frozen_table_and_composes_the_rest() {
+        let kb = keybindings();
+        let (s, reader) = Surface::capture(20, 4);
+        let mut failures = Vec::new();
+        for k in TABLE {
+            set_key_modes(&s, k.app_cursor, k.kitty);
+            let ev = key_event(k.chars, k.unmod, k.keycode, k.mods);
+            let m = ev.modifierFlags();
+            let route = pane_key_action(
+                m.contains(NSEventModifierFlags::Control),
+                m.contains(NSEventModifierFlags::Option),
+                m.contains(NSEventModifierFlags::Command),
+                Some(k.unmod),
+                k.kitty,
+            );
+            let (want, want_bytes): (KeyResult, &[u8]) = match route {
+                PaneKeyAction::ToggleFilter => (KeyResult::Host(HostKey::ToggleFilter), b""),
+                PaneKeyAction::AdjustVirtualWidth(d) => (KeyResult::Host(HostKey::AdjustVirtualWidth(d)), b""),
+                PaneKeyAction::Send { direct: true, .. } => (KeyResult::Sent, k.out),
+                PaneKeyAction::Send { direct: false, .. } => (KeyResult::Compose, b""),
+            };
+            let got = s.key(&appkit_input::key_event(&ev), &kb);
+            let bytes = drain(&reader);
+            if got != want || bytes != want_bytes {
+                failures.push(format!("{}: expected {:?} {:?}, got {:?} {:?}", k.name,
+                    want, String::from_utf8_lossy(want_bytes), got, String::from_utf8_lossy(&bytes)));
+            }
+        }
+        assert!(failures.is_empty(), "{} case(s) moved:\n{}", failures.len(), failures.join("\n"));
+        // The table has both kinds, so the loop above tested both paths.
+        assert!(TABLE.iter().any(|k| k.kitty > 0 && k.mods.contains("ctrl")));
+    }
+
+    const K_F: u16 = 0x03;
+
+    #[test]
+    fn host_keys_never_reach_the_pane() {
+        let kb = keybindings();
+        let (s, reader) = surface(10, 2, &["one", "two", "three"]);
+        set_key_modes(&s, false, 1);
+        let ctrl_f = typed("\u{6}", "f", K_F, "ctrl");
+        assert_eq!(host_key(&ctrl_f), Some(HostKey::ToggleFilter));
+        assert_eq!(s.key(&ctrl_f, &kb), KeyResult::Host(HostKey::ToggleFilter));
+        let widen = typed("\u{F703}", "\u{F703}", K_RIGHT, "ctrl alt");
+        assert_eq!(host_key(&widen), Some(HostKey::AdjustVirtualWidth(1.0)));
+        assert_eq!(s.key(&widen, &kb), KeyResult::Host(HostKey::AdjustVirtualWidth(1.0)));
+        assert_eq!(drain(&reader), b"");
+        assert_eq!(s.terminal.read().scrollback_len(), 1, "nothing wiped");
+        assert_eq!(host_key(&typed("a", "a", K_A, "ctrl")), None);
+    }
+
+    #[test]
+    fn ctrl_l_wipes_the_scrollback_then_still_sends_the_key() {
+        let kb = keybindings();
+        let ctrl_l = typed("\u{c}", "l", K_L, "ctrl");
+
+        let (s, reader) = surface(10, 2, &["one", "two", "three"]);
+        assert_eq!(s.key(&ctrl_l, &kb), KeyResult::Compose, "without kitty: through text input");
+        assert_eq!(s.terminal.read().scrollback_len(), 0);
+        assert_eq!(drain(&reader), b"", "the key itself comes back through send_key");
+
+        let (s, reader) = surface(10, 2, &["one", "two", "three"]);
+        set_key_modes(&s, false, 1);
+        assert_eq!(s.key(&ctrl_l, &kb), KeyResult::Sent);
+        assert_eq!(s.terminal.read().scrollback_len(), 0);
+        assert_eq!(drain(&reader), b"\x1b[108;5u");
+
+        let (s, _reader) = surface(10, 2, &["one", "two", "three"]);
+        s.terminal.write().in_alt_screen = true;
+        assert_eq!(s.key(&ctrl_l, &kb), KeyResult::Compose);
+        assert_eq!(s.terminal.read().scrollback_len(), 1, "alt-screen keeps the scrollback");
+    }
+
+    #[test]
+    fn a_sent_key_and_committed_text_answer_the_pane_and_return_to_the_live_screen() {
+        let kb = keybindings();
+        let (s, reader) = surface(10, 2, &["one", "two", "three"]);
+        set_key_modes(&s, false, 1);
+
+        s.terminal.write().scroll(1);
+        s.set_awaiting();
+        assert_eq!(s.key(&typed("\u{1}", "a", K_A, "ctrl"), &kb), KeyResult::Sent);
+        assert_eq!(s.terminal.read().scroll_offset(), 0);
+        assert!(!s.is_awaiting());
+        assert_eq!(drain(&reader), b"\x1b[97;5u");
+
+        s.terminal.write().scroll(1);
+        s.set_awaiting();
+        s.send_key(&typed("\u{F700}", "\u{F700}", K_UP, ""), &kb);
+        assert_eq!(s.terminal.read().scroll_offset(), 0);
+        assert!(!s.is_awaiting());
+        assert_eq!(drain(&reader), b"\x1b[A");
+
+        s.terminal.write().scroll(1);
+        s.set_awaiting();
+        s.text("ê");
+        assert_eq!(s.terminal.read().scroll_offset(), 0);
+        assert!(!s.is_awaiting());
+        assert_eq!(drain(&reader), "ê".as_bytes());
+        s.text("");
+        assert_eq!(drain(&reader), b"");
+    }
+
+    #[test]
+    fn a_key_handed_to_text_input_leaves_the_pane_as_it_was() {
+        let kb = keybindings();
+        let (s, reader) = surface(10, 2, &["one", "two", "three"]);
+        s.terminal.write().scroll(1);
+        s.set_awaiting();
+        assert_eq!(s.key(&typed("a", "a", K_A, ""), &kb), KeyResult::Compose);
+        assert_eq!(s.terminal.read().scroll_offset(), 1);
+        assert!(s.is_awaiting());
+        assert_eq!(drain(&reader), b"");
+    }
+
+    #[test]
+    fn paste_brackets_and_strips_the_terminator_without_answering_the_pane() {
+        let (s, reader) = Surface::capture(10, 2);
+        s.set_awaiting();
+        s.paste("ls\n");
+        assert_eq!(drain(&reader), b"ls\n");
+        s.terminal.write().bracketed_paste = true;
+        s.paste("a\x1b[20\x1b[201~1~b");
+        assert_eq!(drain(&reader), b"\x1b[200~ab\x1b[201~", "the terminator re-formed by one pass is stripped too");
+        assert!(s.is_awaiting(), "a paste is not an answer");
+    }
+
+    // Mouse: cell 10×20 px, a full 2-row screen (no bottom gravity).
+
+    const CELL: (f32, f32) = (10.0, 20.0);
+
+    fn mouse(action: MouseAction, col: f32, row: f32, click_count: isize) -> MouseEvent {
+        MouseEvent { action, button: 0, mods: Mods::default(), x: col * 10.0 + 5.0, y: row * 20.0 + 5.0, click_count }
+    }
+
+    fn selection(s: &Surface) -> Option<(GridPos, GridPos, SelectionMode)> {
+        s.terminal.read().selection.as_ref().map(|sel| (sel.anchor, sel.end, sel.mode))
+    }
+
+    fn gp(line: usize, col: u16) -> GridPos { GridPos { line, col } }
+
+    #[test]
+    fn press_drag_release_selects_and_returns_the_text() {
+        let (s, reader) = surface(20, 2, &["hello world", "second"]);
+        assert_eq!(s.mouse(&mouse(MouseAction::Press, 6.0, 0.0, 1), CELL), MouseResult::Local);
+        assert_eq!(selection(&s), Some((gp(0, 6), gp(0, 6), SelectionMode::Normal)));
+        assert_eq!(s.mouse(&mouse(MouseAction::Drag, 2.0, 1.0, 0), CELL), MouseResult::Autoscroll(0));
+        assert_eq!(selection(&s), Some((gp(0, 6), gp(1, 2), SelectionMode::Normal)));
+        assert_eq!(s.mouse(&mouse(MouseAction::Release, 2.0, 1.0, 0), CELL), MouseResult::Local);
+        assert_eq!(s.finish_selection().as_deref(), Some("world\nsec"));
+        assert_eq!(drain(&reader), b"", "no report without mouse mode");
+    }
+
+    #[test]
+    fn a_plain_click_selects_nothing_and_a_double_click_the_word() {
+        let (s, _reader) = surface(20, 2, &["hello world", "second"]);
+        s.mouse(&mouse(MouseAction::Press, 3.0, 0.0, 1), CELL);
+        assert_eq!(s.finish_selection(), None);
+        assert_eq!(selection(&s), None);
+        s.mouse(&mouse(MouseAction::Press, 8.0, 0.0, 2), CELL);
+        assert_eq!(s.finish_selection().as_deref(), Some("world"));
+        s.mouse(&mouse(MouseAction::Press, 1.0, 1.0, 3), CELL);
+        assert_eq!(selection(&s).map(|x| x.2), Some(SelectionMode::Line));
+    }
+
+    #[test]
+    fn a_press_off_the_grid_starts_nothing() {
+        let (s, _reader) = surface(20, 2, &["hello world", "second"]);
+        let off = MouseEvent { x: -1.0, ..mouse(MouseAction::Press, 0.0, 0.0, 1) };
+        assert_eq!(s.mouse(&off, CELL), MouseResult::Local);
+        assert_eq!(selection(&s), None);
+    }
+
+    #[test]
+    fn dragging_past_the_pane_asks_for_autoscroll_by_distance() {
+        let (s, _reader) = surface(20, 2, &["hello world", "second"]);
+        s.mouse(&mouse(MouseAction::Press, 0.0, 0.0, 1), CELL);
+        let at_y = |y: f32| MouseEvent { y, ..mouse(MouseAction::Drag, 1.0, 0.0, 0) };
+        assert_eq!(s.mouse(&at_y(81.0), CELL), MouseResult::Autoscroll(3), "41 px below the 40 px grid");
+        assert_eq!(s.mouse(&at_y(-1.0), CELL), MouseResult::Autoscroll(-1));
+        assert_eq!(s.mouse(&at_y(5000.0), CELL), MouseResult::Autoscroll(10));
+        assert_eq!(s.mouse(&at_y(10.0), CELL), MouseResult::Autoscroll(0));
+    }
+
+    #[test]
+    fn autoscroll_stretches_the_selection_to_the_visible_edge() {
+        let (s, _reader) = surface(10, 2, &["one", "two", "three", "four"]);
+        assert_eq!(s.terminal.read().scrollback_len(), 2);
+        s.autoscroll_selection(-1);
+        assert_eq!(s.terminal.read().scroll_offset(), 0, "no selection, no scroll");
+
+        s.mouse(&mouse(MouseAction::Press, 1.0, 0.0, 1), CELL);
+        s.autoscroll_selection(-1);
+        assert_eq!(s.terminal.read().scroll_offset(), 1);
+        assert_eq!(selection(&s).map(|x| x.1), Some(gp(1, 0)), "first visible line");
+        s.autoscroll_selection(1);
+        assert_eq!(s.terminal.read().scroll_offset(), 0);
+        assert_eq!(selection(&s).map(|x| x.1), Some(gp(3, 9)), "last visible line, last column");
+    }
+
+    #[test]
+    fn mouse_reporting_sends_sgr_and_skips_the_selection() {
+        let (s, reader) = surface(20, 2, &["hello world", "second"]);
+        {
+            let mut t = s.terminal.write();
+            t.mouse_mode = 1000;
+            t.sgr_mouse = true;
+        }
+        assert_eq!(s.mouse(&mouse(MouseAction::Press, 2.0, 1.0, 1), CELL), MouseResult::Reported);
+        assert_eq!(drain(&reader), b"\x1b[<0;3;2M");
+        assert_eq!(selection(&s), None);
+        assert_eq!(s.mouse(&mouse(MouseAction::Release, 2.0, 1.0, 0), CELL), MouseResult::Reported);
+        assert_eq!(drain(&reader), b"\x1b[<0;3;2m");
+        // Mode 1000 does not report drags or bare moves.
+        assert_eq!(s.mouse(&mouse(MouseAction::Drag, 4.0, 1.0, 0), CELL), MouseResult::Autoscroll(0));
+        assert_eq!(s.mouse(&mouse(MouseAction::Move, 4.0, 1.0, 0), CELL), MouseResult::Local);
+        assert_eq!(drain(&reader), b"");
+
+        s.terminal.write().mouse_mode = 1002;
+        let right = MouseEvent { button: 2, ..mouse(MouseAction::Drag, 4.0, 1.0, 0) };
+        assert_eq!(s.mouse(&right, CELL), MouseResult::Reported);
+        assert_eq!(drain(&reader), b"\x1b[<34;5;2M");
+        assert_eq!(s.mouse(&mouse(MouseAction::Move, 4.0, 1.0, 0), CELL), MouseResult::Local);
+
+        s.terminal.write().mouse_mode = 1003;
+        let moved = MouseEvent { button: 2, ..mouse(MouseAction::Move, 4.0, 0.0, 0) };
+        assert_eq!(s.mouse(&moved, CELL), MouseResult::Reported);
+        assert_eq!(drain(&reader), b"\x1b[<35;5;1M", "a move reports no button");
+
+        let mods = Mods { shift: true, ctrl: true, option: false };
+        let pressed = MouseEvent { mods, ..mouse(MouseAction::Press, 0.0, 0.0, 1) };
+        s.mouse(&pressed, CELL);
+        assert_eq!(drain(&reader), b"\x1b[<20;1;1M");
+
+        let off = MouseEvent { x: -1.0, ..mouse(MouseAction::Press, 0.0, 0.0, 1) };
+        assert_eq!(s.mouse(&off, CELL), MouseResult::Reported, "still the app's, even off the grid");
+        assert_eq!(drain(&reader), b"");
+    }
+
+    #[test]
+    fn mouse_mode_without_sgr_is_not_reported() {
+        let (s, reader) = surface(20, 2, &["hello world", "second"]);
+        s.terminal.write().mouse_mode = 1003;
+        assert_eq!(s.mouse(&mouse(MouseAction::Press, 2.0, 0.0, 1), CELL), MouseResult::Local);
+        assert!(selection(&s).is_some());
+        assert_eq!(drain(&reader), b"");
+    }
+
+    // Scroll
+
+    fn wheel(dy: f64, precise: bool) -> ScrollEvent {
+        ScrollEvent { dy, precise, mods: Mods::default(), x: 5.0, y: 25.0 }
+    }
+
+    #[test]
+    fn scroll_moves_the_scrollback_by_whole_lines() {
+        let (s, reader) = surface(10, 2, &["1", "2", "3", "4", "5", "6"]);
+        assert_eq!(s.terminal.read().scrollback_len(), 4);
+        s.scroll(&wheel(4.0, true), CELL, 6.0, 0);
+        assert_eq!(s.terminal.read().scroll_offset(), 0, "not a whole line yet");
+        s.scroll(&wheel(4.0, true), CELL, 6.0, 0);
+        assert_eq!(s.terminal.read().scroll_offset(), 1);
+        assert!((s.scroll_accumulator.get() - 2.0 / 6.0).abs() < 1e-12, "remainder kept");
+        s.scroll(&wheel(3.9, false), CELL, 6.0, 0);
+        assert_eq!(s.terminal.read().scroll_offset(), 4);
+        assert_eq!(s.scroll_accumulator.get(), 0.0, "reset at the top bound");
+        s.scroll(&wheel(-1.5, false), CELL, 6.0, 0);
+        assert_eq!(s.terminal.read().scroll_offset(), 3);
+        assert_eq!(drain(&reader), b"");
+    }
+
+    #[test]
+    fn scroll_with_mouse_reporting_sends_one_wheel_report_per_line() {
+        let (s, reader) = surface(10, 2, &["1", "2", "3", "4", "5", "6"]);
+        {
+            let mut t = s.terminal.write();
+            t.mouse_mode = 1000;
+            t.sgr_mouse = true;
+        }
+        s.scroll(&wheel(-2.0, false), CELL, 6.0, 0);
+        assert_eq!(drain(&reader), b"\x1b[<65;1;2M\x1b[<65;1;2M");
+        let ctrl_up = ScrollEvent { mods: Mods { ctrl: true, ..Mods::default() }, ..wheel(1.0, false) };
+        s.scroll(&ctrl_up, CELL, 6.0, 0);
+        assert_eq!(drain(&reader), b"\x1b[<80;1;2M");
+        assert_eq!(s.terminal.read().scroll_offset(), 0, "the scrollback does not move");
+        s.scroll(&wheel(4.0, true), CELL, 6.0, 0);
+        assert_eq!(drain(&reader), b"", "less than a line: nothing yet");
     }
 }

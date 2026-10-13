@@ -1,5 +1,6 @@
 mod anchors;
 mod app;
+mod appkit_input;
 mod agent_session;
 mod bookmarks;
 mod claude_history;
@@ -17,6 +18,8 @@ mod recent_projects;
 mod renderer;
 mod search_history;
 mod session;
+mod surface;
+mod tab_colors;
 mod terminal;
 mod update_check;
 mod window;

@@ -187,7 +187,7 @@ impl Pty {
         shell_ready: Arc<AtomicBool>,
         working_dir: Option<&str>,
         pane_id: u32,
-        open_timer: Arc<crate::pane::PaneOpenTimer>,
+        open_timer: Arc<crate::surface::PaneOpenTimer>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_pair = openpty(None, None)?;
 

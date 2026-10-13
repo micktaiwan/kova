@@ -588,31 +588,13 @@ impl KovaView {
     fn extend_drag_selection(&self) {
         let ivars = self.ivars();
         {
-            let speed = ivars.auto_scroll_speed.get();
+            let speed = ivars.input.autoscroll_speed();
             if speed != 0 {
                 let tabs = ivars.tabs.borrow();
                 let idx = ivars.active_tab.get();
                 if let Some(tab) = tabs.get(idx) {
                     if let Some(pane) = tab.pane(tab.focused_pane) {
-                        let mut term = pane.terminal.write();
-                        if term.selection.is_some() {
-                            term.scroll(-speed);
-                            let sb_len = term.scrollback_len();
-                            let scroll_off = term.scroll_offset();
-                            if speed < 0 {
-                                let first_visible = (sb_len as i64 - scroll_off as i64) as usize;
-                                if let Some(ref mut sel) = term.selection {
-                                    sel.end = crate::terminal::GridPos { line: first_visible, col: 0 };
-                                }
-                            } else {
-                                let last_visible = (sb_len as i64 - scroll_off as i64 + term.rows as i64 - 1) as usize;
-                                let last_col = term.cols.saturating_sub(1);
-                                if let Some(ref mut sel) = term.selection {
-                                    sel.end = crate::terminal::GridPos { line: last_visible, col: last_col };
-                                }
-                            }
-                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
+                        pane.autoscroll_selection(speed);
                     }
                 }
             }

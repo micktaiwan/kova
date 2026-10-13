@@ -5,7 +5,7 @@ mod geometry;
 mod ipc_handlers;
 mod overlays;
 use overlays::{FilterState, RenamePaneState, RenameTabState};
-pub use ipc_handlers::{IpcCloseTabResult, IpcMergeTabResult, IpcSwapPaneResult, PaneSignal};
+pub use ipc_handlers::{IpcMergeTabResult, IpcSwapPaneResult};
 mod recent_projects_overlay;
 use recent_projects_overlay::RecentProjectsState;
 mod resize;
@@ -18,22 +18,23 @@ use tabs::{MergeTabState, SendToWindowState};
 use switcher::{PaneSwitcherState, SwitcherRow};
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility};
+use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSArray, NSObjectProtocol, NSString};
+use objc2_foundation::{NSObjectProtocol, NSString};
 use objc2_metal::MTLCreateSystemDefaultDevice;
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::Arc;
 
+use crate::appkit_input::{self, copy_to_pasteboard, AppKitInput, PaneOrigin, ScrollAxisLock};
 use crate::config::{Config, TerminalConfig};
-use crate::input;
+use crate::input::{self, MouseAction, MouseResult};
 use crate::keybindings::{Action, Keybindings, KeyCombo};
 use crate::pane::{alloc_tab_id, NavDirection, Pane, PaneId, SplitDirection, Tab, TabId};
 use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
 use crate::terminal::pty::ProcessInfo;
-use crate::terminal::{FilterMatch, GridPos};
+use crate::terminal::FilterMatch;
 
 #[derive(Clone, Copy)]
 struct SeparatorDrag {
@@ -50,13 +51,6 @@ struct DragTabState {
     start_x: f32,
     current_x: f32,
     dragging: bool,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum ScrollAxisLock {
-    None,
-    Vertical,
-    Horizontal,
 }
 
 pub struct KovaViewIvars {
@@ -87,14 +81,9 @@ pub struct KovaViewIvars {
     hovered_url: RefCell<Option<(PaneId, Vec<(usize, u16, u16)>, String)>>,
     /// Whether Cmd key is currently held (for URL hover detection)
     cmd_held: Cell<bool>,
-    /// Auto-scroll speed during drag selection (lines/tick, positive = down, negative = up, 0 = inactive)
-    auto_scroll_speed: Cell<i32>,
-    /// Marked text from IME composition (dead keys, etc.)
-    marked_text: RefCell<Option<String>>,
-    /// Current NSEvent being processed by interpretKeyEvents, so doCommandBySelector can access it.
-    /// SAFETY: pointer is only live during the synchronous keyDown → interpretKeyEvents → doCommandBySelector
-    /// call chain, and cleared immediately after. Never accessed outside that stack frame.
-    current_event: Cell<Option<*const NSEvent>>,
+    /// Terminal input from AppKit events, for the focused pane (or the pane
+    /// under the pointer): composition, drag auto-scroll, scroll axis lock.
+    input: AppKitInput,
     /// Window is closing — tick() should return false immediately.
     closing: Cell<bool>,
     /// Skip session save for this window (Cmd+Shift+Q kill).
@@ -116,8 +105,6 @@ pub struct KovaViewIvars {
     recent_projects: RefCell<Option<RecentProjectsState>>,
     /// Countdown frames for "⌘? for help" hint in global status bar (fps * 3).
     help_hint_frames: Cell<u32>,
-    /// Axis lock for trackpad scroll gestures (prevents cross-axis drift).
-    scroll_axis_lock: Cell<ScrollAxisLock>,
     /// "Send Tab to Window" overlay state.
     send_to_window: RefCell<Option<SendToWindowState>>,
     /// "Merge Tab" overlay state.
@@ -337,34 +324,12 @@ define_class!(
     unsafe impl NSTextInputClient for KovaView {
         #[unsafe(method(insertText:replacementRange:))]
         unsafe fn insert_text_replacement_range(&self, string: &objc2::runtime::AnyObject, _replacement_range: objc2_foundation::NSRange) {
-            let text = unsafe { nsstring_from_input(string) };
-            // Clear marked text
-            *self.ivars().marked_text.borrow_mut() = None;
-            // Write to PTY
-            if let Some(pane) = self.focused_pane() {
-                pane.terminal.write().reset_scroll();
-                // Typing into a pane answers it: it is no longer waiting on us.
-                pane.clear_awaiting();
-                input::write_text(&text, &pane.pty);
-            }
+            unsafe { self.ivars().input.insert_text(string, self.focused_pane().map(|p| &**p)) }
         }
 
         #[unsafe(method(doCommandBySelector:))]
         unsafe fn do_command_by_selector(&self, _selector: objc2::runtime::Sel) {
-            if let Some(event_ptr) = self.ivars().current_event.get() {
-                let event = unsafe { &*event_ptr };
-                if let Some(pane) = self.focused_pane() {
-                    let (cursor_keys_app, kitty_flags) = {
-                        let term = pane.terminal.read();
-                        (term.cursor_keys_application, term.kitty_flags())
-                    };
-                    pane.terminal.write().reset_scroll();
-                    pane.clear_awaiting();
-                    if let Some(kb) = self.ivars().keybindings.get() {
-                        input::handle_key_event(event, &pane.pty, cursor_keys_app, kb, kitty_flags);
-                    }
-                }
-            }
+            self.ivars().input.do_command_by_selector(|| self.focused_pane().map(|p| &**p), self.ivars().keybindings.get());
         }
 
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
@@ -374,32 +339,27 @@ define_class!(
             _selected_range: objc2_foundation::NSRange,
             _replacement_range: objc2_foundation::NSRange,
         ) {
-            let text = unsafe { nsstring_from_input(string) };
-            *self.ivars().marked_text.borrow_mut() = if text.is_empty() { None } else { Some(text) };
+            unsafe { self.ivars().input.set_marked_text(string) }
         }
 
         #[unsafe(method(unmarkText))]
         fn unmark_text(&self) {
-            *self.ivars().marked_text.borrow_mut() = None;
+            self.ivars().input.unmark_text();
         }
 
         #[unsafe(method(hasMarkedText))]
         fn has_marked_text(&self) -> bool {
-            self.ivars().marked_text.borrow().is_some()
+            self.ivars().input.has_marked_text()
         }
 
         #[unsafe(method(markedRange))]
         fn marked_range(&self) -> objc2_foundation::NSRange {
-            if self.ivars().marked_text.borrow().is_some() {
-                objc2_foundation::NSRange { location: 0, length: 1 }
-            } else {
-                objc2_foundation::NSRange { location: objc2_foundation::NSNotFound as usize, length: 0 }
-            }
+            self.ivars().input.marked_range()
         }
 
         #[unsafe(method(selectedRange))]
         fn selected_range(&self) -> objc2_foundation::NSRange {
-            objc2_foundation::NSRange { location: objc2_foundation::NSNotFound as usize, length: 0 }
+            self.ivars().input.selected_range()
         }
 
         #[unsafe(method_id(attributedSubstringForProposedRange:actualRange:))]
@@ -424,24 +384,12 @@ define_class!(
             _range: objc2_foundation::NSRange,
             _actual_range: objc2_foundation::NSRangePointer,
         ) -> objc2_core_foundation::CGRect {
-            let frame = self.frame();
-            let window_frame = if let Some(window) = self.window() {
-                window.frame()
-            } else {
-                return objc2_core_foundation::CGRect::ZERO;
-            };
-            objc2_core_foundation::CGRect {
-                origin: objc2_core_foundation::CGPoint {
-                    x: window_frame.origin.x + frame.origin.x,
-                    y: window_frame.origin.y + frame.origin.y,
-                },
-                size: objc2_core_foundation::CGSize { width: 0.0, height: 0.0 },
-            }
+            self.ivars().input.first_rect_for_character_range(self)
         }
 
         #[unsafe(method(characterIndexForPoint:))]
         fn character_index_for_point(&self, _point: objc2_core_foundation::CGPoint) -> usize {
-            objc2_foundation::NSNotFound as usize
+            self.ivars().input.character_index_for_point()
         }
     }
 
@@ -527,56 +475,22 @@ define_class!(
                 return;
             }
 
-            let modifiers = event.modifierFlags();
-            let unmod = event.charactersIgnoringModifiers().map(|s| s.to_string());
-            let route = |kitty_flags: u8| input::pane_key_action(
-                modifiers.contains(NSEventModifierFlags::Control),
-                modifiers.contains(NSEventModifierFlags::Option),
-                modifiers.contains(NSEventModifierFlags::Command),
-                unmod.as_deref(),
-                kitty_flags,
-            );
-            let wipe_scrollback = match route(0) {
-                input::PaneKeyAction::ToggleFilter => {
+            // Window keys first, even with no pane under focus
+            let key = appkit_input::key_event(event);
+            match input::host_key(&key) {
+                Some(input::HostKey::ToggleFilter) => {
                     self.toggle_filter();
                     return;
                 }
-                input::PaneKeyAction::AdjustVirtualWidth(dir) => {
+                Some(input::HostKey::AdjustVirtualWidth(dir)) => {
                     self.adjust_virtual_width(dir);
                     return;
                 }
-                input::PaneKeyAction::Send { wipe_scrollback, .. } => wipe_scrollback,
-            };
+                None => {}
+            }
 
-            if let Some(pane) = self.focused_pane() {
-                if wipe_scrollback {
-                    let mut term = pane.terminal.write();
-                    if !term.in_alt_screen {
-                        term.clear_scrollback_and_screen();
-                    }
-                }
-
-                let (kitty_flags, cursor_keys_app) = {
-                    let term = pane.terminal.read();
-                    (term.kitty_flags(), term.cursor_keys_application)
-                };
-
-                let direct = matches!(route(kitty_flags), input::PaneKeyAction::Send { direct: true, .. });
-                if direct {
-                    // Kitty mode: bypass macOS text input for modified keys
-                    pane.terminal.write().reset_scroll();
-                    pane.clear_awaiting();
-                    if let Some(kb) = self.ivars().keybindings.get() {
-                        input::handle_key_event(event, &pane.pty, cursor_keys_app, kb, kitty_flags);
-                    }
-                } else {
-                    // Normal path: macOS text input (dead keys, IME)
-                    self.ivars().current_event.set(Some(event as *const NSEvent));
-                    let event_retained: Retained<NSEvent> = event.retain();
-                    let events = NSArray::from_retained_slice(&[event_retained]);
-                    self.interpretKeyEvents(&events);
-                    self.ivars().current_event.set(None);
-                }
+            if let (Some(pane), Some(kb)) = (self.focused_pane(), self.ivars().keybindings.get()) {
+                self.ivars().input.key_down(self, event, &key, pane, kb);
             }
         }
 
@@ -715,71 +629,16 @@ define_class!(
                 return;
             }
 
-            // Phase-based axis lock (trackpad only)
-            if is_trackpad {
-                let phase = event.phase();
-                let momentum = event.momentumPhase();
-
-                if phase == NSEventPhase::Began {
-                    let dy = event.scrollingDeltaY().abs();
-                    let dx = event.scrollingDeltaX().abs();
-                    ivars.scroll_axis_lock.set(if dy >= dx {
-                        ScrollAxisLock::Vertical
-                    } else {
-                        ScrollAxisLock::Horizontal
-                    });
-                } else if phase.intersects(NSEventPhase::Ended | NSEventPhase::Cancelled)
-                    && momentum == NSEventPhase::None
-                {
-                    ivars.scroll_axis_lock.set(ScrollAxisLock::None);
-                } else if momentum.intersects(NSEventPhase::Ended | NSEventPhase::Cancelled) {
-                    ivars.scroll_axis_lock.set(ScrollAxisLock::None);
-                }
-            }
-
-            let lock = ivars.scroll_axis_lock.get();
+            let lock = ivars.input.scroll_axis_lock(event);
 
             // Vertical scroll (pane under cursor)
             if lock != ScrollAxisLock::Horizontal {
                 if let Some((pane, vp)) = self.pane_at_event(event) {
-                    let dy = event.scrollingDeltaY();
                     let sensitivity = ivars.config.get()
                         .map(|c| c.terminal.scroll_sensitivity)
                         .unwrap_or(TerminalConfig::default().scroll_sensitivity);
-                    let (lines, acc) = input::scroll_lines(pane.scroll_accumulator.get(), dy, is_trackpad, sensitivity);
-                    pane.scroll_accumulator.set(acc);
-                    if lines != 0 {
-                        // Forward scroll to PTY if mouse reporting is active
-                        let mouse_mode = pane.terminal.read().mouse_mode;
-                        let sgr = pane.terminal.read().sgr_mouse;
-                        if mouse_mode >= 1000 && sgr {
-                            if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
-                                // Each discrete line = one scroll event
-                                let (button, count) = input::wheel_reports(lines);
-                                for _ in 0..count {
-                                    self.send_sgr_mouse(pane, button, col, row, true, false, event);
-                                }
-                            }
-                        } else {
-                            let mut term = pane.terminal.write();
-                            let active_tab_idx = ivars.active_tab.get();
-                            log::debug!("SCROLL-EVENT tab={} pane={} term_id={} lines={} offset_before={}",
-                                active_tab_idx, pane.id, term.terminal_id, lines, term.scroll_offset());
-                            // One info line per scroll session (offset 0 → >0), to pair
-                            // tab/pane with the SCROLL-START line for the cross-tab
-                            // scrollback bug — without needing RUST_LOG=debug.
-                            if term.scroll_offset() == 0 && lines > 0 {
-                                log::info!("SCROLL-BEGIN tab={} pane={} term_id={}",
-                                    active_tab_idx, pane.id, term.terminal_id);
-                            }
-                            term.scroll(lines);
-                            // Reset accumulator when hitting bounds to avoid residual drift
-                            let at_bound = term.scroll_offset() == 0
-                                || term.scroll_offset() == term.scrollback_len() as i32;
-                            if at_bound {
-                                pane.scroll_accumulator.set(0.0);
-                            }
-                        }
+                    if let Some(cell) = self.cell_size() {
+                        ivars.input.scroll(self, event, pane, self.pane_origin(&vp), cell, sensitivity, ivars.active_tab.get());
                     }
                 }
             }
@@ -904,22 +763,9 @@ define_class!(
                         }
                     }
                 }
-                // Forward to PTY if mouse reporting is active
-                {
-                    let term = pane.terminal.read();
-                    if term.mouse_mode >= 1000 && term.sgr_mouse {
-                        drop(term);
-                        if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
-                            // button 0=left, 1=middle, 2=right
-                            let button_number = event.buttonNumber() as u8;
-                            let button_code = button_number.min(2);
-                            self.send_sgr_mouse(pane, button_code, col, row, true, false, event);
-                        }
-                        return;
-                    }
-                }
-                if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
-                    pane.terminal.write().start_selection(pos, event.clickCount());
+                // Reported to the app, or starts a selection
+                if let Some(cell) = self.cell_size() {
+                    self.ivars().input.mouse(self, event, MouseAction::Press, pane, self.pane_origin(&vp), cell);
                 }
             }
         }
@@ -985,61 +831,23 @@ define_class!(
                 return;
             }
 
-            // Forward drag to PTY if mouse reporting mode 1002+ is active
-            if let Some(pane) = self.focused_pane() {
-                let term = pane.terminal.read();
-                if term.mouse_mode >= 1002 && term.sgr_mouse {
-                    drop(term);
-                    let vp = {
-                        let tabs = self.ivars().tabs.borrow();
-                        let idx = self.ivars().active_tab.get();
-                        tabs.get(idx).and_then(|t| t.viewport_for_pane(pane.id, self.panes_viewport_for_tab(t)))
-                    };
-                    if let Some(vp) = vp {
-                        if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
-                            let button_number = event.buttonNumber() as u8;
-                            let button_code = button_number.min(2);
-                            self.send_sgr_mouse(pane, button_code, col, row, true, true, event);
-                        }
-                    }
-                    return;
-                }
-                drop(term);
-            }
-
-            // Drag continues on the focused pane (set by mouseDown)
+            // Drag continues on the focused pane (set by mouseDown): reported
+            // to the app, or extends the selection
             if let Some(pane) = self.focused_pane() {
                 let vp = {
                     let tabs = self.ivars().tabs.borrow();
                     let idx = self.ivars().active_tab.get();
                     tabs.get(idx).and_then(|t| t.viewport_for_pane(pane.id, self.panes_viewport_for_tab(t)))
                 };
-                if let Some(vp) = vp {
-                    if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
-                        // Mouse is inside viewport — normal drag
-                        self.ivars().auto_scroll_speed.set(0);
-                        pane.terminal.write().extend_selection(pos);
-                    } else {
-                        // Mouse is outside viewport — compute auto-scroll speed
-                        let renderer = self.ivars().renderer.get();
-                        if let Some(renderer) = renderer {
-                            let (_, pixel_y) = self.event_to_pixel(event);
-                            let renderer_r = renderer.read();
-                            let cell_h = renderer_r.cell_size().1;
-                            drop(renderer_r);
-
-                            let rel_y = pixel_y - vp.y;
-                            let speed = pane.terminal.read().drag_autoscroll_speed(rel_y, cell_h);
-                            self.ivars().auto_scroll_speed.set(speed);
-                        }
-                    }
+                if let (Some(vp), Some(cell)) = (vp, self.cell_size()) {
+                    self.ivars().input.mouse(self, event, MouseAction::Drag, pane, self.pane_origin(&vp), cell);
                 }
             }
         }
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
-            self.ivars().auto_scroll_speed.set(0);
+            self.ivars().input.end_drag();
             if self.ivars().drag_tab.get().is_some() {
                 self.ivars().drag_tab.set(None);
                 return;
@@ -1048,24 +856,18 @@ define_class!(
                 self.ivars().drag_separator.set(None);
                 return;
             }
-            // Forward to PTY if mouse reporting is active
+            // Reported to the app under the pointer, if it asked
             if let Some((pane, vp)) = self.pane_at_event(event) {
-                let term = pane.terminal.read();
-                if term.mouse_mode >= 1000 && term.sgr_mouse {
-                    drop(term);
-                    if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
-                        let button_number = event.buttonNumber() as u8;
-                        let button_code = button_number.min(2);
-                        self.send_sgr_mouse(pane, button_code, col, row, false, false, event);
+                if let Some(cell) = self.cell_size() {
+                    let result = self.ivars().input.mouse(self, event, MouseAction::Release, pane, self.pane_origin(&vp), cell);
+                    if result == MouseResult::Reported {
+                        return;
                     }
-                    return;
                 }
             }
+            // Otherwise the focused pane's selection ends and is copied
             if let Some(pane) = self.focused_pane() {
-                let text = pane.terminal.write().finish_selection();
-                if let Some(text) = text {
-                    copy_to_pasteboard(&text);
-                }
+                self.ivars().input.finish_selection(pane);
             }
         }
 
@@ -1102,16 +904,13 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
-            // Forward move to PTY if all-motion tracking (mode 1003) is active
+            // Reported to the app if it tracks all motion (mode 1003)
             if let Some((pane, vp)) = self.pane_at_event(event) {
-                let term = pane.terminal.read();
-                if term.mouse_mode >= 1003 && term.sgr_mouse {
-                    drop(term);
-                    if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
-                        // No button pressed during move → button code 3 (no button) + motion flag
-                        self.send_sgr_mouse(pane, 3, col, row, true, true, event);
+                if let Some(cell) = self.cell_size() {
+                    let result = self.ivars().input.mouse(self, event, MouseAction::Move, pane, self.pane_origin(&vp), cell);
+                    if result == MouseResult::Reported {
+                        return;
                     }
-                    return;
                 }
             }
             self.update_separator_cursor(event);
@@ -1146,28 +945,6 @@ define_class!(
     }
 );
 
-/// Extract a String from an NSTextInputClient input object (NSString or NSAttributedString).
-unsafe fn nsstring_from_input(obj: &objc2::runtime::AnyObject) -> String {
-    let responds: bool = unsafe { msg_send![obj, respondsToSelector: objc2::sel!(string)] };
-    if responds {
-        let ns_str: *const NSString = unsafe { msg_send![obj, string] };
-        unsafe { &*ns_str }.to_string()
-    } else {
-        let ns_str: &NSString = unsafe { &*(obj as *const objc2::runtime::AnyObject as *const NSString) };
-        ns_str.to_string()
-    }
-}
-
-/// Copy text to the system pasteboard.
-fn copy_to_pasteboard(text: &str) {
-    let pasteboard = NSPasteboard::generalPasteboard();
-    pasteboard.clearContents();
-    let ns_str = NSString::from_str(text);
-    unsafe {
-        pasteboard.setString_forType(&ns_str, objc2_app_kit::NSPasteboardTypeString);
-    }
-}
-
 impl KovaView {
     fn new(mtm: MainThreadMarker, frame: CGRect) -> Retained<Self> {
         let this = mtm.alloc::<Self>().set_ivars(KovaViewIvars {
@@ -1188,9 +965,7 @@ impl KovaView {
             drag_tab: Cell::new(None),
             hovered_url: RefCell::new(None),
             cmd_held: Cell::new(false),
-            auto_scroll_speed: Cell::new(0),
-            marked_text: RefCell::new(None),
-            current_event: Cell::new(None),
+            input: AppKitInput::new(),
             closing: Cell::new(false),
             skip_session_save: Cell::new(false),
             last_title: RefCell::new(None),
@@ -1204,7 +979,6 @@ impl KovaView {
             send_to_window: RefCell::new(None),
             merge_tab: RefCell::new(None),
             help_hint_frames: Cell::new(180), // updated in setup_metal
-            scroll_axis_lock: Cell::new(ScrollAxisLock::None),
             resize_feedback: Cell::new(None),
             transient_status: RefCell::new(None),
             bookmark_keys: RefCell::new(crate::bookmarks::keys(&crate::bookmarks::load().items)),
@@ -1534,23 +1308,6 @@ impl KovaView {
 
 
 
-    /// Encode modifier flags for SGR mouse reporting.
-    fn mouse_modifiers(event: &NSEvent) -> u8 {
-        let flags = event.modifierFlags();
-        input::mouse_modifiers(
-            flags.contains(NSEventModifierFlags::Shift),
-            flags.contains(NSEventModifierFlags::Option),
-            flags.contains(NSEventModifierFlags::Control),
-        )
-    }
-
-    /// Send an SGR mouse event to the PTY. `button_code` is the base button (0=left, 1=middle, 2=right, 64/65=scroll).
-    /// `press` = true for press/motion ('M'), false for release ('m').
-    /// `motion` = true adds +32 to the button code for motion events.
-    fn send_sgr_mouse(&self, pane: &Pane, button_code: u8, col: u16, row: u16, press: bool, motion: bool, event: &NSEvent) {
-        let mods = Self::mouse_modifiers(event);
-        pane.pty.write(&input::sgr_mouse_bytes(button_code, mods, col, row, press, motion));
-    }
 
 
 
@@ -1981,26 +1738,10 @@ impl KovaView {
                         });
 
                     if let Some(path) = pasted_image {
-                        let bracketed = pane.terminal.read().bracketed_paste;
-                        if bracketed { pane.pty.write(b"\x1b[200~"); }
-                        pane.pty.write(path.as_bytes());
-                        if bracketed { pane.pty.write(b"\x1b[201~"); }
+                        // The path Kova just built holds no paste terminator.
+                        pane.paste(&path);
                     } else if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
-                        let mut text = text.to_string();
-                        let bracketed = pane.terminal.read().bracketed_paste;
-                        if bracketed {
-                            // A paste containing the bracketed-paste
-                            // terminator would break out of the paste
-                            // and inject keystrokes into the app.
-                            // Loop to a fixpoint: a single replace can
-                            // re-form the terminator from its halves.
-                            while text.contains("\x1b[201~") {
-                                text = text.replace("\x1b[201~", "");
-                            }
-                            pane.pty.write(b"\x1b[200~");
-                        }
-                        pane.pty.write(text.as_bytes());
-                        if bracketed { pane.pty.write(b"\x1b[201~"); }
+                        pane.paste(&text.to_string());
                     }
                 }
             }

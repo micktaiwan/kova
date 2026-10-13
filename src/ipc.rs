@@ -9,6 +9,11 @@
 //! one-way event stream (see the "Event subscriptions" section at the bottom).
 //! After its response — a snapshot of the current state — Kova pushes one JSON
 //! line per state change and never reads from that connection again.
+//!
+//! The commands that only need panes and tabs are run by `host::dispatch`
+//! against whatever app holds them (`host::IpcHost`); the app keeps the rest.
+
+pub mod host;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -19,9 +24,9 @@ use std::sync::{mpsc, Mutex};
 /// Maximum length of a single JSON line from a client (64 KB).
 const MAX_LINE_LEN: usize = 65536;
 
-/// How many colors the tab palette holds. Mirrors `renderer::TAB_COLORS`, which is what
+/// How many colors the tab palette holds. Mirrors `tab_colors::TAB_COLORS`, which is what
 /// the right-click menu offers; an index outside it would be silently wrapped at draw time.
-const TAB_COLOR_COUNT: usize = crate::renderer::TAB_COLORS.len();
+const TAB_COLOR_COUNT: usize = crate::tab_colors::TAB_COLORS.len();
 
 /// Filter for commands that act on a set of panes.
 pub enum PaneFilter {
@@ -217,7 +222,7 @@ pub enum IpcResponse {
 }
 
 impl IpcResponse {
-    fn to_json(&self) -> serde_json::Value {
+    pub(crate) fn to_json(&self) -> serde_json::Value {
         match self {
             IpcResponse::Ok { data } => {
                 let mut obj = serde_json::json!({"ok": true});
@@ -539,7 +544,7 @@ fn optional_u32(v: &serde_json::Value, key: &str) -> Result<Option<u32>, String>
     }
 }
 
-fn parse_command(line: &str) -> Result<IpcCommand, String> {
+pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
     let v: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("invalid JSON: {}", e))?;
 
