@@ -35,6 +35,10 @@ pub struct AgentSession {
     pub id: String,
     /// Conversation name: Claude's explicit `/rename` or Codex's persisted name.
     pub name: Option<String>,
+    /// Claude only: the name other Claude sessions address this one by with
+    /// `SendMessage` (see `claude_session::Session::peer_name`). Codex has no
+    /// such thing, so it is always `None` there.
+    pub peer_name: Option<String>,
 }
 
 /// The agent session running under `shell_pid`, if any.
@@ -44,10 +48,10 @@ pub struct AgentSession {
 /// scan only happens for panes that are not Claude.
 pub fn for_shell(shell_pid: u32) -> Option<AgentSession> {
     if let Some(s) = crate::claude_session::session_for_shell(shell_pid) {
-        return Some(AgentSession { agent: Agent::Claude, id: s.id, name: s.name });
+        return Some(AgentSession { agent: Agent::Claude, id: s.id, name: s.name, peer_name: s.peer_name });
     }
     let s = crate::codex_session::for_shell(shell_pid)?;
-    Some(AgentSession { agent: Agent::Codex, id: s.id, name: s.name })
+    Some(AgentSession { agent: Agent::Codex, id: s.id, name: s.name, peer_name: None })
 }
 
 /// The command line that reopens this conversation, or `None` when the id is

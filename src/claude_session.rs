@@ -59,6 +59,11 @@ pub struct Session {
     /// the file is the only way to show it. A name Claude Code derived on its
     /// own does NOT count — see `parse_session_file`.
     pub name: Option<String>,
+    /// The `name` field as Claude Code wrote it, derived or not: the address
+    /// other Claude sessions give `SendMessage` / `ListAgents` ("lempire-f1").
+    /// Unlike `name`, a derived one is kept, because it is exactly what a peer
+    /// has to type to reach a session nobody renamed.
+    pub peer_name: Option<String>,
 }
 
 fn sessions_dir() -> PathBuf {
@@ -127,14 +132,14 @@ fn parse_session_file(data: &str) -> Option<(u32, u64, Session)> {
     // strictly less than the app's own title, so it must not shadow it: only a
     // name the user chose with /rename gets to name the pane.
     let derived = json.get("nameSource").and_then(|v| v.as_str()) == Some("derived");
-    let name = json
+    let peer_name = json
         .get("name")
-        .filter(|_| !derived)
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .map(str::to_string);
-    Some((pid, started_at, Session { id, name }))
+    let name = peer_name.clone().filter(|_| !derived);
+    Some((pid, started_at, Session { id, name, peer_name }))
 }
 
 /// Read `~/.claude/sessions/` once into a `Scan`: a map of "ancestor PID →
@@ -400,6 +405,31 @@ mod tests {
         let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000,
             "cwd":"/Users/x/eko","name":"eko-e3","nameSource":"derived"}"#;
         assert_eq!(parse_session_file(data).unwrap().2.name, None);
+    }
+
+    #[test]
+    fn derived_name_is_still_the_peer_address() {
+        // The pane title ignores a derived name, but it is the name another
+        // session passes to SendMessage, so `peer_name` keeps it.
+        let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000,
+            "cwd":"/Users/x/lempire","name":"lempire-f1","nameSource":"derived"}"#;
+        let session = parse_session_file(data).unwrap().2;
+        assert_eq!(session.name, None);
+        assert_eq!(session.peer_name.as_deref(), Some("lempire-f1"));
+    }
+
+    #[test]
+    fn renamed_session_has_the_same_name_and_peer_name() {
+        let session = parse_session_file(LIVE_FILE).unwrap().2;
+        assert_eq!(session.peer_name, session.name);
+    }
+
+    #[test]
+    fn no_or_blank_name_means_no_peer_name() {
+        let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000}"#;
+        assert_eq!(parse_session_file(data).unwrap().2.peer_name, None);
+        let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000,"name":" ","nameSource":"derived"}"#;
+        assert_eq!(parse_session_file(data).unwrap().2.peer_name, None);
     }
 
     #[test]

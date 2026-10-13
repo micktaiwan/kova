@@ -2013,6 +2013,15 @@ impl Pane {
             .and_then(|s| s.name.clone())
     }
 
+    /// Name other Claude sessions reach this one by with `SendMessage` /
+    /// `ListAgents`: the session file's `name`, derived or set by `/rename`.
+    /// `None` for other agents and before Claude Code has written a name.
+    pub fn claude_peer_name(&self) -> Option<String> {
+        self.agent_session.borrow().as_ref()
+            .filter(|s| s.agent == crate::agent_session::Agent::Claude)
+            .and_then(|s| s.peer_name.clone())
+    }
+
     /// True if the app in this pane is actively working: its live OSC 0/2 title
     /// leads with one of Claude Code's animated spinners (see `is_working_marker`).
     /// The asterisk idle marker (`✳ Claude Code`) does NOT count. Reads the live
@@ -2819,12 +2828,14 @@ mod tests {
         pane.terminal.write().title = Some("Codex".into());
         pane.agent_session.replace(Some(AgentSession {
             agent: Agent::Codex, id: "codex-id".into(), name: Some("premier nom".into()),
+            peer_name: Some("leak".into()),
         }));
         assert_eq!(pane.display_title("shell"), "premier nom");
         assert_eq!(pane.agent_session_name().as_deref(), Some("premier nom"));
         assert_eq!(pane.agent_session_id().as_deref(), Some("codex-id"));
         assert_eq!(pane.claude_session_name(), None);
         assert_eq!(pane.claude_session_id(), None);
+        assert_eq!(pane.claude_peer_name(), None);
 
         pane.agent_session.borrow_mut().as_mut().unwrap().name = Some("renommé 🦀".into());
         assert_eq!(pane.display_title("shell"), "renommé 🦀");
@@ -2835,11 +2846,23 @@ mod tests {
 
         pane.agent_session.replace(Some(AgentSession {
             agent: Agent::Claude, id: "claude-id".into(), name: Some("Claude nommé".into()),
+            peer_name: Some("Claude nommé".into()),
         }));
         assert_eq!(pane.display_title("shell"), "Claude nommé");
         assert_eq!(pane.agent_session_name(), pane.claude_session_name());
         assert_eq!(pane.claude_session_name().as_deref(), Some("Claude nommé"));
         assert_eq!(pane.agent_session_id(), pane.claude_session_id());
+        assert_eq!(pane.claude_peer_name().as_deref(), Some("Claude nommé"));
+
+        // Never renamed: no session name, so the title falls back, but the
+        // derived peer name is still exposed for SendMessage.
+        pane.agent_session.replace(Some(AgentSession {
+            agent: Agent::Claude, id: "claude-id".into(), name: None,
+            peer_name: Some("lempire-f1".into()),
+        }));
+        assert_eq!(pane.claude_session_name(), None);
+        assert_eq!(pane.claude_peer_name().as_deref(), Some("lempire-f1"));
+        assert_eq!(pane.display_title("shell"), "Codex");
     }
 
     #[test]

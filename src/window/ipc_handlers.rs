@@ -89,6 +89,9 @@ pub fn pane_json(
         "agent_session_name": pane.agent_session_name(),
         "claude_session_id": pane.claude_session_id(),
         "claude_session_name": pane.claude_session_name(),
+        // The SendMessage / ListAgents address of the pane's Claude session,
+        // derived names included — `claude_session_name` only carries /rename.
+        "peer_name": pane.claude_peer_name(),
     })
 }
 
