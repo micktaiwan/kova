@@ -4076,3 +4076,280 @@ mod tests {
         }
     }
 }
+
+/// Characterization of `build_vertices` as of 13/10/2026, before the embedding
+/// refactor (docs/embedding.md). The renderer is the real one on the real Metal
+/// device, but its atlas carries fixed metrics and synthetic glyphs, so the
+/// snapshots depend on neither the installed font nor the macOS version.
+///
+/// A snapshot that moves means the pixels a pane draws moved. To accept a change
+/// on purpose: `KOVA_UPDATE_SNAPSHOTS=1 cargo test vertex_snapshots`, then read the
+/// diff of `src/renderer/snapshots/`.
+#[cfg(test)]
+mod vertex_snapshots {
+    use super::*;
+    use crate::terminal::{GridPos, Selection, SelectionMode};
+    use glyph_atlas::GlyphInfo;
+
+    const CELL_W: f32 = 10.0;
+    const CELL_H: f32 = 20.0;
+
+    fn renderer() -> Renderer {
+        let device = MTLCreateSystemDefaultDevice().expect("no Metal device");
+        let layer = CAMetalLayer::new();
+        layer.setDevice(Some(&device));
+        layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        let mut config = Config::default();
+        config.status_bar.enabled = false;
+        let term = Arc::new(RwLock::new(TerminalState::new(4, 2, 10, [255; 3], [0; 3])));
+        let mut r = Renderer::new(&device, &layer, term, 2.0, &config);
+        r.atlas.fake_metrics(CELL_W, CELL_H, 4.0, 1024, 512);
+        r
+    }
+
+    /// A deterministic atlas slot per char: a 16-px grid indexed by code point.
+    fn slot(code: u32, wide: bool) -> GlyphInfo {
+        GlyphInfo {
+            x: (code % 32) * 32,
+            y: (code / 32 % 16) * 32,
+            width: if wide { 2 * CELL_W as u32 } else { CELL_W as u32 - 2 },
+            height: CELL_H as u32 - 4,
+            is_color: false,
+        }
+    }
+
+    /// Register every glyph the visible cells need, so nothing is rasterized.
+    fn fill_atlas(r: &mut Renderer, t: &TerminalState) {
+        for line in t.visible_lines() {
+            for cell in line.iter() {
+                if let Some(ref cl) = cell.cluster {
+                    let code: u32 = cl.chars().map(|c| c as u32).sum();
+                    r.atlas.fake_cluster_glyph(cl, slot(code, false));
+                } else if !cell.is_blank() {
+                    let wide = unicode_width::UnicodeWidthChar::width(cell.c) == Some(2);
+                    r.atlas.fake_glyph(cell.c, slot(cell.c as u32, wide));
+                }
+            }
+        }
+    }
+
+    /// A terminal with the default config colors, as Kova builds them.
+    fn term(cols: u16, rows: u16) -> TerminalState {
+        let c = Config::default();
+        TerminalState::new(
+            cols,
+            rows,
+            10,
+            crate::terminal::color_to_u8(c.colors.foreground),
+            crate::terminal::color_to_u8(c.colors.background),
+        )
+    }
+
+    fn type_lines(t: &mut TerminalState, lines: &[&str]) {
+        for (i, l) in lines.iter().enumerate() {
+            if i > 0 {
+                t.newline();
+                t.carriage_return();
+            }
+            for c in l.chars() {
+                t.put_char(c);
+            }
+        }
+    }
+
+    fn vp() -> PaneViewport {
+        PaneViewport { x: 100.0, y: 50.0, width: 140.0, height: 90.0 }
+    }
+
+    fn build(r: &mut Renderer, t: &TerminalState, focused: bool) -> Vec<Vertex> {
+        fill_atlas(r, t);
+        r.build_vertices(t, &vp(), true, focused, None, PaneAttention::None, 0, 1, None, false)
+    }
+
+    fn dump(vs: &[Vertex]) -> String {
+        let f = |x: f32| format!("{:.4}", x);
+        let mut out = String::new();
+        for (i, v) in vs.iter().enumerate() {
+            if i % 6 == 0 {
+                out.push_str(&format!("# quad {}\n", i / 6));
+            }
+            out.push_str(&format!(
+                "pos {} {} | uv {} {} | fg {} {} {} {} | bg {} {} {} {}\n",
+                f(v.position[0]), f(v.position[1]),
+                f(v.tex_coords[0]), f(v.tex_coords[1]),
+                f(v.color[0]), f(v.color[1]), f(v.color[2]), f(v.color[3]),
+                f(v.bg_color[0]), f(v.bg_color[1]), f(v.bg_color[2]), f(v.bg_color[3]),
+            ));
+        }
+        out
+    }
+
+    fn check(name: &str, vs: &[Vertex]) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/renderer/snapshots")
+            .join(format!("{name}.snap"));
+        let got = dump(vs);
+        let update = std::env::var_os("KOVA_UPDATE_SNAPSHOTS").is_some();
+        match std::fs::read_to_string(&path) {
+            Ok(want) if !update => {
+                if want != got {
+                    let first = want.lines().zip(got.lines()).position(|(a, b)| a != b);
+                    panic!(
+                        "vertex snapshot {name} moved ({} lines expected, {} got); first difference at line {:?}:\n  want: {:?}\n  got:  {:?}",
+                        want.lines().count(), got.lines().count(), first.map(|i| i + 1),
+                        first.and_then(|i| want.lines().nth(i)), first.and_then(|i| got.lines().nth(i)),
+                    );
+                }
+            }
+            _ => std::fs::write(&path, got).expect("write snapshot"),
+        }
+    }
+
+    #[test]
+    fn plain_text_with_a_focused_block_cursor() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["ab", "cd"]);
+        check("plain_focused", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn unfocused_pane_full_dim_and_hollow_cursor() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["ab"]);
+        check("unfocused_full_dim", &build(&mut r, &t, false));
+    }
+
+    #[test]
+    fn unfocused_pane_text_dim() {
+        let mut r = renderer();
+        r.dim_mode = DimMode::Text;
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["ab"]);
+        check("unfocused_text_dim", &build(&mut r, &t, false));
+    }
+
+    #[test]
+    fn colors_and_background_runs() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        t.set_sgr(&[31]);
+        t.put_char('R');
+        t.set_sgr(&[0, 44]);
+        t.put_char('B');
+        t.put_char(' ');
+        t.put_char('B');
+        t.set_sgr(&[0, 38, 2, 10, 200, 30]);
+        t.put_char('g');
+        t.set_sgr(&[0]);
+        check("colors_bg_runs", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn bold_italic_underline_strikethrough() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        for (sgr, c) in [(1u16, 'b'), (3, 'i'), (4, 'u'), (9, 's')] {
+            t.set_sgr(&[sgr]);
+            t.put_char(c);
+            t.set_sgr(&[0]);
+        }
+        t.set_sgr(&[4]);
+        t.put_char(' ');
+        t.set_sgr(&[0]);
+        check("attributes", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn selection_highlight() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["hello", "world"]);
+        t.selection = Some(Selection {
+            anchor: GridPos { line: 0, col: 3 },
+            end: GridPos { line: 1, col: 1 },
+            mode: SelectionMode::Normal,
+        });
+        check("selection", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn wide_chars_and_clusters() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["前x", "e\u{301}!"]);
+        check("wide_and_cluster", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn paste_block_rows() {
+        let mut r = renderer();
+        let mut t = term(12, 5);
+        type_lines(&mut t, &["say:", "```slack", "body", "```", "```/slack"]);
+        check("paste_block", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn scrolled_back_hides_the_cursor_and_shows_scrollback() {
+        let mut r = renderer();
+        let mut t = term(12, 2);
+        type_lines(&mut t, &["one", "two", "three", "four"]);
+        t.scroll(2);
+        check("scrolled_back", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn bottom_gravity_on_a_short_screen() {
+        let mut r = renderer();
+        let mut t = term(12, 4);
+        type_lines(&mut t, &["$ ls"]);
+        assert!(t.y_offset_rows() > 0);
+        check("bottom_gravity", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn hovered_url_underline() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["http://a.b/c"]);
+        r.hovered_url = Some(vec![(0, 0, 12), (1, 0, 3)]);
+        check("hovered_url", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn underline_and_bar_cursors() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["ab"]);
+        t.cursor_shape = CursorShape::Underline;
+        check("cursor_underline", &build(&mut r, &t, true));
+        t.cursor_shape = CursorShape::Bar;
+        check("cursor_bar", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn hidden_cursor_and_blink_off_draw_no_cursor() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["ab"]);
+        fill_atlas(&mut r, &t);
+        let on = r.build_vertices(&t, &vp(), true, true, None, PaneAttention::None, 0, 1, None, false);
+        let off = r.build_vertices(&t, &vp(), false, true, None, PaneAttention::None, 0, 1, None, false);
+        assert_eq!(on.len() - off.len(), 6, "blink off drops exactly the cursor quad");
+        t.cursor_visible = false;
+        let hidden = r.build_vertices(&t, &vp(), true, true, None, PaneAttention::None, 0, 1, None, false);
+        assert_eq!(hidden.len(), off.len());
+    }
+
+    #[test]
+    fn snapshots_ignore_the_installed_font() {
+        // Two renderers built independently produce the same bytes: nothing in
+        // the output comes from the atlas the font would have filled.
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["Wy!", "前"]);
+        let a = dump(&build(&mut renderer(), &t, true));
+        let b = dump(&build(&mut renderer(), &t, true));
+        assert_eq!(a, b);
+    }
+}

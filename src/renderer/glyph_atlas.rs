@@ -444,6 +444,34 @@ impl GlyphAtlas {
         atlas
     }
 
+    /// Test-only: replace the font metrics with fixed ones and empty every glyph
+    /// table, so vertex output depends on nothing CoreText or the OS decides.
+    /// The italic face is dropped (italic cells take the synthetic shear).
+    #[cfg(test)]
+    pub fn fake_metrics(&mut self, cell_w: f32, cell_h: f32, descent: f64, atlas_w: u32, atlas_h: u32) {
+        self.cell_width = cell_w;
+        self.cell_height = cell_h;
+        self.descent = descent;
+        self.atlas_width = atlas_w;
+        self.atlas_height = atlas_h;
+        self.glyphs.clear();
+        self.cluster_glyphs.clear();
+        self.italic_glyphs.clear();
+        self.italic_font = None;
+    }
+
+    /// Test-only: register a glyph without rasterizing anything.
+    #[cfg(test)]
+    pub fn fake_glyph(&mut self, c: char, info: GlyphInfo) {
+        self.glyphs.insert(c, info);
+    }
+
+    /// Test-only: register a cluster glyph without rasterizing anything.
+    #[cfg(test)]
+    pub fn fake_cluster_glyph(&mut self, cluster: &str, info: GlyphInfo) {
+        self.cluster_glyphs.insert(cluster.into(), info);
+    }
+
     pub fn glyph(&self, c: char) -> Option<&GlyphInfo> {
         self.glyphs.get(&c)
     }

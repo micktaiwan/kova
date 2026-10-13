@@ -545,13 +545,18 @@ fn jump_to_search_hit(hit: &SearchHit) {
         }
         // Order the window front and make it key so it visibly takes focus.
         win.makeKeyAndOrderFront(None);
-        if !view.activate_tab(tab_id) {
-            return;
-        }
-        if let Some(pane_id) = pane_id {
-            view.focus_pane_in_active_tab(pane_id);
-            // ~30 frames ≈ 0.5s @ 60fps; renderer pulses the pane border for that span.
-            view.set_pane_flash(pane_id, 30, None);
+        match pane_id {
+            // `ipc_focus_pane` restores a minimized pane first: focusing it in
+            // place left the tab with no visible focus (status bar "26/25").
+            Some(pane_id) => {
+                if view.ipc_focus_pane(pane_id) {
+                    // ~30 frames ≈ 0.5s @ 60fps; renderer pulses the pane border for that span.
+                    view.set_pane_flash(pane_id, 30, None);
+                }
+            }
+            None => {
+                view.activate_tab(tab_id);
+            }
         }
         return;
     }

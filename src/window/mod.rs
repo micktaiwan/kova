@@ -33,7 +33,7 @@ use crate::keybindings::{Action, Keybindings, KeyCombo};
 use crate::pane::{alloc_tab_id, NavDirection, Pane, PaneId, SplitDirection, Tab, TabId};
 use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
 use crate::terminal::pty::ProcessInfo;
-use crate::terminal::{FilterMatch, GridPos, Selection, SelectionMode};
+use crate::terminal::{FilterMatch, GridPos};
 
 #[derive(Clone, Copy)]
 struct SeparatorDrag {
@@ -527,87 +527,42 @@ define_class!(
                 return;
             }
 
-            // Ctrl+F → toggle filter (in addition to Cmd+F via performKeyEquivalent)
-            {
-                let modifiers = event.modifierFlags();
-                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
-                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
-                if has_ctrl && !has_cmd {
-                    if let Some(chars) = event.charactersIgnoringModifiers() {
-                        if chars.to_string() == "f" {
-                            self.toggle_filter();
-                            return;
-                        }
-                    }
+            let modifiers = event.modifierFlags();
+            let unmod = event.charactersIgnoringModifiers().map(|s| s.to_string());
+            let route = |kitty_flags: u8| input::pane_key_action(
+                modifiers.contains(NSEventModifierFlags::Control),
+                modifiers.contains(NSEventModifierFlags::Option),
+                modifiers.contains(NSEventModifierFlags::Command),
+                unmod.as_deref(),
+                kitty_flags,
+            );
+            let wipe_scrollback = match route(0) {
+                input::PaneKeyAction::ToggleFilter => {
+                    self.toggle_filter();
+                    return;
                 }
-            }
-
-            // Ctrl+L → wipe Kova's scrollback, then let the key through so the app
-            // redraws. The app's own answer to Ctrl+L is `ESC[H ESC[2J` (terminfo
-            // `clear`), which only erases the visible screen — the scrollback needs
-            // `ESC[3J`, which nothing sends here. Skipped in alt-screen, where Ctrl+L
-            // means "repaint" and the scrollback holds whatever ran before the
-            // full-screen app.
-            {
-                let modifiers = event.modifierFlags();
-                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
-                let has_option = modifiers.contains(NSEventModifierFlags::Option);
-                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
-                if has_ctrl && !has_option && !has_cmd {
-                    if let Some(chars) = event.charactersIgnoringModifiers() {
-                        if chars.to_string() == "l" {
-                            if let Some(pane) = self.focused_pane() {
-                                let mut term = pane.terminal.write();
-                                if !term.in_alt_screen {
-                                    term.clear_scrollback_and_screen();
-                                }
-                            }
-                        }
-                    }
+                input::PaneKeyAction::AdjustVirtualWidth(dir) => {
+                    self.adjust_virtual_width(dir);
+                    return;
                 }
-            }
-
-            // Ctrl+Option+arrows → adjust virtual width
-            {
-                let modifiers = event.modifierFlags();
-                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
-                let has_option = modifiers.contains(NSEventModifierFlags::Option);
-                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
-                if has_ctrl && has_option && !has_cmd {
-                    if let Some(chars) = event.charactersIgnoringModifiers() {
-                        let dir = match chars.to_string().as_str() {
-                            "\u{f703}" => Some(1.0_f32),
-                            "\u{f702}" => Some(-1.0_f32),
-                            _ => None,
-                        };
-                        if let Some(dir) = dir {
-                            self.adjust_virtual_width(dir);
-                            return;
-                        }
-                    }
-                }
-            }
+                input::PaneKeyAction::Send { wipe_scrollback, .. } => wipe_scrollback,
+            };
 
             if let Some(pane) = self.focused_pane() {
+                if wipe_scrollback {
+                    let mut term = pane.terminal.write();
+                    if !term.in_alt_screen {
+                        term.clear_scrollback_and_screen();
+                    }
+                }
+
                 let (kitty_flags, cursor_keys_app) = {
                     let term = pane.terminal.read();
                     (term.kitty_flags(), term.cursor_keys_application)
                 };
 
-                let modifiers = event.modifierFlags();
-                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
-                let has_alt = modifiers.contains(NSEventModifierFlags::Option);
-                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
-
-                // Option alone on a printable key composes a character on macOS
-                // layouts (French: Option+$ = €, Option+( = {). It must go through
-                // text input, otherwise kitty mode sends Alt+$ and the char is lost.
-                let option_composes_text = has_alt && !has_ctrl && event
-                    .charactersIgnoringModifiers()
-                    .and_then(|s| s.to_string().chars().next())
-                    .is_some_and(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(&c));
-
-                if kitty_flags > 0 && (has_ctrl || has_alt) && !has_cmd && !option_composes_text {
+                let direct = matches!(route(kitty_flags), input::PaneKeyAction::Send { direct: true, .. });
+                if direct {
                     // Kitty mode: bypass macOS text input for modified keys
                     pane.terminal.write().reset_scroll();
                     pane.clear_awaiting();
@@ -788,17 +743,11 @@ define_class!(
             if lock != ScrollAxisLock::Horizontal {
                 if let Some((pane, vp)) = self.pane_at_event(event) {
                     let dy = event.scrollingDeltaY();
-                    let lines = if is_trackpad {
-                        let sensitivity = ivars.config.get()
-                            .map(|c| c.terminal.scroll_sensitivity)
-                            .unwrap_or(TerminalConfig::default().scroll_sensitivity);
-                        let acc = pane.scroll_accumulator.get() + dy / sensitivity;
-                        let discrete = acc as i32;
-                        pane.scroll_accumulator.set(acc - discrete as f64);
-                        discrete
-                    } else {
-                        dy as i32
-                    };
+                    let sensitivity = ivars.config.get()
+                        .map(|c| c.terminal.scroll_sensitivity)
+                        .unwrap_or(TerminalConfig::default().scroll_sensitivity);
+                    let (lines, acc) = input::scroll_lines(pane.scroll_accumulator.get(), dy, is_trackpad, sensitivity);
+                    pane.scroll_accumulator.set(acc);
                     if lines != 0 {
                         // Forward scroll to PTY if mouse reporting is active
                         let mouse_mode = pane.terminal.read().mouse_mode;
@@ -806,8 +755,7 @@ define_class!(
                         if mouse_mode >= 1000 && sgr {
                             if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
                                 // Each discrete line = one scroll event
-                                let count = lines.unsigned_abs() as usize;
-                                let button = if lines > 0 { 64u8 } else { 65u8 }; // 64=up, 65=down
+                                let (button, count) = input::wheel_reports(lines);
                                 for _ in 0..count {
                                     self.send_sgr_mouse(pane, button, col, row, true, false, event);
                                 }
@@ -971,30 +919,7 @@ define_class!(
                     }
                 }
                 if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
-                    let click_count = event.clickCount();
-                    let mut term = pane.terminal.write();
-                    if click_count == 2 {
-                        // Double-click: select word
-                        let (wstart, wend) = term.word_bounds_at(pos);
-                        term.selection = Some(Selection {
-                            anchor: GridPos { line: pos.line, col: wstart },
-                            end: GridPos { line: pos.line, col: wend },
-                            mode: SelectionMode::Word,
-                        });
-                    } else if click_count >= 3 {
-                        // Triple-click: select entire line
-                        let row_len = term.row_at(pos.line)
-                            .map(|r| r.cells.len().saturating_sub(1) as u16)
-                            .unwrap_or(0);
-                        term.selection = Some(Selection {
-                            anchor: GridPos { line: pos.line, col: 0 },
-                            end: GridPos { line: pos.line, col: row_len },
-                            mode: SelectionMode::Line,
-                        });
-                    } else {
-                        term.selection = Some(Selection { anchor: pos, end: pos, mode: SelectionMode::Normal });
-                    }
-                    term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    pane.terminal.write().start_selection(pos, event.clickCount());
                 }
             }
         }
@@ -1093,47 +1018,7 @@ define_class!(
                     if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
                         // Mouse is inside viewport — normal drag
                         self.ivars().auto_scroll_speed.set(0);
-                        let mut term = pane.terminal.write();
-                        // Read mode and anchor before mutating selection
-                        let sel_info = term.selection.as_ref().map(|s| (s.mode, s.anchor));
-                        if let Some((mode, anchor)) = sel_info {
-                            match mode {
-                                SelectionMode::Word => {
-                                    let (wstart, wend) = term.word_bounds_at(pos);
-                                    let anchor_before = (anchor.line, anchor.col) <= (pos.line, wstart);
-                                    if let Some(sel) = term.selection.as_mut() {
-                                        if anchor_before {
-                                            sel.end = GridPos { line: pos.line, col: wend };
-                                        } else {
-                                            sel.end = GridPos { line: pos.line, col: wstart };
-                                        }
-                                    }
-                                }
-                                SelectionMode::Line => {
-                                    let row_len = term.row_at(pos.line)
-                                        .map(|r| r.cells.len().saturating_sub(1) as u16)
-                                        .unwrap_or(0);
-                                    let anchor_row_len = term.row_at(anchor.line)
-                                        .map(|r| r.cells.len().saturating_sub(1) as u16)
-                                        .unwrap_or(0);
-                                    if let Some(sel) = term.selection.as_mut() {
-                                        if pos.line >= anchor.line {
-                                            sel.anchor.col = 0;
-                                            sel.end = GridPos { line: pos.line, col: row_len };
-                                        } else {
-                                            sel.anchor.col = anchor_row_len;
-                                            sel.end = GridPos { line: pos.line, col: 0 };
-                                        }
-                                    }
-                                }
-                                SelectionMode::Normal => {
-                                    if let Some(sel) = term.selection.as_mut() {
-                                        sel.end = pos;
-                                    }
-                                }
-                            }
-                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
+                        pane.terminal.write().extend_selection(pos);
                     } else {
                         // Mouse is outside viewport — compute auto-scroll speed
                         let renderer = self.ivars().renderer.get();
@@ -1144,25 +1029,8 @@ define_class!(
                             drop(renderer_r);
 
                             let rel_y = pixel_y - vp.y;
-                            let term = pane.terminal.read();
-                            let y_offset = term.y_offset_rows() as f32 * cell_h;
-                            let bottom = y_offset + (term.rows as f32 * cell_h);
-
-                            if rel_y < y_offset {
-                                // Above viewport — scroll up
-                                let dist = y_offset - rel_y;
-                                let speed = -((dist / cell_h).ceil() as i32).clamp(1, 10);
-                                self.ivars().auto_scroll_speed.set(speed);
-                            } else if rel_y > bottom {
-                                // Below viewport — scroll down
-                                let dist = rel_y - bottom;
-                                let speed = ((dist / cell_h).ceil() as i32).clamp(1, 10);
-                                self.ivars().auto_scroll_speed.set(speed);
-                            } else {
-                                // Mouse is vertically inside viewport but pixel_to_grid_in
-                                // returned None (e.g. mouse to the left of the grid) — no scroll
-                                self.ivars().auto_scroll_speed.set(0);
-                            }
+                            let speed = pane.terminal.read().drag_autoscroll_speed(rel_y, cell_h);
+                            self.ivars().auto_scroll_speed.set(speed);
                         }
                     }
                 }
@@ -1194,17 +1062,8 @@ define_class!(
                 }
             }
             if let Some(pane) = self.focused_pane() {
-                let mut term = pane.terminal.write();
-                // Single click (no drag) — clear selection
-                if let Some(ref sel) = term.selection {
-                    if sel.anchor == sel.end && sel.mode == SelectionMode::Normal {
-                        term.selection = None;
-                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return;
-                    }
-                }
-                let text = term.selected_text();
-                if !text.is_empty() {
+                let text = pane.terminal.write().finish_selection();
+                if let Some(text) = text {
                     copy_to_pasteboard(&text);
                 }
             }
@@ -1678,11 +1537,11 @@ impl KovaView {
     /// Encode modifier flags for SGR mouse reporting.
     fn mouse_modifiers(event: &NSEvent) -> u8 {
         let flags = event.modifierFlags();
-        let mut m: u8 = 0;
-        if flags.contains(NSEventModifierFlags::Shift) { m |= 4; }
-        if flags.contains(NSEventModifierFlags::Option) { m |= 8; }
-        if flags.contains(NSEventModifierFlags::Control) { m |= 16; }
-        m
+        input::mouse_modifiers(
+            flags.contains(NSEventModifierFlags::Shift),
+            flags.contains(NSEventModifierFlags::Option),
+            flags.contains(NSEventModifierFlags::Control),
+        )
     }
 
     /// Send an SGR mouse event to the PTY. `button_code` is the base button (0=left, 1=middle, 2=right, 64/65=scroll).
@@ -1690,10 +1549,7 @@ impl KovaView {
     /// `motion` = true adds +32 to the button code for motion events.
     fn send_sgr_mouse(&self, pane: &Pane, button_code: u8, col: u16, row: u16, press: bool, motion: bool, event: &NSEvent) {
         let mods = Self::mouse_modifiers(event);
-        let cb = button_code | mods | if motion { 32 } else { 0 };
-        let suffix = if press { 'M' } else { 'm' };
-        let seq = format!("\x1b[<{};{};{}{}", cb, col, row, suffix);
-        pane.pty.write(seq.as_bytes());
+        pane.pty.write(&input::sgr_mouse_bytes(button_code, mods, col, row, press, motion));
     }
 
 
@@ -1872,33 +1728,6 @@ impl KovaView {
                 // offset centers content in the (larger) viewport. Match the
                 // other tab-switch paths which all resize after activation.
                 self.resize_all_panes();
-                self.mark_dirty();
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Focus a specific pane within the active tab. Returns true if found.
-    fn focus_pane_in_active_tab(&self, pane_id: PaneId) -> bool {
-        let mut tabs = self.ivars().tabs.borrow_mut();
-        let idx = self.ivars().active_tab.get();
-        if let Some(tab) = tabs.get_mut(idx) {
-            // Walk panes to confirm the id exists in this tab before assigning.
-            let mut found = false;
-            tab.for_each_pane(&mut |p| {
-                if p.id == pane_id { found = true; }
-            });
-            if found {
-                tab.focused_pane = pane_id;
-                // Scroll the virtual viewport so the pane is on-screen if it
-                // sits outside the visible horizontal span (e.g. jumped to from
-                // global search).
-                let screen_w = self.drawable_viewport().width;
-                let min_w = self.min_split_width_px();
-                tab.clamp_scroll(screen_w, min_w);
-                self.scroll_to_reveal_pane(tab, pane_id, screen_w);
-                drop(tabs);
                 self.mark_dirty();
                 return true;
             }

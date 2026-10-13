@@ -72,8 +72,8 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 
 - Mac-only, pas de cross-platform
 - Performance et RAM minimale avant tout
-- Pas de feature creep : tabs, splits, config, c'est tout
-- **Du code que Mickael a validé (« ça me convient », « c'est bon ») ne se modifie plus.** Si une revue trouve ensuite un écart entre le code et les specs, ce sont les specs qu'on aligne sur le code, jamais l'inverse : toucher au comportement après validation introduit des régressions sur quelque chose qu'il a déjà accepté.
+- Pas de feature creep côté app : tabs, splits, config, c'est tout. Seule extension admise (levée par Mickael le 13/10/2026) : Kova sert aussi de bibliothèque de terminal à Kana, chantier décrit dans `docs/embedding.md`.
+- **Le comportement que Mickael a validé (« ça me convient », « c'est bon ») ne change plus ; le code, lui, peut bouger, à condition que des tests prouvent que le comportement est identique.** Ordre imposé : les tests qui figent le comportement d'abord, verts, puis le déplacement. Si une revue trouve un écart entre le code et les specs, ce sont les specs qu'on aligne sur le code, jamais l'inverse : changer un comportement validé introduit des régressions sur quelque chose qu'il a déjà accepté. (Règle reformulée le 13/10/2026 ; avant, le code validé lui-même ne se modifiait plus.)
 
 ## Le skill `kova` est la surface publique de cet outil
 

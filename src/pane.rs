@@ -607,6 +607,39 @@ impl Tab {
         })
     }
 
+    /// Test-only: a tab laid out from the given columns of panes, focused on its
+    /// first pane.
+    #[cfg(test)]
+    pub fn with_columns(columns: Vec<Vec<Pane>>) -> Self {
+        let focused = columns[0][0].id;
+        let n = columns.len();
+        let columns = columns
+            .into_iter()
+            .map(|panes| {
+                let rows = panes.len();
+                Column { panes, row_weights: vec![1.0; rows], custom_row_weights: vec![false; rows] }
+            })
+            .collect();
+        Tab {
+            id: alloc_tab_id(),
+            columns,
+            column_weights: vec![1.0; n],
+            custom_weights: vec![false; n],
+            focused_pane: focused,
+            custom_title: None,
+            color: None,
+            has_bell: false,
+            has_completion: false,
+            has_running: false,
+            fg_running_cache: false,
+            minimized_stack: Vec::new(),
+            scroll_offset_x: 0.0,
+            virtual_width_override: 0.0,
+            geometry_scale: 0.0,
+            cell_h: Cell::new(0.0),
+        }
+    }
+
     /// Create a placeholder tab with a dummy pane (no shell process).
     /// Used for deferred tab restore to avoid shell contention at startup.
     pub fn placeholder(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
@@ -1885,6 +1918,41 @@ impl Pane {
             fg_process: RefCell::new(None),
             cached_cwd: RefCell::new(None),
         })
+    }
+
+    /// Test-only: a pane without a shell whose PTY input is readable on the
+    /// returned fd (see [`Pty::capture`]).
+    #[cfg(test)]
+    pub fn capture(cols: u16, rows: u16) -> (Self, std::os::fd::OwnedFd) {
+        let config = Config::default();
+        let terminal = Arc::new(RwLock::new(TerminalState::new(
+            cols,
+            rows,
+            config.terminal.scrollback,
+            crate::terminal::color_to_u8(config.colors.foreground),
+            crate::terminal::color_to_u8(config.colors.background),
+        )));
+        let (pty, reader) = Pty::capture();
+        let pane = Pane {
+            id: alloc_pane_id(),
+            terminal,
+            pty,
+            shell_exited: Arc::new(AtomicBool::new(false)),
+            shell_ready: Arc::new(AtomicBool::new(true)),
+            scroll_accumulator: Cell::new(0.0),
+            pending_command: Cell::new(None),
+            run_pending: Cell::new(false),
+            custom_title: None,
+            minimized: false,
+            open_timer: Arc::new(PaneOpenTimer::new()),
+            awaiting: Cell::new(AwaitingFlag::default()),
+            agent_session: RefCell::new(None),
+            idle_agent_seen: Cell::new(false),
+            last_seen: Cell::new(0),
+            fg_process: RefCell::new(None),
+            cached_cwd: RefCell::new(None),
+        };
+        (pane, reader)
     }
 
     pub fn cwd(&self) -> Option<String> {

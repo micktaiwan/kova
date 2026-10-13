@@ -257,23 +257,7 @@ impl KovaView {
 
         let rel_x = pixel_x - vp.x - self.h_padding();
         let rel_y = pixel_y - vp.y;
-
-        let term = pane.terminal.read();
-        let y_offset = term.y_offset_rows();
-        let col = (rel_x / cell_w).floor() as i32;
-        let visible_row = (rel_y / cell_h).floor() as i32 - y_offset as i32;
-
-        if visible_row < 0 || col < 0 {
-            return None;
-        }
-        let col = (col as u16).min(term.cols.saturating_sub(1));
-        let visible_row = visible_row as usize;
-        if visible_row >= term.rows as usize {
-            return None;
-        }
-
-        let abs_line = (term.scrollback_len() as i64 - term.scroll_offset() as i64 + visible_row as i64) as usize;
-        Some(GridPos { line: abs_line, col })
+        pane.terminal.read().grid_pos_at(rel_x, rel_y, cell_w, cell_h)
     }
 
     /// Convert pixel coords to 1-based (col, row) within a pane viewport.
@@ -287,19 +271,7 @@ impl KovaView {
 
         let rel_x = pixel_x - vp.x - self.h_padding();
         let rel_y = pixel_y - vp.y;
-
-        let term = pane.terminal.read();
-        let y_offset = term.y_offset_rows();
-        let col = (rel_x / cell_w).floor() as i32;
-        let row = (rel_y / cell_h).floor() as i32 - y_offset as i32;
-
-        if row < 0 || col < 0 {
-            return None;
-        }
-        let col = (col as u16).min(term.cols.saturating_sub(1));
-        let row = (row as u16).min(term.rows.saturating_sub(1));
-        // SGR uses 1-based coordinates
-        Some((col + 1, row + 1))
+        pane.terminal.read().sgr_cell_at(rel_x, rel_y, cell_w, cell_h)
     }
 
     /// Compute cols/rows for a pane viewport.

@@ -696,35 +696,14 @@ fn handle_ipc_get_pane_content(
     mode_str: &str,
     trim: bool,
 ) -> crate::ipc::IpcResponse {
-    use crate::ipc::IpcResponse;
-
     let mode = parse_dump_mode(mode_str);
     let ids = resolve_pane_filter(windows, filter);
     let wins = windows.borrow();
-
-    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(ids.len());
-    for pane_id in ids {
-        let mut found: Option<serde_json::Value> = None;
-        for win in wins.iter() {
-            if let Some(view) = kova_view(win) {
-                if let Some(entry) = view.ipc_dump_pane_text(pane_id, mode, trim) {
-                    found = Some(entry);
-                    break;
-                }
-            }
-        }
-        match found {
-            Some(entry) => entries.push(entry),
-            None => entries.push(serde_json::json!({
-                "id": pane_id,
-                "error": "not found",
-            })),
-        }
-    }
-
-    IpcResponse::Ok {
-        data: Some(serde_json::json!({ "panes": entries })),
-    }
+    crate::ipc::pane_content_response(ids, |pane_id| {
+        wins.iter()
+            .filter_map(|win| kova_view(win))
+            .find_map(|view| view.ipc_dump_pane_text(pane_id, mode, trim))
+    })
 }
 
 /// IPC: return only the size (chars/bytes) of what `get-pane-content` would return.
@@ -734,50 +713,14 @@ fn handle_ipc_count_pane_content(
     mode_str: &str,
     trim: bool,
 ) -> crate::ipc::IpcResponse {
-    use crate::ipc::IpcResponse;
-
     let mode = parse_dump_mode(mode_str);
     let ids = resolve_pane_filter(windows, filter);
     let wins = windows.borrow();
-
-    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(ids.len());
-    let mut total_chars: u64 = 0;
-    let mut total_bytes: u64 = 0;
-
-    for pane_id in ids {
-        let mut measured: Option<(usize, usize)> = None;
-        for win in wins.iter() {
-            if let Some(view) = kova_view(win) {
-                if let Some(m) = view.ipc_measure_pane_text(pane_id, mode, trim) {
-                    measured = Some(m);
-                    break;
-                }
-            }
-        }
-        match measured {
-            Some((chars, bytes)) => {
-                total_chars += chars as u64;
-                total_bytes += bytes as u64;
-                entries.push(serde_json::json!({
-                    "id": pane_id,
-                    "chars": chars,
-                    "bytes": bytes,
-                }));
-            }
-            None => entries.push(serde_json::json!({
-                "id": pane_id,
-                "error": "not found",
-            })),
-        }
-    }
-
-    IpcResponse::Ok {
-        data: Some(serde_json::json!({
-            "total_chars": total_chars,
-            "total_bytes": total_bytes,
-            "panes": entries,
-        })),
-    }
+    crate::ipc::pane_count_response(ids, |pane_id| {
+        wins.iter()
+            .filter_map(|win| kova_view(win))
+            .find_map(|view| view.ipc_measure_pane_text(pane_id, mode, trim))
+    })
 }
 
 /// IPC: wait for a pane to be marked completed (OSC 133;D or `mark-completed`).

@@ -233,6 +233,65 @@ impl IpcResponse {
     }
 }
 
+/// `get-pane-content` reply: one entry per requested id, in request order
+/// (duplicates kept), `{"id", "error": "not found"}` for an id `find` misses.
+pub fn pane_content_response(
+    ids: Vec<u32>,
+    mut find: impl FnMut(u32) -> Option<serde_json::Value>,
+) -> IpcResponse {
+    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(ids.len());
+    for pane_id in ids {
+        match find(pane_id) {
+            Some(entry) => entries.push(entry),
+            None => entries.push(serde_json::json!({
+                "id": pane_id,
+                "error": "not found",
+            })),
+        }
+    }
+
+    IpcResponse::Ok {
+        data: Some(serde_json::json!({ "panes": entries })),
+    }
+}
+
+/// `count-pane-content` reply: per-pane `(chars, bytes)` from `measure`, totals
+/// over the panes found, and a "not found" entry for each id it misses.
+pub fn pane_count_response(
+    ids: Vec<u32>,
+    mut measure: impl FnMut(u32) -> Option<(usize, usize)>,
+) -> IpcResponse {
+    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(ids.len());
+    let mut total_chars: u64 = 0;
+    let mut total_bytes: u64 = 0;
+
+    for pane_id in ids {
+        match measure(pane_id) {
+            Some((chars, bytes)) => {
+                total_chars += chars as u64;
+                total_bytes += bytes as u64;
+                entries.push(serde_json::json!({
+                    "id": pane_id,
+                    "chars": chars,
+                    "bytes": bytes,
+                }));
+            }
+            None => entries.push(serde_json::json!({
+                "id": pane_id,
+                "error": "not found",
+            })),
+        }
+    }
+
+    IpcResponse::Ok {
+        data: Some(serde_json::json!({
+            "total_chars": total_chars,
+            "total_bytes": total_bytes,
+            "panes": entries,
+        })),
+    }
+}
+
 /// A pending IPC request: the command plus a channel to send the response back.
 pub type IpcRequest = (IpcCommand, mpsc::Sender<IpcResponse>);
 
@@ -1044,6 +1103,110 @@ mod tests {
 
     fn err(line: &str) -> String {
         parse_command(line).err().expect("expected an error")
+    }
+
+    // --- Characterization of the pane commands (13/10/2026, docs/embedding.md) ---
+
+    #[test]
+    fn response_json_shape() {
+        assert_eq!(IpcResponse::Ok { data: None }.to_json(), serde_json::json!({"ok": true}));
+        assert_eq!(
+            IpcResponse::Ok { data: Some(serde_json::json!([1])) }.to_json(),
+            serde_json::json!({"ok": true, "data": [1]})
+        );
+        assert_eq!(
+            IpcResponse::Error { message: "pane 3 not found".into() }.to_json(),
+            serde_json::json!({"ok": false, "error": "pane 3 not found"})
+        );
+    }
+
+    fn data(r: IpcResponse) -> serde_json::Value {
+        match r {
+            IpcResponse::Ok { data: Some(d) } => d,
+            _ => panic!("expected ok with data"),
+        }
+    }
+
+    #[test]
+    fn pane_content_keeps_request_order_duplicates_and_misses() {
+        let d = data(pane_content_response(vec![2, 9, 2], |id| {
+            (id == 2).then(|| serde_json::json!({"id": 2, "text": "x"}))
+        }));
+        assert_eq!(d, serde_json::json!({"panes": [
+            {"id": 2, "text": "x"},
+            {"id": 9, "error": "not found"},
+            {"id": 2, "text": "x"},
+        ]}));
+        assert_eq!(data(pane_content_response(vec![], |_| None)), serde_json::json!({"panes": []}));
+    }
+
+    #[test]
+    fn pane_count_totals_only_the_panes_found() {
+        let d = data(pane_count_response(vec![1, 5, 2], |id| match id {
+            1 => Some((3, 4)),
+            2 => Some((10, 12)),
+            _ => None,
+        }));
+        assert_eq!(d, serde_json::json!({
+            "total_chars": 13,
+            "total_bytes": 16,
+            "panes": [
+                {"id": 1, "chars": 3, "bytes": 4},
+                {"id": 5, "error": "not found"},
+                {"id": 2, "chars": 10, "bytes": 12},
+            ],
+        }));
+    }
+
+    #[test]
+    fn pane_commands_parse() {
+        assert!(matches!(parse_command(r#"{"cmd":"list-panes"}"#), Ok(IpcCommand::ListPanes)));
+        assert!(matches!(parse_command(r#"{"cmd":"close-pane","pane_id":4}"#), Ok(IpcCommand::ClosePaneById(4))));
+        assert!(matches!(parse_command(r#"{"cmd":"focus-pane","pane_id":4}"#), Ok(IpcCommand::FocusPane(4))));
+        match parse_command(r#"{"cmd":"send-keys","pane_id":4,"text":"ls\r"}"#) {
+            Ok(IpcCommand::SendKeys { pane_id: 4, text }) => assert_eq!(text, "ls\r"),
+            _ => panic!("send-keys"),
+        }
+        assert_eq!(err(r#"{"cmd":"send-keys","pane_id":4}"#), "missing \"text\" field");
+        assert!(parse_command(r#"{"cmd":"close-pane"}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"focus-pane","pane_id":"4"}"#).is_err());
+    }
+
+    #[test]
+    fn pane_content_args_defaults_and_errors() {
+        match parse_command(r#"{"cmd":"get-pane-content"}"#) {
+            Ok(IpcCommand::GetPaneContent { panes: PaneFilter::All, mode, trim_trailing_blank_lines: true }) => {
+                assert_eq!(mode, "visible")
+            }
+            _ => panic!("defaults"),
+        }
+        match parse_command(r#"{"cmd":"count-pane-content","panes":[3,1,3],"mode":"scrollback","trim_trailing_blank_lines":false}"#) {
+            Ok(IpcCommand::CountPaneContent { panes: PaneFilter::Ids(ids), mode, trim_trailing_blank_lines: false }) => {
+                assert_eq!(ids, vec![3, 1, 3]);
+                assert_eq!(mode, "scrollback");
+            }
+            _ => panic!("explicit args"),
+        }
+        assert!(matches!(
+            parse_command(r#"{"cmd":"get-pane-content","panes":"all","mode":"all"}"#),
+            Ok(IpcCommand::GetPaneContent { panes: PaneFilter::All, .. })
+        ));
+        assert_eq!(
+            err(r#"{"cmd":"get-pane-content","panes":"some"}"#),
+            "\"panes\" string must be \"all\", got \"some\""
+        );
+        assert_eq!(
+            err(r#"{"cmd":"get-pane-content","panes":[1,-2]}"#),
+            "\"panes\"[1] must be a non-negative integer"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"get-pane-content","mode":"grid"}"#),
+            "\"mode\" must be one of \"visible\", \"scrollback\", \"all\" (got \"grid\")"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"get-pane-content","trim_trailing_blank_lines":"no"}"#),
+            "\"trim_trailing_blank_lines\" must be a boolean"
+        );
     }
 
     #[test]

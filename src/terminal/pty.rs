@@ -436,6 +436,26 @@ impl Pty {
         })
     }
 
+    /// Test-only: a childless PTY whose other end is handed back in raw mode, so a
+    /// test can read exactly the bytes Kova wrote (no echo, no CR/LF translation).
+    #[cfg(test)]
+    pub fn capture() -> (Self, OwnedFd) {
+        let pair = openpty(None, None).expect("openpty");
+        let mut tio = termios::tcgetattr(&pair.user).expect("tcgetattr");
+        tio.make_raw();
+        termios::tcsetattr(&pair.user, termios::OptionalActions::Now, &tio).expect("tcsetattr");
+        let pty = Pty {
+            master_fd: pair.controller,
+            child_pid: 0,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            input_chars: Arc::new(AtomicU64::new(0)),
+            last_activity_secs: Arc::new(AtomicU64::new(0)),
+            reader_thread: None,
+            is_dummy: true,
+        };
+        (pty, pair.user)
+    }
+
     /// Returns true if this PTY has a real child process (not a dummy).
     pub fn is_live(&self) -> bool {
         !self.is_dummy

@@ -2341,6 +2341,151 @@ impl TerminalState {
         }
     }
 
+    /// Grid position under a point, in pixels relative to the pane's text origin
+    /// (pane x + horizontal padding, pane y). None above the grid, left of it, or
+    /// below the last row; a column past the right edge clamps to the last column.
+    pub fn grid_pos_at(&self, rel_x: f32, rel_y: f32, cell_w: f32, cell_h: f32) -> Option<GridPos> {
+        let y_offset = self.y_offset_rows();
+        let col = (rel_x / cell_w).floor() as i32;
+        let visible_row = (rel_y / cell_h).floor() as i32 - y_offset as i32;
+
+        if visible_row < 0 || col < 0 {
+            return None;
+        }
+        let col = (col as u16).min(self.cols.saturating_sub(1));
+        let visible_row = visible_row as usize;
+        if visible_row >= self.rows as usize {
+            return None;
+        }
+
+        let abs_line = (self.scrollback_len() as i64 - self.scroll_offset() as i64 + visible_row as i64) as usize;
+        Some(GridPos { line: abs_line, col })
+    }
+
+    /// 1-based (col, row) for SGR mouse reports under the same point as
+    /// [`grid_pos_at`](Self::grid_pos_at). Past the right or bottom edge clamps
+    /// to the last cell; above or left of the grid is None.
+    pub fn sgr_cell_at(&self, rel_x: f32, rel_y: f32, cell_w: f32, cell_h: f32) -> Option<(u16, u16)> {
+        let y_offset = self.y_offset_rows();
+        let col = (rel_x / cell_w).floor() as i32;
+        let row = (rel_y / cell_h).floor() as i32 - y_offset as i32;
+
+        if row < 0 || col < 0 {
+            return None;
+        }
+        let col = (col as u16).min(self.cols.saturating_sub(1));
+        let row = (row as u16).min(self.rows.saturating_sub(1));
+        // SGR uses 1-based coordinates
+        Some((col + 1, row + 1))
+    }
+
+    /// Mouse down at `pos`: one click starts a character selection, two select the
+    /// word, three or more the whole row.
+    pub fn start_selection(&mut self, pos: GridPos, click_count: isize) {
+        if click_count == 2 {
+            // Double-click: select word
+            let (wstart, wend) = self.word_bounds_at(pos);
+            self.selection = Some(Selection {
+                anchor: GridPos { line: pos.line, col: wstart },
+                end: GridPos { line: pos.line, col: wend },
+                mode: SelectionMode::Word,
+            });
+        } else if click_count >= 3 {
+            // Triple-click: select entire line
+            let row_len = self.row_at(pos.line)
+                .map(|r| r.cells.len().saturating_sub(1) as u16)
+                .unwrap_or(0);
+            self.selection = Some(Selection {
+                anchor: GridPos { line: pos.line, col: 0 },
+                end: GridPos { line: pos.line, col: row_len },
+                mode: SelectionMode::Line,
+            });
+        } else {
+            self.selection = Some(Selection { anchor: pos, end: pos, mode: SelectionMode::Normal });
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Mouse dragged to `pos`: grow the selection in its own unit (character, word
+    /// or row). No-op without a selection.
+    pub fn extend_selection(&mut self, pos: GridPos) {
+        // Read mode and anchor before mutating selection
+        let Some((mode, anchor)) = self.selection.as_ref().map(|s| (s.mode, s.anchor)) else { return };
+        match mode {
+            SelectionMode::Word => {
+                let (wstart, wend) = self.word_bounds_at(pos);
+                let anchor_before = (anchor.line, anchor.col) <= (pos.line, wstart);
+                if let Some(sel) = self.selection.as_mut() {
+                    if anchor_before {
+                        sel.end = GridPos { line: pos.line, col: wend };
+                    } else {
+                        sel.end = GridPos { line: pos.line, col: wstart };
+                    }
+                }
+            }
+            SelectionMode::Line => {
+                let row_len = self.row_at(pos.line)
+                    .map(|r| r.cells.len().saturating_sub(1) as u16)
+                    .unwrap_or(0);
+                let anchor_row_len = self.row_at(anchor.line)
+                    .map(|r| r.cells.len().saturating_sub(1) as u16)
+                    .unwrap_or(0);
+                if let Some(sel) = self.selection.as_mut() {
+                    if pos.line >= anchor.line {
+                        sel.anchor.col = 0;
+                        sel.end = GridPos { line: pos.line, col: row_len };
+                    } else {
+                        sel.anchor.col = anchor_row_len;
+                        sel.end = GridPos { line: pos.line, col: 0 };
+                    }
+                }
+            }
+            SelectionMode::Normal => {
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.end = pos;
+                }
+            }
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Mouse up: a click that did not move clears its empty selection and copies
+    /// nothing; otherwise the selected text to copy, if any.
+    pub fn finish_selection(&mut self) -> Option<String> {
+        // Single click (no drag) — clear selection
+        if let Some(ref sel) = self.selection {
+            if sel.anchor == sel.end && sel.mode == SelectionMode::Normal {
+                self.selection = None;
+                self.dirty.store(true, Ordering::Relaxed);
+                return None;
+            }
+        }
+        let text = self.selected_text();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Auto-scroll speed while a selection is dragged past the pane, in lines per
+    /// tick (negative = up, toward older output). `rel_y` is the pointer's y from
+    /// the pane's top, in pixels. 0 while the pointer is vertically on the grid.
+    pub fn drag_autoscroll_speed(&self, rel_y: f32, cell_h: f32) -> i32 {
+        let y_offset = self.y_offset_rows() as f32 * cell_h;
+        let bottom = y_offset + (self.rows as f32 * cell_h);
+
+        if rel_y < y_offset {
+            // Above viewport — scroll up
+            let dist = y_offset - rel_y;
+            -((dist / cell_h).ceil() as i32).clamp(1, 10)
+        } else if rel_y > bottom {
+            // Below viewport — scroll down
+            let dist = rel_y - bottom;
+            ((dist / cell_h).ceil() as i32).clamp(1, 10)
+        } else {
+            // Mouse is vertically inside viewport but the grid hit-test returned
+            // None (e.g. mouse to the left of the grid) — no scroll
+            0
+        }
+    }
+
     /// Search all lines (scrollback + grid) for a case-insensitive query.
     /// Returns matching lines as (absolute_line_index, line_text).
     pub fn search_lines(&self, query: &str) -> Vec<FilterMatch> {
@@ -3467,4 +3612,618 @@ mod tests {
         eprintln!("SB AFTER  {:?}", sb_after);
     }
 
+    // --- Characterization: selection, words, selected text, URLs ---
+    //
+    // These freeze the behavior as of 13/10/2026, before the embedding refactor
+    // (docs/embedding.md). They describe what Kova does, quirks included: a failing
+    // test after a refactor means behavior moved, not that the test is wrong.
+    mod frozen_selection {
+        use super::*;
+
+        /// One hard line per entry (newline + carriage return between them).
+        fn lines(t: &mut TerminalState, ls: &[&str]) {
+            for (i, l) in ls.iter().enumerate() {
+                if i > 0 {
+                    t.newline();
+                    t.carriage_return();
+                }
+                put_str(t, l);
+            }
+        }
+
+        fn select(t: &mut TerminalState, a: (usize, u16), e: (usize, u16)) {
+            t.selection = Some(Selection {
+                anchor: GridPos { line: a.0, col: a.1 },
+                end: GridPos { line: e.0, col: e.1 },
+                mode: SelectionMode::Normal,
+            });
+        }
+
+        fn wb(t: &TerminalState, line: usize, col: u16) -> (u16, u16) {
+            t.word_bounds_at(GridPos { line, col })
+        }
+
+        // word_bounds_at
+
+        #[test]
+        fn word_is_a_run_of_word_chars_around_the_click() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "foo bar");
+            assert_eq!(wb(&t, 0, 1), (0, 2));
+            assert_eq!(wb(&t, 0, 0), (0, 2));
+            assert_eq!(wb(&t, 0, 6), (4, 6));
+        }
+
+        #[test]
+        fn clicking_a_space_or_delimiter_selects_that_cell_only() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "foo bar:baz");
+            assert_eq!(wb(&t, 0, 3), (3, 3), "space");
+            assert_eq!(wb(&t, 0, 7), (7, 7), "colon is a delimiter");
+            assert_eq!(wb(&t, 0, 15), (15, 15), "blank padding past the text");
+        }
+
+        #[test]
+        fn path_punctuation_belongs_to_the_word() {
+            // '_', '-', '.', '/', '~' are word chars; ':' is not.
+            let mut t = term(40, 3);
+            put_str(&mut t, "see ~/src/my_main-v2.rs:12 ok");
+            assert_eq!(wb(&t, 0, 8), (4, 22), "~/src/my_main-v2.rs");
+            assert_eq!(wb(&t, 0, 24), (24, 25), "12 after the colon");
+        }
+
+        #[test]
+        fn unicode_letters_are_word_chars() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "café x");
+            assert_eq!(wb(&t, 0, 1), (0, 3));
+        }
+
+        #[test]
+        fn wide_char_word_stops_at_its_continuation_cell() {
+            // Quirk frozen as-is: the '\0' continuation of a wide char is not a word
+            // char, so a double-click on CJK text selects a single glyph.
+            let mut t = term(20, 3);
+            put_str(&mut t, "前前 a");
+            assert_eq!(wb(&t, 0, 0), (0, 0));
+            assert_eq!(wb(&t, 0, 2), (2, 2));
+        }
+
+        #[test]
+        fn word_does_not_cross_a_soft_wrap() {
+            let mut t = term(5, 3);
+            put_str(&mut t, "abcdefgh");
+            assert_eq!(wb(&t, 0, 2), (0, 4));
+            assert_eq!(wb(&t, 1, 1), (0, 2));
+        }
+
+        #[test]
+        fn out_of_range_position_returns_the_click_itself() {
+            let mut t = term(10, 3);
+            put_str(&mut t, "abc");
+            assert_eq!(wb(&t, 0, 50), (50, 50), "column past the row");
+            assert_eq!(wb(&t, 99, 1), (1, 1), "line past the buffer");
+        }
+
+        // is_selected
+
+        #[test]
+        fn nothing_is_selected_without_a_selection() {
+            let t = term(10, 3);
+            assert!(!t.is_selected(0, 0));
+        }
+
+        #[test]
+        fn single_line_selection_is_inclusive_on_both_ends() {
+            let mut t = term(10, 3);
+            select(&mut t, (0, 2), (0, 4));
+            let got: Vec<bool> = (0..6).map(|c| t.is_selected(0, c)).collect();
+            assert_eq!(got, [false, false, true, true, true, false]);
+            assert!(!t.is_selected(1, 3));
+        }
+
+        #[test]
+        fn reversed_selection_covers_the_same_cells() {
+            let mut t = term(10, 3);
+            select(&mut t, (0, 4), (0, 2));
+            let got: Vec<bool> = (0..6).map(|c| t.is_selected(0, c)).collect();
+            assert_eq!(got, [false, false, true, true, true, false]);
+        }
+
+        #[test]
+        fn multi_line_selection_runs_to_line_ends_in_between() {
+            let mut t = term(10, 4);
+            select(&mut t, (0, 3), (2, 1));
+            assert!(!t.is_selected(0, 2));
+            assert!(t.is_selected(0, 3));
+            assert!(t.is_selected(0, 9));
+            assert!(t.is_selected(1, 0));
+            assert!(t.is_selected(1, 9));
+            assert!(t.is_selected(2, 0));
+            assert!(t.is_selected(2, 1));
+            assert!(!t.is_selected(2, 2));
+            assert!(!t.is_selected(3, 0));
+            // Reversed (dragging upward) is the same range.
+            select(&mut t, (2, 1), (0, 3));
+            assert!(!t.is_selected(0, 2));
+            assert!(t.is_selected(1, 5));
+            assert!(!t.is_selected(2, 2));
+        }
+
+        #[test]
+        fn clear_selection_drops_it() {
+            let mut t = term(10, 3);
+            select(&mut t, (0, 0), (0, 3));
+            t.clear_selection();
+            assert!(t.selection.is_none());
+            assert_eq!(t.selected_text(), "");
+        }
+
+        // selected_text
+
+        #[test]
+        fn selected_text_is_empty_without_a_selection() {
+            let mut t = term(10, 3);
+            put_str(&mut t, "hello");
+            assert_eq!(t.selected_text(), "");
+        }
+
+        #[test]
+        fn selected_text_of_part_of_a_line() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "hello world");
+            select(&mut t, (0, 6), (0, 10));
+            assert_eq!(t.selected_text(), "world");
+            select(&mut t, (0, 10), (0, 6));
+            assert_eq!(t.selected_text(), "world", "anchor after end");
+        }
+
+        #[test]
+        fn selected_text_trims_trailing_blanks_and_joins_hard_lines_with_newline() {
+            let mut t = term(10, 4);
+            lines(&mut t, &["ab  ", "cd"]);
+            select(&mut t, (0, 0), (1, 9));
+            assert_eq!(t.selected_text(), "ab\ncd");
+        }
+
+        #[test]
+        fn selected_text_keeps_a_blank_line_between_paragraphs() {
+            let mut t = term(10, 4);
+            lines(&mut t, &["a", "", "b"]);
+            select(&mut t, (0, 0), (2, 9));
+            assert_eq!(t.selected_text(), "a\n\nb");
+        }
+
+        #[test]
+        fn selected_text_does_not_break_a_soft_wrapped_line() {
+            let mut t = term(5, 3);
+            put_str(&mut t, "abcdefgh");
+            select(&mut t, (0, 0), (1, 4));
+            assert_eq!(t.selected_text(), "abcdefgh");
+        }
+
+        #[test]
+        fn selected_text_skips_wide_char_continuations() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "前 hello");
+            select(&mut t, (0, 0), (0, 7));
+            assert_eq!(t.selected_text(), "前 hello");
+        }
+
+        #[test]
+        fn selected_text_emits_whole_clusters() {
+            let mut t = term(10, 3);
+            put_str(&mut t, "e\u{301}x");
+            select(&mut t, (0, 0), (0, 1));
+            assert_eq!(t.selected_text(), "e\u{301}x");
+        }
+
+        #[test]
+        fn selected_text_clamps_an_end_past_the_row() {
+            let mut t = term(10, 3);
+            put_str(&mut t, "abc");
+            select(&mut t, (0, 1), (0, 500));
+            assert_eq!(t.selected_text(), "bc");
+        }
+
+        #[test]
+        fn selected_text_spans_scrollback_and_grid() {
+            let mut t = term(10, 2);
+            lines(&mut t, &["one", "two", "three", "four"]);
+            assert_eq!(t.scrollback_len(), 2);
+            select(&mut t, (1, 0), (2, 9));
+            assert_eq!(t.selected_text(), "two\nthree");
+        }
+
+        #[test]
+        fn selected_text_drops_paste_block_tag_lines() {
+            // Tag lines are skipped without a newline of their own; the line before
+            // a dropped closing tag keeps its newline (frozen as-is).
+            let mut t = term(20, 5);
+            lines(&mut t, &["hello", "```slack", "body", "```/slack"]);
+            select(&mut t, (0, 0), (3, 19));
+            assert_eq!(t.selected_text(), "hello\nbody\n");
+        }
+
+        #[test]
+        fn a_bare_fence_is_kept_in_the_selection() {
+            let mut t = term(20, 5);
+            lines(&mut t, &["```", "code", "```"]);
+            select(&mut t, (0, 0), (2, 19));
+            assert_eq!(t.selected_text(), "```\ncode\n```");
+        }
+
+        #[test]
+        fn selection_is_dropped_when_the_screen_is_cleared() {
+            let mut t = term(10, 3);
+            put_str(&mut t, "abc");
+            select(&mut t, (0, 0), (0, 2));
+            t.clear_scrollback_and_screen();
+            assert!(t.selection.is_none());
+        }
+
+        // selected_text_joined (Cmd+Shift+C)
+
+        #[test]
+        fn joined_text_merges_consecutive_lines_with_a_space() {
+            let mut t = term(10, 4);
+            lines(&mut t, &["hello", "world"]);
+            select(&mut t, (0, 0), (1, 9));
+            assert_eq!(t.selected_text_joined(), "hello world");
+        }
+
+        #[test]
+        fn joined_text_keeps_paragraphs_and_collapses_blank_runs() {
+            let mut t = term(10, 6);
+            lines(&mut t, &["a", "b", "", "", "c"]);
+            select(&mut t, (0, 0), (4, 9));
+            assert_eq!(t.selected_text_joined(), "a b\n\nc");
+        }
+
+        #[test]
+        fn joined_text_collapses_every_run_of_spaces_indent_included() {
+            // Quirk frozen as-is: the space collapse also eats the first line's indent.
+            let mut t = term(20, 4);
+            lines(&mut t, &["  one   two", "    three"]);
+            select(&mut t, (0, 0), (1, 19));
+            assert_eq!(t.selected_text_joined(), " one two three");
+        }
+
+        #[test]
+        fn joined_text_is_empty_without_a_selection() {
+            let t = term(10, 3);
+            assert_eq!(t.selected_text_joined(), "");
+        }
+
+        // url_at
+
+        #[test]
+        fn url_under_the_click_with_its_segment() {
+            let mut t = term(40, 3);
+            put_str(&mut t, "go https://a.com/x now");
+            let (segs, url) = t.url_at(0, 5).expect("url");
+            assert_eq!(url, "https://a.com/x");
+            assert_eq!(segs, vec![(0, 3, 18)], "end column is exclusive");
+            assert!(t.url_at(0, 1).is_none(), "click before the url");
+            assert!(t.url_at(0, 19).is_none(), "click after the url");
+        }
+
+        #[test]
+        fn plain_http_is_detected_other_schemes_are_not() {
+            let mut t = term(40, 3);
+            lines(&mut t, &["http://b.org", "ftp://c.org", "file:///tmp/x"]);
+            assert_eq!(t.url_at(0, 0).map(|u| u.1).as_deref(), Some("http://b.org"));
+            assert!(t.url_at(1, 2).is_none());
+            assert!(t.url_at(2, 2).is_none());
+        }
+
+        #[test]
+        fn trailing_punctuation_is_not_part_of_the_url() {
+            let mut t = term(60, 3);
+            put_str(&mut t, "(see https://a.com/x).");
+            assert_eq!(t.url_at(0, 6).unwrap().1, "https://a.com/x");
+            t.carriage_return();
+            t.newline();
+            put_str(&mut t, "https://a.com/p?q=1;,:]");
+            assert_eq!(t.url_at(1, 0).unwrap().1, "https://a.com/p?q=1");
+        }
+
+        #[test]
+        fn quotes_angles_and_backticks_end_the_url() {
+            let mut t = term(60, 4);
+            lines(&mut t, &["<https://a.com>", "\"https://b.com\"", "`https://c.com`"]);
+            assert_eq!(t.url_at(0, 3).unwrap().1, "https://a.com");
+            assert_eq!(t.url_at(1, 3).unwrap().1, "https://b.com");
+            assert_eq!(t.url_at(2, 3).unwrap().1, "https://c.com");
+        }
+
+        #[test]
+        fn the_url_under_the_click_wins_among_several() {
+            let mut t = term(60, 3);
+            put_str(&mut t, "https://one.io and https://two.io");
+            assert_eq!(t.url_at(0, 2).unwrap().1, "https://one.io");
+            assert_eq!(t.url_at(0, 25).unwrap().1, "https://two.io");
+            assert!(t.url_at(0, 16).is_none(), "the word between");
+        }
+
+        #[test]
+        fn a_url_soft_wrapped_over_two_rows_is_one_url() {
+            let mut t = term(10, 4);
+            put_str(&mut t, "https://example.com/ab");
+            let expected = "https://example.com/ab";
+            let (segs, url) = t.url_at(0, 3).unwrap();
+            assert_eq!(url, expected);
+            assert_eq!(segs, vec![(0, 0, 10), (1, 0, 10), (2, 0, 2)]);
+            let (segs2, url2) = t.url_at(2, 1).expect("clicking the tail finds it too");
+            assert_eq!(url2, expected);
+            assert_eq!(segs2, segs);
+        }
+
+        #[test]
+        fn a_hard_line_break_ends_the_url() {
+            let mut t = term(40, 3);
+            lines(&mut t, &["https://a.com/", "rest"]);
+            assert_eq!(t.url_at(0, 0).unwrap().1, "https://a.com/");
+            assert!(t.url_at(1, 1).is_none());
+        }
+
+        #[test]
+        fn osc8_hyperlink_wins_and_covers_its_cells() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "see ");
+            t.set_hyperlink(Some("https://target.example/doc".into()));
+            put_str(&mut t, "click");
+            t.set_hyperlink(None);
+            put_str(&mut t, " end");
+            let (segs, url) = t.url_at(0, 5).unwrap();
+            assert_eq!(url, "https://target.example/doc");
+            assert_eq!(segs, vec![(0, 4, 9)]);
+            assert!(t.url_at(0, 1).is_none());
+        }
+
+        #[test]
+        fn osc8_hyperlink_segments_on_every_visible_row() {
+            let mut t = term(20, 3);
+            t.set_hyperlink(Some("https://x.example".into()));
+            put_str(&mut t, "one");
+            t.set_hyperlink(None);
+            t.newline();
+            t.carriage_return();
+            put_str(&mut t, "and ");
+            t.set_hyperlink(Some("https://x.example".into()));
+            put_str(&mut t, "two");
+            t.set_hyperlink(None);
+            let (segs, url) = t.url_at(1, 5).unwrap();
+            assert_eq!(url, "https://x.example");
+            assert_eq!(segs, vec![(0, 0, 3), (1, 4, 7)]);
+        }
+
+        #[test]
+        fn url_at_out_of_range_is_none() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "https://a.com");
+            assert!(t.url_at(0, 25).is_none(), "column past the row");
+            assert!(t.url_at(7, 0).is_none(), "row past the screen");
+        }
+
+        // Pixel → cell (cell 10×20 px)
+
+        #[test]
+        fn grid_pos_at_maps_pixels_to_cells() {
+            let mut t = term(10, 4);
+            lines(&mut t, &["a", "b", "c", "d"]); // full screen: no gravity offset
+            assert_eq!(t.y_offset_rows(), 0);
+            let at = |x, y| t.grid_pos_at(x, y, 10.0, 20.0);
+            assert_eq!(at(0.0, 0.0), Some(GridPos { line: 0, col: 0 }));
+            assert_eq!(at(9.9, 19.9), Some(GridPos { line: 0, col: 0 }));
+            assert_eq!(at(10.0, 20.0), Some(GridPos { line: 1, col: 1 }));
+            assert_eq!(at(95.0, 79.0), Some(GridPos { line: 3, col: 9 }));
+            assert_eq!(at(500.0, 10.0), Some(GridPos { line: 0, col: 9 }), "right edge clamps");
+            assert_eq!(at(-0.1, 10.0), None, "left of the grid");
+            assert_eq!(at(5.0, -0.1), None, "above the grid");
+            assert_eq!(at(5.0, 80.0), None, "below the last row");
+        }
+
+        #[test]
+        fn grid_pos_at_follows_scrollback_and_scroll_offset() {
+            let mut t = term(10, 2);
+            lines(&mut t, &["one", "two", "three", "four"]);
+            assert_eq!(t.scrollback_len(), 2);
+            assert_eq!(t.grid_pos_at(0.0, 0.0, 10.0, 20.0), Some(GridPos { line: 2, col: 0 }));
+            t.scroll(1);
+            assert_eq!(t.grid_pos_at(0.0, 0.0, 10.0, 20.0), Some(GridPos { line: 1, col: 0 }));
+            t.scroll(5);
+            assert_eq!(t.grid_pos_at(0.0, 25.0, 10.0, 20.0), Some(GridPos { line: 1, col: 0 }));
+        }
+
+        #[test]
+        fn grid_pos_at_accounts_for_bottom_gravity() {
+            // Short shell output sits at the bottom: rows above it are padding.
+            let mut t = term(10, 5);
+            put_str(&mut t, "$ ls");
+            assert_eq!(t.y_offset_rows(), 4);
+            assert_eq!(t.grid_pos_at(0.0, 0.0, 10.0, 20.0), None, "padding rows are not cells");
+            assert_eq!(t.grid_pos_at(15.0, 85.0, 10.0, 20.0), Some(GridPos { line: 0, col: 1 }));
+            assert_eq!(t.sgr_cell_at(15.0, 85.0, 10.0, 20.0), Some((2, 1)));
+        }
+
+        #[test]
+        fn sgr_cell_at_is_one_based_and_clamps_both_edges() {
+            let mut t = term(10, 4);
+            lines(&mut t, &["a", "b", "c", "d"]);
+            let at = |x, y| t.sgr_cell_at(x, y, 10.0, 20.0);
+            assert_eq!(at(0.0, 0.0), Some((1, 1)));
+            assert_eq!(at(25.0, 45.0), Some((3, 3)));
+            assert_eq!(at(500.0, 500.0), Some((10, 4)), "bottom-right clamps");
+            assert_eq!(at(-1.0, 0.0), None);
+            assert_eq!(at(0.0, -1.0), None);
+        }
+
+        // Selection by click and drag
+
+        fn pos(line: usize, col: u16) -> GridPos { GridPos { line, col } }
+
+        fn sel_of(t: &TerminalState) -> (GridPos, GridPos, SelectionMode) {
+            let s = t.selection.as_ref().expect("selection");
+            (s.anchor, s.end, s.mode)
+        }
+
+        #[test]
+        fn single_click_starts_an_empty_character_selection() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "hello world");
+            t.dirty.store(false, Ordering::Relaxed);
+            t.start_selection(pos(0, 3), 1);
+            assert_eq!(sel_of(&t), (pos(0, 3), pos(0, 3), SelectionMode::Normal));
+            assert!(t.dirty.load(Ordering::Relaxed));
+        }
+
+        #[test]
+        fn double_click_selects_the_word() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "hello world");
+            t.start_selection(pos(0, 8), 2);
+            assert_eq!(sel_of(&t), (pos(0, 6), pos(0, 10), SelectionMode::Word));
+            assert_eq!(t.selected_text(), "world");
+        }
+
+        #[test]
+        fn triple_click_and_more_select_the_whole_row() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "hello world");
+            t.start_selection(pos(0, 2), 3);
+            assert_eq!(sel_of(&t), (pos(0, 0), pos(0, 19), SelectionMode::Line));
+            assert_eq!(t.selected_text(), "hello world");
+            t.start_selection(pos(0, 2), 5);
+            assert_eq!(sel_of(&t).2, SelectionMode::Line);
+        }
+
+        #[test]
+        fn click_count_zero_is_a_character_selection() {
+            let mut t = term(20, 3);
+            t.start_selection(pos(0, 1), 0);
+            assert_eq!(sel_of(&t).2, SelectionMode::Normal);
+        }
+
+        #[test]
+        fn dragging_a_character_selection_moves_its_end() {
+            let mut t = term(20, 3);
+            lines(&mut t, &["hello world", "second"]);
+            t.start_selection(pos(0, 6), 1);
+            t.extend_selection(pos(1, 2));
+            assert_eq!(sel_of(&t), (pos(0, 6), pos(1, 2), SelectionMode::Normal));
+            assert_eq!(t.selected_text(), "world
+sec");
+            t.extend_selection(pos(0, 2));
+            assert_eq!(t.selected_text(), "llo w", "dragging back before the anchor");
+        }
+
+        #[test]
+        fn dragging_a_word_selection_grows_by_whole_words() {
+            let mut t = term(30, 3);
+            put_str(&mut t, "alpha beta gamma");
+            t.start_selection(pos(0, 7), 2); // "beta" 6..9
+            t.extend_selection(pos(0, 12)); // into "gamma" 11..15
+            assert_eq!(sel_of(&t), (pos(0, 6), pos(0, 15), SelectionMode::Word));
+            assert_eq!(t.selected_text(), "beta gamma");
+            t.extend_selection(pos(0, 1)); // back into "alpha" 0..4
+            assert_eq!(sel_of(&t), (pos(0, 6), pos(0, 0), SelectionMode::Word));
+            // Quirk frozen as-is: the anchor stays at the start of the first word, so
+            // dragging backward drops the rest of it.
+            assert_eq!(t.selected_text(), "alpha b");
+        }
+
+        #[test]
+        fn dragging_a_line_selection_grows_by_whole_rows() {
+            let mut t = term(10, 4);
+            lines(&mut t, &["one", "two", "three"]);
+            t.start_selection(pos(1, 1), 3);
+            t.extend_selection(pos(2, 0));
+            assert_eq!(sel_of(&t), (pos(1, 0), pos(2, 9), SelectionMode::Line));
+            assert_eq!(t.selected_text(), "two
+three");
+            t.extend_selection(pos(0, 5));
+            assert_eq!(sel_of(&t), (pos(1, 9), pos(0, 0), SelectionMode::Line));
+            assert_eq!(t.selected_text(), "one
+two");
+        }
+
+        #[test]
+        fn extend_without_a_selection_does_nothing() {
+            let mut t = term(10, 3);
+            t.extend_selection(pos(0, 3));
+            assert!(t.selection.is_none());
+        }
+
+        #[test]
+        fn mouse_up_after_a_plain_click_clears_and_copies_nothing() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "hello");
+            t.start_selection(pos(0, 2), 1);
+            t.dirty.store(false, Ordering::Relaxed);
+            assert_eq!(t.finish_selection(), None);
+            assert!(t.selection.is_none());
+            assert!(t.dirty.load(Ordering::Relaxed));
+        }
+
+        #[test]
+        fn mouse_up_after_a_drag_returns_the_text_to_copy() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "hello world");
+            t.start_selection(pos(0, 0), 1);
+            t.extend_selection(pos(0, 4));
+            assert_eq!(t.finish_selection().as_deref(), Some("hello"));
+            assert!(t.selection.is_some(), "the selection stays on screen");
+        }
+
+        #[test]
+        fn mouse_up_after_a_double_click_copies_the_word_even_one_cell_long() {
+            let mut t = term(20, 3);
+            put_str(&mut t, "a bc");
+            t.start_selection(pos(0, 0), 2);
+            assert_eq!(t.finish_selection().as_deref(), Some("a"));
+        }
+
+        #[test]
+        fn mouse_up_over_blank_cells_copies_nothing_and_keeps_the_selection() {
+            let mut t = term(20, 3);
+            t.start_selection(pos(0, 2), 1);
+            t.extend_selection(pos(0, 6));
+            assert_eq!(t.finish_selection(), None);
+            assert!(t.selection.is_some());
+            assert_eq!(t.finish_selection(), None);
+        }
+
+        #[test]
+        fn drag_past_the_pane_autoscrolls_faster_with_distance() {
+            let mut t = term(10, 4);
+            lines(&mut t, &["a", "b", "c", "d"]); // rows span 0..80 px
+            assert_eq!(t.drag_autoscroll_speed(40.0, 20.0), 0, "on the grid");
+            assert_eq!(t.drag_autoscroll_speed(80.0, 20.0), 0, "bottom edge itself");
+            assert_eq!(t.drag_autoscroll_speed(-1.0, 20.0), -1);
+            assert_eq!(t.drag_autoscroll_speed(-41.0, 20.0), -3);
+            assert_eq!(t.drag_autoscroll_speed(81.0, 20.0), 1);
+            assert_eq!(t.drag_autoscroll_speed(121.0, 20.0), 3);
+            assert_eq!(t.drag_autoscroll_speed(5000.0, 20.0), 10, "capped at 10 lines per tick");
+            assert_eq!(t.drag_autoscroll_speed(-5000.0, 20.0), -10);
+        }
+
+        #[test]
+        fn drag_above_bottom_gravity_padding_scrolls_up() {
+            let mut t = term(10, 5);
+            put_str(&mut t, "$ ls"); // 4 padding rows: grid starts at 80 px
+            assert_eq!(t.drag_autoscroll_speed(70.0, 20.0), -1);
+            assert_eq!(t.drag_autoscroll_speed(90.0, 20.0), 0);
+        }
+
+        #[test]
+        fn url_at_reads_visible_rows_when_scrolled_back() {
+            let mut t = term(30, 2);
+            lines(&mut t, &["https://old.example", "b", "c", "d"]);
+            assert!(t.scrollback_len() >= 2);
+            assert!(t.url_at(0, 2).is_none(), "live screen shows c/d");
+            t.scroll(t.scrollback_len() as i32);
+            assert_eq!(t.url_at(0, 2).unwrap().1, "https://old.example");
+        }
+    }
 }
