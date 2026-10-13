@@ -12,20 +12,7 @@ fn active_tab_after_removals(active: usize, removed: &[usize], remaining: usize)
     active.saturating_sub(removed_before).min(remaining.saturating_sub(1))
 }
 
-/// Rendering a background window does not mean its selected pane was read.
-/// Keep the completion flag itself sticky for IPC wait-for-completion.
-fn pane_attention(term: &crate::terminal::TerminalState, seen: bool) -> (bool, bool) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if seen {
-        let had_bell = term.bell.swap(false, Relaxed);
-        let had_completion = term.unread_completion();
-        term.ack_completion();
-        if had_bell || had_completion {
-            term.dirty.store(true, Relaxed);
-        }
-    }
-    (term.unread_completion(), term.bell.load(Relaxed))
-}
+use crate::surface::pane_attention;
 
 /// How many panes sit entirely off-screen, left and right of the visible strip.
 ///
@@ -660,18 +647,7 @@ impl KovaView {
             let tabs = ivars.tabs.borrow();
             for tab in tabs.iter() {
                 tab.for_each_pane(&mut |pane| {
-                    let term = pane.terminal.read();
-                    let cwd = term.cwd.clone();
-                    let old_branch = term.git_branch.clone();
-                    drop(term);
-                    if let Some(ref cwd) = cwd {
-                        let new_branch = crate::terminal::parser::resolve_git_branch(cwd);
-                        if new_branch != old_branch {
-                            let mut term = pane.terminal.write();
-                            term.git_branch = new_branch;
-                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
+                    pane.refresh_git_branch();
                 });
             }
         }

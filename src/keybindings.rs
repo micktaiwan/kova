@@ -102,16 +102,32 @@ impl KeyCombo {
         let ctrl = modifiers.contains(NSEventModifierFlags::Control);
         let option = modifiers.contains(NSEventModifierFlags::Option);
         let shift = modifiers.contains(NSEventModifierFlags::Shift);
+        Self::from_parts(cmd, ctrl, option, shift, event.keyCode(), || {
+            event.charactersIgnoringModifiers().map(|s| s.to_string())
+        })
+    }
 
+    /// The combo of a key event given as its parts: the modifiers, the macOS
+    /// virtual keycode, and `charactersIgnoringModifiers` (asked for only
+    /// when the keycode does not decide). What `from_event` reads off an
+    /// `NSEvent`, and what a host that hands over plain values (the C API)
+    /// provides itself.
+    pub fn from_parts(
+        cmd: bool,
+        ctrl: bool,
+        option: bool,
+        shift: bool,
+        keycode: u16,
+        chars_ignoring_modifiers: impl FnOnce() -> Option<String>,
+    ) -> Self {
         // Use keycodes only for special keys (arrows, enter, backspace) where
         // charactersIgnoringModifiers returns private-use Unicode characters.
         // For all other keys, use charactersIgnoringModifiers which respects the
         // active keyboard layout (AZERTY, QWERTZ, etc.).
-        let key = keycode_to_special(event.keyCode())
-            .or_else(|| keycode_to_digit(event.keyCode()))
+        let key = keycode_to_special(keycode)
+            .or_else(|| keycode_to_digit(keycode))
             .unwrap_or_else(|| {
-                let chars = event.charactersIgnoringModifiers();
-                let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
+                let ch_str = chars_ignoring_modifiers().unwrap_or_default();
                 let c = ch_str.chars().next().unwrap_or('\0');
                 Key::Char(c.to_ascii_lowercase())
             });

@@ -40,6 +40,26 @@ pub static GLOBAL_PRINTABLE_CHARS: AtomicU64 = AtomicU64::new(0);
 static PTY_REGISTRY: parking_lot::Mutex<Vec<PtyEntry>> =
     parking_lot::Mutex::new(Vec::new());
 
+/// The reaper threads of dropped PTYs that may still be running, so that
+/// `wait_for_reapers` can wait for them. Finished ones are pruned whenever a
+/// new one is added.
+static REAPERS: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Wait until every PTY dropped so far is reaped: its shell and its
+/// foreground job gone (a job that ignores SIGHUP is killed after
+/// `JOB_GRACE`, so this takes at most about that long). Returns how many
+/// reapers were still running. For a library host quitting (`crate::embed::
+/// shutdown`); Kova.app's quit path is `shutdown_all`.
+pub fn wait_for_reapers() -> usize {
+    let handles = std::mem::take(&mut *REAPERS.lock());
+    let running = handles.iter().filter(|h| !h.is_finished()).count();
+    for h in handles {
+        let _ = h.join();
+    }
+    running
+}
+
 /// Returns the foreground process group ID if it differs from the shell's PID
 /// (i.e. a command like vim, cargo, etc. is running).
 fn foreground_pgid(master_fd: i32, child_pid: u32) -> Option<i32> {
@@ -165,6 +185,27 @@ fn version_from_exe_path(exe_path: &str) -> Option<String> {
     numeric.then(|| base.to_string())
 }
 
+/// What a spawned shell is told beyond Kova's own variables: the socket its
+/// `KOVA_SOCKET` names, and the host's extra variables.
+///
+/// Kova.app always spawns with `SpawnEnv::default()` — its own socket, nothing
+/// extra. A library host (`crate::embed`) names the socket it serves, so the
+/// hooks running in its panes talk to it rather than to Kova.app.
+pub struct SpawnEnv {
+    pub socket: std::path::PathBuf,
+    /// `(name, value)`, set before Kova's own variables (which win).
+    pub vars: Vec<(String, String)>,
+    /// The shell to run; `None` = `$SHELL` (else `/bin/zsh`), what Kova.app
+    /// always runs. Tests name `/bin/sh` so no user setup plays a part.
+    pub shell: Option<String>,
+}
+
+impl Default for SpawnEnv {
+    fn default() -> Self {
+        SpawnEnv { socket: crate::ipc::socket_path(), vars: Vec::new(), shell: None }
+    }
+}
+
 pub struct Pty {
     master_fd: OwnedFd,
     child_pid: u32,
@@ -188,6 +229,7 @@ impl Pty {
         working_dir: Option<&str>,
         pane_id: u32,
         open_timer: Arc<crate::surface::PaneOpenTimer>,
+        env: &SpawnEnv,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_pair = openpty(None, None)?;
 
@@ -203,7 +245,10 @@ impl Pty {
         };
         let _ = termios::tcsetwinsize(master_fd.as_fd(), winsize);
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let shell = env
+            .shell
+            .clone()
+            .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()));
         // Login shell: arg0 = "-" + shell name (e.g. "-zsh")
         let shell_name = std::path::Path::new(&shell)
             .file_name()
@@ -222,8 +267,14 @@ impl Pty {
         // Spawn shell using Command + pre_exec (like Alacritty).
         // pre_exec runs in the child after fork, before exec — the correct
         // place for setsid + TIOCSCTTY to establish the controlling terminal.
+        let mut command = std::process::Command::new(&shell);
+        // The host's variables first, so the ones Kova sets below win: a host
+        // cannot point KOVA_SOCKET / KOVA_PANE_ID somewhere else by accident.
+        for (key, value) in &env.vars {
+            command.env(key, value);
+        }
         let child = unsafe {
-            std::process::Command::new(&shell)
+            command
                 .arg0(&arg0)
                 .stdin(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
                 .stdout(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
@@ -231,7 +282,7 @@ impl Pty {
                 .env("TERM", "xterm-256color")
                 .env("TERM_PROGRAM", "Kova")
                 .env("KOVA_SHELL_INTEGRATION", "1")
-                .env("KOVA_SOCKET", crate::ipc::socket_path())
+                .env("KOVA_SOCKET", &env.socket)
                 .env("KOVA_PANE_ID", pane_id.to_string())
                 .current_dir(&start_dir)
                 .pre_exec(move || {
@@ -754,9 +805,16 @@ impl Drop for Pty {
         let result = std::thread::Builder::new()
             .name(format!("pty-reaper-{}", pid))
             .spawn(reap.clone());
-        if let Err(e) = result {
-            log::warn!("Failed to spawn reaper for pid {}: {}, reaping synchronously", pid, e);
-            reap();
+        match result {
+            Ok(handle) => {
+                let mut reapers = REAPERS.lock();
+                reapers.retain(|h| !h.is_finished());
+                reapers.push(handle);
+            }
+            Err(e) => {
+                log::warn!("Failed to spawn reaper for pid {}: {}, reaping synchronously", pid, e);
+                reap();
+            }
         }
         log::info!("PTY child {} cleanup delegated to reaper thread", pid);
     }

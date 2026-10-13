@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::terminal::pty::{ProcessInfo, Pty};
+use crate::terminal::pty::{ProcessInfo, Pty, SpawnEnv};
 use crate::terminal::TerminalState;
 
 pub type PaneId = u32;
@@ -238,7 +238,9 @@ pub struct Surface {
     /// Command to inject into PTY once shell is ready (for session restore).
     pub pending_command: Cell<Option<String>>,
     /// Press Enter after `pending_command` instead of leaving it for review.
-    /// Only set by `run_pending_command`, for a line Kova built itself.
+    /// Only set by `run_pending_command`: for a line Kova built itself (the
+    /// search palette's resume command), or the `command` a library host
+    /// passed to `kova_pane_new`, which that host answers for.
     run_pending: Cell<bool>,
     /// Open-latency instrumentation (time-to-rectangle / time-to-prompt).
     pub open_timer: Arc<PaneOpenTimer>,
@@ -283,6 +285,17 @@ pub struct RunningState {
 
 impl Surface {
     pub fn spawn(cols: u16, rows: u16, config: &Config, working_dir: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with(cols, rows, config, working_dir, &SpawnEnv::default())
+    }
+
+    /// `spawn`, telling the shell `env` (its `KOVA_SOCKET`, extra variables).
+    pub fn spawn_with(
+        cols: u16,
+        rows: u16,
+        config: &Config,
+        working_dir: Option<&str>,
+        env: &SpawnEnv,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Reference instant for open-latency instrumentation — captured first so
         // it covers the whole spawn (TerminalState alloc + fork/exec + dups).
         let open_timer = Arc::new(PaneOpenTimer::new());
@@ -299,6 +312,7 @@ impl Surface {
             working_dir,
             id,
             open_timer.clone(),
+            env,
         )?;
         Ok(Self::assemble(id, terminal, pty, shell_exited, shell_ready, open_timer))
     }
@@ -620,6 +634,23 @@ impl Surface {
         self.agent_session.borrow().is_some() && !self.is_working()
     }
 
+    /// Re-resolve the git branch of the shell's directory for the status bar,
+    /// and redraw when it changed. The host calls it on its own slow cadence.
+    pub fn refresh_git_branch(&self) {
+        let term = self.terminal.read();
+        let cwd = term.cwd.clone();
+        let old_branch = term.git_branch.clone();
+        drop(term);
+        if let Some(ref cwd) = cwd {
+            let new_branch = crate::terminal::parser::resolve_git_branch(cwd);
+            if new_branch != old_branch {
+                let mut term = self.terminal.write();
+                term.git_branch = new_branch;
+                term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     /// If the shell is ready and there's a pending command, write it to the PTY
     /// — without \r so the user can review before pressing Enter, unless
     /// `run_pending_command` asked for it to run.
@@ -643,6 +674,25 @@ impl Surface {
         }
         self.pending_command.set(cmd);
     }
+}
+
+/// A pane's `(unread completion, bell)` for this frame; when `seen` (it is
+/// under the eye), both are acknowledged first. Shared by Kova.app's frame
+/// loop and the library's pane (`crate::embed`).
+///
+/// Rendering a background window does not mean its selected pane was read.
+/// Keep the completion flag itself sticky for IPC wait-for-completion.
+pub fn pane_attention(term: &TerminalState, seen: bool) -> (bool, bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if seen {
+        let had_bell = term.bell.swap(false, Relaxed);
+        let had_completion = term.unread_completion();
+        term.ack_completion();
+        if had_bell || had_completion {
+            term.dirty.store(true, Relaxed);
+        }
+    }
+    (term.unread_completion(), term.bell.load(Relaxed))
 }
 
 /// A blank terminal state sized `cols`×`rows`, with the configured scrollback

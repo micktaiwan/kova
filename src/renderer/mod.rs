@@ -1,6 +1,7 @@
 mod blink;
 pub mod context;
 pub mod glyph_atlas;
+pub mod layer;
 pub mod pane_renderer;
 pub mod pipeline;
 pub mod vertex;

@@ -318,70 +318,113 @@ impl Drop for SocketCleanup {
 /// in its timer tick to process commands.
 pub fn start(
 ) -> mpsc::Receiver<IpcRequest> {
+    start_at(socket_path())
+}
+
+/// `start`, listening on `path`. Kova.app listens on `socket_path()`. The
+/// bind happens on the listener thread, so a failure is only logged: Kova.app
+/// runs on without a socket.
+pub fn start_at(path: PathBuf) -> mpsc::Receiver<IpcRequest> {
     let (tx, rx) = mpsc::channel::<IpcRequest>();
 
     std::thread::Builder::new()
         .name("ipc-listener".into())
         .spawn(move || {
-            let path = socket_path();
-
-            // Remove stale socket from a previous crash
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
-            }
-
-            // Tighten umask so the socket inode is born owner-only (closes the
-            // TOCTOU window between bind() and the chmod below).
-            #[cfg(unix)]
-            let prev_umask = unsafe { libc::umask(0o077) };
-
-            let listener = match UnixListener::bind(&path) {
+            let listener = match bind(&path) {
                 Ok(l) => l,
                 Err(e) => {
-                    #[cfg(unix)]
-                    unsafe { libc::umask(prev_umask); }
                     log::error!("IPC: failed to bind {}: {}", path.display(), e);
                     return;
                 }
             };
-
-            #[cfg(unix)]
-            unsafe { libc::umask(prev_umask); }
-
-            // Belt and suspenders: enforce 0o600 even if umask didn't take.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                let _ = std::fs::set_permissions(&path, perms);
-            }
-
-            // Guard ensures cleanup even on panic
-            let _cleanup = SocketCleanup { path: path.clone() };
-
-            log::info!("IPC: listening on {}", path.display());
-
-            for stream in listener.incoming() {
-                let stream = match stream {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!("IPC: accept error: {}", e);
-                        continue;
-                    }
-                };
-
-                let tx = tx.clone();
-                std::thread::Builder::new()
-                    .name("ipc-conn".into())
-                    .spawn(move || {
-                        handle_connection(stream, tx);
-                    })
-                    .ok();
-            }
+            serve(listener, path, tx);
         })
         .expect("failed to spawn IPC listener thread");
 
     rx
+}
+
+/// `start_at` for a host linking the library (`crate::embed`): the socket is
+/// bound on the calling thread, so the caller learns whether it is served;
+/// only accepting runs on the listener thread.
+pub fn start_bound(path: PathBuf) -> std::io::Result<mpsc::Receiver<IpcRequest>> {
+    let listener = match bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("IPC: failed to bind {}: {}", path.display(), e);
+            return Err(e);
+        }
+    };
+    let (tx, rx) = mpsc::channel::<IpcRequest>();
+    let thread_path = path.clone();
+    let spawned = std::thread::Builder::new()
+        .name("ipc-listener".into())
+        .spawn(move || serve(listener, thread_path, tx));
+    if let Err(e) = spawned {
+        // The listener died with the closure; nothing serves the file.
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(rx)
+}
+
+/// Bind the socket at `path`, owner-only, replacing a stale file left by a
+/// crash.
+fn bind(path: &std::path::Path) -> std::io::Result<UnixListener> {
+    // Remove stale socket from a previous crash
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Tighten umask so the socket inode is born owner-only (closes the
+    // TOCTOU window between bind() and the chmod below).
+    #[cfg(unix)]
+    let prev_umask = unsafe { libc::umask(0o077) };
+
+    let bound = UnixListener::bind(path);
+
+    #[cfg(unix)]
+    unsafe { libc::umask(prev_umask); }
+
+    let listener = bound?;
+
+    // Belt and suspenders: enforce 0o600 even if umask didn't take.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+
+    Ok(listener)
+}
+
+/// Accept connections forever, one thread per connection, each request sent
+/// to the main thread through `tx`. The socket file is removed when this
+/// returns or panics.
+fn serve(listener: UnixListener, path: PathBuf, tx: mpsc::Sender<IpcRequest>) {
+    // Guard ensures cleanup even on panic
+    let _cleanup = SocketCleanup { path: path.clone() };
+
+    log::info!("IPC: listening on {}", path.display());
+
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("IPC: accept error: {}", e);
+                continue;
+            }
+        };
+
+        let tx = tx.clone();
+        std::thread::Builder::new()
+            .name("ipc-conn".into())
+            .spawn(move || {
+                handle_connection(stream, tx);
+            })
+            .ok();
+    }
 }
 
 /// Handle a single client connection: read one JSON line, dispatch, respond.

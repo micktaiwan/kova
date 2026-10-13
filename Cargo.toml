@@ -3,6 +3,24 @@ name = "kova"
 version = "1.14.0"
 edition = "2024"
 
+# The terminal is a library (src/lib.rs) with two clients: the `kova` binary
+# below (Kova.app) and other hosts that link the static library through the C
+# API (`include/kova.h`). Library and binary share the name `kova`, so log
+# lines and panic messages keep their `kova::…` module paths; the outputs do
+# not collide (libkova.a and libkova.rlib for the library, `kova` for the
+# binary that build.sh copies into the bundle).
+[lib]
+name = "kova"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
+# Doc comments carry terminal transcripts and markdown fences, never Rust
+# examples: they were never compiled while Kova was a binary-only crate.
+doctest = false
+
+[[bin]]
+name = "kova"
+path = "src/main.rs"
+
 [dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSNotification", "NSRunLoop", "NSThread", "NSArray", "NSDictionary", "NSValue", "NSRange", "NSData", "NSAttributedString", "NSBundle", "NSError"] }

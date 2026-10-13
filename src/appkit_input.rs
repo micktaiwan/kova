@@ -125,7 +125,13 @@ impl AppKitInput {
     /// `string` must be the NSString or NSAttributedString AppKit passed.
     pub unsafe fn set_marked_text(&self, string: &objc2::runtime::AnyObject) {
         let text = unsafe { nsstring_from_input(string) };
-        *self.marked_text.borrow_mut() = if text.is_empty() { None } else { Some(text) };
+        self.set_preedit(&text);
+    }
+
+    /// The text being composed, as plain text: empty ends the composition.
+    /// What `setMarkedText:` records, and a host's typed `preedit` call.
+    pub fn set_preedit(&self, text: &str) {
+        *self.marked_text.borrow_mut() = if text.is_empty() { None } else { Some(text.to_string()) };
     }
 
     /// `unmarkText`.
@@ -197,7 +203,14 @@ impl AppKitInput {
             y: py - origin.y,
             click_count,
         };
-        let result = surface.mouse(&ev, cell);
+        self.typed_mouse(&ev, surface, cell)
+    }
+
+    /// A mouse event already in the typed form, for a host that has no
+    /// `NSEvent` to hand over (the C API). Same recording of the drag
+    /// auto-scroll speed as `mouse`.
+    pub fn typed_mouse(&self, ev: &MouseEvent, surface: &Surface, cell: (f32, f32)) -> MouseResult {
+        let result = surface.mouse(ev, cell);
         if let MouseResult::Autoscroll(speed) = result {
             self.autoscroll_speed.set(speed);
         }

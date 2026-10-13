@@ -25,7 +25,9 @@ pub enum IpcSwapPaneResult {
 }
 
 /// The JSON shape of one pane, shared by `list-panes`, the `subscribe` snapshot
-/// and the event payloads — a client parses the same object everywhere.
+/// and the event payloads — a client parses the same object everywhere. The
+/// shape itself is `crate::ipc::host::surface_json`, which a library host
+/// shares.
 ///
 /// Costs a `proc_pidinfo` (the CWD) and a process-table walk (the children), so
 /// callers on a polling path must build it only for panes they actually report.
@@ -35,50 +37,7 @@ pub fn pane_json(
     tab_idx: usize,
     focused: bool,
 ) -> serde_json::Value {
-    let pid = pane.pty.pid();
-    let children = pane.pty.child_processes();
-    let is_idle = children.is_empty();
-    let child_json: Vec<serde_json::Value> = children
-        .into_iter()
-        .map(|(cpid, info)| {
-            serde_json::json!({
-                "pid": cpid,
-                "name": info.name,
-                "version": info.version,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "id": pane.id,
-        "window": win_idx,
-        "tab": tab_idx,
-        "cwd": pane.cwd().unwrap_or_default(),
-        "title": pane.display_title("shell"),
-        "focused": focused,
-        "pid": pid,
-        "child_processes": child_json,
-        "is_idle": is_idle,
-        "working": pane.is_working(),
-        "awaiting": pane.is_awaiting(),
-        "awaiting_since": pane.awaiting_since(),
-        // Whether the waiting pane has been looked at here since it started waiting. A remote
-        // client walking waiting panes needs that halt, or it hands back panes already read on
-        // this Mac. False on a pane that is not waiting at all, where the bit means nothing.
-        "awaiting_seen": pane.is_awaiting() && !pane.is_awaiting_unseen(),
-        "minimized": pane.minimized,
-        // Which agent holds the pane's conversation ("claude", "codex"), absent
-        // at a bare shell. `claude_session_id` stays Claude-only so a client
-        // that resumes with it never gets an id Claude cannot open; the
-        // agent-agnostic id is next to it.
-        "agent": pane.agent_kind().map(|a| a.as_str()),
-        "agent_session_id": pane.agent_session_id(),
-        "agent_session_name": pane.agent_session_name(),
-        "claude_session_id": pane.claude_session_id(),
-        "claude_session_name": pane.claude_session_name(),
-        // The SendMessage / ListAgents address of the pane's Claude session,
-        // derived names included — `claude_session_name` only carries /rename.
-        "peer_name": pane.claude_peer_name(),
-    })
+    crate::ipc::host::surface_json(pane, &pane.display_title("shell"), pane.minimized, win_idx, tab_idx, focused)
 }
 
 /// `list-panes` for one window's tabs: every pane in tab then column then row

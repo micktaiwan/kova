@@ -166,15 +166,37 @@ Souris (texte connu à l'écran, puis `pbpaste` après chaque geste) :
    et liste de gestes rejouée.
 3. La cible bibliothèque : `[lib]` et `staticlib` dans `kova/Cargo.toml` (aucune aujourd'hui),
    plus une API C (créer un pane dans une vue, entrée, taille, lecture du contenu, fermeture).
+   Fait le 13/10/2026 : la bibliothèque s'appelle `kova` comme le binaire (`src/lib.rs`,
+   `libkova.a`, `libkova.rlib`), pour que les lignes de log et les panics gardent leur préfixe
+   `kova::…` ; Cargo n'y voit pas de collision. Le binaire `kova` est bâti dessus et garde son nom
+   et son chemin, donc `build.sh` ne change pas. L'API C est `include/kova.h` (`src/capi.rs`), au-dessus de `src/embed.rs` : un pane est
+   un `Surface` plus, si l'hôte donne une `NSView`, une sous-vue de la bibliothèque (le composant
+   de saisie partagé) qui dessine le pane seul dans son `CAMetalLayer` (`src/renderer/layer.rs`,
+   le même `PaneRenderer` que Kova.app ; un `RenderContext` par échelle, partagé, libéré avec le
+   dernier pane). L'horloge reste à l'hôte (`kova_pane_tick`, `kova_pane_draw`), et
+   `kova_ipc_start` sert le socket sur les panes de l'hôte, un onglet par pane (lié avant de rendre
+   la main : un échec de `bind` revient en -1). En quittant, l'hôte appelle `kova_shutdown`, qui
+   attend que shells et jobs de premier plan soient morts ; `kova_pane_free` seul ne fait que
+   lancer leur récolte sur un thread. Kova.app ne passe
+   par rien de tout ça. Prouvé hors de Kana : tests Rust sur les fonctions C (dont toute la table
+   de touches figée) et `tests/c_smoke/smoke.m`, un programme Objective-C qui lie la bibliothèque,
+   lance deux panes (dont un dans une `NSView` hors fenêtre, dessiné) et interroge le socket.
 4. Kana : la vue du pane, le lien de la bibliothèque dans `build.sh` et `Package.swift`, le
    socket, la table note → session (chemin et inode), les trois hooks (SessionStart,
    UserPromptSubmit, PreToolUse), la commande `kana edit`, la commande qui reçoit un nouvel
    identifiant de session, la surveillance du dossier des notes, et la fusion à trois versions si Mickael la valide.
 
+## Vérifié depuis
+
+- Deux appels à `MTLCreateSystemDefaultDevice` rendent le même objet (même pointeur, même
+  `registryID`), mesuré sur le Mac de Mickael le 13/10/2026 par
+  `cargo test the_system_default_device -- --nocapture` (`src/renderer/layer.rs`), qui a
+  affiché `MTLCreateSystemDefaultDevice: 0x1016b9800 / 0x1016b9800, registryID 4294968545 /
+  4294968545`. Sur une machine sans device Metal, ce test passe sans rien vérifier. La bibliothèque n'en dépend pas : un contexte neuf reprend le device
+  d'un contexte vivant.
+
 ## Non vérifié
 
-- Que deux appels à `MTLCreateSystemDefaultDevice` rendent le même device, pour partager le
-  contexte de rendu entre deux layers.
 - Qu'une vue Rust fournie par la bibliothèque s'insère sans friction dans la fenêtre AppKit de
   Kana (premier répondeur, focus entre l'éditeur et le terminal).
 - Que Kite supporte un serveur qui répond à `list-tabs` par un onglet par note.

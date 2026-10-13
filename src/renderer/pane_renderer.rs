@@ -190,6 +190,12 @@ impl PaneRenderer {
         self.entry.as_ref().is_some_and(|e| e.key != *key)
     }
 
+    /// Whether a build is cached (false before the first one, or after the
+    /// cache was dropped).
+    pub(super) fn is_built(&self) -> bool {
+        self.entry.is_some()
+    }
+
     /// The vertices of the last build, empty before the first one.
     pub(super) fn vertices(&self) -> &[Vertex] {
         self.entry.as_ref().map_or(&[], |e| &e.verts)

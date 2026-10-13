@@ -65,6 +65,17 @@ impl CursorBlink {
     }
 }
 
+impl CursorBlink {
+    /// Whether the cursor would be shown by a `sample` at `now`, without
+    /// recording anything: what a host asks before deciding to draw.
+    pub(super) fn peek(&self, now: Instant, cursor_epoch: Option<u32>, period_frames: u32, fps: u32) -> bool {
+        let restarted = cursor_epoch.is_some_and(|epoch| epoch != self.last_epoch);
+        let origin = if restarted { now } else { self.origin.unwrap_or(now) };
+        let frame = frame_at(now.saturating_duration_since(origin).as_nanos(), fps);
+        blink_phase(frame, 0, period_frames).0
+    }
+}
+
 /// The frame a sample `elapsed_nanos` after frame 1 falls on, at `fps` ticks
 /// per second: 1 + round(elapsed × fps). Integer arithmetic, so the boundary
 /// between two frames does not depend on float rounding.
@@ -181,6 +192,25 @@ mod tests {
         let (on, changed) = b.sample(start + Duration::from_millis(1400), Some(1), 60, 60);
         assert!(on);
         assert!(changed);
+    }
+
+    #[test]
+    fn peek_answers_what_the_next_sample_will_say_without_recording_it() {
+        let start = Instant::now();
+        let mut b = CursorBlink::new();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        // Before any sample, with or without a cursor move.
+        assert!(b.peek(at(0), Some(1), 60, 60));
+        assert!(b.peek(at(0), None, 60, 60));
+        b.sample(at(0), Some(1), 60, 60);
+        let moves = [(100, Some(1)), (470, Some(1)), (480, Some(1)), (700, Some(1)), (980, Some(1)), (1200, Some(2)), (1300, Some(2)), (1800, Some(2)), (1900, None)];
+        for (ms, epoch) in moves {
+            let peeked = b.peek(at(ms), epoch, 60, 60);
+            // Peeking twice changes nothing.
+            assert_eq!(b.peek(at(ms), epoch, 60, 60), peeked, "{ms} ms");
+            assert_eq!(b.sample(at(ms), epoch, 60, 60).0, peeked, "{ms} ms");
+        }
+        assert!(b.peek(at(5000), Some(1), 1, 60), "no blink below two frames");
     }
 
     #[test]
