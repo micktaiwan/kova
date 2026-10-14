@@ -555,8 +555,10 @@ impl Perform for VteHandler {
                     // Current working directory: file://hostname/path
                     if params[1].len() > MAX_OSC_PAYLOAD { return; }
                     let uri = String::from_utf8_lossy(params[1]);
+                    // The path is a URL path: a space arrives as %20 ("Application%20Support"),
+                    // and kept encoded it is a directory that does not exist.
                     let path = if let Some(rest) = uri.strip_prefix("file://") {
-                        rest.find('/').map(|i| rest[i..].to_string())
+                        rest.find('/').map(|i| percent_decode(&rest[i..]))
                     } else {
                         None
                     };
@@ -946,6 +948,26 @@ impl AnsiColor {
             }
         }
     }
+}
+
+/// Decode %XX escapes of a URL path into UTF-8; a malformed escape is kept as is.
+fn percent_decode(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(b) = hex {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -1407,5 +1429,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn osc7_cwd_is_percent_decoded() {
+        let term = drive(20, 5, &[b"\x1b]7;file://mac/Users/me/Library/Application%20Support/X\x07"]);
+        assert_eq!(term.read().cwd.as_deref(), Some("/Users/me/Library/Application Support/X"));
+        // UTF-8 escapes, and a plain path is left alone.
+        let term = drive(20, 5, &[b"\x1b]7;file://mac/tmp/caf%C3%A9\x07"]);
+        assert_eq!(term.read().cwd.as_deref(), Some("/tmp/caf\u{e9}"));
+        let term = drive(20, 5, &[b"\x1b]7;file://mac/tmp/plain\x07"]);
+        assert_eq!(term.read().cwd.as_deref(), Some("/tmp/plain"));
+    }
+
+    #[test]
+    fn percent_decode_keeps_malformed_escapes() {
+        assert_eq!(percent_decode("/a%2"), "/a%2");
+        assert_eq!(percent_decode("/a%zz/b"), "/a%zz/b");
+        assert_eq!(percent_decode("/100%25"), "/100%");
     }
 }
