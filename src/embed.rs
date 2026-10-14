@@ -777,13 +777,18 @@ define_class!(
         }
 
         /// Edit > Paste (Cmd+V in the host's menu): the pasteboard's text, in
-        /// bracketed-paste markers when the app asked for them.
+        /// bracketed-paste markers when the app asked for them. An image is
+        /// written to /tmp and its path pasted, as Kova.app does: that is how
+        /// Claude Code takes an image from a terminal.
         #[unsafe(method(paste:))]
         fn paste(&self, _sender: Option<&AnyObject>) {
             shield("paste:", || {
                 let Some(pane) = self.pane() else { return };
                 let pasteboard = NSPasteboard::generalPasteboard();
-                if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+                if let Some(path) = appkit_input::pasted_image_path(&pasteboard) {
+                    // The path Kova just built holds no paste terminator.
+                    pane.surface.paste(&path);
+                } else if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
                     pane.surface.paste(&text.to_string());
                 }
             });

@@ -324,6 +324,21 @@ unsafe fn nsstring_from_input(obj: &objc2::runtime::AnyObject) -> String {
     }
 }
 
+/// The pasteboard's PNG image written to /tmp, and its path: pasted into a
+/// terminal, the path is how Claude Code takes an image. None without an image.
+pub fn pasted_image_path(pasteboard: &NSPasteboard) -> Option<String> {
+    let data = unsafe { pasteboard.dataForType(objc2_app_kit::NSPasteboardTypePNG) }?;
+    if data.is_empty() {
+        return None;
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = format!("/tmp/kova-paste-{timestamp}.png");
+    std::fs::write(&path, data.to_vec()).ok().map(|_| path)
+}
+
 /// Copy text to the system pasteboard.
 pub fn copy_to_pasteboard(text: &str) {
     let pasteboard = NSPasteboard::generalPasteboard();

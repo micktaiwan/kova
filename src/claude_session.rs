@@ -272,7 +272,7 @@ pub fn session_for_shell(shell_pid: u32) -> Option<Session> {
 /// goes straight to the PTY, so a newline inside it would end the `claude` line and
 /// run the rest on its own, no Enter needed. Claude Code writes a UUID here, so
 /// anything outside `[A-Za-z0-9_-]` is refused rather than escaped.
-fn is_safe_session_id(id: &str) -> bool {
+pub(crate) fn is_safe_session_id(id: &str) -> bool {
     !id.is_empty()
         && id
             .bytes()

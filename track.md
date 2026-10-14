@@ -2,6 +2,16 @@
 
 ## En cours
 
+### Kova en bibliothèque pour Kana : les manques du pane intégré
+
+**Statut** : 🔄 étapes 1 à 3 de `docs/embedding.md` faites et publiées en v2.0.0 (14/10/2026) ; l'étape 4 (Kana) vit dans `kana/track.md`.
+
+**D'où ça part** : Kova sert aussi de terminal à Kana (un pane par note), via `libkova.a` et l'API C de `include/kova.h`. Kova.app n'a pas changé de comportement (tests figés d'abord, audits). Mais le pane fourni par la bibliothèque (`src/embed.rs`, `KovaPaneView`) n'a pas tout ce que Kova.app sait faire, et seul le texte avait été porté pour Cmd+V : le coller d'image manquait (une autre session le porte, 14/10).
+
+**Ce qui manque encore au pane intégré**, d'après le rapport de l'étape 3 : survol et Cmd+clic d'URL, filtre Ctrl+F (la touche est avalée), notifications et `subscribe` (répondent une erreur), les retouches de redimensionnement de Kova.app (relance de dessin de Claude Code, réparation des bandes vides), et la fenêtre des accents probablement mal placée dans une sous-vue. Rien n'a tourné dans une vraie fenêtre de Kana.
+
+**Prochaine action** : porter ces manques un par un dans `src/embed.rs` quand Mickael les rencontre dans Kana, en commençant par le survol et le Cmd+clic d'URL.
+
 ### Revue UX/UI du 10/10/2026 — rien n'a été fait
 
 **Statut** : ⏸️ propositions seulement, **aucune n'a été implémentée**. Vérifié le 13/10/2026 dans le code : le switcher ignore toujours les lettres tapées (`src/window/switcher.rs:927`), les titres d'onglet sont toujours coupés à 25 caractères sans `…` (`src/renderer/mod.rs:2212`), le picker de fusion de fenêtre s'appelle toujours « Send Tab to Window » (`src/window/tick.rs:357`), et le menu de couleur dit toujours « Aucune » (`src/window/tabs.rs:100`).

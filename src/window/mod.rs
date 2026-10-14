@@ -1521,8 +1521,18 @@ impl KovaView {
     fn do_close_window(&self) {
         // Check for running processes and confirm
         let procs = self.running_processes();
+        // The open todos of every conversation the window's panes hold or held.
+        let sessions = {
+            let tabs = self.ivars().tabs.borrow();
+            let mut sessions: Vec<String> = Vec::new();
+            for tab in tabs.iter() {
+                tab.for_each_pane(&mut |pane| push_raf_session(&mut sessions, pane));
+            }
+            sessions
+        };
+        let (todos, conversations) = open_todos_of(&sessions);
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        if !confirm_running_processes(mtm, &procs, "Close this window?", "Close") {
+        if !confirm_close(mtm, &procs, &todos, conversations, "Close this window?", "Close") {
             return;
         }
         // Save all tabs to recent projects before closing (single I/O cycle)
@@ -1725,19 +1735,7 @@ impl KovaView {
                     }
                 } else if let Some(pane) = self.focused_pane() {
                     let pasteboard = NSPasteboard::generalPasteboard();
-                    let pasted_image = unsafe { pasteboard.dataForType(objc2_app_kit::NSPasteboardTypePNG) }
-                        .and_then(|data| {
-                            if data.is_empty() { return None; }
-                            let bytes = data.to_vec();
-                            let timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis();
-                            let path = format!("/tmp/kova-paste-{timestamp}.png");
-                            std::fs::write(&path, bytes).ok().map(|_| path)
-                        });
-
-                    if let Some(path) = pasted_image {
+                    if let Some(path) = appkit_input::pasted_image_path(&pasteboard) {
                         // The path Kova just built holds no paste terminator.
                         pane.paste(&path);
                     } else if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
@@ -2039,14 +2037,77 @@ static WINDOW_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 /// Show a confirmation alert listing running processes.
 /// Returns `true` if the user confirmed (or no processes are running).
 pub fn confirm_running_processes(mtm: MainThreadMarker, procs: &[(String, String)], message: &str, confirm_button: &str) -> bool {
-    if procs.is_empty() {
+    confirm_close(mtm, procs, &[], 0, message, confirm_button)
+}
+
+/// `confirm_running_processes`, plus what the closing conversations still have
+/// to do: `todos` are their open todo texts (`crate::raf`), `conversations` how
+/// many conversations those come from. The dialog appears when a process runs
+/// or when there are open todos — the latter covers a pane whose `claude` has
+/// exited but whose conversation still has work left. With neither, nothing is
+/// asked, as before.
+pub fn confirm_close(
+    mtm: MainThreadMarker,
+    procs: &[(String, String)],
+    todos: &[String],
+    conversations: usize,
+    message: &str,
+    confirm_button: &str,
+) -> bool {
+    if procs.is_empty() && todos.is_empty() {
         return true;
     }
-    let mut lines = String::from("The following processes are running:");
-    for (tab, name) in procs {
-        lines.push_str(&format!("\n\u{2022} Tab \u{ab}{}\u{bb}: {}", tab, name));
+    confirm_action(mtm, message, &close_dialog_text(procs, todos, conversations), confirm_button)
+}
+
+/// Informative text of the close / quit confirmation: the running processes,
+/// then, when there are open todos, a blank line and their list. Without a
+/// running process, the todo list alone.
+fn close_dialog_text(procs: &[(String, String)], todos: &[String], conversations: usize) -> String {
+    let mut lines = String::new();
+    if !procs.is_empty() {
+        lines.push_str("The following processes are running:");
+        for (tab, name) in procs {
+            lines.push_str(&format!("\n\u{2022} Tab \u{ab}{}\u{bb}: {}", tab, name));
+        }
     }
-    confirm_action(mtm, message, &lines, confirm_button)
+    let warning = crate::raf::close_warning(todos, conversations);
+    if !warning.is_empty() {
+        if !lines.is_empty() {
+            lines.push_str("\n\n");
+        }
+        lines.push_str(&warning);
+    }
+    lines
+}
+
+/// Add the Claude conversation `pane` holds or held — live, left behind by an
+/// exited `claude`, or waiting in a restored resume line — to `sessions`,
+/// once. That is the conversation whose open todos a close warns about.
+pub(super) fn push_raf_session(sessions: &mut Vec<String>, pane: &Pane) {
+    let id = pane.last_claude_session_id().or_else(|| {
+        let last = pane.last_command();
+        switcher::pending_session_id(last.as_deref()).map(str::to_string)
+    });
+    if let Some(id) = id {
+        if !sessions.contains(&id) {
+            sessions.push(id);
+        }
+    }
+}
+
+/// Open todos of every distinct Claude conversation in `sessions`, flattened,
+/// and how many conversations they came from. Reads `~/.claude/raf/` — only
+/// call it when a close is under way, never per frame.
+pub(super) fn open_todos_of(sessions: &[String]) -> (Vec<String>, usize) {
+    let lists: Vec<Vec<String>> = sessions
+        .iter()
+        .filter_map(|id| crate::raf::load(id))
+        .map(|r| r.todos)
+        .filter(|t| !t.is_empty())
+        .collect();
+    let n = lists.len();
+    (lists.into_iter().flatten().collect(), n)
 }
 
 /// Ask a yes/no question in a warning alert. Returns `true` if the user picked
@@ -2186,6 +2247,36 @@ const MAX_BAND_REPAIRS: u32 = 2;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_dialog_text_lists_the_running_processes_as_before() {
+        // Frozen: the text the dialog showed before todos were added to it.
+        let procs = vec![("kova".to_string(), "claude".to_string()), ("logs".to_string(), "tail".to_string())];
+        assert_eq!(
+            close_dialog_text(&procs, &[], 0),
+            "The following processes are running:\n\u{2022} Tab \u{ab}kova\u{bb}: claude\n\u{2022} Tab \u{ab}logs\u{bb}: tail"
+        );
+    }
+
+    #[test]
+    fn close_dialog_text_without_a_process_is_the_todo_list_alone() {
+        let todos = vec!["ship it".to_string()];
+        assert_eq!(
+            close_dialog_text(&[], &todos, 1),
+            "1 thing left to do in this conversation:\n\u{2022} ship it"
+        );
+    }
+
+    #[test]
+    fn close_dialog_text_adds_the_open_todos_after_a_blank_line() {
+        let procs = vec![("kova".to_string(), "claude".to_string())];
+        let todos = vec!["ship it".to_string()];
+        assert_eq!(
+            close_dialog_text(&procs, &todos, 1),
+            "The following processes are running:\n\u{2022} Tab \u{ab}kova\u{bb}: claude\n\n\
+             1 thing left to do in this conversation:\n\u{2022} ship it"
+        );
+    }
 
 
 

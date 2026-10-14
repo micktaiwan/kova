@@ -256,6 +256,12 @@ pub struct Surface {
     /// lookup scans a directory or the process table. `None` = no agent in this
     /// pane; a conversation nobody named is `Some` with a `name` of `None`.
     pub agent_session: RefCell<Option<crate::agent_session::AgentSession>>,
+    /// Id of the last Claude conversation `agent_session` saw in this pane.
+    /// Unlike `agent_session`, it survives `claude` exiting (`/exit`) and the
+    /// shell dying, so closing the pane can still warn about that
+    /// conversation's open todos (`crate::raf`). Replaced only by the next
+    /// Claude conversation seen here; a Codex one leaves it alone.
+    pub last_claude_session: RefCell<Option<String>>,
     /// Name of the binary running in the foreground (`claude`, `nvim`, `ssh`…),
     /// `None` at a bare shell prompt. Cached because the status bar reads it on
     /// every frame while resolving it costs two syscalls: it is refreshed on the
@@ -374,6 +380,7 @@ impl Surface {
             open_timer,
             awaiting: Cell::new(AwaitingFlag::default()),
             agent_session: RefCell::new(None),
+            last_claude_session: RefCell::new(None),
             fg_process: RefCell::new(None),
             cached_cwd: RefCell::new(None),
         }
@@ -468,7 +475,22 @@ impl Surface {
     /// a cached scan of `~/.claude/sessions/`, then of the process table for
     /// Codex.
     pub fn refresh_agent_session(&self) {
-        *self.agent_session.borrow_mut() = crate::agent_session::for_shell(self.pty.pid());
+        self.set_agent_session(crate::agent_session::for_shell(self.pty.pid()));
+    }
+
+    /// Store what the probe found, remembering a Claude conversation's id in
+    /// `last_claude_session` so it outlives the session itself.
+    pub(crate) fn set_agent_session(&self, found: Option<crate::agent_session::AgentSession>) {
+        if let Some(s) = found.as_ref().filter(|s| s.agent == crate::agent_session::Agent::Claude) {
+            self.last_claude_session.replace(Some(s.id.clone()));
+        }
+        *self.agent_session.borrow_mut() = found;
+    }
+
+    /// The Claude conversation this pane holds, or held last: the live one,
+    /// else the one `claude` left behind when it exited.
+    pub fn last_claude_session_id(&self) -> Option<String> {
+        self.claude_session_id().or_else(|| self.last_claude_session.borrow().clone())
     }
 
     /// Check whether something runs in this surface. Two sources:

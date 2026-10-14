@@ -2207,6 +2207,33 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_remembers_its_last_claude_session_after_claude_exits() {
+        use crate::agent_session::{Agent, AgentSession};
+        let (pane, _fd) = super::Pane::capture(10, 2);
+        assert_eq!(pane.last_claude_session_id(), None);
+        pane.set_agent_session(Some(claude_session()));
+        assert_eq!(pane.last_claude_session_id().as_deref(), Some("claude-id"));
+        // `/exit`: the probe finds nothing, the id stays.
+        pane.set_agent_session(None);
+        assert_eq!(pane.claude_session_id(), None);
+        assert_eq!(pane.last_claude_session_id().as_deref(), Some("claude-id"));
+        // A Codex conversation is not a Claude one: the Claude id stays.
+        pane.set_agent_session(Some(AgentSession {
+            agent: Agent::Codex, id: "codex-id".into(), name: None, peer_name: None,
+        }));
+        assert_eq!(pane.last_claude_session_id().as_deref(), Some("claude-id"));
+        // The next Claude conversation replaces it.
+        pane.set_agent_session(Some(AgentSession {
+            agent: Agent::Claude, id: "next-id".into(), name: None, peer_name: None,
+        }));
+        assert_eq!(pane.last_claude_session_id().as_deref(), Some("next-id"));
+        // A dead shell keeps it too.
+        pane.shell_exited.store(true, std::sync::atomic::Ordering::Relaxed);
+        pane.check_running(false);
+        assert_eq!(pane.last_claude_session_id().as_deref(), Some("next-id"));
+    }
+
+    #[test]
     fn a_pane_whose_shell_exited_forgets_its_program_and_rearms_cmd_j() {
         let (pane, _fd) = super::Pane::capture(10, 2);
         pane.agent_session.replace(Some(claude_session()));

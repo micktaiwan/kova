@@ -361,15 +361,15 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false },
-                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, bookmarked, anchored, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref(), bookmarked: *bookmarked, anchored: *anchored },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None },
+                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref(), bookmarked: *bookmarked, anchored: *anchored, raf_todo: raf_todo.as_deref(), raf_idea: raf_idea.as_deref() },
                 // A bookmark row borrows the pane row's shape: its title on the
                 // left, the project and agent dim on the right.
-                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false, anchored: false },
+                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false, anchored: false, raf_todo: None, raf_idea: None },
                 // An anchor row is the same shape, painted like a saved
                 // conversation: it is one, and its section header is what says
                 // it is today's.
-                SwitcherRow::Anchor { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: true, anchored: true },
+                SwitcherRow::Anchor { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: true, anchored: true, raf_todo: None, raf_idea: None },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()

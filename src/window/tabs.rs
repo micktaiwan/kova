@@ -355,20 +355,29 @@ impl KovaView {
         // Collect info for confirmation dialog BEFORE holding the borrow,
         // because NSAlert runs a modal run loop that can dispatch events
         // which access tabs → would panic on double borrow.
-        let proc = {
+        let (procs, sessions) = {
             let tabs = self.ivars().tabs.borrow();
             let idx = self.ivars().active_tab.get();
             if idx >= tabs.len() {
                 return;
             }
-            tabs[idx].pane(tabs[idx].focused_pane)
+            let pane = tabs[idx].pane(tabs[idx].focused_pane);
+            let procs: Vec<(String, String)> = pane
                 .and_then(|p| p.foreground_process_name().map(|name| (tabs[idx].title(), name)))
-        };
-        if let Some(proc) = proc {
-            let mtm = unsafe { MainThreadMarker::new_unchecked() };
-            if !confirm_running_processes(mtm, &[proc], "Close this pane?", "Close") {
-                return;
+                .into_iter()
+                .collect();
+            let mut sessions = Vec::new();
+            if let Some(p) = pane {
+                push_raf_session(&mut sessions, p);
             }
+            (procs, sessions)
+        };
+        // A pane whose `claude` has exited still warns when its conversation
+        // has open todos; without either, it closes without a dialog as before.
+        let (todos, conversations) = open_todos_of(&sessions);
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        if !confirm_close(mtm, &procs, &todos, conversations, "Close this pane?", "Close") {
+            return;
         }
 
         let mut tabs = self.ivars().tabs.borrow_mut();
@@ -452,23 +461,27 @@ impl KovaView {
         // Capture the target tab index once — the confirmation modal pumps events,
         // so `active_tab` could drift before we call remove_tab.
         let target_idx = self.ivars().active_tab.get();
-        let procs = {
+        let (procs, sessions) = {
             let tabs = self.ivars().tabs.borrow();
             if target_idx >= tabs.len() {
                 return;
             }
             let title = tabs[target_idx].title();
             let mut result = Vec::new();
+            let mut sessions: Vec<String> = Vec::new();
             tabs[target_idx].for_each_pane(&mut |pane| {
                 if let Some(name) = pane.foreground_process_name() {
                     result.push((title.clone(), name));
                 }
+                push_raf_session(&mut sessions, pane);
             });
-            result
+            (result, sessions)
         };
 
+        // Open todos of every conversation the tab's panes hold or held.
+        let (todos, conversations) = open_todos_of(&sessions);
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        if !confirm_running_processes(mtm, &procs, "Close this tab?", "Close") {
+        if !confirm_close(mtm, &procs, &todos, conversations, "Close this tab?", "Close") {
             return;
         }
 

@@ -122,6 +122,11 @@ const ANCHOR_FG: [f32; 4] = [1.0, 0.8, 0.25, 1.0];
 /// Color of the "Claude Code is working" marker (status-bar ✳ counter and
 /// switcher ✳ icon). Green: something is happening, nothing is owed.
 const WORKING_FG: [f32; 4] = [0.6, 0.85, 0.6, 1.0];
+/// Open todos at the end of a pane switcher row: warm, so a conversation with
+/// work left in it is spotted without reading the dim tail of every row.
+const RAF_TODO_FG: [f32; 4] = [0.95, 0.6, 0.3, 1.0];
+/// Between the todo and idea counts of a switcher row.
+const RAF_SEPARATOR: &str = " \u{b7} ";
 
 /// Color of the status-bar unread counter. Same amber as the per-pane bell dot:
 /// the counter and the dots it sums must read as one signal.
@@ -248,6 +253,12 @@ pub struct PaneSwitcherRowRender<'a> {
     /// anchor colour, and the anchors section leaves it out: one row per
     /// conversation, where the conversation actually is.
     pub anchored: bool,
+    /// Open todos of the pane's Claude conversation (`"3 todo"`), drawn in
+    /// colour at the very end of the row, after the binary.
+    pub raf_todo: Option<&'a str>,
+    /// Open ideas of the same conversation (`"1 idea"`), drawn dim after the
+    /// todos (` · ` between them), or alone when there are no todos.
+    pub raf_idea: Option<&'a str>,
 }
 
 /// One column of the pane-switcher overlay: a vertical run of rows holding
@@ -413,6 +424,19 @@ struct SwitcherRowSplit {
     /// Where the binary starts, or `None` when the column is too narrow to
     /// carry both — a half-written program name is worse than none.
     process_x: Option<f32>,
+}
+
+/// Width, in cells, of what a pane switcher row parks flush right: the binary,
+/// then two cells, then the todo count, ` · `, the idea count. Each part is
+/// optional and the gaps only appear between parts that exist.
+fn switcher_row_tail_chars(process: Option<&str>, raf_todo: Option<&str>, raf_idea: Option<&str>) -> usize {
+    let n = |s: Option<&str>| s.map_or(0, |s| s.chars().count());
+    let raf = match (raf_todo, raf_idea) {
+        (Some(_), Some(_)) => n(raf_todo) + RAF_SEPARATOR.chars().count() + n(raf_idea),
+        _ => n(raf_todo) + n(raf_idea),
+    };
+    let gap = if process.is_some() && raf > 0 { 2 } else { 0 };
+    n(process) + gap + raf
 }
 
 /// Lay out one pane switcher row. Pure geometry, so it can be checked without
@@ -2199,15 +2223,32 @@ impl Renderer {
                     // dim: it says what the pane *is* without competing with the
                     // title, which is what the eye scans. The title is clipped
                     // before it rather than drawn under it.
+                    // The conversation's open todos and ideas follow it, same
+                    // tail: todos in colour, ideas dim.
                     let split = switcher_row_split(
                         left_margin,
                         right_margin,
-                        row.process.map_or(0, |p| p.chars().count()),
+                        switcher_row_tail_chars(row.process, row.raf_todo, row.raf_idea),
                         scaled_cell_w,
                     );
                     self.ctx.render_text(vertices, &text, left_margin, text_y, split.title_limit, row_fg, no_bg, body_scale);
-                    if let (Some(process), Some(proc_x)) = (row.process, split.process_x) {
-                        self.ctx.render_text(vertices, process, proc_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                    if let Some(mut tail_x) = split.process_x {
+                        if let Some(process) = row.process {
+                            self.ctx.render_text(vertices, process, tail_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                            tail_x += (process.chars().count() + 2) as f32 * scaled_cell_w;
+                        }
+                        if let Some(todo) = row.raf_todo {
+                            let todo_fg = if row.bookmarked { row_fg } else { RAF_TODO_FG };
+                            self.ctx.render_text(vertices, todo, tail_x, text_y, right_margin, todo_fg, no_bg, body_scale);
+                            tail_x += todo.chars().count() as f32 * scaled_cell_w;
+                            if row.raf_idea.is_some() {
+                                self.ctx.render_text(vertices, RAF_SEPARATOR, tail_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                                tail_x += RAF_SEPARATOR.chars().count() as f32 * scaled_cell_w;
+                            }
+                        }
+                        if let Some(idea) = row.raf_idea {
+                            self.ctx.render_text(vertices, idea, tail_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                        }
                     }
                     if row.anchored {
                         // Anchor mark in the 4th char slot, right before the
@@ -3126,6 +3167,21 @@ mod tests {
         let split = switcher_row_split(0.0, 300.0, 14, 10.0);
         assert_eq!(split.process_x, Some(160.0));
         assert_eq!(split.title_limit, 140.0);
+    }
+
+    #[test]
+    fn switcher_row_tail_is_the_binary_alone_without_a_raf() {
+        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), None, None), 14);
+        assert_eq!(switcher_row_tail_chars(None, None, None), 0);
+    }
+
+    #[test]
+    fn switcher_row_tail_adds_the_raf_after_a_two_cell_gap() {
+        // "claude 2.1.226" + 2 + "3 todo" + " · " + "1 idea"
+        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), Some("3 todo"), Some("1 idea")), 14 + 2 + 6 + 3 + 6);
+        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), Some("3 todo"), None), 14 + 2 + 6);
+        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), None, Some("2 ideas")), 14 + 2 + 7);
+        assert_eq!(switcher_row_tail_chars(None, Some("3 todo"), None), 6);
     }
 
     #[test]

@@ -31,6 +31,12 @@ pub(super) enum SwitcherRow {
         /// own section whether or not a pane holds it, so this row is dropped
         /// before the list is shown — see `drop_anchored_panes`.
         anchored: bool,
+        /// What the pane's Claude conversation still has to do, read from
+        /// `~/.claude/raf/` when the list is built (`crate::raf`): `"3 todo"`,
+        /// drawn in colour at the row end, and `"1 idea"`, drawn dim. `None`
+        /// when the count is zero or the pane holds no Claude conversation.
+        raf_todo: Option<String>,
+        raf_idea: Option<String>,
     },
     /// An anchored conversation — selectable, and always listed, even when a
     /// pane still holds it: the anchors are what today is for, so the section
@@ -654,6 +660,14 @@ impl KovaView {
                             }
                         }
                     }
+                    // The conversation's open items. A restored pane whose
+                    // resume line still waits at the prompt holds it too.
+                    let raf = pane
+                        .claude_session_id()
+                        .or_else(|| pending_session_id(last_command.as_deref()).map(str::to_string))
+                        .and_then(|id| crate::raf::load(&id))
+                        .unwrap_or_default();
+                    let (raf_todo, raf_idea) = crate::raf::marker_parts(raf.todos.len(), raf.ideas.len());
                     rows.push(SwitcherRow::Pane {
                         pane_id: pane.id,
                         title,
@@ -665,6 +679,8 @@ impl KovaView {
                         process,
                         bookmarked,
                         anchored: anchored_pane,
+                        raf_todo,
+                        raf_idea,
                     });
                 });
                 groups.push(rows);
@@ -1273,6 +1289,8 @@ mod tests {
                             process: None,
                             bookmarked: false,
                             anchored: c == 'a',
+                            raf_todo: None,
+                            raf_idea: None,
                         },
                     })
                     .collect()
@@ -1560,6 +1578,8 @@ mod tests {
             process: None,
             bookmarked: false,
             anchored: false,
+            raf_todo: None,
+            raf_idea: None,
         };
         assert!(!working.needs_attention());
     }

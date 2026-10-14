@@ -273,6 +273,52 @@ drops the banner.
 
 ---
 
+### `ask` — put an agent's question on the user's screen and wait for the answer
+
+```json
+{ "cmd": "ask", "question": {
+    "id": "6f1c…-uuid", "message": "Send the reply to Robin?",
+    "actions": ["OK", "KO"], "input": true, "asked_at": 1792000000,
+    "from": { "name": "routine", "session_id": "…", "pane_id": 12,
+              "kova_socket": "/tmp/kova-123.sock", "cwd": "/Users/…/project" } } }
+```
+
+Not meant to be spoken by hand: `kova ask "<message>" [--actions OK,KO]` builds it
+from its environment (`CLAUDE_CODE_SESSION_ID`, `KOVA_PANE_ID`, `KOVA_SOCKET`) and
+`kova ask --help` documents the client. `id` must be a UUID (it names files on
+disk), `session_id` must be a plain `[A-Za-z0-9_-]` id (it reaches a command line).
+
+Kova shows the question on a card in the top-right corner of the screen (one
+card, oldest question first, a Dock badge counting them) and answers only when
+the user does — there is no server-side timeout. The response is
+`{"ok":true,"data":{"id":…,"action":"OK","text":"…"}}`, after which the client must
+write the line `ack` within 2 s: without it, the answer is considered lost on
+the way and Kova delivers it to the conversation itself:
+
+1. typed into the asker's pane, if that pane still runs the asker's Claude
+   conversation (same `claude_session_id`, or the conversation's process
+   descends from the pane's shell);
+2. if the conversation is open in another process, Kova waits for it to end;
+3. then reopens it in a new tab: `claude --dangerously-skip-permissions --resume
+   <session_id> '<the answer>'`, in the directory the conversation ran in (read
+   from its transcript, which `claude --resume` needs; not the asker's `cwd`).
+   No transcript, or `claude` no longer running in the new pane 10 s after
+   Enter (it exits at once on "No conversation found"), and the answer stays
+   on disk, retried at the next launch.
+
+A pane of a library host (Kana) names that host's socket, which answers `ask`
+with `command not supported by this host` (or `unknown command: ask` for a
+build older than `ask`): `kova ask` then asks Kova.app.
+
+Questions and undelivered answers survive a restart (`~/.config/kova/ask/`,
+`KOVA_ASK_DIR` overrides it). Only the Kova holding that directory's lock
+(`owner.lock`, taken at launch) writes there and replays it: another Kova
+running at the same time keeps its own questions in memory only, since
+anything it wrote would be shown and delivered a second time by the holder. Kova.app only: a library host answers `command not
+supported by this host`, which sends `kova ask` on to Kova.app.
+
+---
+
 ### `set-anchor` — put a conversation at the head of the anchors
 
 ```json

@@ -38,6 +38,8 @@ pub struct AppDelegateIvars {
     /// methods rather than polled: the tick has no `MainThreadMarker` to ask
     /// `NSApplication` with, and an edge-driven flag is exact anyway.
     app_active: Cell<bool>,
+    /// Agents' questions waiting for the user (`kova ask`), shown on the card.
+    asks: RefCell<crate::ask::Board>,
 }
 
 define_class!(
@@ -102,6 +104,10 @@ define_class!(
             // Start IPC server (Unix socket for external process control)
             let ipc_rx = crate::ipc::start();
             *self.ivars().ipc_rx.borrow_mut() = Some(ipc_rx);
+
+            // Agents' questions asked before a restart come back on the card,
+            // and answers not yet delivered resume their delivery.
+            self.ivars().asks.borrow_mut().restore();
 
             // Start global render timer — single timer for all windows
             self.start_global_timer(config.terminal.fps);
@@ -210,6 +216,7 @@ impl AppDelegate {
             pending_waits: RefCell::new(Vec::new()),
             events: RefCell::new(crate::events::EventState::new()),
             app_active: Cell::new(false),
+            asks: RefCell::new(crate::ask::Board::new()),
         });
         let retained: Retained<Self> = unsafe { msg_send![super(this), init] };
         retained.ivars().config.set(config).ok();
@@ -294,6 +301,12 @@ impl AppDelegate {
                                     });
                                     continue;
                                 }
+                                // `ask` waits for the user, however long: the
+                                // responder is kept until the card is answered.
+                                if let crate::ipc::IpcCommand::Ask(question) = cmd {
+                                    ivars.asks.borrow_mut().add(*question, responder);
+                                    continue;
+                                }
                                 match handle_ipc_command(cmd, &ivars.windows, &ivars.config) {
                                     Disposition::Reply(response) => {
                                         let _ = responder.send(response);
@@ -308,6 +321,15 @@ impl AppDelegate {
                                 }
                             }
                         }
+                    }
+
+                    // Answers given on the question card, then the card itself.
+                    {
+                        let mut asks = ivars.asks.borrow_mut();
+                        for a in crate::ask_card::take_answers() {
+                            asks.answer(&a.id, a.action, a.text);
+                        }
+                        asks.refresh_card(MainThreadMarker::new_unchecked());
                     }
 
                     // Focus the panes whose notification was clicked. Done here
@@ -727,6 +749,12 @@ fn handle_ipc_command_sync(
         // Intercepted in the tick, before this dispatcher — it needs the event
         // state, which lives on the delegate. Reaching here means that branch was
         // lost in a refactor.
+        IpcCommand::Ask(_) => {
+            log::error!("IPC: ask reached the generic dispatcher");
+            crate::ipc::IpcResponse::Error {
+                message: "internal: ask was not intercepted".to_string(),
+            }
+        }
         IpcCommand::Subscribe { .. } => {
             log::error!("IPC: subscribe reached the generic dispatcher");
             crate::ipc::IpcResponse::Error {

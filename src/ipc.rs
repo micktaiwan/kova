@@ -199,6 +199,11 @@ pub enum IpcCommand {
     Subscribe {
         topics: u32,
     },
+    /// An agent's question for the user (`kova ask`, `crate::ask`). Kova.app
+    /// shows it on a card and answers only when the user does, however long
+    /// that takes; the connection then waits for the client's `ack` before the
+    /// answer counts as handed over. Served by `handle_connection` itself.
+    Ask(Box<crate::ask::Question>),
 }
 
 /// How long the IPC connection thread should wait for the main thread's response.
@@ -493,6 +498,10 @@ fn handle_connection(
                 unregister_subscriber(sub_id);
                 return;
             }
+            Ok(IpcCommand::Ask(question)) => {
+                serve_ask(&stream, &tx, *question);
+                return;
+            }
             Ok(cmd) => dispatch(&tx, cmd),
             Err(msg) => IpcResponse::Error { message: msg },
         };
@@ -502,6 +511,50 @@ fn handle_connection(
             break;
         }
         let _ = writer.flush();
+    }
+}
+
+/// How long a client gets to acknowledge an answer before Kova delivers it late.
+const ASK_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Serve one `ask`: hand the question to the main thread, wait for the user's
+/// answer for as long as it takes, write it, then wait for the client's `ack`.
+///
+/// Without the `ack` the answer is not considered handed over: a write lands in
+/// the socket buffer of a client whose timeout fired an instant before, and
+/// nobody would ever read it. In that case this thread delivers it late itself
+/// (`crate::ask::deliver_late`, which may block for hours).
+fn serve_ask(stream: &UnixStream, tx: &mpsc::Sender<IpcRequest>, question: crate::ask::Question) {
+    let mut writer = stream;
+    let (resp_tx, resp_rx) = mpsc::channel::<IpcResponse>();
+    if tx.send((IpcCommand::Ask(Box::new(question.clone())), resp_tx)).is_err() {
+        let resp = IpcResponse::Error { message: "app shutting down".to_string() };
+        let _ = writeln!(writer, "{}", resp.to_json());
+        return;
+    }
+    // No timeout: the user answers when they answer. The main thread keeps the
+    // sender until then; dropping it (Kova quitting) ends the wait.
+    let Ok(response) = resp_rx.recv() else { return };
+    let IpcResponse::Ok { data: Some(data) } = &response else {
+        let _ = writeln!(writer, "{}", response.to_json());
+        return;
+    };
+    let Ok(answer) = serde_json::from_value::<crate::ask::Answer>(data.clone()) else {
+        log::error!("IPC ask: the main thread answered with something that is not an answer");
+        return;
+    };
+    let store = crate::ask::AskStore::new(crate::ask::AskStore::default_root());
+    let sent = writeln!(writer, "{}", response.to_json()).is_ok() && writer.flush().is_ok();
+    let _ = stream.set_read_timeout(Some(ASK_ACK_TIMEOUT));
+    let mut ack = String::new();
+    let acked = sent && BufReader::new(stream).read_line(&mut ack).is_ok() && ack.trim() == "ack";
+    if acked {
+        log::info!("ask {}: answer returned to the waiting asker: {}", question.id, answer.line());
+        store.remove_delivery(&question.id);
+    } else {
+        log::info!("ask {}: the asker no longer waits, delivering late", question.id);
+        let own = socket_path().to_string_lossy().into_owned();
+        crate::ask::deliver_late(&store, &question, &answer, &own);
     }
 }
 
@@ -563,6 +616,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "clear-anchors" => &[],
         "reload-config" => &[],
         "subscribe" => &["events"],
+        "ask" => &["question"],
         _ => return None,
     })
 }
@@ -909,6 +963,22 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 Some(_) => return Err("\"events\" must be an array of strings".to_string()),
             };
             Ok(IpcCommand::Subscribe { topics })
+        }
+        "ask" => {
+            let raw = v.get("question").ok_or_else(|| "missing \"question\" field".to_string())?;
+            let question: crate::ask::Question = serde_json::from_value(raw.clone())
+                .map_err(|e| format!("invalid \"question\": {}", e))?;
+            // The id names files on disk; the session id may end up on a command line.
+            if !crate::ask::is_safe_question_id(&question.id) {
+                return Err("\"question.id\" must be a UUID".to_string());
+            }
+            if question.message.trim().is_empty() {
+                return Err("\"question.message\" must not be empty".to_string());
+            }
+            if question.from.session_id.as_deref().is_some_and(|s| !crate::ask::is_safe_session_id(s)) {
+                return Err("\"question.from.session_id\" must be a plain session id".to_string());
+            }
+            Ok(IpcCommand::Ask(Box::new(question)))
         }
         other => Err(format!("unknown command: {}", other)),
     }

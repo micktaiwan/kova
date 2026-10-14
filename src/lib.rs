@@ -11,6 +11,8 @@ pub mod session;
 
 mod agent_session;
 mod anchors;
+mod ask;
+mod ask_card;
 mod appkit_input;
 mod bookmarks;
 mod claude_history;
@@ -24,6 +26,7 @@ mod keybindings;
 mod notification;
 mod pane;
 mod pane_history;
+mod raf;
 mod recent_projects;
 mod renderer;
 mod search_history;
@@ -32,6 +35,11 @@ mod tab_colors;
 mod terminal;
 mod update_check;
 mod window;
+
+/// `kova ask …` (see `ask::USAGE`): returns the exit code.
+pub fn ask_cli(args: &[String]) -> i32 {
+    ask::run_cli(args)
+}
 
 /// Process RSS (Resident Set Size) in MB via mach API.
 pub(crate) fn get_rss_mb() -> f64 {
