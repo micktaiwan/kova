@@ -250,6 +250,11 @@ int kova_pane_is_alive(KovaPaneId pane);
  * hooks set it through the socket), and nothing contradicts it. */
 int kova_pane_is_awaiting(KovaPaneId pane);
 
+/* 1 while the app in the pane is working: Claude Code's spinner leads its
+ * terminal title (the idle asterisk does not count). What Kova.app counts in
+ * its status bar's ✳N. Read on demand, no event. */
+int kova_pane_is_working(KovaPaneId pane);
+
 /* ── Socket ───────────────────────────────────────────────────────────── */
 
 /* Serve Kova's socket protocol at path (NULL: /tmp/kova-<pid>.sock, where

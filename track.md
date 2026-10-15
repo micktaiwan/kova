@@ -8,9 +8,11 @@
 
 **D'où ça part** : Kova sert aussi de terminal à Kana (un pane par note), via `libkova.a` et l'API C de `include/kova.h`. Kova.app n'a pas changé de comportement (tests figés d'abord, audits). Mais le pane fourni par la bibliothèque (`src/embed.rs`, `KovaPaneView`) n'a pas tout ce que Kova.app sait faire, et seul le texte avait été porté pour Cmd+V : le coller d'image manquait (une autre session le porte, 14/10).
 
-**Ce qui manque encore au pane intégré**, d'après le rapport de l'étape 3 : survol et Cmd+clic d'URL, filtre Ctrl+F (la touche est avalée), notifications et `subscribe` (répondent une erreur), les retouches de redimensionnement de Kova.app (relance de dessin de Claude Code, réparation des bandes vides), et la fenêtre des accents probablement mal placée dans une sous-vue. Rien n'a tourné dans une vraie fenêtre de Kana.
+**Ce qui manque encore au pane intégré**, d'après le rapport de l'étape 3 : survol et Cmd+clic d'URL, filtre Ctrl+F (la touche est avalée), notifications et `subscribe` (répondent une erreur), les retouches de redimensionnement de Kova.app (relance de dessin de Claude Code, réparation des bandes vides), la fenêtre des accents mal placée dans une sous-vue (au coin de la fenêtre, prouvé par `KovaEmbedTests` de Kana) et le signal de focus. Le pane tourne dans Kana depuis le 14/10.
 
-**Prochaine action** : porter ces manques un par un dans `src/embed.rs` quand Mickael les rencontre dans Kana, en commençant par le survol et le Cmd+clic d'URL.
+**Correctif prêt, seule copie** : la fenêtre des accents, la réparation au redimensionnement (`src/resize_repair.rs`) et le signal de focus sont corrigés dans le worktree `~/projects/perso/kova-embed-fixes`, en modifications non commitées sur un HEAD détaché en 690cba8. Aucune branche, aucun stash ni aucun commit ne les porte (vérifié le 15/10 : `git log --all -- src/resize_repair.rs` vide). Ne pas retirer ce worktree avant de les avoir reportées sur `main` ; son `target/` se supprime sans perte (il se recompile), mais la commande de test de Kana `KOVA_TARGET_DIR=…/kova-embed-fixes/target` (`kana/CLAUDE.md`) en dépend tant que le correctif n'est pas sur `main`.
+
+**Prochaine action** : reporter ce correctif sur `main` (d'après la note Kana du 14/10, il ne s'applique plus proprement : conflit dans `src/lib.rs`, non revérifié), puis porter les autres manques un par un dans `src/embed.rs` quand Mickael les rencontre dans Kana, en commençant par le survol et le Cmd+clic d'URL.
 
 ### Revue UX/UI du 10/10/2026 — rien n'a été fait
 

@@ -24,6 +24,9 @@ pub(super) enum SearchTarget {
     /// A query searched earlier in this run of Kova. Opening it does not jump
     /// anywhere: it retypes the query into the input and searches again.
     Recall { query: String },
+    /// A bookmarked conversation (Cmd+B). Opening it is the same gesture as its
+    /// Cmd+P row: focus the pane that holds it, else reopen it in its project.
+    Bookmark(crate::bookmarks::Bookmark),
 }
 
 /// One hit returned by the search worker.
@@ -90,6 +93,9 @@ struct SearchPaneSnapshot {
     /// Conversation the pane runs, if any: its indexed prompts are searched
     /// along with the screen.
     session_id: Option<String>,
+    /// Conversation id of whatever agent the pane runs (Claude or Codex), the
+    /// id a bookmark is keyed on.
+    agent_session: Option<String>,
 }
 
 /// A key pressed with Cmd or Ctrl held. Option stays typing: it composes
@@ -288,6 +294,75 @@ fn match_pane(p: &SearchPaneSnapshot, terms: &[String], session_text: Option<&St
     PaneMatch { fit: worst, snippet }
 }
 
+/// Match one bookmark against `terms`: its saved label, its directory and —
+/// for a Claude conversation — the indexed prompts. Same rule as a pane: the
+/// best source per term, the weakest term for the bookmark.
+fn match_bookmark(
+    bm: &crate::bookmarks::Bookmark,
+    terms: &[String],
+    said: Option<&String>,
+) -> PaneMatch {
+    use crate::claude_history::{fit, Fit};
+    let label = lowercase_same_len(&bm.label);
+    let cwd = lowercase_same_len(&bm.cwd);
+    let empty = String::new();
+    let said = said.unwrap_or(&empty);
+    let mut worst = Fit::Word;
+    let mut snippet_term: Option<&String> = None;
+    for t in terms {
+        let named = fit(&label, t).max(fit(&cwd, t));
+        let in_prompts = fit(said, t);
+        worst = worst.min(named.max(in_prompts));
+        // A term the row already shows needs no line to explain it.
+        if named != Fit::Word && in_prompts != Fit::Absent && snippet_term.is_none() {
+            snippet_term = Some(t);
+        }
+    }
+    let snippet = match worst {
+        Fit::Absent => None,
+        _ => snippet_term.and_then(|t| content_snippet(said, said, t)),
+    };
+    PaneMatch { fit: worst, snippet }
+}
+
+/// The bookmark hits for `terms`: those carrying every term as a word, then
+/// those that only match inside longer words. A bookmark whose conversation is
+/// in `listed_sessions` — a pane already listed above — is left out: it is
+/// that row, not a second one (same rule as Cmd+P).
+fn bookmark_hits(
+    bookmarks: &[crate::bookmarks::Bookmark],
+    terms: &[String],
+    said: &std::collections::HashMap<String, String>,
+    listed_sessions: &std::collections::HashSet<String>,
+) -> (Vec<SearchHit>, Vec<SearchHit>) {
+    use crate::claude_history::Fit;
+    let mut word = Vec::new();
+    let mut inside = Vec::new();
+    for bm in bookmarks {
+        if bm.session_id.as_ref().is_some_and(|id| listed_sessions.contains(id)) {
+            continue;
+        }
+        let m = match_bookmark(bm, terms, bm.session_id.as_ref().and_then(|id| said.get(id)));
+        let dir = std::path::Path::new(&bm.cwd)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&bm.cwd);
+        let mut label = format!("{} · {}", dir, bm.label);
+        if let Some(s) = m.snippet {
+            label = format!("{}  ·  {}", label, s);
+        }
+        match m.fit {
+            Fit::Absent => {}
+            Fit::Inside => inside.push(SearchHit {
+                label: format!("Bookmark · {}", label),
+                target: SearchTarget::Bookmark(bm.clone()),
+            }),
+            Fit::Word => word.push(SearchHit { label, target: SearchTarget::Bookmark(bm.clone()) }),
+        }
+    }
+    (word, inside)
+}
+
 /// Worker-thread search, case-insensitive.
 ///
 /// The query is cut into terms on spaces and commas, and a pane or tab has to
@@ -304,11 +379,14 @@ fn match_pane(p: &SearchPaneSnapshot, terms: &[String], session_text: Option<&St
 ///   1. Panes whose title, screen or conversation matches, grouped under a
 ///      per-tab header (one entry per pane).
 ///   2. A "Tabs" section listing tabs whose title matches.
-///   3. A "Claude sessions (closed)" section: past conversations that match,
+///   3. A "Bookmarks" section: saved conversations (Cmd+B) whose label,
+///      directory or prompts match, minus those whose pane is listed in 1.
+///   4. A "Claude sessions (closed)" section: past conversations that match,
 ///      most recent first. This is what makes a session findable once its pane
-///      is gone — the whole point of `claude_history`.
-///   4. "Inside longer words": the panes, tabs and closed sessions of sections
-///      1–3 that only matched that way.
+///      is gone — the whole point of `claude_history`. A bookmarked one is
+///      left to section 3.
+///   5. "Inside longer words": the panes, tabs, bookmarks and closed sessions
+///      of sections 1–4 that only matched that way.
 /// `panes` arrives already ordered by tab (window → tab → pane), so consecutive
 /// grouping by `tab_id` reconstructs the per-tab groups without sorting.
 fn run_search_worker(
@@ -316,6 +394,7 @@ fn run_search_worker(
     tabs: &[SearchTabSnapshot],
     panes: &[SearchPaneSnapshot],
     live_sessions: &[String],
+    bookmarks: &[crate::bookmarks::Bookmark],
 ) -> Vec<SearchRow> {
     use crate::claude_history::{fit, Fit};
     let terms = crate::claude_history::split_terms(query);
@@ -325,10 +404,15 @@ fn run_search_worker(
     }
 
     // First, as it refreshes the index the live panes are then matched on.
-    let archived = crate::claude_history::search(query, live_sessions);
-    let pane_sessions: Vec<String> = panes.iter().filter_map(|p| p.session_id.clone()).collect();
-    let said = crate::claude_history::texts_of(&pane_sessions);
+    // A bookmarked conversation is not offered again as a closed session.
+    let mut not_closed: Vec<String> = live_sessions.to_vec();
+    not_closed.extend(bookmarks.iter().filter_map(|b| b.session_id.clone()));
+    let archived = crate::claude_history::search(query, &not_closed);
+    let mut indexed: Vec<String> = panes.iter().filter_map(|p| p.session_id.clone()).collect();
+    indexed.extend(bookmarks.iter().filter_map(|b| b.session_id.clone()));
+    let said = crate::claude_history::texts_of(&indexed);
     let mut inside: Vec<SearchHit> = Vec::new();
+    let mut listed_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Section 1: matching panes, grouped by tab.
     let mut current_tab: Option<TabId> = None;
@@ -339,6 +423,9 @@ fn run_search_worker(
             None => p.pane_title.clone(),
         };
         let target = SearchTarget::Open { tab_id: p.tab_id, pane_id: Some(p.pane_id) };
+        if m.fit != Fit::Absent {
+            listed_sessions.extend(p.agent_session.clone());
+        }
         match m.fit {
             Fit::Absent => continue,
             Fit::Inside => {
@@ -376,7 +463,15 @@ fn run_search_worker(
         }
     }
 
-    // Section 3: Claude conversations that are not open anywhere any more.
+    // Section 3: bookmarks.
+    let (bookmarked, bookmarked_inside) = bookmark_hits(bookmarks, &terms, &said, &listed_sessions);
+    if !bookmarked.is_empty() {
+        rows.push(SearchRow::Header("Bookmarks".to_string()));
+        rows.extend(bookmarked.into_iter().map(SearchRow::Hit));
+    }
+    inside.extend(bookmarked_inside);
+
+    // Section 4: Claude conversations that are not open anywhere any more.
     // Only the latest few are listed — a common word matches hundreds of
     // sessions, and the rest of them would bury the open panes above. What was
     // cut is named in the header rather than dropped silently.
@@ -402,7 +497,7 @@ fn run_search_worker(
         rows.extend(archived.hits.into_iter().map(|h| SearchRow::Hit(archived_hit(h))));
     }
 
-    // Section 4: what only matched inside longer words, open things first.
+    // Section 5: what only matched inside longer words, open things first.
     let inside_shown = inside.len() + archived.inside.len();
     if inside_shown > 0 {
         rows.push(SearchRow::Header(capped_header(
@@ -525,7 +620,7 @@ fn focus_pane_with_claude_session(session_id: &str) -> bool {
 fn jump_to_search_hit(hit: &SearchHit) {
     let (tab_id, pane_id) = match &hit.target {
         SearchTarget::Open { tab_id, pane_id } => (*tab_id, *pane_id),
-        SearchTarget::Archived { .. } | SearchTarget::Recall { .. } => return,
+        SearchTarget::Archived { .. } | SearchTarget::Recall { .. } | SearchTarget::Bookmark(_) => return,
     };
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let app = NSApplication::sharedApplication(mtm);
@@ -740,6 +835,7 @@ impl KovaView {
                         pane_title: pane.display_title("shell"),
                         terminal: pane.terminal.clone(),
                         session_id: pane.claude_session_id(),
+                        agent_session: pane.agent_session_id(),
                     });
                 });
             }
@@ -784,7 +880,8 @@ impl KovaView {
         }
 
         std::thread::spawn(move || {
-            let hits = run_search_worker(&query, &tabs_snap, &panes_snap, &live_sessions);
+            let bookmarks = crate::bookmarks::load().items;
+            let hits = run_search_worker(&query, &tabs_snap, &panes_snap, &live_sessions, &bookmarks);
             let _ = tx.send((query_id, hits));
         });
 
@@ -1016,6 +1113,7 @@ impl KovaView {
                             SearchTarget::Archived { session_id, cwd } => {
                                 self.open_archived_claude_session(session_id, cwd)
                             }
+                            SearchTarget::Bookmark(bm) => self.open_saved_conversation(bm),
                             SearchTarget::Recall { .. } => unreachable!("handled above"),
                         }
                     }
@@ -1140,6 +1238,77 @@ mod tests {
         let mut state = palette_state("de", "d", results);
         drop_recall_rows(&mut state);
         assert_eq!(state.rows.len(), 1);
+    }
+
+    fn bookmark(id: Option<&str>, cwd: &str, label: &str) -> crate::bookmarks::Bookmark {
+        crate::bookmarks::Bookmark {
+            agent: id.map(|_| crate::agent_session::Agent::Claude),
+            session_id: id.map(str::to_string),
+            cwd: cwd.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    fn hit_labels(hits: &[SearchHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.label.as_str()).collect()
+    }
+
+    #[test]
+    fn a_bookmark_matches_on_its_label_its_directory_or_its_prompts() {
+        use std::collections::{HashMap, HashSet};
+        let items = vec![
+            bookmark(Some("a"), "/Users/x/kova", "Search palette"),
+            bookmark(Some("b"), "/Users/x/cto", "Weekly"),
+            bookmark(None, "/Users/x/janus", "shell"),
+        ];
+        let said: HashMap<String, String> =
+            [("b".to_string(), "on parle du deploy staging".to_string())].into();
+        let none = HashSet::new();
+        let terms = crate::claude_history::split_terms;
+
+        let (word, _) = bookmark_hits(&items, &terms("palette"), &said, &none);
+        assert_eq!(hit_labels(&word), ["kova · Search palette"]);
+        let (word, _) = bookmark_hits(&items, &terms("janus"), &said, &none);
+        assert_eq!(hit_labels(&word), ["janus · shell"], "the directory counts");
+        // Found by what was said in it: the row shows the line that matched.
+        let (word, _) = bookmark_hits(&items, &terms("cto deploy"), &said, &none);
+        assert_eq!(hit_labels(&word), ["cto · Weekly  ·  on parle du deploy staging"]);
+        // Every term has to be there.
+        let (word, inside) = bookmark_hits(&items, &terms("kova deploy"), &said, &none);
+        assert!(word.is_empty() && inside.is_empty());
+    }
+
+    #[test]
+    fn a_bookmark_inside_a_longer_word_goes_to_the_last_section() {
+        let items = vec![bookmark(Some("a"), "/k", "Chapitre trois")];
+        let (word, inside) = bookmark_hits(
+            &items,
+            &crate::claude_history::split_terms("pitr"),
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(word.is_empty());
+        assert_eq!(hit_labels(&inside), ["Bookmark · k · Chapitre trois"]);
+    }
+
+    #[test]
+    fn a_bookmark_whose_pane_is_listed_is_not_listed_twice() {
+        let items = vec![bookmark(Some("a"), "/k", "palette"), bookmark(None, "/k", "palette")];
+        let listed: std::collections::HashSet<String> = ["a".to_string()].into();
+        let (word, _) = bookmark_hits(
+            &items,
+            &crate::claude_history::split_terms("palette"),
+            &Default::default(),
+            &listed,
+        );
+        assert_eq!(word.len(), 1);
+        assert!(word[0].target_is_shell_bookmark());
+    }
+
+    impl SearchHit {
+        fn target_is_shell_bookmark(&self) -> bool {
+            matches!(&self.target, SearchTarget::Bookmark(b) if b.session_id.is_none())
+        }
     }
 
     #[test]

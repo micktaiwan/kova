@@ -412,6 +412,13 @@ pub extern "C" fn kova_pane_is_awaiting(pane: u32) -> c_int {
     guard("kova_pane_is_awaiting", -1, || yes_no(embed::find(pane).map(|p| p.surface.is_awaiting())))
 }
 
+/// 1 while the app in the pane is working: Claude Code's spinner leads its
+/// title. What Kova.app counts in its status bar's `✳N`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kova_pane_is_working(pane: u32) -> c_int {
+    guard("kova_pane_is_working", -1, || yes_no(embed::find(pane).map(|p| p.surface.is_working())))
+}
+
 // ─── Socket ─────────────────────────────────────────────────────────────────
 
 /// Serve the socket protocol at `path` (NULL: `/tmp/kova-<pid>.sock`).
@@ -527,6 +534,7 @@ mod tests {
         assert!(kova_pane_copy_selection(ghost).is_null());
         assert_eq!(kova_pane_is_alive(ghost), -1);
         assert_eq!(kova_pane_is_awaiting(ghost), -1);
+        assert_eq!(kova_pane_is_working(ghost), -1);
     }
 
     /// Every case of the frozen key table (`input::tests::TABLE`) sent through
@@ -657,6 +665,13 @@ mod tests {
         p.surface.terminal.write().title = Some("vim notes.md".into());
         assert_ne!(kova_pane_tick(pane) & embed::EVENT_TITLE_CHANGED, 0);
         assert_eq!(take(kova_pane_copy_title(pane)).as_deref(), Some("vim notes.md"));
+        assert_eq!(kova_pane_is_working(pane), 0);
+        p.surface.terminal.write().title = Some("\u{2810} Claude Code".into());
+        assert_eq!(kova_pane_is_working(pane), 1, "Claude's spinner: working");
+        p.surface.terminal.write().title = Some("\u{2733} Claude Code".into());
+        assert_eq!(kova_pane_is_working(pane), 0, "the idle asterisk is not work");
+        p.surface.terminal.write().title = Some("vim notes.md".into());
+        kova_pane_tick(pane);
 
         p.surface.set_awaiting();
         assert_eq!(kova_pane_is_awaiting(pane), 1);

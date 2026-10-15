@@ -31,7 +31,7 @@ Cmd+hover highlights URLs with an underline and pointer cursor. Cmd+click opens 
 
 Cmd+F opens an inline search overlay with match highlighting. Click a match to jump to it.
 
-Cmd+Shift+F searches every pane of every tab at once, and the same palette also reaches the Claude Code sessions that are no longer open: closed transcripts are indexed by the prompts you typed in them, and picking one reopens it with `claude --resume` in its own project directory. An empty input offers what you searched earlier in the run.
+Cmd+Shift+F searches every pane of every tab at once, and the same palette also reaches the Claude Code sessions that are no longer open: closed transcripts are indexed by the prompts you typed in them, and picking one reopens it with `claude --resume` in its own project directory. Bookmarks (Cmd+B) are listed too, matched on their name, directory and prompts. An empty input offers what you searched earlier in the run.
 
 ### Attention routing
 
@@ -131,7 +131,7 @@ focus_border_color = [0.4, 0.6, 1.0]
 | Cmd+R | Repaint focused pane (force redraw via SIGWINCH) |
 | Cmd+F | Search scrollback |
 | Ctrl+L | Passed to the app as usual, and clears Kova's scrollback with it (not in alt-screen) |
-| Cmd+Shift+F | Global search (all tabs and panes, plus closed Claude sessions) |
+| Cmd+Shift+F | Global search (all tabs and panes, bookmarks, plus closed Claude sessions) |
 | Cmd+P | Tab/pane switcher |
 | Cmd+Shift+J | Pane switcher, unread panes only |
 | Cmd+B | Bookmark the focused pane's conversation (toggle) |

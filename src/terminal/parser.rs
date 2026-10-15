@@ -496,6 +496,53 @@ impl VteHandler {
     }
 }
 
+/// Decode standard base64 (padding optional, whitespace skipped). None on any other byte.
+fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &c in input {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Put text on the macOS clipboard from the parser thread. `pbcopy` rather than NSPasteboard,
+/// which wants the main thread; a background thread so the PTY reader never waits on it.
+fn copy_to_clipboard(text: String) {
+    // The parser fuzz test feeds OSC 52 on purpose; a test run must not clobber the clipboard.
+    if cfg!(test) { return; }
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let child = std::process::Command::new("/usr/bin/pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn();
+        match child {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child.wait();
+            }
+            Err(e) => log::warn!("OSC 52: pbcopy failed: {}", e),
+        }
+    });
+}
+
 impl Perform for VteHandler {
     fn print(&mut self, c: char) {
         self.print_buf.push(c);
@@ -566,6 +613,19 @@ impl Perform for VteHandler {
                         // Filesystem I/O done during parsing — no lock held
                         let git_branch = resolve_git_branch(&path);
                         self.ops.push(TermOp::SetCwd(path, git_branch));
+                    }
+                }
+                b"52" => {
+                    // OSC 52 ; selection ; base64 — a program puts text on the clipboard.
+                    // Claude Code copies a mouse selection this way and then says "copied";
+                    // ignoring it left the old clipboard in place under that message.
+                    // A "?" payload asks to *read* the clipboard: never answered.
+                    const MAX_OSC52_PAYLOAD: usize = 8 * 1024 * 1024;
+                    let Some(data) = params.get(2) else { return };
+                    if *data == b"?" || data.len() > MAX_OSC52_PAYLOAD { return; }
+                    match decode_base64(data).map(String::from_utf8) {
+                        Some(Ok(text)) => copy_to_clipboard(text),
+                        _ => log::debug!("OSC 52: payload is not base64 UTF-8, ignored"),
                     }
                 }
                 b"133" => {
@@ -973,6 +1033,15 @@ fn percent_decode(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_osc52_base64() {
+        assert_eq!(decode_base64(b"Zm9v").unwrap(), b"foo");
+        assert_eq!(decode_base64(b"Zm9vYg==").unwrap(), b"foob");
+        assert_eq!(decode_base64(b"Zm9vYmE").unwrap(), b"fooba");
+        assert!(decode_base64(b"Zm9v!").is_none());
+    }
+
     use crate::terminal::{DEFAULT_BG, DEFAULT_FG};
 
     /// Feed raw bytes through the real vte parser into a TerminalState.
