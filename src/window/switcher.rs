@@ -179,6 +179,44 @@ enum SwitcherTarget {
     Anchor(usize),
 }
 
+/// Which list the full switcher shows. The attention-only list (`u`) has no
+/// such choice: it answers one question, and ignores this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SwitcherView {
+    /// The open panes, tab by tab — what Cmd+P opens on.
+    Panes,
+    /// The saved conversations in place of the open panes (`b`).
+    Bookmarks,
+    /// Every pane in one list, biggest resident memory first (`m`): which
+    /// sessions to close when the Mac runs short.
+    Memory,
+}
+
+/// `b` and `m` each flip between their own list and the open panes; from the
+/// other one, they go straight to theirs.
+pub(super) fn toggled_view(current: SwitcherView, wanted: SwitcherView) -> SwitcherView {
+    if current == wanted { SwitcherView::Panes } else { wanted }
+}
+
+/// A byte count the way the memory list shows it: "312 MB", "1.4 GB".
+pub(super) fn format_memory(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let mb = bytes as f64 / MB;
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else {
+        format!("{:.0} MB", mb)
+    }
+}
+
+/// The memory list: pane rows, biggest first, one group each so the column
+/// packing spreads them over the columns in reading order. Ties keep the tab
+/// order they came in.
+pub(super) fn memory_groups(mut panes: Vec<(u64, SwitcherRow)>) -> Vec<Vec<SwitcherRow>> {
+    panes.sort_by(|a, b| b.0.cmp(&a.0));
+    panes.into_iter().map(|(_, row)| vec![row]).collect()
+}
+
 pub(super) struct PaneSwitcherState {
     /// Columns of rows. Each column holds whole tabs (a tab header followed by
     /// its pane rows); a tab is never split across two columns.
@@ -195,11 +233,14 @@ pub(super) struct PaneSwitcherState {
     /// The toggle rebuilds the overlay, so this is only what the current
     /// snapshot was built with — what the title says and what the toggle flips.
     pub(super) filtered: bool,
-    /// The bookmark half of the list: `b` swaps the open panes for the saved
-    /// conversations. The list opens on the panes — what is running is what
+    /// Which list is up: the open panes, the bookmarks (`b`), or the panes by
+    /// memory (`m`). The list opens on the panes — what is running is what
     /// Cmd+P is asked for nine times out of ten, and the bookmarks used to push
     /// it off the screen.
-    pub(super) show_bookmarks: bool,
+    pub(super) view: SwitcherView,
+    /// The memory list's total and pane count, for its title; `None` on the
+    /// other lists.
+    pub(super) memory_total: Option<(u64, usize)>,
     /// Every pane's (bell, unread completion) when this snapshot was built,
     /// so the tick can tell when a row's dot has gone stale.
     pub(super) attention: Vec<(PaneId, bool, bool)>,
@@ -487,8 +528,8 @@ impl KovaView {
         if self.ivars().pane_switcher.borrow().is_none() {
             return;
         }
-        let (_, show_bookmarks) = self.pane_switcher_modes();
-        self.open_pane_switcher(false, show_bookmarks);
+        let (_, view) = self.pane_switcher_modes();
+        self.open_pane_switcher(false, view);
         if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
             if let Some((c, r)) = bookmark_row_after_removal(&state.columns, index) {
                 state.selected_col = c;
@@ -499,11 +540,11 @@ impl KovaView {
         self.mark_dirty();
     }
 
-    /// What the open overlay is showing: the attention-only flag, and whether
-    /// the bookmark half is up. Both default to off when no overlay is open.
-    pub(super) fn pane_switcher_modes(&self) -> (bool, bool) {
+    /// What the open overlay is showing: the attention-only flag, and which
+    /// list is up. Off and the open panes when no overlay is open.
+    pub(super) fn pane_switcher_modes(&self) -> (bool, SwitcherView) {
         let guard = self.ivars().pane_switcher.borrow();
-        guard.as_ref().map_or((false, false), |s| (s.filtered, s.show_bookmarks))
+        guard.as_ref().map_or((false, SwitcherView::Panes), |s| (s.filtered, s.view))
     }
 
     /// Each pane's (bell, unread completion), as the switcher rows show them:
@@ -542,8 +583,8 @@ impl KovaView {
                 _ => None,
             }
         };
-        let (filtered, show_bookmarks) = self.pane_switcher_modes();
-        self.open_pane_switcher(filtered, show_bookmarks);
+        let (filtered, view) = self.pane_switcher_modes();
+        self.open_pane_switcher(filtered, view);
         let Some(target) = selected_pane else { return };
         {
             let mut guard = self.ivars().pane_switcher.borrow_mut();
@@ -586,10 +627,15 @@ impl KovaView {
     /// crosses windows), and its last tier — an idle Claude session — is not an
     /// unread pane, so it is not in here either.
     ///
-    /// `show_bookmarks` swaps the tab groups for the saved conversations —
-    /// the `b` toggle. The anchors stay in both halves: they are what today is
-    /// for, and they sit in the same place whatever the rest of the list shows.
-    pub(super) fn open_pane_switcher(&self, filtered: bool, show_bookmarks: bool) {
+    /// `view` picks the full list's content. `Bookmarks` swaps the tab groups
+    /// for the saved conversations — the `b` toggle. The anchors stay in both
+    /// of those: they are what today is for, and they sit in the same place
+    /// whatever the rest of the list shows. `Memory` (`m`) is every pane in one
+    /// list, biggest first, each row ending with what its process tree holds.
+    pub(super) fn open_pane_switcher(&self, filtered: bool, view: SwitcherView) {
+        let show_bookmarks = view == SwitcherView::Bookmarks;
+        let memory_view = !filtered && view == SwitcherView::Memory;
+        let mut memory_rows: Vec<(u64, SwitcherRow)> = Vec::new();
         // Read once, up front: the same list marks the open panes below and
         // fills the bookmark groups at the end.
         let saved = crate::bookmarks::load();
@@ -638,7 +684,16 @@ impl KovaView {
                         )
                     };
                     let title = pane.display_title("shell");
-                    let process = switcher_process_label(pane.fg_process().as_ref(), &title);
+                    let mut process = switcher_process_label(pane.fg_process().as_ref(), &title);
+                    // Probed only for the memory list: a process-tree walk per
+                    // pane is not worth paying on every Cmd+P.
+                    let memory = memory_view.then(|| pane.pty.tree_resident_bytes());
+                    if let Some(bytes) = memory {
+                        process = Some(match process {
+                            Some(p) => format!("{}  {}", format_memory(bytes), p),
+                            None => format_memory(bytes),
+                        });
+                    }
                     let session = pane.agent_session_id();
                     let bookmarked =
                         session.as_ref().is_some_and(|id| bookmarked_sessions.contains(id.as_str()));
@@ -668,7 +723,7 @@ impl KovaView {
                         .and_then(|id| crate::raf::load(&id))
                         .unwrap_or_default();
                     let (raf_todo, raf_idea) = crate::raf::marker_parts(raf.todos.len(), raf.ideas.len());
-                    rows.push(SwitcherRow::Pane {
+                    let row = SwitcherRow::Pane {
                         pane_id: pane.id,
                         title,
                         is_current,
@@ -681,19 +736,27 @@ impl KovaView {
                         anchored: anchored_pane,
                         raf_todo,
                         raf_idea,
-                    });
+                    };
+                    match memory {
+                        Some(bytes) => memory_rows.push((bytes, row)),
+                        None => rows.push(row),
+                    }
                 });
                 groups.push(rows);
             }
         }
-        if !filtered && groups.iter().all(|g| g.iter().all(|r| !r.is_pane())) {
+        if !filtered && memory_rows.is_empty() && groups.iter().all(|g| g.iter().all(|r| !r.is_pane())) {
             return; // nothing to switch to
         }
+        let memory_total = memory_view
+            .then(|| (memory_rows.iter().map(|(b, _)| *b).sum::<u64>(), memory_rows.len()));
         // Saved conversations, one group per directory at the end of the list.
         // Only on the full list: the attention-only one answers "what is asking
         // for something", and a bookmark never asks for anything. Neither does
         // an anchor — same reason it is left out of the filtered list.
-        if !filtered {
+        if memory_view {
+            groups = memory_groups(memory_rows);
+        } else if !filtered {
             let tabs = if show_bookmarks { Vec::new() } else { groups };
             // On the bookmark half, an open conversation keeps its row: the pane
             // that holds it is not on screen to stand for it. Only an anchored
@@ -742,9 +805,11 @@ impl KovaView {
         columns.push(cur);
 
         // Land on the currently-focused pane; otherwise the first pane row.
+        // The memory list starts at its top: the biggest pane is what it is
+        // opened for.
         let mut selected_col = 0usize;
         let mut selected_row = 0usize;
-        let mut found = false;
+        let mut found = memory_view;
         'outer: for (c, col) in columns.iter().enumerate() {
             for (r, row) in col.iter().enumerate() {
                 if matches!(row, SwitcherRow::Pane { is_current: true, .. }) {
@@ -774,7 +839,8 @@ impl KovaView {
             scroll,
             scroll_acc: 0.0,
             filtered,
-            show_bookmarks,
+            view,
+            memory_total,
             attention,
         });
         self.pane_switcher_clamp_scroll();
@@ -828,10 +894,16 @@ impl KovaView {
         // `b` swaps the open panes for the bookmarks, and back. Not on the
         // attention-only list, which answers a different question and has no
         // bookmark half.
-        if keycode == 0x0B && !event.modifierFlags().contains(NSEventModifierFlags::Command) {
-            let (filtered, show_bookmarks) = self.pane_switcher_modes();
+        // `m` does the same with the memory list.
+        let wanted = match keycode {
+            0x0B => Some(SwitcherView::Bookmarks),
+            0x2E => Some(SwitcherView::Memory),
+            _ => None,
+        };
+        if let Some(wanted) = wanted.filter(|_| !event.modifierFlags().contains(NSEventModifierFlags::Command)) {
+            let (filtered, view) = self.pane_switcher_modes();
             if !filtered {
-                self.open_pane_switcher(false, !show_bookmarks);
+                self.open_pane_switcher(false, toggled_view(view, wanted));
                 return;
             }
         }
@@ -841,8 +913,8 @@ impl KovaView {
             matches!(kb.window_map.get(&opens_filtered), Some(Action::OpenUnreadSwitcher))
         });
         if keycode == 0x20 || opens_filtered {
-            let (filtered, show_bookmarks) = self.pane_switcher_modes();
-            self.open_pane_switcher(!filtered, show_bookmarks);
+            let (filtered, view) = self.pane_switcher_modes();
+            self.open_pane_switcher(!filtered, view);
             return;
         }
 
@@ -852,8 +924,14 @@ impl KovaView {
         // press, and the selection follows the pane it moved. Only on the full
         // list: the attention-only one hides rows, so the pane the move steps
         // over is often not the row above or below, and the list would look
-        // unchanged while the layout moved underneath.
-        let full_list = self.ivars().pane_switcher.borrow().as_ref().is_some_and(|s| !s.filtered);
+        // unchanged while the layout moved underneath. Not on the memory list
+        // either, whose order is the memory and not the tab's.
+        let full_list = self
+            .ivars()
+            .pane_switcher
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| !s.filtered && s.view != SwitcherView::Memory);
         if full_list
             && event.modifierFlags().contains(NSEventModifierFlags::Command)
             && (keycode == 0x7E || keycode == 0x7D)
@@ -969,8 +1047,8 @@ impl KovaView {
             SwitcherTarget::Anchor(_) => {}
             SwitcherTarget::Pane(pane_id) => {
                 self.toggle_pane_bookmark(pane_id);
-                let (filtered, show_bookmarks) = self.pane_switcher_modes();
-                self.open_pane_switcher(filtered, show_bookmarks);
+                let (filtered, view) = self.pane_switcher_modes();
+                self.open_pane_switcher(filtered, view);
                 if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
                     for (c, col) in state.columns.iter().enumerate() {
                         if let Some(r) = col.iter().position(
@@ -1051,8 +1129,8 @@ impl KovaView {
         if self.ivars().pane_switcher.borrow().is_none() {
             return;
         }
-        let (filtered, show_bookmarks) = self.pane_switcher_modes();
-        self.open_pane_switcher(filtered, show_bookmarks);
+        let (filtered, view) = self.pane_switcher_modes();
+        self.open_pane_switcher(filtered, view);
         // Put the selection back where the eye is: the rebuild moved every row
         // below the Anchors section, which just gained or lost a line. A pane is
         // found again by its id; an anchored or un-anchored conversation by the
@@ -1117,8 +1195,8 @@ impl KovaView {
         }
         self.resize_all_panes();
 
-        let (filtered, show_bookmarks) = self.pane_switcher_modes();
-        self.open_pane_switcher(filtered, show_bookmarks);
+        let (filtered, view) = self.pane_switcher_modes();
+        self.open_pane_switcher(filtered, view);
         if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
             for (c, col) in state.columns.iter().enumerate() {
                 if let Some(r) = col.iter().position(
@@ -1634,5 +1712,57 @@ mod tests {
         let g = switcher_grid(&["hb", "hc"]);
         let (c, r) = next_unread_row(&g, 0, 1).expect("an unread pane exists");
         assert!(matches!(g[c][r], SwitcherRow::Pane { .. }));
+    }
+
+    fn pane_titled(title: &str) -> SwitcherRow {
+        match switcher_grid(&["."]).remove(0).remove(0) {
+            SwitcherRow::Pane { pane_id, is_current, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, .. } => {
+                SwitcherRow::Pane { pane_id, title: title.into(), is_current, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn titles(groups: &[Vec<SwitcherRow>]) -> Vec<String> {
+        groups
+            .iter()
+            .flatten()
+            .map(|r| match r {
+                SwitcherRow::Pane { title, .. } => title.clone(),
+                _ => "?".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_memory_list_puts_the_biggest_pane_first_and_keeps_tab_order_on_ties() {
+        let groups = memory_groups(vec![
+            (100, pane_titled("small")),
+            (900, pane_titled("big")),
+            (500, pane_titled("tie-first")),
+            (500, pane_titled("tie-second")),
+        ]);
+        assert_eq!(titles(&groups), ["big", "tie-first", "tie-second", "small"]);
+        // One group per row, so the column packing can spread them.
+        assert!(groups.iter().all(|g| g.len() == 1));
+    }
+
+    #[test]
+    fn memory_reads_in_mb_then_gb() {
+        assert_eq!(format_memory(0), "0 MB");
+        assert_eq!(format_memory(312 * 1024 * 1024), "312 MB");
+        assert_eq!(format_memory(1023 * 1024 * 1024), "1023 MB");
+        assert_eq!(format_memory(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(format_memory((13.8 * 1024.0 * 1024.0 * 1024.0) as u64), "13.8 GB");
+    }
+
+    #[test]
+    fn b_and_m_flip_their_own_list_and_jump_from_the_other() {
+        use SwitcherView::*;
+        assert_eq!(toggled_view(Panes, Memory), Memory);
+        assert_eq!(toggled_view(Memory, Memory), Panes);
+        assert_eq!(toggled_view(Bookmarks, Memory), Memory);
+        assert_eq!(toggled_view(Memory, Bookmarks), Bookmarks);
+        assert_eq!(toggled_view(Bookmarks, Bookmarks), Panes);
     }
 }

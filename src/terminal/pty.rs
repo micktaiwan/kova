@@ -90,6 +90,63 @@ impl ProcessInfo {
     }
 }
 
+/// The direct children of `pid`, via `proc_listchildpids`.
+fn child_pids(pid: i32) -> Vec<i32> {
+    // First call to get count
+    let count = unsafe { libc::proc_listchildpids(pid, std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut pids = vec![0i32; count as usize];
+    let actual = unsafe {
+        libc::proc_listchildpids(
+            pid,
+            pids.as_mut_ptr() as *mut libc::c_void,
+            (pids.len() * std::mem::size_of::<i32>()) as i32,
+        )
+    };
+    if actual <= 0 {
+        return Vec::new();
+    }
+    // proc_listchildpids returns a *count* of PIDs written, not a byte
+    // length — dividing by size_of::<i32>() truncated every shell with
+    // fewer than four children down to zero.
+    pids.truncate(actual as usize);
+    pids.retain(|&p| p > 0);
+    pids
+}
+
+/// Resident size of one process in bytes, 0 when it cannot be read (gone, or
+/// not ours).
+fn resident_bytes(pid: i32) -> u64 {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+    let ret = unsafe {
+        libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, &mut info as *mut _ as *mut libc::c_void, size)
+    };
+    if ret == size { info.pti_resident_size } else { 0 }
+}
+
+/// Resident memory of `root` and all its descendants, in bytes. A pid seen
+/// twice is counted once, so a process that moves while the tree is walked
+/// cannot double the total.
+pub fn tree_resident_bytes(root: i32) -> u64 {
+    if root <= 0 {
+        return 0;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    let mut total = 0u64;
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        total += resident_bytes(pid);
+        stack.extend(child_pids(pid));
+    }
+    total
+}
+
 /// The name and version of the program running as `pid`.
 ///
 /// The obvious source, `proc_name`, returns the kernel's `p_comm`: the basename
@@ -619,28 +676,20 @@ impl Pty {
     /// Returns the list of child processes of the shell (pid, name + version).
     /// Uses macOS `proc_listchildpids`, then `process_info` for each child.
     pub fn child_processes(&self) -> Vec<(u32, ProcessInfo)> {
-        let pid = self.child_pid as i32;
-        // First call to get count
-        let count = unsafe { libc::proc_listchildpids(pid, std::ptr::null_mut(), 0) };
-        if count <= 0 {
-            return Vec::new();
+        child_pids(self.child_pid as i32)
+            .into_iter()
+            .map(|cpid| (cpid as u32, process_info(cpid as u32)))
+            .collect()
+    }
+
+    /// Resident memory of the pane: the shell and every process below it
+    /// (the agent, and the MCP servers and tools it started), in bytes. Zero
+    /// for a pane with no real child.
+    pub fn tree_resident_bytes(&self) -> u64 {
+        if self.is_dummy {
+            return 0;
         }
-        let mut pids = vec![0i32; count as usize];
-        let actual = unsafe {
-            libc::proc_listchildpids(
-                pid,
-                pids.as_mut_ptr() as *mut libc::c_void,
-                (pids.len() * std::mem::size_of::<i32>()) as i32,
-            )
-        };
-        if actual <= 0 {
-            return Vec::new();
-        }
-        // proc_listchildpids returns a *count* of PIDs written, not a byte
-        // length — dividing by size_of::<i32>() truncated every shell with
-        // fewer than four children down to zero.
-        pids.truncate(actual as usize);
-        pids.iter().map(|&cpid| (cpid as u32, process_info(cpid as u32))).collect()
+        tree_resident_bytes(self.child_pid as i32)
     }
 
     /// Returns the current working directory of the child shell process.
@@ -822,6 +871,28 @@ impl Drop for Pty {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_process_tree_holds_at_least_its_root() {
+        let me = std::process::id() as i32;
+        let own = super::tree_resident_bytes(me);
+        assert!(own > 0, "this test process has resident memory");
+        assert_eq!(super::tree_resident_bytes(0), 0);
+        assert_eq!(super::tree_resident_bytes(-1), 0);
+    }
+
+    #[test]
+    fn a_process_tree_counts_its_children() {
+        let mut child = std::process::Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        let me = std::process::id() as i32;
+        let alone = super::resident_bytes(me);
+        let tree = super::tree_resident_bytes(me);
+        let sleep = super::resident_bytes(child.id() as i32);
+        child.kill().ok();
+        child.wait().ok();
+        assert!(sleep > 0);
+        assert!(tree >= alone + sleep - alone / 10, "tree {} alone {} child {}", tree, alone, sleep);
+    }
+
     use super::*;
 
     /// Build a KERN_PROCARGS2-shaped buffer: argc, exec path, padding, argv.

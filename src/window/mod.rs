@@ -689,7 +689,7 @@ define_class!(
             if let Some(renderer) = self.ivars().renderer.get() {
                 if let Some((zx, zy, zw, zh)) = renderer.read().minimized_counter_zone {
                     if px >= zx && px < zx + zw && py >= zy && py < zy + zh {
-                        self.open_pane_switcher(false, false);
+                        self.open_pane_switcher(false, switcher::SwitcherView::Panes);
                         return;
                     }
                 }
@@ -1592,8 +1592,8 @@ impl KovaView {
             Action::CloseTab => self.do_close_tab(),
             Action::OpenRecentProject => self.do_open_recent_projects(),
             Action::OpenSearchPalette => self.do_open_search_palette(),
-            Action::OpenPaneSwitcher => self.open_pane_switcher(false, false),
-            Action::OpenUnreadSwitcher => self.open_pane_switcher(true, false),
+            Action::OpenPaneSwitcher => self.open_pane_switcher(false, switcher::SwitcherView::Panes),
+            Action::OpenUnreadSwitcher => self.open_pane_switcher(true, switcher::SwitcherView::Panes),
             Action::ToggleBookmark => self.do_toggle_bookmark(),
             Action::ToggleAnchor => self.do_toggle_anchor(),
             Action::FocusAnchor => self.do_focus_anchor(),

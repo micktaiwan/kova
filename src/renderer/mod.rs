@@ -283,6 +283,9 @@ pub struct PaneSwitcherRenderData<'a> {
     /// The bookmark half is up: the saved conversations in place of the open
     /// panes (`b`). Changes the title and the hint line, for the same reason.
     pub show_bookmarks: bool,
+    /// The memory list is up (`m`): every pane, biggest first. Carries what
+    /// they hold together ("13.8 GB") and how many there are, for the title.
+    pub memory_total: Option<(String, usize)>,
 }
 
 /// Vertical geometry of a list overlay (title + subtitle + scrolling rows),
@@ -2099,6 +2102,8 @@ impl Renderer {
                 1 => "Unread Panes  —  1".to_string(),
                 n => format!("Unread Panes  —  {}", n),
             }
+        } else if let Some((total, panes)) = &data.memory_total {
+            format!("Memory  —  {} in {} panes", total, panes)
         } else if data.show_bookmarks {
             let saved = data
                 .columns
@@ -2133,11 +2138,20 @@ impl Renderer {
                 ("u", "All panes"),
                 ("esc", "Cancel"),
             ]
+        } else if data.memory_total.is_some() {
+            &[
+                ("\u{2191}\u{2193}\u{2190}\u{2192}", "Navigate"),
+                ("\u{23ce}", "Focus"),
+                ("m", "Open panes"),
+                ("b", "Bookmarks"),
+                ("esc", "Cancel"),
+            ]
         } else if data.show_bookmarks {
             &[
                 ("\u{2191}\u{2193}\u{2190}\u{2192}", "Navigate"),
                 ("\u{23ce}", "Open"),
                 ("b", "Open panes"),
+                ("m", "Memory"),
                 ("\u{2318}\u{21e7}A", "Anchor"),
                 ("\u{2318}\u{232b}", "Remove bookmark"),
                 ("esc", "Cancel"),
@@ -2149,6 +2163,7 @@ impl Renderer {
                 ("\u{23ce}", "Focus"),
                 ("\u{2318}\u{2191}\u{2193}", "Move"),
                 ("b", "Bookmarks"),
+                ("m", "Memory"),
                 ("\u{2318}B", "Bookmark"),
                 ("\u{2318}\u{21e7}A", "Anchor"),
                 ("u", "Unread only"),

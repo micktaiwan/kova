@@ -383,7 +383,8 @@ impl KovaView {
             selected_col: state.selected_col,
             selected_row: state.selected_row,
             filtered: state.filtered,
-            show_bookmarks: state.show_bookmarks,
+            show_bookmarks: state.view == super::switcher::SwitcherView::Bookmarks,
+            memory_total: state.memory_total.map(|(bytes, panes)| (super::switcher::format_memory(bytes), panes)),
         });
 
         // Update resize feedback (decrement frames, build text)
