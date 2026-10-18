@@ -564,7 +564,7 @@ Runs the exact same handler as the corresponding keyboard shortcut — this is t
 
 Response: `{ "ok": true }`, or `{ "ok": false, "error": "unknown action: ..." }`.
 
-**Action names** (kebab-case, mirroring the config keys in `config.rs`):
+**Action names** (kebab-case; the table is `action_from_ipc_name` in `src/keybindings.rs`):
 
 ```
 new-tab  close-pane-or-tab  close-tab  close-window  kill-window  new-window
