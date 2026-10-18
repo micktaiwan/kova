@@ -1,204 +1,205 @@
-# Kova en bibliothèque : un terminal pour Kova.app et pour Kana
+# Kova as a library: one terminal for Kova.app and for a host app
 
-Déplacé le 13/10/2026 depuis `kana/docs/claude-pane.md`, où vit le reste de l'analyse (le
-besoin dans les mots de Mickael, la partie Claude, la synchro avec le texte, les pistes
-écartées). Ce fichier porte la partie qui se fait dans Kova : l'architecture, les tests à écrire
-avant de toucher au code, et l'ordre du chantier. Les numéros de ligne datent du 13/10/2026 ;
-les relire avant de s'en servir.
+This file covers the part of the work done inside Kova: the architecture, the tests to write
+before touching the code, and the order of the work. The host side (the need, the Claude part,
+syncing with the text, discarded options) lives with the host app. Line numbers may be stale;
+reread them before relying on them.
 
-Le besoin, en une phrase : Mickael veut dans Kana (son éditeur, `~/projects/perso/kana`) un
-pane Kova par note, où tourne une conversation Claude Code, avec le même code de terminal que
-Kova.app (aucune copie), zéro régression sur Kova garantie par des tests écrits avant le
-refactoring, et les sessions visibles dans Kite.
+The need, in one sentence: a host app (an editor) wants one Kova pane per note, running a
+Claude Code conversation, with the same terminal code as Kova.app (no copy), zero regression
+on Kova guaranteed by tests written before the refactoring, and the sessions visible to remote
+clients that already talk to Kova's socket.
 
-## La solution retenue : Kova devient une bibliothèque, Kova.app et Kana en sont deux clients
+## The chosen solution: Kova becomes a library, Kova.app and the host app are two of its clients
 
-Un seul code de terminal, utilisé par deux apps. Kova.app est le premier client et ne perd rien ;
-Kana est le second et affiche un pane par note. C'est l'architecture de Ghostty : un cœur de
-terminal en bibliothèque, et une app macOS qui l'utilise avec une vue par split
-(`ghostty_surface_new`, `include/ghostty.h` du repo ghostty-org/ghostty). Ghostty présente
-cette API comme interne, pas conçue pour d'autres apps ; ici les deux clients sont à Mickael,
-donc ce n'est pas un frein.
+One terminal codebase, used by two apps. Kova.app is the first client and loses nothing; the
+host app is the second and shows one pane per note. This is Ghostty's architecture: a terminal
+core as a library, and a macOS app that uses it with one view per split
+(`ghostty_surface_new`, `include/ghostty.h` in the ghostty-org/ghostty repo). Ghostty presents
+this API as internal, not designed for other apps; here both clients have the same owner, so
+that is not a blocker.
 
-### Les pièces
+### The pieces
 
-- **Rien n'existe tant qu'aucun pane n'est ouvert** : ouvrir le pane d'une note crée son
-  `Surface` (le shell, puis `claude`) ; le fermer détruit le `Surface`, ce qui termine `claude`.
-  Le contexte de rendu partagé est créé avec le premier pane et libéré avec le dernier.
+- **Nothing exists until a pane is opened**: opening a note's pane creates its
+  `Surface` (the shell, then `claude`); closing it destroys the `Surface`, which ends `claude`.
+  The shared rendering context is created with the first pane and freed with the last.
 
-- **Un `Surface` par pane, dans la bibliothèque** : le PTY, l'état du terminal, la sélection, le
-  défilement, la session d'agent, le flag « attend l'utilisateur ». La base existe :
-  `Pane` porte déjà son PTY, son terminal, `awaiting` et `agent_session`
-  (`kova/src/pane.rs:1656-1687`). Le rafraîchissement de la session d'agent, aujourd'hui fait au
-  niveau de l'onglet (`Tab::check_running`, `pane.rs:779-800`), descend dans le pane.
-- **L'entrée par une API typée, comme Ghostty** : `key`, `text`, `preedit` (le texte en cours de
-  composition, les accents), `mouse`, `scroll`. Toute la logique (quels octets envoyer pour une
-  touche, le choix entre composer un accent ou envoyer Option, Ctrl+L, la sélection au clic,
-  le défilement) vit dans la bibliothèque, une seule fois. La traduction des événements macOS
-  (touches, texte en composition, souris) vers cette API est elle aussi écrite une seule fois,
-  dans la bibliothèque : un composant de saisie partagé. `KovaView` traite d'abord ce qui
-  appartient à la fenêtre (overlays, raccourcis d'onglets) puis lui passe la main pour le pane
-  actif ; dans Kana, la vue du pane est fournie par la bibliothèque et n'est que ce composant
-  plus un `Surface`. Il ne reste dans chaque classe de vue que les méthodes que macOS exige,
-  chacune d'une ligne qui délègue : aucun code de saisie en double, et Kana n'en écrit aucun.
-  Ghostty sépare de la même façon la logique (dans le cœur : `ghostty_surface_text`,
-  `ghostty_surface_preedit`) de la vue macOS.
-  État à l'étape 2 (13/10/2026) : `key`, `text`, `mouse`, `scroll` sont sur `Surface`
-  (`src/input.rs`) ; le texte en composition reste dans le composant de saisie partagé
-  (`src/appkit_input.rs`), parce que rien dans le terminal ne le lit encore.
-- **Le dessin : un contexte partagé et un dessinateur par pane.** Un `RenderContext` (device
-  Metal, pipeline, atlas de glyphes par échelle d'écran) et un `PaneRenderer` qui dessine un pane
-  dans le rectangle que l'hôte lui donne. Kova.app garde un seul layer par fenêtre et dessine
-  ses panes dedans, comme aujourd'hui ; Kana donne un layer qui ne contient qu'un pane.
-  Pourquoi pas un layer par pane comme Ghostty : Kova dessine aujourd'hui toute la fenêtre en
-  une seule image (un seul `nextDrawable` et un seul `presentDrawable`,
-  `kova/src/renderer/mod.rs:1092`, `:1444`), overlays compris. Garder ce modèle, c'est ne rien
-  changer à ce que Kova.app affiche, donc ne rien risquer sur un comportement déjà validé ;
-  passer à un layer par pane changerait la façon dont la fenêtre se compose, sans gain prouvé
-  (aucune mesure n'a été faite dans un sens ou dans l'autre). Le code est déjà presque découpé ainsi : un cache de vertices et une
-  zone de découpe par pane (`mod.rs:927`, `:1317-1325`). Le gain de Ghostty, ne pas redessiner
-  un pane qui ne change pas quand on fait défiler les colonnes, s'obtient aussi : le cache
-  contient aujourd'hui la position du pane (`mod.rs:827`), il suffit de dessiner en coordonnées
-  locales et de passer la position à part.
-  **Corrigé le 13/10/2026 (étape 2)** : pas aussi simple. Le build arrondit chaque position
-  au pixel entier dans l'espace du drawable (`(ox + col_idx as f32 * cell_w).round()`,
-  `src/renderer/pane_renderer.rs`), et la position d'un pane peut être fractionnaire (largeurs
-  de colonnes en poids, défilement au trackpad). Un build fait à l'origine puis translaté place
-  les glyphes jusqu'à un demi-pixel à côté ; le test `a_shifted_build_is_not_a_build_in_place`
-  fige ce contre-exemple. Le cache reste donc indexé sur le rectangle absolu. Variante non
-  évaluée : construire avec la partie fractionnaire de la position et translater de la partie
-  entière, ce qui garde les arrondis ; restent les sommes non arrondies (texte de la barre de
-  statut, inclinaison de l'italique) qui tomberaient sur d'autres f32, effet à l'écran non mesuré.
-- **L'horloge reste à l'hôte** : le pane dit s'il doit être redessiné, l'hôte décide quand.
-  Kova.app garde son timer (`kova/src/app.rs:226-232`). Le clignotement du curseur, compté en
-  images aujourd'hui (`mod.rs:1002`), passe en temps réel pour ne pas dépendre de l'hôte.
-- **Le socket IPC pour Kite** : le transport (`kova/src/ipc.rs`) et les commandes qui portent sur un pane (`list-panes`, `send-keys`,
-  `get-pane-content`, `count-pane-content`, `focus-pane`, `close-pane`, `notify`…) passent dans
-  la bibliothèque, écrites une fois contre une interface d'hôte (« donne-moi les panes, ce
-  pane, mets-le au premier plan »). Le transport n'est pas tout à fait autonome : il lit une
-  constante du rendu, `crate::renderer::TAB_COLORS` (`kova/src/ipc.rs:24`), à déplacer avec lui.
-  Fait à l'étape 2 : elle vit dans `src/tab_colors.rs`, et l'interface d'hôte est le trait
+- **One `Surface` per pane, in the library**: the PTY, the terminal state, the selection, the
+  scrolling, the agent session, the "waiting for the user" flag. The base exists:
+  `Pane` already carries its PTY, its terminal, `awaiting` and `agent_session`
+  (`kova/src/pane.rs:1656-1687`). Refreshing the agent session, done today at the
+  tab level (`Tab::check_running`, `pane.rs:779-800`), moves down into the pane.
+- **Input through a typed API, like Ghostty**: `key`, `text`, `preedit` (the text being
+  composed, accents), `mouse`, `scroll`. All the logic (which bytes to send for a key, the
+  choice between composing an accent or sending Option, Ctrl+L, click selection, scrolling)
+  lives in the library, once. Translating macOS events (keys, composed text, mouse) into this
+  API is also written once, in the library: a shared input component. `KovaView` first handles
+  what belongs to the window (overlays, tab shortcuts) then hands over to it for the active
+  pane; in the host app, the pane view is provided by the library and is just this component
+  plus a `Surface`. Each view class keeps only the methods macOS requires, each a one-line
+  delegation: no duplicated input code, and the host app writes none.
+  Ghostty separates the logic (in the core: `ghostty_surface_text`,
+  `ghostty_surface_preedit`) from the macOS view in the same way.
+  Status at step 2: `key`, `text`, `mouse`, `scroll` are on `Surface`
+  (`src/input.rs`); composed text stays in the shared input component
+  (`src/appkit_input.rs`), because nothing in the terminal reads it yet.
+- **Drawing: a shared context and one drawer per pane.** A `RenderContext` (Metal device,
+  pipeline, glyph atlas per screen scale) and a `PaneRenderer` that draws a pane in the
+  rectangle the host gives it. Kova.app keeps a single layer per window and draws its panes in
+  it, as today; the host app provides a layer that contains only one pane.
+  Why not one layer per pane like Ghostty: Kova today draws the whole window as one image (a
+  single `nextDrawable` and a single `presentDrawable`,
+  `kova/src/renderer/mod.rs:1092`, `:1444`), overlays included. Keeping this model means
+  changing nothing in what Kova.app displays, so risking nothing on already validated behavior;
+  switching to one layer per pane would change how the window is composed, with no proven gain
+  (no measurement has been made either way). The code is already almost split this way: a
+  vertex cache and a clip area per pane (`mod.rs:927`, `:1317-1325`). Ghostty's gain, not
+  redrawing a pane that doesn't change while scrolling the columns, can be had too: the cache
+  today contains the pane's position (`mod.rs:827`); it is enough to draw in local coordinates
+  and pass the position separately.
+  **Corrected at step 2**: not that simple. The build rounds each position to the whole pixel
+  in drawable space (`(ox + col_idx as f32 * cell_w).round()`,
+  `src/renderer/pane_renderer.rs`), and a pane's position can be fractional (column widths as
+  weights, trackpad scrolling). A build done at the origin then translated places glyphs up to
+  half a pixel off; the test `a_shifted_build_is_not_a_build_in_place` freezes this
+  counterexample. So the cache stays keyed on the absolute rectangle. Unevaluated variant:
+  build with the fractional part of the position and translate by the integer part, which keeps
+  the rounding; what remains are the unrounded sums (status bar text, italic slant) that would
+  land on other f32 values, with an on-screen effect not measured.
+- **The clock stays with the host**: the pane says whether it needs a redraw, the host decides
+  when. Kova.app keeps its timer (`kova/src/app.rs:226-232`). Cursor blinking, counted in
+  frames today (`mod.rs:1002`), moves to real time so as not to depend on the host.
+- **The IPC socket for remote clients**: the transport (`kova/src/ipc.rs`) and the commands
+  that act on a pane (`list-panes`, `send-keys`, `get-pane-content`, `count-pane-content`,
+  `focus-pane`, `close-pane`, `notify`…) move into the library, written once against a host
+  interface ("give me the panes, this pane, bring it to the front"). The transport is not
+  entirely self-contained: it reads a rendering constant, `crate::renderer::TAB_COLORS`
+  (`kova/src/ipc.rs:24`), to be moved along with it.
+  Done at step 2: it lives in `src/tab_colors.rs`, and the host interface is the trait
   `IpcHost` (`src/ipc/host.rs`).
-  Les commandes d'onglets et de fenêtres restent à Kova.app, sauf deux que Kite envoie à
-  l'instance qui tient le pane : `list-tabs` et `close-tab` (`kite/daemon/src/api.rs:655-664`,
-  fermeture d'un projet depuis Kite). Kana y répond avec « un onglet par note », et `close-tab`
-  y ferme le pane de la note.
-- **Kana a son propre socket**, `/tmp/kova-<pid de Kana>.sock`, au même protocole. Kite trouve
-  déjà toutes les instances (`kite/daemon/src/kova.rs:25-46`) et range les panes par socket.
-  `KOVA_SOCKET` et `KOVA_PANE_ID`, donnés au shell (`kova/src/terminal/pty.rs:234-235`), pointent
-  alors vers Kana, donc les hooks Claude qui marquent un pane (`~/.claude/hooks/kova-pane-status.sh`)
-  marchent dans Kana sans changement. Enregistrer les panes de Kana dans le process Kova.app
-  obligerait à faire passer le terminal d'un process à l'autre : plus compliqué, et Kana
-  dépendrait de Kova ouvert.
-- **Ce qui reste à Kova.app** : fenêtres, onglets, colonnes, séparateurs, overlays, signets,
-  ancres, Cmd+J.
+  Tab and window commands stay with Kova.app, except two that a remote client sends to the
+  instance holding the pane: `list-tabs` and `close-tab` (closing a project from the client).
+  The host app answers them with "one tab per note", and `close-tab` there closes the note's
+  pane.
+- **The host app has its own socket**, `/tmp/kova-<host pid>.sock`, with the same protocol. A
+  client that already discovers every instance's socket and groups panes by socket sees it
+  without changes. `KOVA_SOCKET` and `KOVA_PANE_ID`, given to the shell
+  (`kova/src/terminal/pty.rs:234-235`), then point to the host app, so the Claude Code hooks
+  that mark a pane work in the host app without changes. Registering the host's panes in the
+  Kova.app process would require passing the terminal from one process to the other: more
+  complicated, and the host app would depend on Kova being open.
+- **What stays with Kova.app**: windows, tabs, columns, separators, overlays, bookmarks,
+  anchors, Cmd+J.
 
-### Deux règles de Kova à lever explicitement
+### Two Kova rules to lift explicitly
 
-`kova/CLAUDE.md`, section Principes, dit « Pas de feature creep : tabs, splits, config, c'est
-tout » et « Du code que Mickael a validé […] ne se modifie plus », parce que toucher au
-comportement validé crée des régressions. Ce chantier ajoute une fonction à Kova (servir un
-autre hôte) et déplace du code validé. La seconde règle vise le comportement : le refactoring
-ne doit en changer aucun, et les tests ci-dessous sont là pour le prouver. Les deux restent à
-lever par Mickael avant de commencer, et `kova/CLAUDE.md` à mettre à jour.
+`kova/CLAUDE.md`, Principles section, said "No feature creep: tabs, splits, config, that's
+it" and "Code the user has validated […] is no longer modified", because touching validated
+behavior creates regressions. This work adds a function to Kova (serving another host) and
+moves validated code. The second rule targets behavior: the refactoring must change none of
+it, and the tests below are there to prove it. Both had to be lifted by the user before
+starting, and `kova/CLAUDE.md` updated.
 
-### D'abord les tests, ensuite le refactoring
+### Tests first, then the refactoring
 
-Le code qui va bouger n'a presque pas de tests : aucun dans `kova/src/input.rs`, un seul dans
-`kova/src/window/mod.rs` (2 682 lignes). La politique de Kova teste la logique pure et laisse
-Metal et AppKit de côté (`kova/CLAUDE.md`, section Tests). D'où l'ordre, chaque étape gardant
-Kova.app utilisable et testé :
+The code that is going to move has almost no tests: none in `kova/src/input.rs`, a single one
+in `kova/src/window/mod.rs` (2,682 lines). Kova's policy tests pure logic and leaves Metal and
+AppKit aside (`kova/CLAUDE.md`, Tests section). Hence the order, each step keeping Kova.app
+usable and tested:
 
-1. Tests de sélection, mots, texte sélectionné et URL sur `TerminalState`, sans rien déplacer :
-   les tests construisent déjà un terminal en mémoire (`kova/src/terminal/mod.rs:3317`).
-2. Sortir le calcul « touche → octets » en fonction pure (`input.rs:53-174`) et figer toute la
-   table : Ctrl+lettre, flèches en mode application, protocole kitty, Shift+Tab, Option.
-3. Le choix composer un accent ou envoyer Option (`window/mod.rs:605-608`), Ctrl+L, Ctrl+F.
-4. Les octets de souris SGR et le pas de défilement du trackpad.
-5. Le passage pixel → cellule sans `NSEvent`, puis la sélection au clic et au glisser.
-6. Une interface « écrire des octets » à la place du vrai PTY, puis les tests des commandes IPC.
-7. Un constructeur de vertices avec un faux atlas de glyphes, puis des instantanés de vertices
-   (plus stables qu'une comparaison d'images, que la police et la version de macOS feraient
-   varier).
-8. Ce qui ne s'automatise pas (vraies touches mortes françaises, ^ puis e, Option+$ ; place de
-   la fenêtre des accents ; défilement à inertie ; triple-clic réel) : une courte liste de
-   gestes, jouée avant et après le refactoring, dans un pane qui affiche les octets reçus
-   (`od -c`) et relue par `get-pane-content`.
+1. Tests for selection, words, selected text and URLs on `TerminalState`, without moving
+   anything: the tests already build an in-memory terminal (`kova/src/terminal/mod.rs:3317`).
+2. Pull the "key → bytes" computation out into a pure function (`input.rs:53-174`) and freeze
+   the whole table: Ctrl+letter, arrows in application mode, kitty protocol, Shift+Tab, Option.
+3. The choice between composing an accent or sending Option (`window/mod.rs:605-608`), Ctrl+L,
+   Ctrl+F.
+4. SGR mouse bytes and the trackpad scroll step.
+5. Pixel → cell conversion without `NSEvent`, then click and drag selection.
+6. A "write bytes" interface in place of the real PTY, then the IPC command tests.
+7. A vertex builder with a fake glyph atlas, then vertex snapshots (more stable than an image
+   comparison, which the font and the macOS version would make vary).
+8. What can't be automated (real French dead keys, ^ then e, Option+$; position of the accent
+   window; inertial scrolling; real triple-click): a short list of gestures, played before and
+   after the refactoring, in a pane that shows the bytes received (`od -c`) and read back via
+   `get-pane-content`.
 
-### Les gestes manuels de l'étape 8
+### The manual gestures of step 8
 
-Joués deux fois : une passe « avant » sur le Kova installé, une passe « après » sur chaque build
-du refactoring, et les deux traces comparées avec `diff`. Le pane de mesure lance
-`python3 scripts/key-probe.py <label>` (une ligne `od -c` par lecture du PTY, trace dans
-`~/Downloads/kova-embedding/key-probe-<label>.log`, Ctrl+D seul pour arrêter) ; la souris passe
-par `scripts/mouse-probe.py <label>` (q pour arrêter). Ce que ces gestes couvrent et que les tests ne
-peuvent pas toucher : le choix que fait macOS entre `insertText:` et `doCommandBySelector:`, le
-vrai clavier AZERTY, la vraie fenêtre des accents, le vrai trackpad.
+Played twice: a "before" pass on the installed Kova, an "after" pass on each refactoring
+build, and both traces compared with `diff`. The measurement pane runs
+`python3 scripts/key-probe.py <label>` (one `od -c` line per PTY read, trace in
+`~/Downloads/kova-embedding/key-probe-<label>.log`, Ctrl+D alone to stop); the mouse goes
+through `scripts/mouse-probe.py <label>` (q to stop). What these gestures cover and tests
+can't touch: the choice macOS makes between `insertText:` and `doCommandBySelector:`, the
+real AZERTY keyboard, the real accent window, the real trackpad.
 
-Passe clavier sans kitty (`key-probe.py avant`), puis la même avec `--kitty` (`avant-kitty`) :
+Keyboard pass without kitty (`key-probe.py avant`), then the same with `--kitty`
+(`avant-kitty`):
 
-1. `^` puis `e`, `¨` puis `i`, `` ` `` puis `a` (touches mortes) ; `^` puis espace.
-2. Option+$, Option+(, Option+e puis e.
-3. Appui long sur `e`, choisir `é` au clavier : noter où s'ouvre la fenêtre des accents.
+1. `^` then `e`, `¨` then `i`, `` ` `` then `a` (dead keys); `^` then space.
+2. Option+$, Option+(, Option+e then e.
+3. Long press on `e`, pick `é` with the keyboard: note where the accent window opens.
 4. Ctrl+A, Ctrl+C, Ctrl+[, Ctrl+Option+A.
-5. Flèches, Home, End, Page Up/Down, Suppr avant, F1 à F4, Shift+Tab, Entrée, Tab, Échap, Retour arrière.
-6. Ctrl+flèche haut, Option+flèche haut, Shift+Entrée, Option+←, Option+→, Cmd+←, Cmd+→, Cmd+Retour arrière.
+5. Arrows, Home, End, Page Up/Down, Forward Delete, F1 to F4, Shift+Tab, Return, Tab, Escape, Backspace.
+6. Ctrl+Up arrow, Option+Up arrow, Shift+Return, Option+←, Option+→, Cmd+←, Cmd+→, Cmd+Backspace.
 
-Hors du probe, dans un shell ordinaire :
+Outside the probe, in an ordinary shell:
 
-7. Ctrl+L : l'écran se vide et le scrollback avec (molette vers le haut : rien) ; dans `vim`, Ctrl+L ne vide pas le scrollback.
-8. Ctrl+F ouvre le filtre, Échap le ferme.
-9. Ctrl+Option+→ et ← : la largeur virtuelle change, rien n'arrive au shell.
+7. Ctrl+L: the screen clears and the scrollback with it (wheel up: nothing); in `vim`, Ctrl+L doesn't clear the scrollback.
+8. Ctrl+F opens the filter, Escape closes it.
+9. Ctrl+Option+→ and ←: the virtual width changes, nothing reaches the shell.
 
-Souris (texte connu à l'écran, puis `pbpaste` après chaque geste) :
+Mouse (known text on screen, then `pbpaste` after each gesture):
 
-10. Clic simple : aucune sélection, presse-papiers inchangé.
-11. Glisser sur deux lignes ; double-clic sur un chemin `~/src/main.rs:12` ; triple-clic réel sur une ligne ; double-clic puis glisser.
-12. Glisser au-delà du bas du pane : le défilement automatique accélère avec la distance.
-13. Cmd+survol d'une URL (soulignée), Cmd+clic (ouverte dans le navigateur).
-14. Défilement trackpad avec inertie dans un long historique, puis dans `mouse-probe.py inertie` (rapports SGR 64/65).
+10. Single click: no selection, clipboard unchanged.
+11. Drag over two lines; double-click on a path `~/src/main.rs:12`; real triple-click on a line; double-click then drag.
+12. Drag past the bottom of the pane: auto-scroll speeds up with distance.
+13. Cmd+hover over a URL (underlined), Cmd+click (opened in the browser).
+14. Inertial trackpad scroll in a long history, then in `mouse-probe.py inertie` (SGR 64/65 reports).
 
-### L'ordre du chantier
+### The order of the work
 
-1. Les tests ci-dessus.
-2. Le refactoring dans Kova, Kova.app restant le seul client : `Surface`, API d'entrée,
-   `RenderContext` et `PaneRenderer`, IPC contre l'interface d'hôte. À chaque étape, tests verts
-   et liste de gestes rejouée.
-3. La cible bibliothèque : `[lib]` et `staticlib` dans `kova/Cargo.toml` (aucune aujourd'hui),
-   plus une API C (créer un pane dans une vue, entrée, taille, lecture du contenu, fermeture).
-   Fait le 13/10/2026 : la bibliothèque s'appelle `kova` comme le binaire (`src/lib.rs`,
-   `libkova.a`, `libkova.rlib`), pour que les lignes de log et les panics gardent leur préfixe
-   `kova::…` ; Cargo n'y voit pas de collision. Le binaire `kova` est bâti dessus et garde son nom
-   et son chemin, donc `build.sh` ne change pas. L'API C est `include/kova.h` (`src/capi.rs`), au-dessus de `src/embed.rs` : un pane est
-   un `Surface` plus, si l'hôte donne une `NSView`, une sous-vue de la bibliothèque (le composant
-   de saisie partagé) qui dessine le pane seul dans son `CAMetalLayer` (`src/renderer/layer.rs`,
-   le même `PaneRenderer` que Kova.app ; un `RenderContext` par échelle, partagé, libéré avec le
-   dernier pane). L'horloge reste à l'hôte (`kova_pane_tick`, `kova_pane_draw`), et
-   `kova_ipc_start` sert le socket sur les panes de l'hôte, un onglet par pane (lié avant de rendre
-   la main : un échec de `bind` revient en -1). En quittant, l'hôte appelle `kova_shutdown`, qui
-   attend que shells et jobs de premier plan soient morts ; `kova_pane_free` seul ne fait que
-   lancer leur récolte sur un thread. Kova.app ne passe
-   par rien de tout ça. Prouvé hors de Kana : tests Rust sur les fonctions C (dont toute la table
-   de touches figée) et `tests/c_smoke/smoke.m`, un programme Objective-C qui lie la bibliothèque,
-   lance deux panes (dont un dans une `NSView` hors fenêtre, dessiné) et interroge le socket.
-4. Kana : la vue du pane, le lien de la bibliothèque dans `build.sh` et `Package.swift`, le
-   socket, la table note → session (chemin et inode), les trois hooks (SessionStart,
-   UserPromptSubmit, PreToolUse), la commande `kana edit`, la commande qui reçoit un nouvel
-   identifiant de session, la surveillance du dossier des notes, et la fusion à trois versions si Mickael la valide.
+1. The tests above.
+2. The refactoring in Kova, with Kova.app still the only client: `Surface`, input API,
+   `RenderContext` and `PaneRenderer`, IPC against the host interface. At each step, green
+   tests and the gesture list replayed.
+3. The library target: `[lib]` and `staticlib` in `kova/Cargo.toml` (none today), plus a C API
+   (create a pane in a view, input, size, content reading, close).
+   Done: the library is called `kova` like the binary (`src/lib.rs`, `libkova.a`,
+   `libkova.rlib`), so that log lines and panics keep their `kova::…` prefix; Cargo sees no
+   collision there. The `kova` binary is built on top of it and keeps its name and path, so
+   `build.sh` doesn't change. The C API is `include/kova.h` (`src/capi.rs`), above
+   `src/embed.rs`: a pane is a `Surface` plus, if the host gives an `NSView`, a library subview
+   (the shared input component) that draws the pane alone in its `CAMetalLayer`
+   (`src/renderer/layer.rs`, the same `PaneRenderer` as Kova.app; one `RenderContext` per
+   scale, shared, freed with the last pane). The clock stays with the host (`kova_pane_tick`,
+   `kova_pane_draw`), and `kova_ipc_start` serves the socket over the host's panes, one tab per
+   pane (bound before returning: a `bind` failure comes back as -1). On quit, the host calls
+   `kova_shutdown`, which waits until shells and foreground jobs are dead; `kova_pane_free`
+   alone only starts reaping them on a thread. Kova.app goes through none of this. Proven
+   outside the host app: Rust tests on the C functions (including the whole frozen key table)
+   and `tests/c_smoke/smoke.m`, an Objective-C program that links the library, launches two
+   panes (one of them in an off-window `NSView`, drawn) and queries the socket.
+4. The host app: the pane view, linking the library in its build, the socket, the note →
+   session table (path and inode), the three hooks (SessionStart, UserPromptSubmit,
+   PreToolUse), an edit command, the command that receives a new session id, watching the
+   notes folder, and a three-way merge if the user validates it.
 
-## Vérifié depuis
+## Verified since
 
-- Deux appels à `MTLCreateSystemDefaultDevice` rendent le même objet (même pointeur, même
-  `registryID`), mesuré sur le Mac de Mickael le 13/10/2026 par
-  `cargo test the_system_default_device -- --nocapture` (`src/renderer/layer.rs`), qui a
-  affiché `MTLCreateSystemDefaultDevice: 0x1016b9800 / 0x1016b9800, registryID 4294968545 /
-  4294968545`. Sur une machine sans device Metal, ce test passe sans rien vérifier. La bibliothèque n'en dépend pas : un contexte neuf reprend le device
-  d'un contexte vivant.
+- Two calls to `MTLCreateSystemDefaultDevice` return the same object (same pointer, same
+  `registryID`), measured with
+  `cargo test the_system_default_device -- --nocapture` (`src/renderer/layer.rs`), which
+  printed `MTLCreateSystemDefaultDevice: 0x1016b9800 / 0x1016b9800, registryID 4294968545 /
+  4294968545`. On a machine without a Metal device, this test passes without checking
+  anything. The library doesn't depend on it: a new context reuses the device of a live
+  context.
 
-## Non vérifié
+## Not verified
 
-- Qu'une vue Rust fournie par la bibliothèque s'insère sans friction dans la fenêtre AppKit de
-  Kana (premier répondeur, focus entre l'éditeur et le terminal).
-- Que Kite supporte un serveur qui répond à `list-tabs` par un onglet par note.
-- Que garder une image par fenêtre ou passer à un layer par pane change quoi que ce soit de
-  mesurable : rien n'a été mesuré.
+- That a Rust view provided by the library fits without friction into the host app's AppKit
+  window (first responder, focus between the editor and the terminal).
+- That a remote client copes with a server that answers `list-tabs` with one tab per note.
+- That keeping one image per window or switching to one layer per pane changes anything
+  measurable: nothing has been measured.

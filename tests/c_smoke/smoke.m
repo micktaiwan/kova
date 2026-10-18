@@ -106,7 +106,7 @@ static KovaPaneId hup_proof_pane(const char *tag, pid_t *shell, pid_t *job) {
     return pane;
 }
 
-// ── A socket client on its own thread, as Kite would be ──────────────────
+// ── A socket client on its own thread, as a remote client would be ───────
 
 typedef struct {
     const char *path;

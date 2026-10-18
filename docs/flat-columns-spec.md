@@ -1,10 +1,10 @@
 # Flat Columns Spec
 
-Refactor du système de splits horizontaux : remplacer l'arbre binaire imbriqué par une liste plate de colonnes. Les splits verticaux restent des arbres binaires à l'intérieur de chaque colonne.
+Refactor of the horizontal split system: replace the nested binary tree with a flat list of columns. Vertical splits remain binary trees inside each column.
 
-**Motivation** : l'imbrication `[[A | B] | C]` crée un modèle mental confus (root vs local, ratios imbriqués, equalize partiel). L'utilisateur pense `[A | B | C]` — le code doit refléter ça.
+**Motivation**: nesting `[[A | B] | C]` creates a confusing mental model (root vs local, nested ratios, partial equalize). The user thinks `[A | B | C]` — the code should reflect that.
 
-## Nouveau data model
+## New data model
 
 ### Tab
 
@@ -22,7 +22,7 @@ pub struct Tab {
 }
 ```
 
-Largeur effective de la colonne `i` :
+Effective width of column `i`:
 
 ```
 column_width[i] = total_width * (column_weights[i] / sum(column_weights))
@@ -42,46 +42,46 @@ pub enum ColumnTree {
 }
 ```
 
-Plus de `HSplit`. Plus de flag `root`. Plus de `custom_ratio` horizontal (les poids des colonnes sont toujours ajustables).
+No more `HSplit`. No more `root` flag. No more horizontal `custom_ratio` (column weights are always adjustable).
 
-### Ce qui disparaît
+### What goes away
 
-- `SplitTree::HSplit` — remplacé par `Tab.columns` + `column_weights`
-- `SplitTree::root` flag — plus nécessaire, toutes les colonnes sont au même niveau
-- `SplitTree::custom_ratio` sur les HSplit — remplacé par les poids du Vec
-- `chain_count(horizontal, root_only)` — remplacé par `columns.len()`
-- `equalize()` dans sa forme actuelle — remplacé par un reset des poids
-- `with_split()` pour les splits horizontaux — remplacé par insertion dans le Vec
+- `SplitTree::HSplit` — replaced by `Tab.columns` + `column_weights`
+- `SplitTree::root` flag — no longer needed, all columns are at the same level
+- `SplitTree::custom_ratio` on HSplits — replaced by the Vec's weights
+- `chain_count(horizontal, root_only)` — replaced by `columns.len()`
+- `equalize()` in its current form — replaced by a weight reset
+- `with_split()` for horizontal splits — replaced by insertion into the Vec
 
-## Opérations
+## Operations
 
-### Créer un split horizontal
+### Creating a horizontal split
 
-**Cmd+D** — insère une nouvelle colonne **juste après** la colonne du pane focusé.
+**Cmd+D** — inserts a new column **right after** the focused pane's column.
 
 ```
 [A | B], focus A → Cmd+D → [A | NEW | B]
 [A | B], focus B → Cmd+D → [A | B | NEW]
 ```
 
-**Cmd+E** — ajoute une nouvelle colonne **à la fin**.
+**Cmd+E** — adds a new column **at the end**.
 
 ```
 [A | B], focus A → Cmd+E → [A | B | NEW]
 ```
 
-Après insertion : la nouvelle colonne reçoit un poids = `sum(existing_weights) / n_existing` (= la moyenne). Les colonnes existantes gardent leurs poids, donc leurs proportions relatives sont préservées. La nouvelle colonne obtient exactement `1/(n+1)` de l'espace total.
+After insertion: the new column gets a weight = `sum(existing_weights) / n_existing` (= the average). Existing columns keep their weights, so their relative proportions are preserved. The new column gets exactly `1/(n+1)` of the total space.
 
-### Créer un split vertical
+### Creating a vertical split
 
-**Cmd+Shift+D** — split vertical du pane focusé : insère un nouveau pane **juste en dessous** du pane focusé. Le pane focusé est remplacé par un `VSplit { old, new, ratio: 0.5 }`.
+**Cmd+Shift+D** — vertical split of the focused pane: inserts a new pane **right below** the focused pane. The focused pane is replaced by a `VSplit { old, new, ratio: 0.5 }`.
 
 ```
 [A | B], focus A → Cmd+Shift+D →  [ A  | B ]
                                    [NEW |   ]
 ```
 
-Si la colonne a déjà un VSplit et que le focus est sur un pane interne, le split s'insère après ce pane :
+If the column already has a VSplit and focus is on an inner pane, the split is inserted after that pane:
 
 ```
 [ A  | B ]                         [ A  | B ]
@@ -89,7 +89,7 @@ Si la colonne a déjà un VSplit et que le focus est sur un pane interne, le spl
                                    [ C  |   ]
 ```
 
-**Cmd+Shift+E** — split vertical **en bas de la colonne** : wrape la colonne entière dans un VSplit avec le nouveau pane en bas.
+**Cmd+Shift+E** — vertical split **at the bottom of the column**: wraps the whole column in a VSplit with the new pane at the bottom.
 
 ```
 [ A  | B ]                         [ A  | B ]
@@ -97,21 +97,21 @@ Si la colonne a déjà un VSplit et que le focus est sur un pane interne, le spl
                                    [NEW |   ]
 ```
 
-Même logique que Cmd+D/E pour l'horizontal : D = après le pane courant, E = à la fin.
+Same logic as Cmd+D/E for horizontal: D = after the current pane, E = at the end.
 
-### Supprimer un pane
+### Removing a pane
 
-Quand un pane est fermé :
+When a pane is closed:
 
-1. **Pane seul dans sa colonne** (ColumnTree::Leaf) → retirer la colonne du Vec, retirer le poids correspondant. Redistribuer le poids retiré proportionnellement aux colonnes restantes.
-2. **Pane dans un VSplit** → le frère remplace le VSplit (promotion). La colonne reste.
-3. **Dernière colonne du tab** → fermer le tab.
+1. **Pane alone in its column** (ColumnTree::Leaf) → remove the column from the Vec, remove the corresponding weight. Redistribute the removed weight proportionally to the remaining columns.
+2. **Pane in a VSplit** → the sibling replaces the VSplit (promotion). The column stays.
+3. **Last column of the tab** → close the tab.
 
-### Equalize (nouveau raccourci)
+### Equalize (new shortcut)
 
-Reset tous les `column_weights` à `1.0`. Optionnel : aussi reset les `ratio` des VSplits internes et mettre `custom_ratio = false`.
+Reset all `column_weights` to `1.0`. Optional: also reset the `ratio` of inner VSplits and set `custom_ratio = false`.
 
-Raccourci proposé : `Cmd+Shift+=` (cohérent avec tmux `select-layout even-horizontal`).
+Proposed shortcut: `Cmd+Shift+=` (consistent with tmux `select-layout even-horizontal`).
 
 ### Virtual width
 
@@ -119,76 +119,76 @@ Raccourci proposé : `Cmd+Shift+=` (cohérent avec tmux `select-layout even-hori
 auto_virtual_width = max(columns.len() * min_split_width, screen_width)
 ```
 
-Si `virtual_width_override > 0` :
+If `virtual_width_override > 0`:
 ```
 virtual_width = max(virtual_width_override, screen_width)
 ```
 
-Plus besoin de `root_only` dans le calcul — `columns.len()` suffit.
+No more need for `root_only` in the computation — `columns.len()` is enough.
 
 ## Resize
 
 ### Mode 1 — Column resize (Cmd+Ctrl+Left/Right)
 
-Déplace le séparateur entre deux colonnes adjacentes.
+Moves the separator between two adjacent columns.
 
-- **Cmd+Ctrl+Right** avec focus dans colonne `i` : cherche le séparateur à droite (entre `i` et `i+1`). Transfère du poids de `i+1` vers `i` (colonne `i` grandit).
-- **Cmd+Ctrl+Left** : inverse.
-- Si pas de séparateur dans cette direction : cherche l'autre côté (colonne `i` rétrécit).
-- Poids minimum par colonne : correspond à `min_split_width` en pixels.
+- **Cmd+Ctrl+Right** with focus in column `i`: looks for the separator on the right (between `i` and `i+1`). Transfers weight from `i+1` to `i` (column `i` grows).
+- **Cmd+Ctrl+Left**: the reverse.
+- If there's no separator in that direction: look on the other side (column `i` shrinks).
+- Minimum weight per column: matches `min_split_width` in pixels.
 
 ### Mode 1 — Vertical resize (Cmd+Ctrl+Up/Down)
 
-Inchangé : ajuste le `ratio` du VSplit ancêtre dans la colonne. Même logique que l'actuel `adjust_ratio_directional` mais limité aux VSplits.
+Unchanged: adjusts the `ratio` of the ancestor VSplit in the column. Same logic as the current `adjust_ratio_directional` but limited to VSplits.
 
 ### Mode 2 — Virtual width global (Ctrl+Option+Left/Right)
 
-Inchangé : ajuste `virtual_width_override`. Tous les poids restent identiques, les colonnes grossissent/rétrécissent proportionnellement.
+Unchanged: adjusts `virtual_width_override`. All weights stay identical, columns grow/shrink proportionally.
 
 ### Mode 3 — Edge grow (Cmd+Ctrl+Option+Left/Right)
 
-Grow/shrink d'une seule colonne. Les autres gardent leur taille pixel.
+Grow/shrink a single column. The others keep their pixel size.
 
-- Augmente `virtual_width_override`.
-- Ajuste le poids de la colonne cible pour qu'elle absorbe l'espace ajouté.
-- Les autres poids sont ajustés pour que leurs colonnes gardent la même largeur pixel.
+- Increases `virtual_width_override`.
+- Adjusts the target column's weight so it absorbs the added space.
+- The other weights are adjusted so their columns keep the same pixel width.
 
 ### Mouse drag
 
-- Hit-test sur les séparateurs verticaux (entre colonnes) et horizontaux (dans les VSplits).
-- Drag vertical separator entre colonnes `i` et `i+1` : ajuste `column_weights[i]` et `column_weights[i+1]`.
-- Drag horizontal separator : ajuste le `ratio` du VSplit concerné (inchangé).
+- Hit-test on vertical separators (between columns) and horizontal ones (in VSplits).
+- Drag vertical separator between columns `i` and `i+1`: adjusts `column_weights[i]` and `column_weights[i+1]`.
+- Drag horizontal separator: adjusts the `ratio` of the VSplit concerned (unchanged).
 
 ### Max pane width invariant
 
-Inchangé : aucun pane ne doit dépasser `screen_width` en largeur. Post-validation après chaque resize.
+Unchanged: no pane may exceed `screen_width` in width. Post-validation after every resize.
 
 ## Navigation
 
 ### Left/Right
 
-Trouver la colonne `i` du pane focusé. Aller à la colonne `i-1` (Left) ou `i+1` (Right). Dans la colonne cible, choisir le pane le plus proche verticalement (par centre de viewport, comme actuellement).
+Find the column `i` of the focused pane. Go to column `i-1` (Left) or `i+1` (Right). In the target column, pick the vertically closest pane (by viewport center, as today).
 
 ### Up/Down
 
-Naviguer dans le VSplit de la colonne courante. Si déjà au top/bottom, rester (pas de wrap).
+Navigate within the current column's VSplit. If already at the top/bottom, stay (no wrap).
 
 ### Swap (Cmd+Shift+Arrows)
 
-- **Left/Right** : swap la colonne entière `i` avec la colonne `i±1` (swap dans le Vec + swap les poids).
-- **Up/Down** : swap les panes dans le VSplit de la colonne (inchangé).
+- **Left/Right**: swap the whole column `i` with column `i±1` (swap in the Vec + swap the weights).
+- **Up/Down**: swap the panes in the column's VSplit (unchanged).
 
 ### Reparent (Cmd+Ctrl+Shift+Arrows)
 
-- **Left/Right** : déplacer le pane focusé dans la colonne adjacente (en VSplit). Si la colonne source se retrouve vide, la retirer.
-- **Up/Down** : déplacer le pane dans le VSplit voisin (inchangé).
+- **Left/Right**: move the focused pane into the adjacent column (as a VSplit). If the source column ends up empty, remove it.
+- **Up/Down**: move the pane into the neighboring VSplit (unchanged).
 
-## Séparateurs visuels
+## Visual separators
 
-- Séparateurs verticaux : entre chaque colonne. Position = somme des largeurs des colonnes 0..i.
-- Séparateurs horizontaux : dans les VSplits de chaque colonne (inchangé).
+- Vertical separators: between each column. Position = sum of the widths of columns 0..i.
+- Horizontal separators: in each column's VSplits (unchanged).
 
-`collect_separators()` et `collect_separator_info()` itèrent sur les colonnes puis descendent dans chaque ColumnTree pour les séparateurs horizontaux.
+`collect_separators()` and `collect_separator_info()` iterate over the columns then descend into each ColumnTree for the horizontal separators.
 
 ## Session persistence
 
@@ -210,51 +210,51 @@ struct SavedTab {
 
 ### Migration
 
-À la restauration, si l'ancien format `SavedTree` est détecté (présence de `HSplit`), le convertir en aplatissant tous les HSplits en colonnes. Les ratios binaires sont convertis en poids proportionnels.
+On restore, if the old `SavedTree` format is detected (presence of `HSplit`), convert it by flattening all HSplits into columns. Binary ratios are converted into proportional weights.
 
-## Fichiers impactés
+## Files affected
 
-| Fichier | Impact |
+| File | Impact |
 |---|---|
-| `src/pane.rs` | **Majeur** — `SplitTree` → `ColumnTree`, refonte des ~30 méthodes |
-| `src/window.rs` | **Majeur** — do_split, resize, navigation, mouse drag |
-| `src/session.rs` | **Moyen** — SavedTree → SavedTab, migration ancien format |
-| `src/renderer/mod.rs` | **Moyen** — viewport computation via `for_each_pane_with_viewport` |
-| `src/config.rs` | **Mineur** — raccourcis (ajout equalize, fusion vsplit/vsplit_root) |
-| `src/keybindings.rs` | **Mineur** — ajout equalize, suppression vsplit_root si fusionné |
-| `src/recent_projects.rs` | **Mineur** — utilise SavedTree |
-| `docs/split-specs.md` | Réécriture complète |
+| `src/pane.rs` | **Major** — `SplitTree` → `ColumnTree`, rework of the ~30 methods |
+| `src/window.rs` | **Major** — do_split, resize, navigation, mouse drag |
+| `src/session.rs` | **Medium** — SavedTree → SavedTab, old format migration |
+| `src/renderer/mod.rs` | **Medium** — viewport computation via `for_each_pane_with_viewport` |
+| `src/config.rs` | **Minor** — shortcuts (add equalize, merge vsplit/vsplit_root) |
+| `src/keybindings.rs` | **Minor** — add equalize, remove vsplit_root if merged |
+| `src/recent_projects.rs` | **Minor** — uses SavedTree |
+| `docs/split-specs.md` | Full rewrite |
 
-## Plan d'implémentation
+## Implementation plan
 
-### Étape 1 — ColumnTree + Tab
+### Step 1 — ColumnTree + Tab
 
-Nouveau enum `ColumnTree` (VSplit + Leaf). Ajouter `columns` et `column_weights` à `Tab`. Migrer les méthodes une par une : d'abord les traversals simples (`pane()`, `pane_mut()`, `for_each_pane()`, `contains()`, `first_pane()`, `last_pane()`), puis les opérations (split, remove, viewport, navigate).
+New `ColumnTree` enum (VSplit + Leaf). Add `columns` and `column_weights` to `Tab`. Migrate the methods one by one: first the simple traversals (`pane()`, `pane_mut()`, `for_each_pane()`, `contains()`, `first_pane()`, `last_pane()`), then the operations (split, remove, viewport, navigate).
 
-### Étape 2 — Split & Remove
+### Step 2 — Split & Remove
 
-Réécrire `do_split` (Cmd+D → insert colonne), `do_split_root` (Cmd+E → push colonne), `do_close_pane_or_tab` avec la logique flat. Supprimer `with_split()` pour les horizontaux.
+Rewrite `do_split` (Cmd+D → insert column), `do_split_root` (Cmd+E → push column), `do_close_pane_or_tab` with the flat logic. Remove `with_split()` for horizontal splits.
 
-### Étape 3 — Viewport & Render
+### Step 3 — Viewport & Render
 
-Adapter `for_each_pane_with_viewport` : itérer sur les colonnes avec les poids, puis descendre dans chaque ColumnTree pour les VSplits. Adapter le renderer.
+Adapt `for_each_pane_with_viewport`: iterate over the columns with the weights, then descend into each ColumnTree for the VSplits. Adapt the renderer.
 
-### Étape 4 — Resize
+### Step 4 — Resize
 
-Réécrire les 3 modes pour le modèle flat. Le mode 1 horizontal devient un ajustement de poids entre colonnes adjacentes. Les modes 2 et 3 s'adaptent avec les poids au lieu des ratios récursifs.
+Rewrite the 3 modes for the flat model. Horizontal mode 1 becomes a weight adjustment between adjacent columns. Modes 2 and 3 adapt using weights instead of recursive ratios.
 
-### Étape 5 — Navigation, Swap, Reparent
+### Step 5 — Navigation, Swap, Reparent
 
-Simplifier avec l'index de colonne dans le Vec.
+Simplify with the column index in the Vec.
 
-### Étape 6 — Session persistence
+### Step 6 — Session persistence
 
-Nouveau format `SavedTab` + migration de l'ancien `SavedTree`.
+New `SavedTab` format + migration of the old `SavedTree`.
 
-### Étape 7 — Equalize shortcut
+### Step 7 — Equalize shortcut
 
-Ajouter le raccourci et l'action (trivial à ce stade).
+Add the shortcut and the action (trivial at this stage).
 
-### Étape 8 — Cleanup
+### Step 8 — Cleanup
 
-Supprimer le code mort (`SplitTree::HSplit`, `root`, `chain_count`, ancien `equalize`). Mettre à jour `docs/split-specs.md`.
+Remove dead code (`SplitTree::HSplit`, `root`, `chain_count`, old `equalize`). Update `docs/split-specs.md`.

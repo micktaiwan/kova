@@ -1,25 +1,25 @@
-# Bugs de scrollback
+# Scrollback bugs
 
-Suivi des problèmes liés au scroll et au scrollback buffer.
+Tracking of issues related to scrolling and the scrollback buffer.
 
 ## Architecture
 
-- `scrollback`: `VecDeque<CompactRow>` — lignes historiques (FIFO, oldest devant)
-- `grid`: `Vec<Row>` — écran courant (taille fixe = `rows`)
-- `scroll_offset`: `i32` — combien de lignes remonter dans le scrollback (0 = pas de scroll)
-- `visible_lines()` blend scrollback + grid selon `scroll_offset`
-- `push_to_scrollback()` — helper unique pour push + limit + scroll_offset adjustment
+- `scrollback`: `VecDeque<CompactRow>` — historical lines (FIFO, oldest at the front)
+- `grid`: `Vec<Row>` — current screen (fixed size = `rows`)
+- `scroll_offset`: `i32` — how many lines to go back up into the scrollback (0 = no scroll)
+- `visible_lines()` blends scrollback + grid according to `scroll_offset`
+- `push_to_scrollback()` — single helper for push + limit + scroll_offset adjustment
 
-## Bugs corrigés
+## Fixed bugs
 
-### Zones vides lors du scroll vers le haut
+### Empty areas when scrolling up
 
-**Symptôme :** Grandes zones noires sans texte visibles en scrollant loin vers le haut.
+**Symptom:** Large black areas with no text visible when scrolling far up.
 
-**Cause :** `erase_in_display` mode 2/3 (`ESC[2J`) blanchissait la grille sur place sans sauver le contenu dans le scrollback. Les lignes vides étaient ensuite poussées dans le scrollback par `scroll_up` au fur et à mesure que du nouveau contenu arrivait.
+**Cause:** `erase_in_display` mode 2/3 (`ESC[2J`) blanked the grid in place without saving its content into the scrollback. The empty lines were then pushed into the scrollback by `scroll_up` as new content arrived.
 
-**Fix :** Avant de blanquer la grille, on copie les lignes jusqu'à la dernière non-vide dans le scrollback. Les trailing blanks (bas d'écran vide) sont ignorés, mais les lignes vides intermédiaires sont préservées pour garder l'espacement visuel.
+**Fix:** Before blanking the grid, we copy the lines up to the last non-empty one into the scrollback. Trailing blanks (empty bottom of the screen) are ignored, but intermediate empty lines are preserved to keep the visual spacing.
 
-## Bugs connus / à investiguer
+## Known bugs / to investigate
 
-_(à compléter)_
+_(to be completed)_

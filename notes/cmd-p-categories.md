@@ -1,71 +1,65 @@
-# Cmd+P : ranger les panes en catégories ? — réflexion du 12-13/10/2026
+# Cmd+P: sorting panes into categories?
 
-Issu d'un `/brain`. Rien n'est décidé ni codé : c'est une réflexion à reprendre.
+Nothing is decided or coded: this is an open design question to pick up later.
 
-## Le point de départ
+## The starting point
 
-Mickael, le 12/10/2026 : « je me demande si dans Cmd-P n'ai pas besoin de catégories, ou
-regroupement par tags, parce que j'ouvre bcp de panes (j'en ai 53 là...) et des fois je suis
-perdu ».
+With many panes open (several dozen), Cmd+P becomes hard to navigate and the user gets lost.
 
-## L'état mesuré ce soir-là
+## The measured state
 
-`list-panes` et `list-tabs` sur le Kova vivant, le 12/10/2026 vers 20 h 40 : 53 panes dans
-11 onglets d'une seule fenêtre. Deux onglets portent l'essentiel :
+`list-panes` and `list-tabs` on a live Kova with about fifty panes in about ten tabs of a single
+window: two tabs hold most of them (one with about 25 panes, another with about 13), and the
+other tabs hold 1 to 3 panes each.
 
-- `CTO` : 26 panes
-- `self` : 13 panes
-- les 9 autres (`lempire`, `pano`, `kraken`, `Mira`, `Kova`, `ImaginOS`, `nido`, `genealogie`,
-  `Kana`) : 1 à 3 panes chacun
+Cmd+P already groups by tab (one header per tab followed by its panes, `src/window/switcher.rs`,
+`open_pane_switcher`). So the problem is not the lack of groups but two groups of 26 and
+13 rows with no landmark inside them.
 
-Cmd+P regroupe déjà par onglet (un en-tête par onglet suivi de ses panes, `src/window/switcher.rs`,
-`open_pane_switcher`). Le problème n'est donc pas l'absence de groupes mais deux groupes de 26 et
-13 lignes sans repère à l'intérieur.
+## What "lost" means
 
-## Ce que veut dire « perdu »
+Two readings were considered:
 
-Deux lectures ont été posées :
+- A: the user is looking for a specific pane and cannot find it (what "typing filters the list"
+  would solve, item #1 of `notes/ux-review-2026-10-10.md`, still not done).
+- B: the user no longer knows which of the panes still matter.
 
-- A : il cherche un pane précis et ne le trouve pas (ce que règlerait « taper filtre la liste »,
-  point n°1 de `notes/ux-review-2026-10-10.md`, toujours pas fait).
-- B : il ne sait plus lesquels de ses panes comptent encore.
+**The answer was B.**
 
-**Mickael a tranché : c'est B.**
+## The constraints
 
-## Les contraintes qu'il a posées
+- **Tabs are projects**, not states or tags. Categories must therefore not be built by
+  repurposing tabs.
+- The imagined gesture: in Cmd+P, **Cmd+↑ / Cmd+↓ to file a pane into a category**.
+- Neither the solution nor its usefulness is certain.
 
-- **Les onglets sont des projets**, pas des états ni des tags. Les catégories ne doivent donc pas
-  être faites en détournant les onglets.
-- Le geste qu'il imagine : dans Cmd+P, **Cmd+↑ / Cmd+↓ pour ranger un pane dans une catégorie**.
-- Il n'est sûr ni de la solution, ni de son utilité.
+## What already exists in the code
 
-## Ce qui existe déjà dans le code
+- **Cmd+↑ / Cmd+↓ in Cmd+P** already moves the selected pane one step in its tab's order
+  (`handle_pane_switcher_key` → `pane_switcher_move_selected`, `src/window/switcher.rs`;
+  `move_pane_in_order`, `src/pane.rs:1516`). It stops at the tab's edges. The imagined
+  gesture is therefore already taken, and sorting into categories would have to either share it
+  (crossing a category boundary when moving down) or use another shortcut.
+- **Anchors** (Cmd+Shift+A) and **bookmarks** (Cmd+B) are already two cross-tab
+  classifications, set by hand; anchors open Cmd+P at the top.
+- **Each terminal knows its last activity** (`last_activity_secs`, shown in the pane's status
+  bar, `src/renderer/mod.rs:1920`). Not checked in detail: I did not see it in the
+  rendering of Cmd+P rows.
 
-- **Cmd+↑ / Cmd+↓ dans Cmd+P** déplace déjà le pane sélectionné d'un cran dans l'ordre de son
-  onglet (`handle_pane_switcher_key` → `pane_switcher_move_selected`, `src/window/switcher.rs` ;
-  `move_pane_in_order`, `src/pane.rs:1516`). Il s'arrête aux bords de l'onglet. Le geste qu'il
-  imagine est donc déjà pris, et un rangement en catégories devra soit le partager (franchir la
-  frontière d'une catégorie en descendant), soit prendre un autre raccourci.
-- **Les ancres** (Cmd+Shift+A) et **les bookmarks** (Cmd+B) sont déjà deux classements
-  transverses aux onglets, posés à la main ; les ancres ouvrent Cmd+P en tête.
-- **Chaque terminal connaît sa dernière activité** (`last_activity_secs`, affichée dans la barre de
-  statut du pane, `src/renderer/mod.rs:1920`). Non vérifié en détail : je ne l'ai pas vue dans le
-  rendu des lignes de Cmd+P.
+## The objection raised during the discussion
 
-## L'objection levée pendant la discussion
+Sorting by theme does not answer B: a pane dead for three days stays dead in the right
+category. And sorting 50 panes by hand is work the system could do (making the end user do
+work the system can do is a design failure). Opposite direction, with no sorting:
+Kova greys out or pushes to the bottom the panes inactive for more than a day, from the
+`last_activity_secs` it already has.
 
-Ranger par thème ne répond pas à B : un pane mort depuis trois jours reste mort dans la bonne
-catégorie. Et ranger 53 panes à la main, c'est du travail que le système pourrait faire
-(règle « faire travailler l'utilisateur final = c'est mal fait »). Piste opposée, sans rangement :
-Kova grise ou relègue en bas les panes inactifs depuis plus d'un jour, à partir de
-`last_activity_secs` qu'il a déjà.
+That direction got no answer: the reply was about tabs (projects, not states).
+The imagined categories might therefore be **states** (active / paused / to close),
+not themes. Not confirmed.
 
-Mickael n'a pas répondu sur cette piste : sa réponse a porté sur les onglets (projets, pas états).
-Les catégories qu'il imagine seraient donc peut-être des **états** (actif / en pause / à fermer),
-pas des thèmes. Non confirmé.
+## Where to pick up
 
-## Où reprendre
-
-La question laissée ouverte : dans `CTO` (26 panes), combien sont vraiment finis ? Si c'est la
-moitié, le besoin est du tri de fin de vie (fermer), pas du rangement. Si presque aucun, le besoin
-est un sous-groupement à l'intérieur d'un projet.
+The question left open: in the largest tab (about 25 panes), how many are really finished? If
+it is half, the need is end-of-life triage (closing), not sorting. If almost none, the need
+is sub-grouping inside a project.

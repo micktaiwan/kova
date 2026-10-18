@@ -1,98 +1,98 @@
 # Font Fallback — Investigation (2026-02-24)
 
-## Ce qui a été implémenté
+## What was implemented
 
-Fichier modifié : `src/renderer/glyph_atlas.rs`
+File changed: `src/renderer/glyph_atlas.rs`
 
-1. **Support UTF-16 surrogate pairs** : supprimé le early return `if count != 1` qui bloquait les caractères hors BMP (emoji). On passe maintenant `count` (1 ou 2) à `glyphs_for_characters`.
+1. **UTF-16 surrogate pair support**: removed the early return `if count != 1` that blocked characters outside the BMP (emoji). We now pass `count` (1 or 2) to `glyphs_for_characters`.
 
-2. **Font fallback via CoreText** : nouvelle méthode `resolve_glyph()` qui :
-   - Essaie d'abord la police principale
-   - Si elle échoue (`!ok || glyph_id == 0`), appelle `CTFont::for_string()` (= `CTFontCreateForString`) pour obtenir une police de fallback
-   - Cache la fallback font dans `HashMap<char, CFRetained<CTFont>>`
+2. **Font fallback via CoreText**: new `resolve_glyph()` method that:
+   - First tries the primary font
+   - If it fails (`!ok || glyph_id == 0`), calls `CTFont::for_string()` (= `CTFontCreateForString`) to get a fallback font
+   - Caches the fallback font in `HashMap<char, CFRetained<CTFont>>`
 
-3. **Imports ajoutés** : `CFRange`, `CFRetained` depuis `objc2_core_foundation`
+3. **Imports added**: `CFRange`, `CFRetained` from `objc2_core_foundation`
 
-## Ce qui fonctionne
+## What works
 
-- `printf '\u2500\u2502\u250C\u2510\n'` → box-drawing s'affichent correctement
-- `printf '\e[38;5;208m╭─╮\e[0m\n'` → box-drawing en couleur OK
-- Alt screen avec box-drawing (test manuel) → OK
-- Emoji `echo "🎉"` → le fallback vers Apple Color Emoji fonctionne (glyph trouvé), mais le rendu est moche car on rasterise en monochrome blanc (bitmap 1-composante alpha). Les emoji couleur nécessiteraient un pipeline RGBA séparé.
+- `printf '─│┌┐\n'` → box-drawing renders correctly
+- `printf '\e[38;5;208m╭─╮\e[0m\n'` → colored box-drawing OK
+- Alt screen with box-drawing (manual test) → OK
+- Emoji `echo "🎉"` → the fallback to Apple Color Emoji works (glyph found), but the rendering is ugly because we rasterize in white monochrome (1-component alpha bitmap). Color emoji would need a separate RGBA pipeline.
 
-## Problème restant : banner Claude Code
+## Remaining problem: Claude Code banner
 
-Le banner Claude Code (Ink/React) affiche des bordures `─` (U+2500). Investigation :
+The Claude Code banner (Ink/React) shows `─` (U+2500) borders. Investigation:
 
-### Faits vérifiés
+### Verified facts
 
-1. Les `─` arrivent dans `put_char` (rows 2, 6, 8) — **OK**
-2. Le glyph est rasterisé (272 bytes non-zero sur bitmap 17×33) — **OK**
-3. Des vertices sont générés chaque frame (3948 render logs sur ~10s) — **OK**
-4. Le glyph fonctionne en mode normal (`printf '\u2500\n'`) — **OK**
-5. Le glyph fonctionne en alt screen manuel (`printf '\e[?1049h...'`) — **OK**
-6. Le glyph fonctionne avec couleur ANSI (`printf '\e[38;5;208m─\e[0m\n'`) — **OK**
-7. Menlo a les glyphs box-drawing nativement (glyph_id=2236 pour ─) — pas besoin de fallback
-8. `$TERM=xterm-256color`, `$TERM_PROGRAM=Kova` — config standard
+1. The `─` reach `put_char` (rows 2, 6, 8) — **OK**
+2. The glyph is rasterized (272 non-zero bytes on a 17×33 bitmap) — **OK**
+3. Vertices are generated every frame (3948 render logs over ~10s) — **OK**
+4. The glyph works in normal mode (`printf '─\n'`) — **OK**
+5. The glyph works in a manual alt screen (`printf '\e[?1049h...'`) — **OK**
+6. The glyph works with ANSI color (`printf '\e[38;5;208m─\e[0m\n'`) — **OK**
+7. Menlo has the box-drawing glyphs natively (glyph_id=2236 for ─) — no fallback needed
+8. `$TERM=xterm-256color`, `$TERM_PROGRAM=Kova` — standard config
 
-### Observation non encore expliquée
+### Observation not yet explained
 
-Un log de render montre `fg=[0.1, 0.1, 0.12]` (quasi-noir) pour des `─`. **ATTENTION** : ce log a peut-être été lu depuis un fichier log stale (le filtre code était `row_idx==2 && col_idx<3` mais le log montrait `row=0, col=48`). **Il faut re-vérifier avec un fichier log propre** pour confirmer si la couleur fg est bien le problème.
+A render log shows `fg=[0.1, 0.1, 0.12]` (almost black) for some `─`. **WARNING**: this log may have been read from a stale log file (the code filter was `row_idx==2 && col_idx<3` but the log showed `row=0, col=48`). **It must be re-checked with a clean log file** to confirm whether the fg color really is the problem.
 
-### Prochaine étape pour le banner
+### Next step for the banner
 
-Relancer un test propre avec Claude Code dans Kova, log vers un **nouveau fichier**, et vérifier :
-- La couleur fg exacte des `─` du banner (avec filtre row/col correspondant aux lignes du banner)
-- Si des cellules sont écrasées entre `put_char` et le rendu
+Run a clean test again with Claude Code in Kova, log to a **new file**, and check:
+- The exact fg color of the banner's `─` (with a row/col filter matching the banner lines)
+- Whether cells are overwritten between `put_char` and rendering
 
-## Problème confirmé : rendu des block elements et box-drawing
+## Confirmed problem: rendering of block elements and box-drawing
 
-### Constat
+### Finding
 
-Comparaison Kova vs autre terminal du banner Claude Code :
-- **Ligne noire horizontale** qui traverse le logo (fait de block elements ▐▛█▜▌▝▘)
-- **Couleurs plus sombres/désaturées** dans Kova
+Comparison of the Claude Code banner in Kova vs another terminal:
+- **Horizontal black line** crossing the logo (made of block elements ▐▛█▜▌▝▘)
+- **Darker/desaturated colors** in Kova
 
-La ligne noire vient du fait que les glyphs de police ne remplissent pas la cellule à 100% (hinting, margins). Les block elements comme `█` sont censés couvrir toute la cellule bord à bord, mais le rendu CoreText laisse des gaps.
+The black line comes from the font glyphs not filling 100% of the cell (hinting, margins). Block elements like `█` are meant to cover the whole cell edge to edge, but CoreText rendering leaves gaps.
 
-### Approche des terminaux modernes (vérifiée)
+### Approach of modern terminals (verified)
 
-Les terminaux majeurs dessinent eux-mêmes les box-drawing et block elements au lieu de passer par la police :
-- **Alacritty** : builtin font (commit f717710) — "font glyphs tend to overlap or not align"
-- **Windows Terminal** : dessine manuellement box-drawing et powerline glyphs
-- **GNOME Terminal** : bitmaps 5×5 étirés pour remplir la cellule
-- **Kitty** : rendering custom pour box-drawing
+The major terminals draw box-drawing and block elements themselves instead of going through the font:
+- **Alacritty**: builtin font (commit f717710) — "font glyphs tend to overlap or not align"
+- **Windows Terminal**: draws box-drawing and powerline glyphs manually
+- **GNOME Terminal**: 5×5 bitmaps stretched to fill the cell
+- **Kitty**: custom rendering for box-drawing
 
-### Plan d'implémentation
+### Implementation plan
 
-Dans `rasterize_char()`, pour les ranges Unicode suivants, dessiner les pixels directement dans le bitmap au lieu de passer par CoreText :
+In `rasterize_char()`, for the following Unicode ranges, draw the pixels directly into the bitmap instead of going through CoreText:
 
-1. **Block elements** (U+2580-U+259F) — priorité haute (logo Claude)
-   - `█` (U+2588) : remplir toute la cellule
-   - `▌` (U+258C) : remplir la moitié gauche
-   - `▐` (U+2590) : remplir la moitié droite
-   - `▀` (U+2580) : remplir la moitié haute
-   - `▄` (U+2584) : remplir la moitié basse
-   - `▛` (U+259B), `▜` (U+259C), `▝` (U+259D), `▘` (U+2598), etc. : quadrants
+1. **Block elements** (U+2580-U+259F) — high priority (Claude logo)
+   - `█` (U+2588): fill the whole cell
+   - `▌` (U+258C): fill the left half
+   - `▐` (U+2590): fill the right half
+   - `▀` (U+2580): fill the top half
+   - `▄` (U+2584): fill the bottom half
+   - `▛` (U+259B), `▜` (U+259C), `▝` (U+259D), `▘` (U+2598), etc.: quadrants
 
-2. **Box-drawing** (U+2500-U+257F) — priorité moyenne (bordures)
-   - `─` (U+2500) : ligne horizontale centrée
-   - `│` (U+2502) : ligne verticale centrée
-   - `┌┐└┘` : coins (jonction de lignes)
-   - `╭╮╰╯` : coins arrondis
-   - `├┤┬┴┼` : jonctions T et croix
-   - Variantes bold (━┃), double (═║╔╗╚╝), etc.
+2. **Box-drawing** (U+2500-U+257F) — medium priority (borders)
+   - `─` (U+2500): centered horizontal line
+   - `│` (U+2502): centered vertical line
+   - `┌┐└┘`: corners (line junctions)
+   - `╭╮╰╯`: rounded corners
+   - `├┤┬┴┼`: T junctions and crosses
+   - Bold (━┃), double (═║╔╗╚╝) variants, etc.
 
-Approche : dans `rasterize_char()`, avant d'appeler `resolve_glyph()`, vérifier si le char est dans ces ranges. Si oui, remplir `bmp_buf` directement avec les pixels blancs aux bonnes positions, puis continuer le flow normal (copie atlas, upload GPU).
+Approach: in `rasterize_char()`, before calling `resolve_glyph()`, check whether the char is in these ranges. If so, fill `bmp_buf` directly with white pixels at the right positions, then continue the normal flow (atlas copy, GPU upload).
 
 Ref: https://github.com/alacritty/alacritty/commit/f7177101eda589596ab08866892bd4629bd1ef44
 
-## Logs de debug ajoutés (à retirer)
+## Debug logs added (to remove)
 
-- `src/renderer/glyph_atlas.rs` : `resolve_glyph()` logge le char, utf16_len, primary/fallback results, nonzero bytes
-- `src/renderer/mod.rs` : log du render des `─` avec fg/bg (filtré row_idx==2, col_idx<3)
-- `src/terminal/mod.rs` : log dans `put_char` pour les box-drawing U+2500-U+257F
+- `src/renderer/glyph_atlas.rs`: `resolve_glyph()` logs the char, utf16_len, primary/fallback results, nonzero bytes
+- `src/renderer/mod.rs`: log of the rendering of `─` with fg/bg (filtered row_idx==2, col_idx<3)
+- `src/terminal/mod.rs`: log in `put_char` for box-drawing U+2500-U+257F
 
-## État du code
+## Code state
 
-Le code compile et le font fallback fonctionne. Les logs de debug sont encore présents.
+The code compiles and the font fallback works. The debug logs are still present.

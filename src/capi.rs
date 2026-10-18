@@ -1,5 +1,5 @@
 //! The C API of the library: what `include/kova.h` declares, for a host that
-//! is not Rust (Kana, in Swift). Thin: every function converts its C values,
+//! is not Rust (a Swift app, say). Thin: every function converts its C values,
 //! calls `crate::embed`, and converts back. No Rust type crosses the boundary;
 //! a pane is named by its id (`KovaPaneId`, the same number its shell sees as
 //! `KOVA_PANE_ID`), strings are NUL-terminated UTF-8, and a string handed out
@@ -781,6 +781,9 @@ mod tests {
             r#"{"cmd":"split"}"#.to_string(),
             r#"{"cmd":"notify","message":"m"}"#.to_string(),
             r#"{"cmd":"focus-pane","pane_id":999999}"#.to_string(),
+            r#"{"cmd":"list-asks"}"#.to_string(),
+            r#"{"cmd":"answer-ask","id":"0f8fad5b-d9cb-469f-a165-70867728950e","action":"OK"}"#.to_string(),
+            r#"{"cmd":"withdraw-asks","session_id":"abc-1"}"#.to_string(),
         ];
         let client_path = path.clone();
         let client = std::thread::spawn(move || {
@@ -823,6 +826,9 @@ mod tests {
         assert_eq!(answers[8]["error"], "command not supported by this host");
         assert_eq!(answers[9]["error"], "notify is not supported by this host");
         assert_eq!(answers[10]["error"], "pane 999999 not found");
+        assert_eq!(answers[11]["error"], "command not supported by this host", "no question card here");
+        assert_eq!(answers[12]["error"], "command not supported by this host");
+        assert_eq!(answers[13]["error"], "command not supported by this host");
 
         assert_ne!(kova_pane_tick(a) & embed::EVENT_FOCUS_REQUESTED, 0);
         assert_ne!(kova_pane_tick(b) & embed::EVENT_CLOSE_REQUESTED, 0);

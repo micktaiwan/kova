@@ -2288,9 +2288,9 @@ mod tests {
 
     #[test]
     fn flash_label_splits_a_cwd_into_directory_and_path_above() {
-        let home = "/Users/mick";
+        let home = "/Users/sam";
         assert_eq!(
-            flash_label_parts("/Users/mick/projects/perso/kova", home),
+            flash_label_parts("/Users/sam/projects/perso/kova", home),
             ("kova".to_string(), "~/projects/perso".to_string())
         );
         // Home itself, and the root, are their own name with nothing above.
@@ -2300,13 +2300,13 @@ mod tests {
         assert_eq!(flash_label_parts("/tmp", home), ("tmp".to_string(), "/".to_string()));
         // A trailing slash must not produce an empty name.
         assert_eq!(
-            flash_label_parts("/Users/mick/dev/", home),
+            flash_label_parts("/Users/sam/dev/", home),
             ("dev".to_string(), "~".to_string())
         );
         // A path that merely starts with the same bytes as $HOME is not under it.
         assert_eq!(
-            flash_label_parts("/Users/mickey/dev", home),
-            ("dev".to_string(), "/Users/mickey".to_string())
+            flash_label_parts("/Users/samuel/dev", home),
+            ("dev".to_string(), "/Users/samuel".to_string())
         );
     }
 

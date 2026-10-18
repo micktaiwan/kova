@@ -258,7 +258,7 @@ int kova_pane_is_working(KovaPaneId pane);
 /* ── Socket ───────────────────────────────────────────────────────────── */
 
 /* Serve Kova's socket protocol at path (NULL: /tmp/kova-<pid>.sock, where
- * Kite looks for Kova instances), over this thread's panes, one tab per
+ * remote clients look for Kova instances), over this thread's panes, one tab per
  * pane (tab id = pane id, window 0). Answered: list-panes, send-keys,
  * get-pane-content, count-pane-content, wait-for-completion, focus-pane and
  * close-pane / close-tab (as KOVA_EVENT_* requests), set-pane-status,

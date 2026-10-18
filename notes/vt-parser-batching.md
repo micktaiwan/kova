@@ -1,26 +1,26 @@
-# VT Parser Batching — Réduction de la contention write lock
+# VT Parser Batching — Reducing write lock contention
 
-## Problème
+## Problem
 
-Le PTY reader thread appelle `parser.advance()` sur un chunk de 4 Ko. Pendant toute la durée du parsing, le write lock sur `TerminalState` est tenu (acquisition lazy au premier `self.term()`, release après `advance()`).
+The PTY reader thread calls `parser.advance()` on a 4 KB chunk. For the whole duration of the parsing, the write lock on `TerminalState` is held (lazy acquisition on the first `self.term()`, release after `advance()`).
 
-`parking_lot::RwLock` donne priorité aux writers. Quand un pane en background reçoit beaucoup de données (build, logs…), le renderer sur le main thread est bloqué en attente du read lock — même pour les panes qui ne sont pas en train d'écrire.
+`parking_lot::RwLock` gives priority to writers. When a background pane receives a lot of data (build, logs…), the renderer on the main thread is blocked waiting for the read lock — even for panes that are not writing.
 
-Résultat : lag visible au switch de tab ou pendant le rendu quand un build tourne en background.
+Result: visible lag on tab switch or during rendering while a build runs in the background.
 
-## Solution : Op-buffer + flush batch
+## Solution: Op-buffer + batch flush
 
-### Principe
+### Principle
 
-Au lieu que les callbacks VTE (`print`, `execute`, `csi_dispatch`…) mutent `TerminalState` directement via `self.term()`, ils accumulent des opérations dans un `Vec<TermOp>` local. Après `parser.advance()`, on prend le write lock **une seule fois**, on replay les ops, puis on release.
+Instead of the VTE callbacks (`print`, `execute`, `csi_dispatch`…) mutating `TerminalState` directly via `self.term()`, they accumulate operations in a local `Vec<TermOp>`. After `parser.advance()`, we take the write lock **only once**, replay the ops, then release.
 
-Le parsing (décoder les séquences VT) se fait **sans lock**. Seul le replay (mutations sur la grille) nécessite le lock. Le replay est beaucoup plus rapide car il n'y a plus de logique de parsing — juste des mutations directes.
+The parsing (decoding the VT sequences) happens **without a lock**. Only the replay (mutations on the grid) needs the lock. The replay is much faster because there is no parsing logic left — just direct mutations.
 
-### Enum `TermOp`
+### `TermOp` enum
 
 ```rust
 enum TermOp {
-    /// Texte à afficher (grapheme clusters déjà découpés)
+    /// Text to display (grapheme clusters already split)
     Print(String),
     /// Control characters
     Backspace,
@@ -34,9 +34,9 @@ enum TermOp {
     CursorForward(u16),
     CursorBackward(u16),
     SetCursorPos(u16, u16),
-    /// Cursor Horizontal Absolute — besoin du cursor_y courant
+    /// Cursor Horizontal Absolute — needs the current cursor_y
     SetCursorCol(u16),
-    /// Vertical Position Absolute — besoin du cursor_x courant
+    /// Vertical Position Absolute — needs the current cursor_x
     SetCursorRow(u16),
     SaveCursor,
     RestoreCursor,
@@ -69,8 +69,8 @@ enum TermOp {
     SetTitle(String),
     SetCwd(String, Option<String>), // path, git_branch
     SetLastCommand(String),
-    /// Responses — nécessitent lecture de l'état puis écriture PTY
-    /// Traitées spécialement pendant le replay.
+    /// Responses — need a state read then a PTY write
+    /// Handled specially during the replay.
     CursorPositionReport,
     DeviceAttributes,
     ReportPrivateMode(u16),
@@ -80,70 +80,70 @@ enum TermOp {
 
 ### Shadow state
 
-Certaines ops ont besoin de **lire** l'état courant du terminal pour construire l'op. Il y a deux approches :
+Some ops need to **read** the current terminal state to build the op. There are two approaches:
 
-**Option A — Ops de haut niveau (recommandée)** : encoder l'intention plutôt que le résultat. Par exemple `SetCursorCol(col)` au lieu de `SetCursorPos(cursor_y, col)`. Le replay résout la dépendance au moment de l'application. C'est ce que fait l'enum ci-dessus.
+**Option A — High-level ops (recommended)**: encode the intent rather than the result. For example `SetCursorCol(col)` instead of `SetCursorPos(cursor_y, col)`. The replay resolves the dependency at application time. That is what the enum above does.
 
-**Option B — Shadow state local** : tracker `cursor_x`, `cursor_y`, `rows`, `cols` localement dans le handler pour construire les ops complètes. Plus complexe et fragile (le shadow state peut diverger).
+**Option B — Local shadow state**: track `cursor_x`, `cursor_y`, `rows`, `cols` locally in the handler to build complete ops. More complex and fragile (the shadow state can diverge).
 
-### Callbacks qui lisent l'état — analyse
+### Callbacks that read the state — analysis
 
-| Callback | Ce qui est lu | Solution Option A |
+| Callback | What is read | Option A solution |
 |----------|--------------|-------------------|
-| CSI `G` (CHA) | `cursor_y` | `SetCursorCol(col)` — le replay fait `set_cursor_pos(cursor_y, col)` |
-| CSI `d` (VPA) | `cursor_x` | `SetCursorRow(row)` — le replay fait `set_cursor_pos(row, cursor_x)` |
-| CSI `r` (DECSTBM) | `rows` | `SetScrollRegion(top, None)` — le replay utilise `rows` comme default |
-| CSI `n` (CPR) | `cursor_y/x` | `CursorPositionReport` — le replay lit la position et écrit au PTY |
-| CSI `p` (DECRPM) | mode flags | `ReportPrivateMode(mode)` — le replay lit le flag et écrit au PTY |
-| ESC `c` (RIS) | dims, colors | `FullReset` — le replay lit les valeurs et reconstruit |
+| CSI `G` (CHA) | `cursor_y` | `SetCursorCol(col)` — the replay does `set_cursor_pos(cursor_y, col)` |
+| CSI `d` (VPA) | `cursor_x` | `SetCursorRow(row)` — the replay does `set_cursor_pos(row, cursor_x)` |
+| CSI `r` (DECSTBM) | `rows` | `SetScrollRegion(top, None)` — the replay uses `rows` as default |
+| CSI `n` (CPR) | `cursor_y/x` | `CursorPositionReport` — the replay reads the position and writes to the PTY |
+| CSI `p` (DECRPM) | mode flags | `ReportPrivateMode(mode)` — the replay reads the flag and writes to the PTY |
+| ESC `c` (RIS) | dims, colors | `FullReset` — the replay reads the values and rebuilds |
 
-**Conclusion** : l'option A couvre 100% des cas. Aucun shadow state nécessaire.
+**Conclusion**: option A covers 100% of the cases. No shadow state needed.
 
-### OSC 7 — cas spécial
+### OSC 7 — special case
 
-OSC 7 (set CWD) fait un I/O filesystem (`resolve_git_branch`) qui est déjà géré en relâchant le lock. Avec le batching, on fait le I/O pendant le parsing (pas de lock tenu) et on push `SetCwd(path, git_branch)` dans le buffer.
+OSC 7 (set CWD) does filesystem I/O (`resolve_git_branch`), which is already handled by releasing the lock. With batching, we do the I/O during the parsing (no lock held) and push `SetCwd(path, git_branch)` into the buffer.
 
-### Réponses PTY (CPR, DA1, DECRPM, Kitty query)
+### PTY responses (CPR, DA1, DECRPM, Kitty query)
 
-Ces callbacks lisent l'état *et* écrivent au PTY. Avec le batching :
-1. On push un op marker (`CursorPositionReport`, etc.)
-2. Pendant le replay, au moment de traiter ce marker, on lit l'état courant (déjà mis à jour par les ops précédentes) et on écrit au PTY
+These callbacks read the state *and* write to the PTY. With batching:
+1. We push a marker op (`CursorPositionReport`, etc.)
+2. During the replay, when processing that marker, we read the current state (already updated by the previous ops) and write to the PTY
 
-Cela introduit un délai minime sur la réponse (le temps du replay), mais c'est négligeable car le replay est rapide et ces réponses ne sont pas time-critical.
+This adds a tiny delay to the response (the replay time), but it is negligible because the replay is fast and these responses are not time-critical.
 
-### Implémentation
+### Implementation
 
-1. Ajouter `ops: Vec<TermOp>` dans `VteHandler`
-2. Tous les callbacks push dans `self.ops` au lieu d'appeler `self.term()`
-3. `flush_print_buf()` devient un push de `Print(buf)` dans ops
-4. Nouvelle méthode `fn apply_ops(&mut self)` :
-   - Prend le write lock une fois
-   - Itère sur `self.ops.drain(..)`
-   - Applique chaque op sur `TerminalState`
-   - Release le lock
-5. Dans `pty.rs`, après `parser.advance()` : appeler `handler.apply_ops()` au lieu de `handler.release_guard()`
+1. Add `ops: Vec<TermOp>` to `VteHandler`
+2. All callbacks push into `self.ops` instead of calling `self.term()`
+3. `flush_print_buf()` becomes a push of `Print(buf)` into ops
+4. New method `fn apply_ops(&mut self)`:
+   - Takes the write lock once
+   - Iterates over `self.ops.drain(..)`
+   - Applies each op to `TerminalState`
+   - Releases the lock
+5. In `pty.rs`, after `parser.advance()`: call `handler.apply_ops()` instead of `handler.release_guard()`
 
-### Changements dans `pty.rs`
+### Changes in `pty.rs`
 
 ```rust
-// Avant
+// Before
 parser.advance(&mut handler, &buf[..n]);
 handler.release_guard();
 
-// Après
+// After
 parser.advance(&mut handler, &buf[..n]);
 handler.apply_ops();
 ```
 
-### Performance attendue
+### Expected performance
 
-- **Durée du write lock** : passe de "temps de parsing VT d'un chunk 4 Ko" à "temps de replay d'un Vec d'ops déjà parsées"
-- Le parsing (la partie lente : décoder les séquences, split graphemes, etc.) se fait sans lock
-- Le replay est une simple boucle de match + mutations directes
-- Estimation : réduction de 5-10× du temps sous write lock pour un chunk typique
+- **Write lock duration**: goes from "VT parsing time of a 4 KB chunk" to "replay time of a Vec of already-parsed ops"
+- The parsing (the slow part: decoding sequences, splitting graphemes, etc.) happens without a lock
+- The replay is a simple match loop + direct mutations
+- Estimate: 5-10× reduction of the time under write lock for a typical chunk
 
-### Risques
+### Risks
 
-- **Taille de l'enum `TermOp`** : ~40 variantes. C'est le gros du travail d'implémentation mais c'est mécanique.
-- **Allocation du Vec** : un `Vec::with_capacity(256)` réutilisé entre les reads suffit (drain, pas de réalloc).
-- **Correction** : le replay doit reproduire exactement le même comportement qu'avant. Tests manuels nécessaires avec `htop`, `vim`, `git log --oneline`, builds cargo, etc.
+- **Size of the `TermOp` enum**: ~40 variants. It is the bulk of the implementation work but it is mechanical.
+- **Vec allocation**: a `Vec::with_capacity(256)` reused between reads is enough (drain, no realloc).
+- **Correctness**: the replay must reproduce exactly the same behavior as before. Manual tests needed with `htop`, `vim`, `git log --oneline`, cargo builds, etc.

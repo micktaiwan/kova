@@ -1,5 +1,6 @@
-//! What a Claude conversation still has to do ("reste à faire"): the todo and
-//! idea list a Claude Code plugin keeps on disk, one file per session, at
+//! What a Claude conversation still has to do ("raf", a French abbreviation of
+//! "still to do"): the todo and idea list a Claude Code plugin keeps on disk,
+//! one file per session, at
 //! `~/.claude/raf/<session-id>.json`.
 //!
 //! Kova only reads it, and only at two moments — when the pane switcher opens

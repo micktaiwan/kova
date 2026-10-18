@@ -307,6 +307,44 @@ impl AppDelegate {
                                     ivars.asks.borrow_mut().add(*question, responder);
                                     continue;
                                 }
+                                // The card's questions, read and answered from
+                                // elsewhere (a remote client): they live on the delegate too.
+                                if let crate::ipc::IpcCommand::ListAsks = cmd {
+                                    let asks = ivars.asks.borrow();
+                                    let list: Vec<serde_json::Value> = asks
+                                        .questions()
+                                        .into_iter()
+                                        .map(|q| {
+                                            let mut entry = serde_json::to_value(q).unwrap_or_default();
+                                            entry["buttons"] = serde_json::json!(q.buttons());
+                                            entry
+                                        })
+                                        .collect();
+                                    let _ = responder.send(crate::ipc::IpcResponse::Ok {
+                                        data: Some(serde_json::json!({ "asks": list })),
+                                    });
+                                    continue;
+                                }
+                                if let crate::ipc::IpcCommand::WithdrawAsks { session_id } = cmd {
+                                    let withdrawn = ivars.asks.borrow_mut().withdraw(&session_id);
+                                    let _ = responder.send(crate::ipc::IpcResponse::Ok {
+                                        data: Some(serde_json::json!({ "withdrawn": withdrawn })),
+                                    });
+                                    continue;
+                                }
+                                if let crate::ipc::IpcCommand::AnswerAsk { id, action, text } = cmd {
+                                    let response = match ivars.asks.borrow_mut().answer_checked(&id, action, text) {
+                                        Ok(answer) => crate::ipc::IpcResponse::Ok {
+                                            data: serde_json::to_value(&answer).ok(),
+                                        },
+                                        Err(message) => {
+                                            log::info!("ask {}: answer-ask refused: {}", id, message);
+                                            crate::ipc::IpcResponse::Error { message }
+                                        }
+                                    };
+                                    let _ = responder.send(response);
+                                    continue;
+                                }
                                 match handle_ipc_command(cmd, &ivars.windows, &ivars.config) {
                                     Disposition::Reply(response) => {
                                         let _ = responder.send(response);
@@ -749,8 +787,8 @@ fn handle_ipc_command_sync(
         // Intercepted in the tick, before this dispatcher — it needs the event
         // state, which lives on the delegate. Reaching here means that branch was
         // lost in a refactor.
-        IpcCommand::Ask(_) => {
-            log::error!("IPC: ask reached the generic dispatcher");
+        IpcCommand::Ask(_) | IpcCommand::ListAsks | IpcCommand::AnswerAsk { .. } | IpcCommand::WithdrawAsks { .. } => {
+            log::error!("IPC: an ask command reached the generic dispatcher");
             crate::ipc::IpcResponse::Error {
                 message: "internal: ask was not intercepted".to_string(),
             }

@@ -204,6 +204,24 @@ pub enum IpcCommand {
     /// that takes; the connection then waits for the client's `ack` before the
     /// answer counts as handed over. Served by `handle_connection` itself.
     Ask(Box<crate::ask::Question>),
+    /// The questions still waiting on this Kova's card, oldest first (a remote
+    /// client shows them on a phone). Served on the main thread from the `Board`.
+    ListAsks,
+    /// Answer a pending question from elsewhere than the card (a remote client): the same
+    /// `Board` path as a click, so the asker gets it the same way. `action`
+    /// and `text` are checked against the question there, not here.
+    AnswerAsk {
+        id: String,
+        action: String,
+        text: String,
+    },
+    /// Take back every question a conversation still has on the card: the user
+    /// answered it in the conversation itself (a prompt typed in the pane, or
+    /// from a remote client), so the card would only deliver a stale answer.
+    /// Nothing is delivered late; a `kova ask` still waiting exits with code 3.
+    WithdrawAsks {
+        session_id: String,
+    },
 }
 
 /// How long the IPC connection thread should wait for the main thread's response.
@@ -617,6 +635,9 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "reload-config" => &[],
         "subscribe" => &["events"],
         "ask" => &["question"],
+        "list-asks" => &[],
+        "answer-ask" => &["id", "action", "text"],
+        "withdraw-asks" => &["session_id"],
         _ => return None,
     })
 }
@@ -980,6 +1001,35 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             }
             Ok(IpcCommand::Ask(Box::new(question)))
         }
+        "list-asks" => Ok(IpcCommand::ListAsks),
+        "answer-ask" => {
+            let text_field = |key: &str| -> Result<Option<String>, String> {
+                match v.get(key) {
+                    None | Some(serde_json::Value::Null) => Ok(None),
+                    Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+                    Some(_) => Err(format!("\"{key}\" must be a string")),
+                }
+            };
+            let id = text_field("id")?.ok_or_else(|| "missing \"id\" field".to_string())?;
+            if !crate::ask::is_safe_question_id(&id) {
+                return Err("\"id\" must be a UUID".to_string());
+            }
+            let action = text_field("action")?.ok_or_else(|| "missing \"action\" field".to_string())?;
+            let text = text_field("text")?.unwrap_or_default();
+            Ok(IpcCommand::AnswerAsk { id, action, text })
+        }
+        "withdraw-asks" => {
+            let session_id = v
+                .get("session_id")
+                .ok_or_else(|| "missing \"session_id\" field".to_string())?
+                .as_str()
+                .ok_or_else(|| "\"session_id\" must be a string".to_string())?
+                .to_string();
+            if !crate::ask::is_safe_session_id(&session_id) {
+                return Err("\"session_id\" must be a plain session id".to_string());
+            }
+            Ok(IpcCommand::WithdrawAsks { session_id })
+        }
         other => Err(format!("unknown command: {}", other)),
     }
 }
@@ -1274,6 +1324,42 @@ mod tests {
                 {"id": 2, "chars": 10, "bytes": 12},
             ],
         }));
+    }
+
+    #[test]
+    fn withdraw_asks_parses_and_refuses_odd_session_ids() {
+        match parse_command(r#"{"cmd":"withdraw-asks","session_id":"7cc50c49-61e0"}"#) {
+            Ok(IpcCommand::WithdrawAsks { session_id }) => assert_eq!(session_id, "7cc50c49-61e0"),
+            _ => panic!("withdraw-asks"),
+        }
+        assert_eq!(err(r#"{"cmd":"withdraw-asks"}"#), "missing \"session_id\" field");
+        assert_eq!(err(r#"{"cmd":"withdraw-asks","session_id":3}"#), "\"session_id\" must be a string");
+        assert_eq!(err(r#"{"cmd":"withdraw-asks","session_id":"a b"}"#), "\"session_id\" must be a plain session id");
+    }
+
+    #[test]
+    fn ask_board_commands_parse() {
+        assert!(matches!(parse_command(r#"{"cmd":"list-asks"}"#), Ok(IpcCommand::ListAsks)));
+        assert_eq!(err(r#"{"cmd":"list-asks","id":"x"}"#), "unknown field \"id\" for command \"list-asks\"");
+        let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        match parse_command(&format!(r#"{{"cmd":"answer-ask","id":"{id}","action":"OK","text":"go"}}"#)) {
+            Ok(IpcCommand::AnswerAsk { id: got, action, text }) => {
+                assert_eq!((got.as_str(), action.as_str(), text.as_str()), (id, "OK", "go"))
+            }
+            _ => panic!("answer-ask"),
+        }
+        match parse_command(&format!(r#"{{"cmd":"answer-ask","id":"{id}","action":"KO"}}"#)) {
+            Ok(IpcCommand::AnswerAsk { text, .. }) => assert_eq!(text, "", "text defaults to empty"),
+            _ => panic!("answer-ask without text"),
+        }
+        assert_eq!(err(r#"{"cmd":"answer-ask","action":"OK"}"#), "missing \"id\" field");
+        assert_eq!(err(r#"{"cmd":"answer-ask","id":"../x","action":"OK"}"#), "\"id\" must be a UUID");
+        assert_eq!(err(&format!(r#"{{"cmd":"answer-ask","id":"{id}"}}"#)), "missing \"action\" field");
+        assert_eq!(err(&format!(r#"{{"cmd":"answer-ask","id":"{id}","action":1}}"#)), "\"action\" must be a string");
+        assert_eq!(
+            err(&format!(r#"{{"cmd":"answer-ask","id":"{id}","action":"OK","pane_id":1}}"#)),
+            "unknown field \"pane_id\" for command \"answer-ask\""
+        );
     }
 
     #[test]

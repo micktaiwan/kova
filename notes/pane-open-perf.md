@@ -1,39 +1,39 @@
-# Perf d'ouverture d'un pane
+# Pane open performance
 
-## Le constat central : deux latences distinctes
+## The central finding: two distinct latencies
 
-« Ouvrir un pane » mélange **deux latences** qui ne se règlent pas avec les mêmes fixes :
+"Opening a pane" mixes **two latencies** that are not solved by the same fixes:
 
-1. **Time-to-rectangle** — le pane se dessine à l'écran. Retardée par du travail
-   **sur le main thread AppKit** : `fork`/`exec` du shell, reflow synchrone des
-   panes voisins (`resize_all_panes`), et jusqu'à une frame d'attente avant le
-   prochain tick `NSTimer`.
-2. **Time-to-prompt** — le shell devient utilisable (premier prompt). Dominée par
-   le **login shell qui source `/etc/zprofile` + `~/.zshrc`** (oh-my-zsh, plugins)
-   dans le process **enfant**. Tourne **déjà hors du thread de Kova** : aucune
-   optimisation main-thread ou rendu ne la touche. Seul levier côté Kova : un pool
-   de shells pré-chauffés.
+1. **Time-to-rectangle** — the pane is drawn on screen. Delayed by work
+   **on the AppKit main thread**: `fork`/`exec` of the shell, synchronous reflow of
+   neighboring panes (`resize_all_panes`), and up to one frame of waiting before the
+   next `NSTimer` tick.
+2. **Time-to-prompt** — the shell becomes usable (first prompt). Dominated by
+   the **login shell sourcing `/etc/zprofile` + `~/.zshrc`** (oh-my-zsh, plugins)
+   in the **child** process. Already runs **off Kova's thread**: no main-thread or
+   rendering optimization touches it. The only lever on Kova's side: a pool
+   of pre-warmed shells.
 
-Nuance vérifiée : sur macOS `fork` coûte en O(nombre d'entrées vm_map), **pas** en
-O(octets mappés) — l'atlas de glyphes / les MTLBuffers ne le gonflent pas. Le
-blocage du `fork` sur le main thread est de l'ordre d'une frame ou deux. La valeur
-de sortir le spawn du main thread est le **découplage** (le pane apparaît avant la
-fin du `fork`), pas de récupérer le temps du `fork`.
+Verified nuance: on macOS `fork` costs O(number of vm_map entries), **not**
+O(mapped bytes) — the glyph atlas / MTLBuffers do not inflate it. The
+`fork` blocks the main thread for about one or two frames. The value
+of moving the spawn off the main thread is the **decoupling** (the pane appears before the
+`fork` finishes), not getting back the `fork` time.
 
-## Instrumentation (en place)
+## Instrumentation (in place)
 
-Trois jalons logués sous le préfixe `PANE-OPEN`, relatifs à une référence unique
-`entry` = début de `Pane::spawn` (le travail pré-spawn dans les handlers de split
-est du calcul flottant sub-µs, replié dedans). Implémentée par `PaneOpenTimer`
-(`src/pane.rs`), partagée immuablement avec le thread de lecture PTY.
+Three milestones logged under the `PANE-OPEN` prefix, relative to a single reference
+`entry` = start of `Pane::spawn` (the pre-spawn work in the split handlers
+is sub-µs floating-point math, folded into it). Implemented by `PaneOpenTimer`
+(`src/pane.rs`), shared immutably with the PTY reader thread.
 
-| Jalon | Sens | Posé dans |
+| Milestone | Meaning | Set in |
 |---|---|---|
-| `tree-inserted` | spawn (fork/exec) + insertion dans l'arbre | `do_split` / `do_split_root` / `ipc_split` après `drop(tabs)`, avant `resize_all_panes` (`src/window.rs`) |
-| `first-paint` | pane soumis au renderer = visible → **time-to-rectangle** | boucle de collecte `pane_data` dans `tick()` (`src/window.rs`) |
-| `shell-ready` | premier octet du shell = premier prompt → **time-to-prompt** | thread de lecture, à la bascule `shell_ready` (`src/terminal/pty.rs`) |
+| `tree-inserted` | spawn (fork/exec) + insertion into the tree | `do_split` / `do_split_root` / `ipc_split` after `drop(tabs)`, before `resize_all_panes` (`src/window.rs`) |
+| `first-paint` | pane submitted to the renderer = visible → **time-to-rectangle** | `pane_data` collection loop in `tick()` (`src/window.rs`) |
+| `shell-ready` | first byte from the shell = first prompt → **time-to-prompt** | reader thread, at the `shell_ready` switch (`src/terminal/pty.rs`) |
 
-Lecture :
+Reading:
 
 ```bash
 grep PANE-OPEN ~/Library/Logs/Kova/kova.log
@@ -42,72 +42,72 @@ grep PANE-OPEN ~/Library/Logs/Kova/kova.log
 # PANE-OPEN id=7 shell-ready  +212.0ms (time-to-prompt)
 ```
 
-- Un split interactif émet **3 lignes** (`tree-inserted` + `first-paint` + `shell-ready`).
-- Un pane de **restore** émet **2 lignes** (pas de `tree-inserted` : les handlers de
-  restore n'appellent pas `mark_inserted`) → l'absence de `tree-inserted` distingue
-  un restore d'un split.
-- Chaque jalon ne loggue qu'une fois (garde atomique).
-- `entry` ≈ keystroke à sub-µs près ; si on veut un jour le délai keystroke→spawn
-  exact, capturer un `Instant` en tête des handlers de split (chemin main-thread,
-  pas de race).
+- An interactive split emits **3 lines** (`tree-inserted` + `first-paint` + `shell-ready`).
+- A **restore** pane emits **2 lines** (no `tree-inserted`: the restore
+  handlers do not call `mark_inserted`) → the absence of `tree-inserted` tells
+  a restore from a split.
+- Each milestone logs only once (atomic guard).
+- `entry` ≈ keystroke to within a sub-µs; if we ever want the exact keystroke→spawn
+  delay, capture an `Instant` at the top of the split handlers (main-thread path,
+  no race).
 
-## Plan priorisé (issu de l'analyse multi-agents, findings vérifiés)
+## Prioritized plan (from the multi-agent analysis, verified findings)
 
-Mesurer **avant** d'optimiser : sans le découpage rectangle vs prompt, on optimise
-la mauvaise moitié. C'est l'objet de l'instrumentation ci-dessus.
+Measure **before** optimizing: without the rectangle vs prompt split, we optimize
+the wrong half. That is the purpose of the instrumentation above.
 
-### Pour « le pane apparaît instantanément »
+### For "the pane appears instantly"
 
-1. **Insérer un placeholder `shell_ready=false` AVANT de spawner, puis spawner le
-   PTY hors du main thread et swapper** (impact élevé / complexité moyenne). Le
-   meilleur ratio. Aujourd'hui les 3 entrées appellent `Pane::spawn` (fork/exec
-   bloquant) **puis** insèrent → le rectangle ne peut pas se dessiner avant la fin
-   du spawn. Détail : ne pas réutiliser `Pane::placeholder` tel quel, il met
-   `shell_ready=true` (masquerait l'overlay de chargement). `Pty` est `Send`.
-3. **Forcer un rendu synchrone après un split + drainer l'IPC avant le tick**
-   (quick win). Il n'y a **aucun chemin `setNeedsDisplay`** : le rendu ne dépend
-   que du `NSTimer`. Un `self.tick()` en fin de `do_split`/`do_split_root` (après
-   `drop(tabs)`) supprime le plancher ~16,67 ms. Pour l'IPC, le drain (`app.rs`)
-   tourne **après** `view.tick()` → un `ipc_split` rend une frame plus tard ; le
-   remonter avant la boucle de tick.
-4. **Découpler le reflow du scrollback des voisins** (complexité élevée).
-   `resize_all_panes` (`src/window.rs`) est synchrone après chaque split et, sur un
-   split **horizontal** (le défaut), reflow tout le `VecDeque` de scrollback des
-   voisins en O(scrollback × cols), jusqu'à 10k lignes. Le nouveau pane, lui, ne
-   paie jamais. Garder le resize de grille visible synchrone, différer le reflow du
-   scrollback.
+1. **Insert a `shell_ready=false` placeholder BEFORE spawning, then spawn the
+   PTY off the main thread and swap** (high impact / medium complexity). The
+   best ratio. Today the 3 entry points call `Pane::spawn` (blocking fork/exec)
+   **then** insert → the rectangle cannot be drawn before the spawn
+   finishes. Detail: do not reuse `Pane::placeholder` as is, it sets
+   `shell_ready=true` (would hide the loading overlay). `Pty` is `Send`.
+3. **Force a synchronous render after a split + drain IPC before the tick**
+   (quick win). There is **no `setNeedsDisplay` path**: rendering depends
+   only on the `NSTimer`. A `self.tick()` at the end of `do_split`/`do_split_root` (after
+   `drop(tabs)`) removes the ~16.67 ms floor. For IPC, the drain (`app.rs`)
+   runs **after** `view.tick()` → an `ipc_split` renders one frame later; move
+   it up before the tick loop.
+4. **Decouple the neighbors' scrollback reflow** (high complexity).
+   `resize_all_panes` (`src/window.rs`) is synchronous after each split and, on a
+   **horizontal** split (the default), reflows the neighbors' whole scrollback `VecDeque`
+   in O(scrollback × cols), up to 10k lines. The new pane itself never
+   pays. Keep the visible grid resize synchronous, defer the scrollback
+   reflow.
 
-### Pour « le prompt utilisable instantané »
+### For "the prompt is usable instantly"
 
-2. **Pool de shells pré-chauffés (1-2 shells pré-forkés)** (impact élevé /
-   complexité élevée). Le **seul levier côté Kova**. Pré-spawner 1-2 vrais shells
-   dans `$HOME` qui sourcent leur rc en tâche de fond et atteignent
-   `shell_ready=true` pendant qu'on bosse ; au split, pop un shell chaud au lieu de
-   forker, `cd <cwd>` si besoin. **Tension avec le principe « RAM minimale »** :
-   garder N petit, jamais de capture PTY sur les shells chauds. `Pty::dummy` /
-   `Pane::placeholder` ne conviennent pas (pas de vrai process).
+2. **Pool of pre-warmed shells (1-2 pre-forked shells)** (high impact /
+   high complexity). The **only lever on Kova's side**. Pre-spawn 1-2 real shells
+   in `$HOME` that source their rc in the background and reach
+   `shell_ready=true` while we work; on split, pop a warm shell instead of
+   forking, `cd <cwd>` if needed. **Tension with the "minimal RAM" principle**:
+   keep N small, never any PTY capture on the warm shells. `Pty::dummy` /
+   `Pane::placeholder` do not fit (no real process).
 
-### Quick wins indépendants
+### Independent quick wins
 
-- **Capture PTY OFF par défaut** (`src/terminal/pty.rs`, l'arm `Err(_) => true`).
-  Pas un gain de latence (`shell_ready` est posé avant l'écriture capture), mais
-  écrit en clair sur disque **tout** ce qui transite par le PTY (y compris les
-  mots de passe tapés) — c'est une expo sécurité. À passer en opt-in `=1`, ou
-  ring-buffer en mémoire vidé seulement quand le bug alt-screen frappe.
-- **Buffer de lecture 4096 → 16-64 KiB** (`src/terminal/pty.rs`) : coalesce les
-  `read()` et les prises de lock sous gros débit. Throughput, pas ouverture.
-- **Poll 100 ms → ~400 ms** (`src/terminal/pty.rs`) : −4× les réveils inactifs
-  (reste sous le warn de join >500 ms au Drop).
-- **Comparer cols/rows avant le `write()` lock** dans `resize_all_panes`
-  (`src/window.rs`, le lock est pris inconditionnellement).
+- **PTY capture OFF by default** (`src/terminal/pty.rs`, the `Err(_) => true` arm).
+  Not a latency gain (`shell_ready` is set before the capture write), but it
+  writes to disk in clear **everything** that goes through the PTY (including
+  typed passwords) — it is a security exposure. Switch to opt-in `=1`, or
+  an in-memory ring buffer flushed only when the alt-screen bug strikes.
+- **Read buffer 4096 → 16-64 KiB** (`src/terminal/pty.rs`): coalesces the
+  `read()` calls and lock acquisitions under heavy throughput. Throughput, not opening.
+- **Poll 100 ms → ~400 ms** (`src/terminal/pty.rs`): 4× fewer idle wake-ups
+  (stays under the join warning >500 ms on Drop).
+- **Compare cols/rows before the `write()` lock** in `resize_all_panes`
+  (`src/window.rs`, the lock is taken unconditionally).
 
-### Hors scope / honnête
+### Out of scope / honest
 
-- Les dotfiles (`~/.zshrc`, oh-my-zsh) dominent le time-to-prompt et **ne sont pas**
-  du code Kova. Mitigation possible : pool (rank 2), ZDOTDIR warm-park opt-in, ou
-  hint doc — pas d'accélération directe du sourcing.
-- Le fix non-login **naïf** (retirer le `-` de `arg0`) est **UNSAFE** : les splits
-  hériteraient de l'env de lancement de Kova, pas du PATH augmenté du premier shell
-  (brew/node/python/rvm vivent dans `~/.zprofile`/`~/.zlogin`) → régression PATH
-  quand Kova est lancé depuis le Finder. Si on poursuit le non-login, capturer
-  l'env résolu du premier login shell et l'injecter dans les splits.
+- Dotfiles (`~/.zshrc`, oh-my-zsh) dominate time-to-prompt and **are not**
+  Kova code. Possible mitigation: pool (rank 2), opt-in ZDOTDIR warm-park, or
+  a doc hint — no direct speed-up of the sourcing.
+- The **naive** non-login fix (removing the `-` from `arg0`) is **UNSAFE**: splits
+  would inherit Kova's launch env, not the augmented PATH of the first shell
+  (brew/node/python/rvm live in `~/.zprofile`/`~/.zlogin`) → PATH regression
+  when Kova is launched from the Finder. If we pursue non-login, capture
+  the resolved env of the first login shell and inject it into the splits.

@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn a_named_tab_is_the_same_tab_whatever_its_focused_directory() {
         let a = closed(Some("Kova"), "/p/kova", &["/p/kova"], 1);
-        let b = closed(Some(" kova "), "/p/mickaelfm", &["/p/kova", "/p/mickaelfm"], 2);
+        let b = closed(Some(" kova "), "/p/website", &["/p/kova", "/p/website"], 2);
         assert_eq!(a.key(), b.key());
     }
 
@@ -309,21 +309,21 @@ mod tests {
         assert_ne!(a.key(), other.key());
         // Two different named tabs may share a focused directory.
         assert_ne!(
-            closed(Some("ASL"), "/p/asl", &["/p/asl"], 1).key(),
-            closed(Some("Docs"), "/p/asl", &["/p/asl"], 1).key(),
+            closed(Some("Wiki"), "/p/wiki", &["/p/wiki"], 1).key(),
+            closed(Some("Docs"), "/p/wiki", &["/p/wiki"], 1).key(),
         );
     }
 
     #[test]
     fn closing_a_tab_again_replaces_its_older_entry() {
         let stored = vec![
-            closed(Some("ASL"), "/p/asl", &["/p/asl"], 5),
+            closed(Some("Wiki"), "/p/wiki", &["/p/wiki"], 5),
             closed(Some("Kova"), "/p/kova", &["/p/kova"], 4),
         ];
-        let fresh = vec![closed(Some("kova"), "/p/mickaelfm", &["/p/mickaelfm"], 9)];
+        let fresh = vec![closed(Some("kova"), "/p/website", &["/p/website"], 9)];
         let merged = merge(fresh, stored);
         let paths: Vec<&str> = merged.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, ["/p/mickaelfm", "/p/asl"]);
+        assert_eq!(paths, ["/p/website", "/p/wiki"]);
     }
 
     #[test]
@@ -343,19 +343,19 @@ mod tests {
     fn dedup_keeps_the_most_recent_of_legacy_duplicates() {
         // Files written before tabs were keyed by name hold the same tab twice.
         let entries = vec![
-            closed(Some("ASL"), "/p/asl", &["/p/asl"], 5),
-            closed(Some("ASL"), "/p/asl/server", &["/p/asl/server"], 3),
+            closed(Some("Wiki"), "/p/wiki", &["/p/wiki"], 5),
+            closed(Some("Wiki"), "/p/wiki/server", &["/p/wiki/server"], 3),
         ];
         let kept = dedup(entries);
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].path, "/p/asl");
+        assert_eq!(kept[0].path, "/p/wiki");
     }
 
     #[test]
     fn has_cwd_looks_at_every_pane_not_only_the_focused_one() {
-        let e = closed(Some("Kova"), "/p/kova", &["/p/kova", "/p/mickaelfm"], 1);
+        let e = closed(Some("Kova"), "/p/kova", &["/p/kova", "/p/website"], 1);
         assert!(e.has_cwd("/p/kova"));
-        assert!(e.has_cwd("/p/mickaelfm"));
+        assert!(e.has_cwd("/p/website"));
         assert!(!e.has_cwd("/p/mira"));
     }
 }

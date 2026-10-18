@@ -253,7 +253,7 @@ pub(super) fn bookmark_detail(bm: &crate::bookmarks::Bookmark) -> Option<String>
     bm.agent.map(|a| a.as_str().to_string())
 }
 
-/// The header naming a directory of bookmarks: its last component ("cto"),
+/// The header naming a directory of bookmarks: its last component ("api"),
 /// or the whole path with `~` for home when another saved directory ends the
 /// same way, so two `app` folders never share one name.
 pub(super) fn bookmark_dir_header(cwd: &str, all_cwds: &[&str], home: Option<&str>) -> String {
@@ -1497,7 +1497,7 @@ mod tests {
     #[test]
     fn bookmarks_are_grouped_by_directory_in_order_of_their_newest() {
         let at = |id: &str, cwd: &str| crate::bookmarks::Bookmark { cwd: cwd.into(), ..saved(id) };
-        let items = vec![at("a", "/h/cto"), at("b", "/h/self"), at("c", "/h/cto")];
+        let items = vec![at("a", "/h/api"), at("b", "/h/web"), at("c", "/h/api")];
         let groups = bookmark_groups(&items, |_| false);
         assert_eq!(switcher_spec(&groups), vec!["hkk".to_string(), "hk".to_string()]);
         let indexes: Vec<usize> = groups[0]
@@ -1510,8 +1510,8 @@ mod tests {
         assert_eq!(indexes, vec![0, 2]);
         match (&groups[0][0], &groups[1][0]) {
             (SwitcherRow::TabHeader(first), SwitcherRow::TabHeader(second)) => {
-                assert_eq!(first, "★ cto");
-                assert_eq!(second, "★ self");
+                assert_eq!(first, "★ api");
+                assert_eq!(second, "★ web");
             }
             _ => panic!("each group starts with its directory"),
         }
@@ -1519,8 +1519,8 @@ mod tests {
 
     #[test]
     fn a_directory_header_shows_the_path_only_when_names_clash() {
-        let cwds = ["/Users/x/a/app", "/Users/x/b/app", "/Users/x/cto"];
-        assert_eq!(bookmark_dir_header("/Users/x/cto", &cwds, Some("/Users/x")), "cto");
+        let cwds = ["/Users/x/a/app", "/Users/x/b/app", "/Users/x/api"];
+        assert_eq!(bookmark_dir_header("/Users/x/api", &cwds, Some("/Users/x")), "api");
         assert_eq!(bookmark_dir_header("/Users/x/a/app", &cwds, Some("/Users/x")), "~/a/app");
         assert_eq!(bookmark_dir_header("/opt/app", &["/opt/app", "/srv/app"], Some("/Users/x")), "/opt/app");
         // "/Users/xy" is not under "/Users/x".

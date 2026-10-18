@@ -368,7 +368,7 @@ fn bookmark_hits(
 /// The query is cut into terms on spaces and commas, and a pane or tab has to
 /// carry every one of them (see `claude_history::split_terms`): one word is too
 /// coarse once there are dozens of panes, and matching the whole query as a
-/// single string would make "dust mcp" find nothing.
+/// single string would make "parser mcp" find nothing.
 ///
 /// A term counts in full only as a whole word: "pitr" is the backup, not the
 /// middle of "chapitre". What matches only inside longer words is not dropped
@@ -1258,21 +1258,21 @@ mod tests {
         use std::collections::{HashMap, HashSet};
         let items = vec![
             bookmark(Some("a"), "/Users/x/kova", "Search palette"),
-            bookmark(Some("b"), "/Users/x/cto", "Weekly"),
-            bookmark(None, "/Users/x/janus", "shell"),
+            bookmark(Some("b"), "/Users/x/api", "Weekly"),
+            bookmark(None, "/Users/x/infra", "shell"),
         ];
         let said: HashMap<String, String> =
-            [("b".to_string(), "on parle du deploy staging".to_string())].into();
+            [("b".to_string(), "we deploy to staging".to_string())].into();
         let none = HashSet::new();
         let terms = crate::claude_history::split_terms;
 
         let (word, _) = bookmark_hits(&items, &terms("palette"), &said, &none);
         assert_eq!(hit_labels(&word), ["kova · Search palette"]);
-        let (word, _) = bookmark_hits(&items, &terms("janus"), &said, &none);
-        assert_eq!(hit_labels(&word), ["janus · shell"], "the directory counts");
+        let (word, _) = bookmark_hits(&items, &terms("infra"), &said, &none);
+        assert_eq!(hit_labels(&word), ["infra · shell"], "the directory counts");
         // Found by what was said in it: the row shows the line that matched.
-        let (word, _) = bookmark_hits(&items, &terms("cto deploy"), &said, &none);
-        assert_eq!(hit_labels(&word), ["cto · Weekly  ·  on parle du deploy staging"]);
+        let (word, _) = bookmark_hits(&items, &terms("api deploy"), &said, &none);
+        assert_eq!(hit_labels(&word), ["api · Weekly  ·  we deploy to staging"]);
         // Every term has to be there.
         let (word, inside) = bookmark_hits(&items, &terms("kova deploy"), &said, &none);
         assert!(word.is_empty() && inside.is_empty());

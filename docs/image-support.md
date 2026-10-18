@@ -1,50 +1,50 @@
 # Inline Image Support (Kitty Graphics Protocol)
 
-Design doc pour l'ajout du support d'images inline dans Kova via le Kitty Graphics Protocol.
+Design doc for adding inline image support to Kova via the Kitty Graphics Protocol.
 
-## Protocole choisi : Kitty Graphics
+## Chosen protocol: Kitty Graphics
 
-Pourquoi Kitty plutôt que Sixel ou iTerm2 :
+Why Kitty rather than Sixel or iTerm2:
 
-- **Kitty** : protocole moderne, bien documenté, séparation image/placement, chunked transfer, z-index, animations. Adopté par Ghostty, WezTerm, Konsole, foot.
-- **Sixel** : ancien (1983), complexe à parser (state machine propre), pas de cache d'image, retransmission à chaque affichage. Rejeté.
-- **iTerm2** : propriétaire, pas de cache, pas de z-index, pas de placements multiples. Non retenu.
+- **Kitty**: modern protocol, well documented, image/placement separation, chunked transfer, z-index, animations. Adopted by Ghostty, WezTerm, Konsole, foot.
+- **Sixel**: old (1983), complex to parse (its own state machine), no image cache, retransmission on every display. Rejected.
+- **iTerm2**: proprietary, no cache, no z-index, no multiple placements. Not chosen.
 
-Spec complète : https://sw.kovidgoyal.net/kitty/graphics-protocol/
+Full spec: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 
-## Format des escape sequences
+## Escape sequence format
 
 ```
 ESC _ G <key=value,key=value,...> ; <base64-payload> ESC \
 ```
 
 - `ESC _` = APC (Application Programming Command)
-- `G` = identifiant du protocole graphique
-- Payload en base64, séparé par `;`
+- `G` = graphics protocol identifier
+- Base64 payload, separated by `;`
 - `ESC \` = ST (String Terminator)
 
-### Clés principales
+### Main keys
 
-| Clé | Rôle | Valeurs |
+| Key | Role | Values |
 |-----|------|---------|
-| `a` | Action | `T` transmit+display (défaut), `t` transmit, `p` place, `d` delete, `q` query |
-| `f` | Format pixels | `24` RGB, `32` RGBA (défaut), `100` PNG |
-| `t` | Mode transmission | `d` direct (défaut), `f` fichier, `t` fichier temp, `s` shared memory |
+| `a` | Action | `T` transmit+display (default), `t` transmit, `p` place, `d` delete, `q` query |
+| `f` | Pixel format | `24` RGB, `32` RGBA (default), `100` PNG |
+| `t` | Transmission mode | `d` direct (default), `f` file, `t` temp file, `s` shared memory |
 | `i` | Image ID | 1..2^32 |
 | `p` | Placement ID | 1..2^32 |
-| `s` | Largeur source (pixels) | requis pour RGB/RGBA |
-| `v` | Hauteur source (pixels) | requis pour RGB/RGBA |
-| `c` | Colonnes d'affichage | integer |
-| `r` | Lignes d'affichage | integer |
-| `z` | Z-index | integer (négatif = sous le texte) |
-| `m` | Chunked transfer | `1` = suite, `0` = dernier chunk |
-| `q` | Mode silencieux | `1` = pas d'OK, `2` = aucune réponse |
+| `s` | Source width (pixels) | required for RGB/RGBA |
+| `v` | Source height (pixels) | required for RGB/RGBA |
+| `c` | Display columns | integer |
+| `r` | Display rows | integer |
+| `z` | Z-index | integer (negative = below the text) |
+| `m` | Chunked transfer | `1` = more, `0` = last chunk |
+| `q` | Quiet mode | `1` = no OK, `2` = no response at all |
 | `o` | Compression | `z` = zlib deflate |
-| `C` | Mouvement curseur | `1` = ne pas bouger le curseur |
+| `C` | Cursor movement | `1` = don't move the cursor |
 
 ### Chunked transfer
 
-Les images sont envoyées par chunks de max 4096 bytes base64 :
+Images are sent in chunks of at most 4096 base64 bytes:
 
 ```
 ESC_G f=100,i=1,m=1; <chunk1> ESC\
@@ -52,33 +52,33 @@ ESC_G m=1;            <chunk2> ESC\
 ESC_G m=0;            <chunk3> ESC\
 ```
 
-Seul le premier chunk porte les clés de contrôle. L'image est placée à réception du dernier chunk (`m=0`).
+Only the first chunk carries the control keys. The image is placed when the last chunk (`m=0`) arrives.
 
-### Réponse du terminal
+### Terminal response
 
 ```
-ESC _ G i=<id> ; OK ESC \           -- succès
-ESC _ G i=<id> ; EINVAL:message ESC\ -- erreur
+ESC _ G i=<id> ; OK ESC \           -- success
+ESC _ G i=<id> ; EINVAL:message ESC\ -- error
 ```
 
-Codes d'erreur : `ENOENT`, `EINVAL`, `ENOSPC`, `ETOODEEP`, `ECYCLE`, `ENOPARENT`.
+Error codes: `ENOENT`, `EINVAL`, `ENOSPC`, `ETOODEEP`, `ECYCLE`, `ENOPARENT`.
 
 ### Delete
 
-`a=d` avec clé `d=` pour cibler : `a` (all visible), `i` (par ID), `c` (au curseur), `p` (à position x,y), etc.
-Minuscule = supprime le placement. Majuscule = supprime aussi les données image.
+`a=d` with key `d=` to target: `a` (all visible), `i` (by ID), `c` (at cursor), `p` (at position x,y), etc.
+Lowercase = deletes the placement. Uppercase = also deletes the image data.
 
-### Détection de support
+### Support detection
 
 ```
 ESC_G i=31,s=1,v=1,a=q,t=d,f=24;AAAA ESC\  ESC[c
 ```
 
-Si le terminal supporte le protocole, il répond avec l'APC avant la réponse DA1.
+If the terminal supports the protocol, it answers with the APC before the DA1 response.
 
-## Architecture d'implémentation dans Kova
+## Implementation architecture in Kova
 
-### Vue d'ensemble
+### Overview
 
 ```
 APC sequence
@@ -98,36 +98,36 @@ APC sequence
                                     └──────────────────┘
 ```
 
-### Chantier 1 : Parser APC (`src/terminal/parser.rs`)
+### Workstream 1: APC parser (`src/terminal/parser.rs`)
 
-Le crate `vte` ne parse pas les séquences APC nativement. Il faut :
+The `vte` crate doesn't parse APC sequences natively. We need to:
 
-1. Intercepter `ESC _` dans le handler VTE (méthode `hook()` pour DCS, ou un handler APC custom)
-2. Détecter le préfixe `G` (protocole graphique Kitty)
-3. Parser les paires `key=value` (toutes single-letter, valeurs entières ou char)
-4. Décoder le payload base64
-5. Gérer le chunking : accumuler les chunks (buffer par image ID) jusqu'à `m=0`
+1. Intercept `ESC _` in the VTE handler (`hook()` method for DCS, or a custom APC handler)
+2. Detect the `G` prefix (Kitty graphics protocol)
+3. Parse the `key=value` pairs (all single-letter, integer or char values)
+4. Decode the base64 payload
+5. Handle chunking: accumulate chunks (buffer per image ID) until `m=0`
 
-**Fichiers impactés** :
-- `src/terminal/parser.rs:106-115` — méthode `hook()`, point d'entrée
-- `src/terminal/parser.rs:119-181` — `osc_dispatch()` pour référence de pattern
+**Files affected**:
+- `src/terminal/parser.rs:106-115` — `hook()` method, entry point
+- `src/terminal/parser.rs:119-181` — `osc_dispatch()` as a pattern reference
 
-**Nouveau code** :
-- Struct `ImageCommand` : action, image ID, format, dimensions, payload, placement params
-- Parser de clés K/V (simple, ~50 lignes)
-- Buffer de chunks (HashMap<image_id, Vec<u8>>)
+**New code**:
+- `ImageCommand` struct: action, image ID, format, dimensions, payload, placement params
+- K/V key parser (simple, ~50 lines)
+- Chunk buffer (HashMap<image_id, Vec<u8>>)
 
-### Chantier 2 : Terminal State (`src/terminal/mod.rs`)
+### Workstream 2: Terminal State (`src/terminal/mod.rs`)
 
-**Contrainte critique** : les cellules font 32 bytes et sont optimisées pour la RAM. Ne PAS toucher au struct `Cell`.
+**Critical constraint**: cells are 32 bytes and optimized for RAM. Do NOT touch the `Cell` struct.
 
-Ajouter à `TerminalState` :
+Add to `TerminalState`:
 
 ```rust
-/// Images décodées en mémoire, indexées par image ID
+/// Decoded images in memory, indexed by image ID
 pub image_store: HashMap<u32, StoredImage>,
 
-/// Placements actifs : où afficher quelle image
+/// Active placements: where to show which image
 pub image_placements: Vec<ImagePlacement>,
 ```
 
@@ -136,43 +136,43 @@ pub struct StoredImage {
     pub id: u32,
     pub width: u32,          // pixels
     pub height: u32,         // pixels
-    pub data: Vec<u8>,       // RGBA décodé
-    pub texture_dirty: bool, // besoin d'upload GPU
+    pub data: Vec<u8>,       // decoded RGBA
+    pub texture_dirty: bool, // needs GPU upload
 }
 
 pub struct ImagePlacement {
     pub image_id: u32,
     pub placement_id: u32,
-    pub col: u16,            // position grille (top-left)
-    pub row: i32,            // peut être négatif (scrollback)
-    pub cols: u16,           // taille d'affichage en cellules
+    pub col: u16,            // grid position (top-left)
+    pub row: i32,            // can be negative (scrollback)
+    pub cols: u16,           // display size in cells
     pub rows: u16,
     pub z_index: i32,
-    pub source_rect: Option<(u32, u32, u32, u32)>, // x, y, w, h dans l'image source
+    pub source_rect: Option<(u32, u32, u32, u32)>, // x, y, w, h in the source image
 }
 ```
 
-**Fichiers impactés** :
-- `src/terminal/mod.rs:124-192` — struct `TerminalState`
+**Files affected**:
+- `src/terminal/mod.rs:124-192` — `TerminalState` struct
 
-### Chantier 3 : Image Manager (nouveau module `src/renderer/image_manager.rs`)
+### Workstream 3: Image Manager (new module `src/renderer/image_manager.rs`)
 
-Gestion des textures Metal pour les images, séparé de l'atlas de glyphes.
+Management of Metal textures for images, separate from the glyph atlas.
 
-Responsabilités :
-- Décoder les PNG (via `image` crate ou CoreGraphics)
-- Décompresser zlib si `o=z`
-- Uploader les pixels en texture Metal (RGBA8Unorm)
-- Cache de textures avec éviction (LRU par taille mémoire)
-- Gérer le cycle de vie : upload quand `texture_dirty`, libérer quand image supprimée
+Responsibilities:
+- Decode PNGs (via the `image` crate or CoreGraphics)
+- Decompress zlib if `o=z`
+- Upload pixels as a Metal texture (RGBA8Unorm)
+- Texture cache with eviction (LRU by memory size)
+- Handle the lifecycle: upload when `texture_dirty`, free when the image is deleted
 
 ```rust
 pub struct ImageManager {
     /// Cache: image_id → Metal texture
     textures: HashMap<u32, MTLTexture>,
-    /// Mémoire GPU utilisée (pour éviction)
+    /// GPU memory used (for eviction)
     gpu_memory_used: usize,
-    gpu_memory_limit: usize,  // ex: 256 MB
+    gpu_memory_limit: usize,  // e.g. 256 MB
 }
 
 impl ImageManager {
@@ -183,53 +183,53 @@ impl ImageManager {
 }
 ```
 
-**Stratégie texture** : une MTLTexture par image (pas d'atlas images). Raisons :
-- Les images ont des tailles très variables (contrairement aux glyphes)
-- Pas besoin de packing complexe
-- Suppression individuelle facile
-- Metal gère bien les centaines de textures
+**Texture strategy**: one MTLTexture per image (no image atlas). Reasons:
+- Images have very variable sizes (unlike glyphs)
+- No need for complex packing
+- Easy individual deletion
+- Metal handles hundreds of textures well
 
-### Chantier 4 : Renderer (`src/renderer/mod.rs`)
+### Workstream 4: Renderer (`src/renderer/mod.rs`)
 
-**Approche** : ajouter une passe d'image entre les backgrounds et les glyphes.
+**Approach**: add an image pass between the backgrounds and the glyphs.
 
-Dans `build_vertices()` (lignes 610-812), après la passe backgrounds (ligne 691) :
+In `build_vertices()` (lines 610-812), after the backgrounds pass (line 691):
 
 ```rust
 // Pass 2.5: Image quads
 for placement in &term.image_placements {
     if !placement_visible(placement, viewport) { continue; }
     let texture = self.image_manager.get_texture(placement.image_id);
-    // Générer un quad qui couvre cols×rows cellules
-    // tex_coords = [0,0] à [1,1] (texture entière) ou sub-rect
-    // Utiliser un marqueur dans color.a pour signaler au shader
+    // Generate a quad covering cols×rows cells
+    // tex_coords = [0,0] to [1,1] (whole texture) or sub-rect
+    // Use a marker in color.a to signal the shader
     self.push_image_quad(vertices, placement, viewport);
 }
 ```
 
-**Multi-texture Metal** :
+**Metal multi-texture**:
 
-Le pipeline Metal actuel n'utilise qu'une texture (l'atlas de glyphes). Pour les images :
-- Bind la texture image en slot 1 (l'atlas reste en slot 0)
-- Le fragment shader détecte via un marqueur dans le vertex quel slot sampler
+The current Metal pipeline uses only one texture (the glyph atlas). For images:
+- Bind the image texture in slot 1 (the atlas stays in slot 0)
+- The fragment shader detects through a marker in the vertex which slot to sample
 
-Problème : on ne peut pas changer de texture entre les vertices d'un même draw call.
+Problem: you can't change texture between vertices of the same draw call.
 
-**Solutions** :
-1. **Draw call séparé par image** : un draw call pour les glyphes (texture atlas), un par image (sa texture). Simple mais plus de draw calls.
-2. **Atlas d'images** : packer les images dans un atlas séparé. Complexe mais un seul draw call.
-3. **Texture array** : utiliser une `MTLTextureArray`. Propre mais limité en nombre de layers.
+**Solutions**:
+1. **Separate draw call per image**: one draw call for glyphs (atlas texture), one per image (its texture). Simple but more draw calls.
+2. **Image atlas**: pack images into a separate atlas. Complex but a single draw call.
+3. **Texture array**: use an `MTLTextureArray`. Clean but limited in number of layers.
 
-**Recommandation** : option 1 (draw calls séparés). Simple, et on aura rarement plus de ~10 images visibles simultanément. Pas de goulot d'étranglement.
+**Recommendation**: option 1 (separate draw calls). Simple, and we'll rarely have more than ~10 images visible at once. No bottleneck.
 
-**Fichiers impactés** :
+**Files affected**:
 - `src/renderer/mod.rs:610-812` — `build_vertices()`
-- `src/renderer/mod.rs:550-598` — soumission GPU (ajouter draw calls images)
-- `src/renderer/mod.rs:110-161` — struct `Renderer` (ajouter `ImageManager`)
+- `src/renderer/mod.rs:550-598` — GPU submission (add image draw calls)
+- `src/renderer/mod.rs:110-161` — `Renderer` struct (add `ImageManager`)
 
-### Chantier 5 : Shaders (`shaders/terminal.metal`)
+### Workstream 5: Shaders (`shaders/terminal.metal`)
 
-Pour les draw calls d'images, on peut réutiliser le même vertex shader. Le fragment shader image est trivial :
+For image draw calls, the same vertex shader can be reused. The image fragment shader is trivial:
 
 ```metal
 fragment float4 image_fragment(
@@ -241,94 +241,94 @@ fragment float4 image_fragment(
 }
 ```
 
-Alternative : un seul fragment shader avec un flag :
+Alternative: a single fragment shader with a flag:
 
 ```metal
-// Utiliser color.a == 0.5 comme marqueur "c'est une image"
+// Use color.a == 0.5 as an "this is an image" marker
 if (in.color.a > 0.4 && in.color.a < 0.6) {
-    return atlas.sample(s, in.tex_coords);  // ici atlas = image texture
+    return atlas.sample(s, in.tex_coords);  // here atlas = image texture
 }
 ```
 
-**Recommandation** : pipeline séparé (un pour glyphes, un pour images). Plus propre, pas de hacks de marqueur.
+**Recommendation**: separate pipeline (one for glyphs, one for images). Cleaner, no marker hacks.
 
-**Fichiers impactés** :
-- `shaders/terminal.metal` — ajouter `image_fragment` (~5 lignes)
-- `src/renderer/pipeline.rs:6-46` — créer un second pipeline state pour images
+**Files affected**:
+- `shaders/terminal.metal` — add `image_fragment` (~5 lines)
+- `src/renderer/pipeline.rs:6-46` — create a second pipeline state for images
 
-## Scope MVP (Phase 1)
+## MVP scope (Phase 1)
 
-Support minimal pour que `icat`, `yazi`, et les outils Kitty fonctionnent :
+Minimal support so that `icat`, `yazi`, and the Kitty tools work:
 
-| Feature | Inclus | Exclu |
+| Feature | Included | Excluded |
 |---------|--------|-------|
-| `a=T` (transmit+display) | oui | |
-| `a=t` + `a=p` (transmit puis place) | oui | |
-| `a=d` (delete) | oui (par ID, all) | delete par position/z-index |
-| `a=q` (query) | oui | |
-| `f=100` (PNG) | oui | |
-| `f=24/32` (raw RGB/RGBA) | oui | |
-| `o=z` (zlib) | oui | |
-| `t=d` (direct) | oui | |
+| `a=T` (transmit+display) | yes | |
+| `a=t` + `a=p` (transmit then place) | yes | |
+| `a=d` (delete) | yes (by ID, all) | delete by position/z-index |
+| `a=q` (query) | yes | |
+| `f=100` (PNG) | yes | |
+| `f=24/32` (raw RGB/RGBA) | yes | |
+| `o=z` (zlib) | yes | |
+| `t=d` (direct) | yes | |
 | `t=f/t/s` (file/temp/shm) | | phase 2 |
-| Chunked transfer (`m=`) | oui | |
-| Placement sizing (`c=`, `r=`) | oui | |
+| Chunked transfer (`m=`) | yes | |
+| Placement sizing (`c=`, `r=`) | yes | |
 | Z-index (`z=`) | | phase 2 |
 | Sub-rect source (`x,y,w,h`) | | phase 2 |
 | Unicode placeholders (`U=1`) | | phase 2 |
 | Animations (`a=f`, `a=a`) | | phase 3 |
 | Relative placements (`P,Q,H,V`) | | phase 3 |
 
-## Dépendances Rust
+## Rust dependencies
 
 ```toml
-# Décodage PNG
-png = "0.17"        # ou image = "0.25" (plus lourd mais multi-format)
+# PNG decoding
+png = "0.17"        # or image = "0.25" (heavier but multi-format)
 
-# Décompression zlib
+# zlib decompression
 flate2 = "1.0"
 
 # Base64
 base64 = "0.22"
 ```
 
-Alternative : utiliser CoreGraphics (déjà disponible) pour décoder les PNG sans dépendance supplémentaire.
+Alternative: use CoreGraphics (already available) to decode PNGs without an extra dependency.
 
-## Considérations
+## Considerations
 
 ### RAM
 
-- Chaque image stockée en RGBA = `width × height × 4` bytes en CPU + autant en GPU
-- Une image 1920×1080 = ~8 MB (CPU) + ~8 MB (GPU)
-- Limiter le cache GPU (ex: 256 MB) avec éviction LRU
-- Les images dans le scrollback : supprimer les données pixel, garder seulement les métadonnées (ou rien)
+- Each image stored as RGBA = `width × height × 4` bytes on the CPU + as much on the GPU
+- A 1920×1080 image = ~8 MB (CPU) + ~8 MB (GPU)
+- Cap the GPU cache (e.g. 256 MB) with LRU eviction
+- Images in the scrollback: drop the pixel data, keep only the metadata (or nothing)
 
 ### Scrollback
 
-Les placements sont liés à une position grille (row, col). Quand les lignes scrollent :
-- Les placements doivent être décalés (row -= 1 à chaque scroll)
-- Les placements qui sortent du scrollback sont supprimés
-- Phase 2 : les Unicode placeholders résolvent ça plus élégamment
+Placements are tied to a grid position (row, col). When lines scroll:
+- Placements must be shifted (row -= 1 on each scroll)
+- Placements that leave the scrollback are deleted
+- Phase 2: Unicode placeholders solve this more elegantly
 
-### Sécurité
+### Security
 
-- Mode fichier (`t=f`) : vérifier que c'est un fichier régulier, pas un device/socket/FIFO
-- Refuser les paths sous `/proc`, `/sys`, `/dev`
-- Mode temp (`t=t`) : vérifier que le path contient `tty-graphics-protocol` et est dans un répertoire temp connu
-- Limiter la taille totale des images en mémoire
+- File mode (`t=f`): check that it's a regular file, not a device/socket/FIFO
+- Reject paths under `/proc`, `/sys`, `/dev`
+- Temp mode (`t=t`): check that the path contains `tty-graphics-protocol` and is in a known temp directory
+- Cap the total size of images in memory
 
-## Ordre d'implémentation suggéré
+## Suggested implementation order
 
-1. **Parser APC** : intercepter les séquences, parser les clés, accumuler les chunks
-2. **Image store** : stocker les images décodées dans `TerminalState`
-3. **Image manager** : upload en texture Metal
-4. **Renderer** : draw call séparé pour les images
-5. **Query response** : répondre à `a=q` pour la détection de support
-6. **Delete** : supprimer par ID et all
-7. **Tests** : vérifier avec `kitten icat image.png`
+1. **APC parser**: intercept the sequences, parse the keys, accumulate the chunks
+2. **Image store**: store decoded images in `TerminalState`
+3. **Image manager**: upload as a Metal texture
+4. **Renderer**: separate draw call for images
+5. **Query response**: answer `a=q` for support detection
+6. **Delete**: delete by ID and all
+7. **Tests**: check with `kitten icat image.png`
 
-## Références
+## References
 
 - [Kitty Graphics Protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
-- [Ghostty source (Zig)](https://github.com/ghostty-org/ghostty) — implémentation de référence
-- [WezTerm image support](https://wezfurlong.org/wezterm/imgcat.html) — autre implémentation Rust
+- [Ghostty source (Zig)](https://github.com/ghostty-org/ghostty) — reference implementation
+- [WezTerm image support](https://wezfurlong.org/wezterm/imgcat.html) — another Rust implementation

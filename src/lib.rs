@@ -2,7 +2,7 @@
 //!
 //! Two clients share this code: Kova.app (`src/main.rs`, which drives
 //! `app::AppDelegate`) and any other host that links the static library
-//! through the C API of `capi` (`include/kova.h`) — Kana, one pane per note.
+//! through the C API of `capi` (`include/kova.h`) — e.g. a host app with one pane per document.
 
 pub mod app;
 pub mod capi;

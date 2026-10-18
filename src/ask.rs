@@ -23,8 +23,8 @@
 //! environment, which any process can set: session ids are refused outside
 //! `[A-Za-z0-9_-]`, question ids outside the UUID shape.
 //!
-//! Ported from Kova Float (`~/projects/perso/kova-float`, `kfloat ask`),
-//! 14/10/2026, where every delivery path was measured first.
+//! Ported from an earlier Swift prototype,
+//! where every delivery path was measured first.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -264,7 +264,7 @@ pub fn descends(pid: i32, ancestor: i32) -> bool {
 /// the proof. Two proofs, either is enough: Kova reports the session in that
 /// pane, or the process running the conversation descends from the pane's
 /// shell. The second exists because the report lags: a pane opened minutes
-/// before still showed no session (14/10/2026, pane 205 in Kova Float's tests).
+/// before still showed no session.
 pub fn pane_holds_session(
     panes: &[serde_json::Value],
     pane_id: u32,
@@ -738,9 +738,48 @@ impl Board {
         self.dirty = true;
     }
 
-    /// The user answered `id` on the card.
-    pub fn answer(&mut self, id: &str, action: String, text: String) {
-        let Some(index) = self.pending.iter().position(|(q, _)| q.id == id) else { return };
+    /// The questions on the card, oldest first (`list-asks`).
+    pub fn questions(&self) -> Vec<&Question> {
+        self.pending.iter().map(|(q, _)| q).collect()
+    }
+
+    /// `answer-ask`: the answer is checked against the question as the card
+    /// would have constrained it, then takes the card's own path.
+    pub fn answer_checked(&mut self, id: &str, action: String, text: String) -> Result<Answer, String> {
+        // The card trims its field; an answer from elsewhere is held to the same text.
+        let text = text.trim().to_string();
+        check_answer(self.pending.iter().map(|(q, _)| q).find(|q| q.id == id), id, &action, &text)?;
+        let answer = Answer { id: id.to_string(), action: action.clone(), text: text.clone() };
+        self.answer(id, action, text);
+        Ok(answer)
+    }
+
+    /// The user answered `session_id`'s questions in the conversation itself:
+    /// take them off the card and off disk, deliver nothing. A `kova ask` still
+    /// waiting gets [`WITHDRAWN`] and exits 3. Returns how many were withdrawn.
+    pub fn withdraw(&mut self, session_id: &str) -> usize {
+        let (gone, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.pending).into_iter().partition(|(q, _)| asked_from(q, session_id));
+        self.pending = kept;
+        for (question, responder) in &gone {
+            log::info!("ask {}: withdrawn, the user answered in the conversation", question.id);
+            if self.owns_store() {
+                self.store.remove_question(&question.id);
+            }
+            if let Some(tx) = responder {
+                let _ = tx.send(crate::ipc::IpcResponse::Error { message: WITHDRAWN.to_string() });
+            }
+        }
+        if !gone.is_empty() {
+            self.dirty = true;
+        }
+        gone.len()
+    }
+
+    /// The user answered `id` on the card. False when no such question waits
+    /// (already answered elsewhere): nothing happens then.
+    pub fn answer(&mut self, id: &str, action: String, text: String) -> bool {
+        let Some(index) = self.pending.iter().position(|(q, _)| q.id == id) else { return false };
         let (question, responder) = self.pending.remove(index);
         self.dirty = true;
         let answer = Answer { id: id.to_string(), action, text };
@@ -759,6 +798,7 @@ impl Board {
         if !handed {
             spawn_late(self.store.clone(), question, answer);
         }
+        true
     }
 
     /// Show the oldest question (or hide the card), when something changed.
@@ -780,6 +820,28 @@ impl Board {
         });
         crate::ask_card::show(mtm, card.as_ref(), self.pending.len().saturating_sub(1));
     }
+}
+
+/// What a `kova ask` still waiting receives when its question is withdrawn.
+pub const WITHDRAWN: &str = "withdrawn: the user answered in the conversation instead of on the card";
+
+/// Whether `question` was asked from the conversation `session_id`.
+pub fn asked_from(question: &Question, session_id: &str) -> bool {
+    question.from.session_id.as_deref() == Some(session_id)
+}
+
+/// Whether an answer coming from elsewhere than the card (`answer-ask`) is one
+/// the card could have given for `question` (`None`: no question `id` waits).
+pub fn check_answer(question: Option<&Question>, id: &str, action: &str, text: &str) -> Result<(), String> {
+    let Some(question) = question else { return Err(format!("no pending question {}", id)) };
+    let buttons = question.buttons();
+    if !buttons.iter().any(|b| b == action) {
+        return Err(format!("\"action\" must be one of: {}", buttons.join(", ")));
+    }
+    if !question.input && !text.is_empty() {
+        return Err("\"text\" must be empty: this question has no text field".to_string());
+    }
+    Ok(())
 }
 
 /// How often a Kova without the ask directory's lock tries to take it.
@@ -813,7 +875,8 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
   --json        print the answer as JSON
   --socket      the Kova to ask (default: $KOVA_SOCKET, else the running Kova.app)
 
-Exit codes: 0 answered · 2 no answer within the timeout · 1 error, or Kova quit while you waited.
+Exit codes: 0 answered · 2 no answer within the timeout · 3 the user answered in the conversation
+instead (the card is withdrawn; their message is the answer) · 1 error, or Kova quit while you waited.
 On a timeout the question stays on the user's screen. When they answer, Kova delivers the answer to
 this conversation itself: typed into its Kova pane if it is still open there, else by reopening it
 in a new Kova tab with `claude --resume`. So after exit 2, end your turn: the answer will come as a message.";
@@ -871,7 +934,7 @@ fn exe_path(pid: i32) -> Option<String> {
 
 /// The Kova to ask when the caller names none and runs outside a Kova pane (a
 /// routine started by launchd): the live `/tmp/kova-<pid>.sock` served by
-/// Kova.app itself. Kana serves the same path shape, hence the executable check.
+/// Kova.app itself. A library host serves the same path shape, hence the executable check.
 fn discover_socket() -> Option<String> {
     let mut found: Vec<(bool, i32, String)> = Vec::new();
     for entry in std::fs::read_dir("/tmp").ok()?.flatten() {
@@ -892,8 +955,75 @@ fn discover_socket() -> Option<String> {
     found.into_iter().map(|(_, _, path)| path).next()
 }
 
+const WITHDRAW_USAGE: &str = "kova ask --withdraw [--session <id> | --session -] [--socket <path>]
+
+Take back the questions a Claude Code conversation still has on the card, because the user answered
+in the conversation instead. Meant for a UserPromptSubmit hook: `--session -` reads the hook's JSON
+input on stdin and takes its `session_id`; without --session, $CLAUDE_CODE_SESSION_ID. Prints
+nothing and exits 0 whatever happens (no Kova, an older Kova, nothing to withdraw), so a prompt is
+never held up by it.";
+
+/// The session `kova ask --withdraw` names: `-` is a hook's JSON input.
+fn withdraw_session(flag: Option<&str>, stdin: impl FnOnce() -> String, env: Option<String>) -> Option<String> {
+    let id = match flag {
+        Some("-") => serde_json::from_str::<serde_json::Value>(&stdin())
+            .ok()?
+            .get("session_id")?
+            .as_str()?
+            .to_string(),
+        Some(id) => id.to_string(),
+        None => env?,
+    };
+    is_safe_session_id(&id).then_some(id)
+}
+
+/// `kova ask --withdraw …`: always 0, see [`WITHDRAW_USAGE`].
+fn run_withdraw(args: &[String]) -> i32 {
+    let mut session: Option<String> = None;
+    let mut socket: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--session" => session = it.next().cloned(),
+            "--socket" => socket = it.next().cloned(),
+            _ => {
+                eprintln!("{}", WITHDRAW_USAGE);
+                return 0;
+            }
+        }
+    }
+    let read_stdin = || {
+        let mut input = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+        input
+    };
+    let Some(session_id) = withdraw_session(session.as_deref(), read_stdin, std::env::var("CLAUDE_CODE_SESSION_ID").ok()) else {
+        return 0;
+    };
+    let body = serde_json::json!({"cmd": "withdraw-asks", "session_id": session_id});
+    let first = socket.or_else(|| std::env::var("KOVA_SOCKET").ok().filter(|s| !s.is_empty())).or_else(discover_socket);
+    let Some(first) = first else { return 0 };
+    let reply = request(&first, body.clone(), Duration::from_secs(1));
+    // A library host's socket has no card: the questions are on Kova.app.
+    let refused = reply.as_ref().and_then(|r| r.get("error")).and_then(|e| e.as_str())
+        .is_some_and(|e| e == "command not supported by this host");
+    if refused {
+        if let Some(app) = discover_socket().filter(|s| *s != first) {
+            let _ = request(&app, body, Duration::from_secs(1));
+        }
+    }
+    0
+}
+
 /// `kova ask …`: returns the process exit code.
 pub fn run_cli(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("--withdraw") {
+        if args.iter().any(|a| a == "-h" || a == "--help") {
+            println!("{}", WITHDRAW_USAGE);
+            return 0;
+        }
+        return run_withdraw(&args[1..]);
+    }
     let fail = |msg: &str, code: i32| -> i32 {
         eprintln!("{}", msg);
         code
@@ -937,10 +1067,10 @@ pub fn run_cli(args: &[String]) -> i32 {
         let _ = stream.set_read_timeout(wait.map(Duration::from_secs));
         let mut line = String::new();
         let read = BufReader::new(&stream).read_line(&mut line);
-        // A pane of Kana (the library host) names Kana's socket, which serves
-        // panes but no card: ask Kova.app instead. The asker keeps Kana's socket
+        // A pane of a library host names the host's socket, which serves
+        // panes but no card: ask Kova.app instead. The asker keeps the host's socket
         // and pane, which is where a late answer is typed.
-        // Same for a socket that predates `ask` altogether (an older Kana build).
+        // Same for a socket that predates `ask` altogether (an older host build).
         let error = serde_json::from_str::<serde_json::Value>(line.trim())
             .ok()
             .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
@@ -993,6 +1123,13 @@ pub fn run_cli(args: &[String]) -> i32 {
                 "kova ask: the Kova on {} predates `ask` ({}). It answers from its next launch.",
                 socket, err
             ), 1);
+        }
+        if err == WITHDRAWN {
+            return fail(
+                "kova ask: the user answered in the conversation instead of on the card; the card is gone. \
+                 End your turn now: their message is the answer.",
+                3,
+            );
         }
         return fail(&format!("kova ask: Kova refused the question: {}", err), 1);
     }
@@ -1050,6 +1187,29 @@ mod tests {
     }
 
     #[test]
+    fn withdraw_takes_the_session_from_the_flag_the_hook_input_or_the_environment() {
+        let none = || -> String { panic!("stdin read without --session -") };
+        assert_eq!(withdraw_session(Some("abc-1"), none, None), Some("abc-1".into()));
+        assert_eq!(withdraw_session(None, none, Some("env-2".into())), Some("env-2".into()));
+        assert_eq!(withdraw_session(None, none, None), None);
+        let hook = || r#"{"session_id":"hook-3","prompt":"deploy"}"#.to_string();
+        assert_eq!(withdraw_session(Some("-"), hook, None), Some("hook-3".into()));
+        assert_eq!(withdraw_session(Some("-"), || "not json".into(), None), None);
+        assert_eq!(withdraw_session(Some("a;b"), none, None), None, "an odd id is dropped, not sent");
+    }
+
+    #[test]
+    fn a_question_belongs_to_the_conversation_that_asked_it() {
+        let q = question("0f8fad5b-d9cb-469f-a165-70867728950e");
+        let own = q.from.session_id.clone().expect("the test asker has a session");
+        assert!(asked_from(&q, &own));
+        assert!(!asked_from(&q, "someone-else"));
+        let mut anonymous = q.clone();
+        anonymous.from.session_id = None;
+        assert!(!asked_from(&anonymous, &own));
+    }
+
+    #[test]
     fn delivery_prefers_the_live_pane() {
         assert_eq!(delivery(&asker(), true, None), Delivery::Pane { socket: "/tmp/kova-1.sock".into(), pane_id: 7 });
         // Open in the pane wins over "open in some process": it is that process.
@@ -1086,18 +1246,34 @@ mod tests {
             "KOVA_SOCKET" => Some("/tmp/k.sock".to_string()),
             _ => None,
         };
-        let a = Asker::from_env(env, None, "/Users/x/projects/lemlist");
+        let a = Asker::from_env(env, None, "/Users/x/projects/app");
         assert_eq!(a, Asker {
-            name: "lemlist".into(),
+            name: "app".into(),
             session_id: Some("e2e1d3cf-7cc0-48a2".into()),
             pane_id: Some(3),
             kova_socket: Some("/tmp/k.sock".into()),
-            cwd: Some("/Users/x/projects/lemlist".into()),
+            cwd: Some("/Users/x/projects/app".into()),
         });
         let evil = Asker::from_env(|k| (k == "CLAUDE_CODE_SESSION_ID").then(|| "x; rm -rf ~".to_string()), Some("n".into()), "/");
         assert_eq!(evil.session_id, None);
         assert!(!is_safe_session_id("a\nb"));
         assert!(!is_safe_session_id(""));
+    }
+
+    #[test]
+    fn answers_from_elsewhere_are_held_to_the_card() {
+        let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        assert_eq!(check_answer(None, id, "OK", ""), Err(format!("no pending question {}", id)));
+        let mut q = question(id);
+        q.actions = vec!["OK".into(), "KO".into()];
+        assert_eq!(check_answer(Some(&q), id, "OK", "fine"), Ok(()));
+        assert_eq!(check_answer(Some(&q), id, "Reply", ""), Err("\"action\" must be one of: OK, KO".into()));
+        assert_eq!(check_answer(Some(&q), id, "ok", ""), Err("\"action\" must be one of: OK, KO".into()));
+        q.actions.clear();
+        assert_eq!(check_answer(Some(&q), id, "Reply", "x"), Ok(()), "no actions: the single Reply button");
+        q.input = false;
+        assert_eq!(check_answer(Some(&q), id, "Reply", ""), Ok(()));
+        assert!(check_answer(Some(&q), id, "Reply", "x").unwrap_err().starts_with("\"text\" must be empty"));
     }
 
     #[test]
@@ -1245,7 +1421,7 @@ mod tests {
     #[test]
     fn agent_colour_is_stable_and_varies() {
         assert_eq!(agent_rgb("Claude · FLoat"), agent_rgb("Claude · FLoat"));
-        let names = ["routine-a", "routine-b", "lemlist", "kova", "mira", "vigie", "cto", "self"];
+        let names = ["routine-a", "routine-b", "app", "kova", "mira", "docs", "api", "web"];
         let distinct: std::collections::HashSet<String> = names.iter().map(|n| format!("{:?}", agent_rgb(n))).collect();
         assert!(distinct.len() > 3);
     }

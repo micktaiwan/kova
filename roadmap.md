@@ -2,155 +2,155 @@
 
 ## Vision
 
-Le terminal Mac le plus rapide et léger possible.
-Rust + Metal, zéro compromis cross-platform.
+The fastest and lightest Mac terminal possible.
+Rust + Metal, zero cross-platform compromise.
 
-## V0 — Preuve de concept
+## V0 — Proof of concept
 
-**Objectif** : une fenêtre qui lance un shell, affiche la sortie, accepte l'input.
+**Goal**: a window that launches a shell, displays the output, accepts input.
 
-- [x] Fenêtre AppKit minimale via `objc2`
-- [x] Rendu texte Metal (monospace, un seul font, pas de ligatures)
-- [x] Atlas de glyphes basique via CoreText
-- [x] Atlas dynamique (rasterisation à la demande des caractères non-ASCII)
-- [x] PTY : spawn d'un shell (zsh) via `Command` + `pre_exec` (safe multi-thread, controlling terminal via `setsid`+`TIOCSCTTY`)
-- [x] Input clavier → PTY
-- [x] Output PTY → écran (parsing VT via `vte`)
-- [x] Scrollback basique
-- [x] Ctrl+C (signal au process)
-- [x] Quitter proprement (Cmd+Q, fermeture fenêtre, cleanup PTY)
-- [x] Buffers Metal pré-alloués (double-buffering, pas d'alloc par frame)
-- [x] Scroll trackpad (accumulateur fractionnaire)
+- [x] Minimal AppKit window via `objc2`
+- [x] Metal text rendering (monospace, a single font, no ligatures)
+- [x] Basic glyph atlas via CoreText
+- [x] Dynamic atlas (on-demand rasterization of non-ASCII characters)
+- [x] PTY: spawn a shell (zsh) via `Command` + `pre_exec` (multi-thread safe, controlling terminal via `setsid`+`TIOCSCTTY`)
+- [x] Keyboard input → PTY
+- [x] PTY output → screen (VT parsing via `vte`)
+- [x] Basic scrollback
+- [x] Ctrl+C (signal to the process)
+- [x] Clean quit (Cmd+Q, window close, PTY cleanup)
+- [x] Pre-allocated Metal buffers (double-buffering, no per-frame alloc)
+- [x] Trackpad scroll (fractional accumulator)
 - [x] Alternate screen buffer (CSI ?1049 h/l)
-- [x] Resize fenêtre (recalcul cols/rows + SIGWINCH)
-  - Le slave PTY est le controlling terminal (`setsid`+`TIOCSCTTY` dans `pre_exec`), donc SIGWINCH atteint les sous-processes automatiquement
-- [x] Cmd+V (coller depuis le presse-papier)
-- [x] Rendu à la demande (dirty flag) — ne redessiner que quand l'état change
+- [x] Window resize (recompute cols/rows + SIGWINCH)
+  - The PTY slave is the controlling terminal (`setsid`+`TIOCSCTTY` in `pre_exec`), so SIGWINCH reaches subprocesses automatically
+- [x] Cmd+V (paste from the clipboard)
+- [x] On-demand rendering (dirty flag) — only redraw when state changes
 
-**Critère de succès** : lancer `ls`, `htop`, `claude` et que ça marche.
+**Success criterion**: run `ls`, `htop`, `claude` and have them work.
 
-## V1 — Utilisable au quotidien
+## V1 — Usable day to day
 
-Ordre recommandé : config d'abord (indépendant), puis sélection texte (pane unique),
-puis refacto multi-pane, puis splits, puis tabs par-dessus.
+Recommended order: config first (independent), then text selection (single pane),
+then multi-pane refactor, then splits, then tabs on top.
 
-### Config & fondations
+### Config & foundations
 
-- [x] Config fichier (TOML) : font, taille, couleurs, FPS, cursor blink, scrollback
-  - `~/.config/kova/config.toml`, defaults sensibles, fallback silencieux
-- [x] Détecter la mort du shell (EOF sur PTY) → fermer la fenêtre
-- [x] Status bar (CWD via OSC 7, git branch, indicateur scroll, titre OSC 0/2, heure HH:MM, couleur par élément configurable)
-- [x] Git branch polling — re-lecture de `.git/HEAD` toutes les ~2s pour détecter les changements de branche sans attendre un changement de CWD
-- [x] Shift+Tab (backtab) — envoie `CSI Z` au lieu du raw `0x19`
-- [x] Sélection texte + copier/coller (mouseDown/Dragged/Up, Cmd+C, highlight sélection, copie auto dans presse-papier, respect du soft-wrap)
-- [x] Resize fenêtre : reflow du texte (struct `Row` avec flag `wrapped`, reconstruction des lignes logiques, re-wrap à la nouvelle largeur)
-- [x] Restauration position fenêtre au lancement — `NSWindow.setFrameAutosaveName` (persistence automatique via `NSUserDefaults`)
+- [x] Config file (TOML): font, size, colors, FPS, cursor blink, scrollback
+  - `~/.config/kova/config.toml`, sensible defaults, silent fallback
+- [x] Detect shell death (EOF on PTY) → close the window
+- [x] Status bar (CWD via OSC 7, git branch, scroll indicator, OSC 0/2 title, HH:MM time, configurable color per element)
+- [x] Git branch polling — re-read `.git/HEAD` every ~2s to detect branch changes without waiting for a CWD change
+- [x] Shift+Tab (backtab) — sends `CSI Z` instead of raw `0x19`
+- [x] Text selection + copy/paste (mouseDown/Dragged/Up, Cmd+C, selection highlight, auto-copy to clipboard, soft-wrap respected)
+- [x] Window resize: text reflow (`Row` struct with `wrapped` flag, rebuild logical lines, re-wrap to the new width)
+- [x] Restore window position at launch — `NSWindow.setFrameAutosaveName` (automatic persistence via `NSUserDefaults`)
 
-### Input macOS
-- [x] Option+Left/Right — déplacement mot par mot (envoie `\x1bb`/`\x1bf`)
-- [x] Cmd+Backspace — effacer toute la ligne (envoie `\x15` Ctrl+U)
-- [x] Cmd+Left/Right — début/fin de ligne (envoie Home `\x1b[H` / End `\x1b[F`)
-- [x] Option key — envoie le caractère composé macOS quand différent du caractère de base
+### macOS input
+- [x] Option+Left/Right — word-by-word movement (sends `\x1bb`/`\x1bf`)
+- [x] Cmd+Backspace — erase the whole line (sends `\x15` Ctrl+U)
+- [x] Cmd+Left/Right — start/end of line (sends Home `\x1b[H` / End `\x1b[F`)
+- [x] Option key — sends the macOS composed character when different from the base character
 
-### Refacto multi-pane (prérequis splits)
+### Multi-pane refactor (prerequisite for splits)
 
-- [x] PTY lifecycle per-pane — shutdown par PTY (Arc<AtomicBool> par instance)
-- [x] Split tree (`enum SplitTree { Leaf(Pane), Hsplit(...), Vsplit(...) }`) — arbre binaire dans `pane.rs`
-- [x] Modèle de focus — tracker le pane actif pour router l'input clavier
-- [x] Renderer multi-pane — `render()` accepte un viewport par pane, clipping et offset
+- [x] Per-pane PTY lifecycle — shutdown per PTY (Arc<AtomicBool> per instance)
+- [x] Split tree (`enum SplitTree { Leaf(Pane), Hsplit(...), Vsplit(...) }`) — binary tree in `pane.rs`
+- [x] Focus model — track the active pane to route keyboard input
+- [x] Multi-pane renderer — `render()` takes a viewport per pane, clipping and offset
 
 ### Splits & tabs
 
-- [x] Splits horizontaux et verticaux (arbre binaire)
-- [x] Navigation entre splits (raccourcis clavier)
-- [x] Séparateurs visuels entre splits (ligne 1px semi-transparente)
-- [x] Padding horizontal des panes (10px)
-- [x] Nouveau split hérite du CWD du pane focusé (via `proc_pidinfo`)
-- [x] Resize des splits (Cmd+Ctrl+arrows + drag souris sur séparateurs, clamp 0.1–0.9)
-- [x] Égalisation automatique des splits — après ajout/suppression d'un pane, tous les panes d'un même axe sont redistribués à taille égale (1/N chacun)
-- [x] Tabs (barre minimale en haut, Cmd+T nouveau tab, Cmd+W ferme pane/tab, rendu Metal, tab bar cliquable)
-- [x] Navigation entre tabs (Cmd+Shift+[/], Cmd+1..9)
-- [x] Drag & reorder des tabs (drag souris avec seuil 3px, swap temps réel)
-- [x] Renommage de tab (Cmd+Shift+R, nom custom prioritaire, vider pour revenir au nom auto)
-- [x] Fermeture split — `exit`/Cmd+W retire le pane de l'arbre, reporte le focus, `app.terminate` seulement quand plus aucun pane
+- [x] Horizontal and vertical splits (binary tree)
+- [x] Navigation between splits (keyboard shortcuts)
+- [x] Visual separators between splits (semi-transparent 1px line)
+- [x] Horizontal pane padding (10px)
+- [x] New split inherits the focused pane's CWD (via `proc_pidinfo`)
+- [x] Split resize (Cmd+Ctrl+arrows + mouse drag on separators, clamp 0.1–0.9)
+- [x] Automatic split equalization — after adding/removing a pane, all panes on the same axis are redistributed at equal size (1/N each)
+- [x] Tabs (minimal bar at the top, Cmd+T new tab, Cmd+W closes pane/tab, Metal rendering, clickable tab bar)
+- [x] Navigation between tabs (Cmd+Shift+[/], Cmd+1..9)
+- [x] Tab drag & reorder (mouse drag with 3px threshold, real-time swap)
+- [x] Tab renaming (Cmd+Shift+R, custom name takes priority, clear it to go back to the auto name)
+- [x] Split close — `exit`/Cmd+W removes the pane from the tree, moves focus, `app.terminate` only when no pane is left
 
 ## V2 — Polished
 
-- [x] Focus events (DEC mode 1004) — notifier le shell/app quand la fenêtre gagne/perd le focus
-- [x] Kitty keyboard protocol (CSI u) — réponse à la query `CSI > 0 u` (flags=0, fallback propre)
-- [x] Save/restore session layout — sauvegarde arbre de tabs/splits et CWD au quit, restauration au lancement
-- [x] File logging — écriture des logs dans un fichier pour debug
-- [x] Tab bar redesign — couleurs de tabs, refonte visuelle
-- [x] Navigation cross-tab (Cmd+Option+Arrows entre splits de différents tabs)
-- [x] Lazy write lock dans le parser VTE — acquisition du write lock uniquement quand nécessaire, réduit la contention
-- [x] Synchronized output (mode 2026) — bufferiser le rendu entre h/l pour éviter le tearing
-- [x] CPR (Cursor Position Report, CSI 6 n) — réponse position curseur
-- [x] DA1 (Device Attributes, CSI c) — identification VT220 + ANSI color
-- [x] DECRPM (Report Private Mode, CSI ? Ps $ p) — report état des modes 1, 7, 25, 1004, 1049, 2004, 2026
-- [x] Bracketed paste mode (DEC 2004) — wrapping `\x1b[200~`/`\x1b[201~` sur Cmd+V
+- [x] Focus events (DEC mode 1004) — notify the shell/app when the window gains/loses focus
+- [x] Kitty keyboard protocol (CSI u) — answer to the `CSI > 0 u` query (flags=0, clean fallback)
+- [x] Save/restore session layout — save the tabs/splits tree and CWD on quit, restore at launch
+- [x] File logging — write logs to a file for debugging
+- [x] Tab bar redesign — tab colors, visual overhaul
+- [x] Cross-tab navigation (Cmd+Option+Arrows between splits of different tabs)
+- [x] Lazy write lock in the VTE parser — take the write lock only when needed, reduces contention
+- [x] Synchronized output (mode 2026) — buffer rendering between h/l to avoid tearing
+- [x] CPR (Cursor Position Report, CSI 6 n) — cursor position answer
+- [x] DA1 (Device Attributes, CSI c) — VT220 + ANSI color identification
+- [x] DECRPM (Report Private Mode, CSI ? Ps $ p) — reports state of modes 1, 7, 25, 1004, 1049, 2004, 2026
+- [x] Bracketed paste mode (DEC 2004) — `\x1b[200~`/`\x1b[201~` wrapping on Cmd+V
 - [x] DECCKM (mode 1) — cursor keys application mode (`\x1bO` vs `\x1b[`)
-- [x] DECAWM (mode 7) — auto-wrap on/off, respecté dans put_char
-- [x] Insert mode (SM/RM 4) — décale les caractères au lieu d'écraser
-- [x] ICH (CSI @) — insertion de caractères blancs à la position curseur
+- [x] DECAWM (mode 7) — auto-wrap on/off, honored in put_char
+- [x] Insert mode (SM/RM 4) — shifts characters instead of overwriting
+- [x] ICH (CSI @) — insert blank characters at the cursor position
 - [x] DECSCUSR (CSI Ps SP q) — cursor shape block/underline/bar
-- [x] Recherche dans le scrollback (Cmd+F — filtre overlay, highlight query, click pour scroller)
-- [x] App icon dans Info.plist (`CFBundleIconFile`) — corrige l'icône surdimensionnée dans Alt-Tab
-- [x] Clickable URLs (Cmd+hover souligne en bleu + curseur main + URL en status bar, Cmd+click ouvre dans le navigateur)
-- [x] Wide characters (emojis, CJK) — détection via `unicode-width`, placeholder `'\0'` en col+1, rasterisation 2× cell_width dans l'atlas
-- [x] Déplacer un split par raccourci (Cmd+Shift+Arrows — swap le pane focusé avec son voisin)
-- [x] Bell indicator sur tabs inactifs (point orange sur les tabs non focusés quand bell reçu)
-- [x] Horizontal scroll splits — quand les splits dépassent la largeur écran, scroll horizontal trackpad + auto-reveal du pane focusé. `min_split_width` configurable.
+- [x] Scrollback search (Cmd+F — overlay filter, query highlight, click to scroll)
+- [x] App icon in Info.plist (`CFBundleIconFile`) — fixes the oversized icon in Alt-Tab
+- [x] Clickable URLs (Cmd+hover underlines in blue + hand cursor + URL in status bar, Cmd+click opens in the browser)
+- [x] Wide characters (emojis, CJK) — detection via `unicode-width`, `'\0'` placeholder in col+1, 2× cell_width rasterization in the atlas
+- [x] Move a split by shortcut (Cmd+Shift+Arrows — swaps the focused pane with its neighbor)
+- [x] Bell indicator on inactive tabs (orange dot on unfocused tabs when a bell is received)
+- [x] Horizontal scroll splits — when splits exceed the screen width, horizontal trackpad scroll + auto-reveal of the focused pane. Configurable `min_split_width`.
 - [x] Color emoji rendering via CoreText fallback fonts
 - [x] Grapheme cluster emoji (flags, ZWJ sequences, skin tones)
-- [x] Optimisation RAM Cell — compact cell storage pour le scrollback (48→32 bytes/cell, -33% RAM). fg/bg stockés en `[u8; 3]` au lieu de `[f32; 3]`, conversion GPU à la volée.
-- [x] Multi-fenêtres — Cmd+N nouvelle fenêtre, Cmd+Q ferme fenêtre active, Cmd+Option+Q kill sans save, Cmd+Shift+T detach tab vers nouvelle fenêtre, Cmd+Ctrl+T break pane vers nouvel onglet. Session restore multi-window. Dealloc différé pour éviter segfault AppKit.
-- [x] Config keybindings (raccourcis configurables via `[keys]` dans config.toml)
-- [x] Notifications visuelles avancées (activité dans un split inactif)
-- [x] PTY cleanup sur thread dédié — `Drop for Pty` délègue l'escalade SIGHUP → SIGTERM → SIGKILL à un thread détaché (`pty-reaper-{pid}`), zéro sleep sur le main thread. `shutdown_all()` fait la même escalade en synchrone avec timeouts réduits (25ms/étape)
-- [x] **Trim trailing blanks** : tronquer les cellules vides en fin de ligne dans le scrollback (`shrink_to_fit`), re-expand au resize. ~50-70% de réduction RAM scrollback.
-- [x] Metriques perf exposées (mémoire, allocations) — overlay Cmd+Shift+I avec RSS, détail terminal/renderer/pane. Frame time non inclus.
-- [x] Double-clic sur un mot → sélectionne le mot entier
-- [x] Minimisation de pane — réduire un pane à une barre 24px affichant titre/CWD. Le pane reste dans le split tree, le sibling récupère l'espace. PTY continue en background, bell/activité visibles sur la barre. Cmd+M minimise le pane focusé, Cmd+Opt+M restaure le dernier minimisé (FILO), click sur la barre restaure ce pane spécifique.
-- [x] Flèches dans le renommage de tab/pane — les flèches gauche/droite naviguent dans le texte, curseur positionnable, backspace/insertion au curseur
+- [x] Cell RAM optimization — compact cell storage for the scrollback (48→32 bytes/cell, -33% RAM). fg/bg stored as `[u8; 3]` instead of `[f32; 3]`, converted for the GPU on the fly.
+- [x] Multi-window — Cmd+N new window, Cmd+Q closes the active window, Cmd+Option+Q kill without save, Cmd+Shift+T detach tab to a new window, Cmd+Ctrl+T break pane to a new tab. Multi-window session restore. Deferred dealloc to avoid an AppKit segfault.
+- [x] Keybindings config (configurable shortcuts via `[keys]` in config.toml)
+- [x] Advanced visual notifications (activity in an inactive split)
+- [x] PTY cleanup on a dedicated thread — `Drop for Pty` delegates the SIGHUP → SIGTERM → SIGKILL escalation to a detached thread (`pty-reaper-{pid}`), zero sleep on the main thread. `shutdown_all()` does the same escalation synchronously with shorter timeouts (25ms/step)
+- [x] **Trim trailing blanks**: truncate empty cells at the end of lines in the scrollback (`shrink_to_fit`), re-expand on resize. ~50-70% scrollback RAM reduction.
+- [x] Exposed perf metrics (memory, allocations) — Cmd+Shift+I overlay with RSS, terminal/renderer/pane breakdown. Frame time not included.
+- [x] Double-click on a word → selects the whole word
+- [x] Pane minimization — shrink a pane to a 24px bar showing title/CWD. The pane stays in the split tree, the sibling takes back the space. The PTY keeps running in the background, bell/activity visible on the bar. Cmd+M minimizes the focused pane, Cmd+Opt+M restores the last minimized one (FILO), clicking the bar restores that specific pane.
+- [x] Arrows in tab/pane renaming — left/right arrows move within the text, positionable cursor, backspace/insertion at the cursor
 
-### Prochaines priorités V2
+### Next V2 priorities
 
-- [x] **Batching du parser VT** _(priorité 1 — perf)_ — le pty-reader tient le write lock sur `TerminalState` pendant tout `parser.advance()` d'un chunk 4 Ko. Quand un pane en background reçoit beaucoup de données (build, logs…), le write lock bloque les read locks du renderer (`parking_lot` donne priorité aux writers → lag visible au switch de tab). Solution : `Vec<TermOp>` local parsé sans lock, flush en un seul write lock. Réduction estimée 5-10× du temps sous lock. Voir `notes/vt-parser-batching.md`.
-- [x] **Font fallback (block elements/box-drawing)** _(priorité 2 — visuel)_ — les caractères U+2500-U+257F (box-drawing) et U+2580-U+259F (block elements) doivent être dessinés directement dans le bitmap au lieu de passer par CoreText. Les glyphs de police ne remplissent pas la cellule bord à bord → ligne noire dans le banner Claude Code, bordures cassées dans toutes les TUI (lazygit, btop). Tous les terminaux modernes (Alacritty, Kitty, WezTerm, Ghostty) font ce rendu custom. Voir `notes/font-fallback-investigation.md`.
-- [ ] **Colonnes pinnées (`custom_weight`)** — flag par colonne indiquant un redimensionnement manuel. Les colonnes pinnées conservent leur poids lors des redistributions. Voir `docs/split-specs.md` section "Colonnes pinnées".
-- [ ] **Redistribution multi-colonnes au resize** — quand un séparateur est déplacé (souris ou clavier), redistribuer l'espace entre toutes les colonnes non-pinnées du côté opposé, au lieu de ne toucher que les deux colonnes adjacentes. Voir `docs/split-specs.md` section "Redistribution des colonnes".
-- [ ] **Curseur souris sur séparateurs** — changer le curseur au survol d'un séparateur (↔ pour colonnes, ↕ pour VSplits, ±3px de tolérance). Voir `docs/split-specs.md` section "Mouse drag".
-- [ ] **Emoji presentation fallback** — les caractères avec `Emoji_Presentation` par défaut (U+2B1C, U+2B1B, U+25AA…) utilisent le glyphe de la font mono au lieu de la version couleur Apple Color Emoji. Fix : forcer le fallback emoji pour les codepoints Unicode `Emoji_Presentation=Yes`.
-- [ ] **Cmd+V dans le champ de recherche** (Cmd+F) — le paste ne fonctionne pas actuellement dans l'overlay de recherche.
-- [ ] **Tab bar font size** : taille de fonte des tabs configurable indépendamment (`tab_bar.font_size`), override possible par fenêtre. Voir `notes/tab-font-size.md`.
-- [ ] **Déplacer un split par drag** (anchor visuelle pendant le drag — le swap par raccourci Cmd+Shift+Arrows existe déjà).
-- [ ] **Run-length encoding** : compresser les séquences de même couleur. (Gain marginal après trim, complexité élevée — déprioritisé.)
+- [x] **VT parser batching** _(priority 1 — perf)_ — the pty-reader holds the write lock on `TerminalState` for the whole `parser.advance()` of a 4 KB chunk. When a background pane receives a lot of data (build, logs…), the write lock blocks the renderer's read locks (`parking_lot` gives priority to writers → visible lag on tab switch). Solution: a local `Vec<TermOp>` parsed without the lock, flushed in a single write lock. Estimated 5-10× reduction of time under lock. See `notes/vt-parser-batching.md`.
+- [x] **Font fallback (block elements/box-drawing)** _(priority 2 — visual)_ — characters U+2500-U+257F (box-drawing) and U+2580-U+259F (block elements) must be drawn directly into the bitmap instead of going through CoreText. Font glyphs don't fill the cell edge to edge → black line in the Claude Code banner, broken borders in every TUI (lazygit, btop). All modern terminals (Alacritty, Kitty, WezTerm, Ghostty) do this custom rendering. See `notes/font-fallback-investigation.md`.
+- [ ] **Pinned columns (`custom_weight`)** — per-column flag marking a manual resize. Pinned columns keep their weight during redistributions. See `docs/split-specs.md` section "Pinned columns/rows".
+- [ ] **Multi-column redistribution on resize** — when a separator is moved (mouse or keyboard), redistribute the space among all non-pinned columns on the opposite side, instead of touching only the two adjacent columns. See `docs/split-specs.md` section "Redistribution".
+- [ ] **Mouse cursor on separators** — change the cursor when hovering a separator (↔ for columns, ↕ for VSplits, ±3px tolerance). See `docs/split-specs.md` section "Mouse drag".
+- [ ] **Emoji presentation fallback** — characters with default `Emoji_Presentation` (U+2B1C, U+2B1B, U+25AA…) use the mono font's glyph instead of the Apple Color Emoji color version. Fix: force the emoji fallback for Unicode codepoints with `Emoji_Presentation=Yes`.
+- [ ] **Cmd+V in the search field** (Cmd+F) — paste currently doesn't work in the search overlay.
+- [ ] **Tab bar font size**: tab font size configurable independently (`tab_bar.font_size`), with a possible per-window override. See `notes/tab-font-size.md`.
+- [ ] **Move a split by drag** (visual anchor during the drag — swap by shortcut Cmd+Shift+Arrows already exists).
+- [ ] **Run-length encoding**: compress runs of the same color. (Marginal gain after trim, high complexity — deprioritized.)
 
-## V3 — Avancé
+## V3 — Advanced
 
-- [x] **IPC / pilotage externe** _(priorité 3 — stratégique)_ — socket Unix (`/tmp/kova-{pid}.sock`) acceptant des commandes JSON : `split --cmd "..."`, `list-panes`, `close-pane`, `send-keys`. Permet à Claude Code Teams de spawner des agents dans des panes séparés (aujourd'hui seul tmux le peut). Transforme Kova de "terminal avec splits" en "plateforme de développement scriptable". Voir `track.md` section IPC.
-- [x] **Restauration des sessions Claude Code** — un pane qui tournait une conversation Claude Code revient avec `claude --resume <id>` pré-tapé au lieu de sa dernière commande shell. Rend le redémarrage de Kova indolore quand une douzaine de conversations sont ouvertes. Voir `track.md`.
-- [x] **Sessions Claude Code en attente d'une réponse** — un état de première classe : chaque session déclare à Kova qu'elle attend, via ses hooks (`Stop` et `permission_prompt` posent, `UserPromptSubmit` et `SessionEnd` retirent), et Kova le rétracte tout seul quand le pane le contredit (process mort, spinner reparti, frappe clavier). Rendu par un `?` sur la ligne du pane dans Cmd+P (où `Tab` saute à la suivante) et un compteur `?N` dans la barre de statut. Répond à « lesquelles de mes vingt sessions me réclament » sans lire un seul écran. Voir `docs/ipc.md` section `set-pane-status`.
-- [x] **Retrouver une session Claude fermée** — la palette de recherche (Cmd+Shift+F) cherche aussi dans les conversations Claude Code passées, pas seulement dans les panes ouverts. Un index (`~/.config/kova/claude_history.json`) ne garde des transcripts que les prompts tapés, le dossier du projet et la date ; il se met à jour à l'ouverture de la palette, en ne relisant que les octets ajoutés (les `.jsonl` sont append-only). La requête se découpe sur les espaces et les virgules et chaque mot doit être présent (ET) — dans les trois sections de la palette, panes ouverts compris —, donc « dust mcp » descend de 7 à 3 sessions. La section n'affiche que les 8 sessions les plus récentes et annonce dans son titre combien ont matché en tout (« oui » en touche 379), pour ne pas enterrer les panes ouverts au-dessus. Entrée sur une ligne archivée rouvre un pane dans le projet de la session, avec `claude --resume <id>` tapé et lancé. Voir `src/claude_history.rs`.
-- [x] **Les ancres — ce à quoi sert la journée** — une deuxième liste à côté des bookmarks, avec une promesse différente : un bookmark dit « cette conversation compte », une ancre dit « c'est ça que je suis censé faire maintenant ». Cmd+Shift+A pose ou retire l'ancre du pane focus (8 max), Cmd+A ramène toujours sur la première — le pane qui la tient, ou la conversation rouverte avec sa ligne de resume quand aucun ne la tient. Cmd+P ouvre sur une section « ⚓ Anchors », en tête et avant les onglets, qui liste les ancres qu'un pane les tienne ou non (contrairement aux bookmarks, dont une conversation ouverte sort) ; une conversation à la fois ancrée et bookmarkée n'apparaît que sous les ancres. La liste est à Kova (`~/.config/kova/anchors.json`) et ne dépend d'aucun outil extérieur : un outil qui sait à quoi sert la journée (track, ici) la pousse par les commandes IPC `set-anchor` et `clear-anchors`, et Kova n'appelle jamais dehors. Voir `src/anchors.rs` et `docs/ipc.md`.
-- [x] **La recherche trouve les conversations du jour** — mesuré le 08/10/2026 : « PITR », tapé dans deux conversations encore ouvertes, ne sortait nulle part. Trois corrections. (1) Un pane Claude ouvert est aussi cherché dans les prompts indexés de sa conversation, pas seulement dans son écran (`match_pane`, `src/window/search_palette.rs`). (2) L'index prend les commandes slash avec leurs arguments (398 en deux semaines, ignorées jusque-là) et les prompts envoyés avec une image ; il garde les 256 Ko les plus récents par session au lieu des 64 premiers (`INDEX_VERSION` 3, une passe complète au premier lancement). (3) Un terme ne compte pleinement qu'en mot entier : « pitr » dans « chapitre » descend dans une dernière section « Inside longer words ». Les sessions fermées sont triées par date seule ; le score de pertinence (récence, investissement, réouvertures, projet, titre) a été retiré.
-- [ ] **Élargir ce que la recherche regarde** — mesuré le 02/09/2026 : Cmd+Shift+F ne trouve pas une session à partir d'un mot qui y a été écrit, et c'est un problème de corpus, pas de matching. Deux trous indépendants. (1) Pour un pane **ouvert**, `run_search_worker` (`src/window.rs:3585`) cherche dans `dump_text(DumpMode::All)`, mais une session Claude Code tourne en écran alterné : `enter_alt_screen` (`src/terminal/mod.rs:1537`) met l'écran normal de côté et `src/terminal/mod.rs:1041` n'alimente le scrollback que hors écran alterné, donc la recherche ne voit que l'écran courant. (2) Pour une session **fermée**, `claude_history.rs` n'indexe que les prompts tapés (`typed_prompt`, ligne 143) — ni les réponses du modèle, ni les sorties d'outils. Cas témoin : chercher « normalized client » (le titre d'une PR discutée pendant une heure) ne rend rien, la phrase n'existant que dans des sorties d'outils. Volumes mesurés sur 40 transcripts pris au hasard (corpus 1,5 Go, 1378 sessions) : prompts tapés 0,4 % des octets bruts, texte du modèle 1,1 %, commandes envoyées aux outils 4,8 %, sorties d'outils 18,4 %, le reste étant de la plomberie JSON. Donc indexer le modèle et les commandes fait passer `claude_history.json` de 3,7 Mo à ~50 Mo (le format JSON monolithique tient encore) ; y ajouter les sorties d'outils donne ~375 Mo de texte et impose SQLite FTS5. Faire aussi chercher les panes Claude **ouverts** dans leur `.jsonl` plutôt que dans `dump_text`, ce qui réutilise le code de la section archivée. **La recherche sémantique par embeddings a été écartée pour l'instant** : elle ne répond pas au problème (le mot cherché n'est dans aucun des deux corpus, donc aucun vecteur ne le rattraperait), elle imposerait un modèle chargé en permanence dans un binaire qui démarre aujourd'hui sans RAM, elle dégrade la recherche littérale (un numéro de PR, un nom de fichier) et elle coûte ~22 000 chunks sur les seuls prompts et réponses, ~375 000 avec les sorties d'outils. Si elle revient un jour, ce sera par un indexeur **séparé** qui écrit un fichier de vecteurs que Kova se contente de lire. En attendant, le contournement est le CLI `pane-grep` (`~/.local/bin/pane-grep`, documenté dans le skill `kova`), qui fait la même recherche depuis Claude en 0,7 s sur les panes ouverts.
-- [ ] Support images inline (Kitty Graphics Protocol) — affichage d'images dans le terminal (`icat`, `yazi`, etc.). Parser APC, image store, texture manager Metal, draw calls séparés. Voir [`docs/image-support.md`](docs/image-support.md)
-- [ ] Shell integration (marks, navigation prompt à prompt)
-- [ ] Complétion inline / suggestions
+- [x] **IPC / external control** _(priority 3 — strategic)_ — Unix socket (`/tmp/kova-{pid}.sock`) accepting JSON commands: `split --cmd "..."`, `list-panes`, `close-pane`, `send-keys`. Lets Claude Code Teams spawn agents in separate panes (today only tmux can). Turns Kova from a "terminal with splits" into a "scriptable development platform". See `docs/ipc.md`.
+- [x] **Restoring Claude Code sessions** — a pane that was running a Claude Code conversation comes back with `claude --resume <id>` pre-typed instead of its last shell command. Makes restarting Kova painless when many conversations are open.
+- [x] **Claude Code sessions waiting for an answer** — a first-class state: each session tells Kova it is waiting, through its hooks (`Stop` and `permission_prompt` set it, `UserPromptSubmit` and `SessionEnd` clear it), and Kova retracts it on its own when the pane contradicts it (dead process, spinner running again, keystroke). Shown by a `?` on the pane's line in Cmd+P (where `Tab` jumps to the next one) and a `?N` counter in the status bar. Answers "which of my many sessions need me" without reading a single screen. See `docs/ipc.md` section `set-pane-status`.
+- [x] **Finding a closed Claude session** — the search palette (Cmd+Shift+F) also searches past Claude Code conversations, not only open panes. An index (`~/.config/kova/claude_history.json`) keeps from the transcripts only the typed prompts, the project directory and the date; it updates when the palette opens, rereading only the appended bytes (the `.jsonl` files are append-only). The query is split on spaces and commas and every word must be present (AND) — in all three sections of the palette, open panes included —, so a two-word query narrows the list much more than either word alone. The section shows only the 8 most recent sessions and states in its title how many matched in total, so as not to bury the open panes above. Enter on an archived line reopens a pane in the session's project, with `claude --resume <id>` typed and launched. See `src/claude_history.rs`.
+- [x] **Anchors — what the day is for** — a second list next to the bookmarks, with a different promise: a bookmark says "this conversation matters", an anchor says "this is what I'm supposed to be doing now". Cmd+Shift+A sets or removes the anchor of the focused pane (8 max), Cmd+A always brings you back to the first one — the pane holding it, or the conversation reopened with its resume line when no pane holds it. Cmd+P opens on an "⚓ Anchors" section, at the top and before the tabs, which lists the anchors whether a pane holds them or not (unlike bookmarks, which an open conversation leaves); a conversation both anchored and bookmarked appears only under the anchors. The list belongs to Kova (`~/.config/kova/anchors.json`) and depends on no outside tool: a tool that knows what the day is for pushes it through the IPC commands `set-anchor` and `clear-anchors`, and Kova never calls out. See `src/anchors.rs` and `docs/ipc.md`.
+- [x] **Search finds today's conversations** — a word typed in two still-open conversations showed up nowhere. Three fixes. (1) An open Claude pane is also searched in its conversation's indexed prompts, not only in its screen (`match_pane`, `src/window/search_palette.rs`). (2) The index takes slash commands with their arguments (ignored until then, though frequent) and prompts sent with an image; it keeps the 256 KB most recent per session instead of the first 64 (`INDEX_VERSION` 3, a full pass on first launch). (3) A term only counts fully as a whole word: a term found only inside a longer word drops into a last section "Inside longer words". Closed sessions are sorted by date alone; the relevance score (recency, investment, reopenings, project, title) was removed.
+- [ ] **Widening what search looks at** — Cmd+Shift+F doesn't find a session from a word that was written in it, and it is a corpus problem, not a matching one. Two independent holes. (1) For an **open** pane, `run_search_worker` (`src/window.rs:3585`) searches `dump_text(DumpMode::All)`, but a Claude Code session runs on the alternate screen: `enter_alt_screen` (`src/terminal/mod.rs:1537`) sets the normal screen aside and `src/terminal/mod.rs:1041` only feeds the scrollback outside the alternate screen, so search only sees the current screen. (2) For a **closed** session, `claude_history.rs` only indexes typed prompts (`typed_prompt`, line 143) — neither the model's answers nor tool outputs. Typical case: searching for a phrase that only ever appeared in tool outputs (such as a PR title discussed at length) returns nothing. Volumes measured on 40 random transcripts (1.5 GB corpus): typed prompts 0.4% of raw bytes, model text 1.1%, commands sent to tools 4.8%, tool outputs 18.4%, the rest being JSON plumbing. So indexing the model and the commands takes `claude_history.json` from 3.7 MB to ~50 MB (the monolithic JSON format still holds); adding tool outputs gives ~375 MB of text and requires SQLite FTS5. Also make **open** Claude panes search in their `.jsonl` rather than in `dump_text`, which reuses the archived section's code. **Semantic search with embeddings was ruled out for now**: it doesn't answer the problem (the searched word is in neither corpus, so no vector would catch it), it would require a model permanently loaded in a binary that today starts with no RAM, it degrades literal search (a PR number, a file name) and it costs ~22,000 chunks on prompts and answers alone, ~375,000 with tool outputs. If it ever comes back, it will be through a **separate** indexer that writes a vector file Kova only reads. Meanwhile, the workaround for open panes is a script that greps the output of the `get-pane-content` IPC command.
+- [ ] Inline image support (Kitty Graphics Protocol) — display images in the terminal (`icat`, `yazi`, etc.). APC parser, image store, Metal texture manager, separate draw calls. See [`docs/image-support.md`](docs/image-support.md)
+- [ ] Shell integration (marks, prompt-to-prompt navigation)
+- [ ] Inline completion / suggestions
 
 ## Nice to have
 
-Items intéressants mais non prioritaires — le gain ne justifie pas l'effort à court terme.
+Interesting but non-priority items — the gain doesn't justify the effort in the short term.
 
-- [ ] Support ProMotion (120Hz) — le dirty flag fait déjà que le rendu est skip quand rien ne change, donc le surcoût est limité au scroll/grosses sorties. Mais la différence 60→120 Hz est marginale pour un terminal (texte statique 99% du temps).
-- [ ] Thèmes de couleurs — les couleurs sont déjà configurables individuellement dans `config.toml`. Les thèmes ajouteraient un niveau d'abstraction (`theme = "catppuccin-mocha"`) pour switcher toute la palette d'un coup (16 ANSI + fg/bg/cursor/sélection). Pratique mais pas bloquant : l'utilisateur peut déjà copier-coller un bloc de couleurs dans son config.
-- [ ] Ligatures — complexe (shaping CoreText par groupes de glyphes vs 1 cell = 1 glyph actuel)
+- [ ] ProMotion support (120Hz) — the dirty flag already skips rendering when nothing changes, so the extra cost is limited to scrolling/large outputs. But the 60→120 Hz difference is marginal for a terminal (static text 99% of the time).
+- [ ] Color themes — colors are already individually configurable in `config.toml`. Themes would add a level of abstraction (`theme = "catppuccin-mocha"`) to switch the whole palette at once (16 ANSI + fg/bg/cursor/selection). Handy but not blocking: users can already copy-paste a block of colors into their config.
+- [ ] Ligatures — complex (CoreText shaping by glyph groups vs the current 1 cell = 1 glyph)
 
 ## Non-goals
 
-- Cross-platform (macOS uniquement)
+- Cross-platform (macOS only)
 - Plugin system
-- Protocoles custom propriétaires
-- Multiplexer réseau (ssh tunneling etc.)
-- Built-in AI (Claude tourne dans le terminal, pas besoin)
+- Proprietary custom protocols
+- Network multiplexer (ssh tunneling etc.)
+- Built-in AI (Claude runs in the terminal, no need)

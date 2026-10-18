@@ -2,15 +2,15 @@
 
 ## Data Model
 
-### Tab (grille plate)
+### Tab (flat grid)
 
-Chaque tab possède une grille plate à deux niveaux : colonnes et lignes. Plus d'imbrication.
+Each tab owns a flat two-level grid: columns and rows. No more nesting.
 
 ```rust
 pub struct Tab {
-    pub columns: Vec<Column>,         // >= 1, liste plate de colonnes
-    pub column_weights: Vec<f32>,     // un poids par colonne (proportionnel, pas normalisé)
-    pub custom_weights: Vec<bool>,    // true = colonne redimensionnée manuellement ("pinnée")
+    pub columns: Vec<Column>,         // >= 1, flat list of columns
+    pub column_weights: Vec<f32>,     // one weight per column (proportional, not normalized)
+    pub custom_weights: Vec<bool>,    // true = column resized manually ("pinned")
     pub focused_pane: PaneId,
     pub virtual_width_override: f32,
     pub scroll_offset_x: f32,
@@ -18,71 +18,71 @@ pub struct Tab {
 }
 ```
 
-### Column (lignes plates)
+### Column (flat rows)
 
 ```rust
 pub struct Column {
-    pub panes: Vec<Pane>,             // >= 1, liste plate de panes (top → bottom)
-    pub row_weights: Vec<f32>,        // un poids par ligne (proportionnel, pas normalisé)
-    pub custom_row_weights: Vec<bool>,// true = ligne redimensionnée manuellement ("pinnée")
+    pub panes: Vec<Pane>,             // >= 1, flat list of panes (top → bottom)
+    pub row_weights: Vec<f32>,        // one weight per row (proportional, not normalized)
+    pub custom_row_weights: Vec<bool>,// true = row resized manually ("pinned")
 }
 ```
 
-Largeur effective de la colonne `i` :
+Effective width of column `i`:
 
 ```
 column_width[i] = total_width * (column_weights[i] / sum(column_weights))
 ```
 
-Hauteur effective du pane `j` dans la colonne `i` :
+Effective height of pane `j` in column `i`:
 
 ```
 row_height[j] = column_height * (row_weights[j] / sum(row_weights))
 ```
 
-Exception : panes minimisés → collapsent à `MINIMIZED_BAR_PX` (24px). Les panes non-minimisés se partagent la hauteur restante proportionnellement.
+Exception: minimized panes → collapse to `MINIMIZED_BAR_PX` (24px). Non-minimized panes share the remaining height proportionally.
 
-- Plus de `HSplit` ni de `VSplit` — les deux axes sont des listes plates.
-- `custom_weights` (colonnes) et `custom_row_weights` (lignes) indiquent un redimensionnement manuel. Voir section "Colonnes/lignes pinnées".
+- No more `HSplit` or `VSplit` — both axes are flat lists.
+- `custom_weights` (columns) and `custom_row_weights` (rows) mark a manual resize. See section "Pinned columns/rows".
 
 ### Viewport computation
 
-Le viewport est calculé en deux niveaux :
+The viewport is computed on two levels:
 
-1. **Colonnes** : itérer sur `columns` + `column_weights`, allouer la largeur de chaque colonne.
-2. **Dans chaque colonne** : itérer sur `panes` + `row_weights`, allouer la hauteur de chaque pane.
+1. **Columns**: iterate over `columns` + `column_weights`, allocate each column's width.
+2. **Within each column**: iterate over `panes` + `row_weights`, allocate each pane's height.
 
-## Créer des splits
+## Creating splits
 
-### Split horizontal — ajout de colonne
+### Horizontal split — adding a column
 
-**Cmd+D** — insère une nouvelle colonne **juste après** la colonne du pane focusé.
+**Cmd+D** — inserts a new column **right after** the focused pane's column.
 
 ```
 [A | B], focus A → Cmd+D → [A | NEW | B]
 [A | B], focus B → Cmd+D → [A | B | NEW]
 ```
 
-**Cmd+E** — ajoute une nouvelle colonne **à la fin**.
+**Cmd+E** — adds a new column **at the end**.
 
 ```
 [A | B], focus A → Cmd+E → [A | B | NEW]
 ```
 
-Poids de la nouvelle colonne = `sum(existing_weights) / n_existing` (la moyenne). Les colonnes existantes gardent leurs poids — leurs proportions relatives sont préservées. La nouvelle colonne obtient `1/(n+1)` de l'espace total.
+Weight of the new column = `sum(existing_weights) / n_existing` (the average). Existing columns keep their weights — their relative proportions are preserved. The new column gets `1/(n+1)` of the total space.
 
-Le nouveau pane hérite du CWD du pane focusé (via `proc_pidinfo`).
+The new pane inherits the focused pane's CWD (via `proc_pidinfo`).
 
-### Split vertical — ajout de ligne dans une colonne
+### Vertical split — adding a row in a column
 
-**Cmd+Shift+D** — insère un nouveau pane **juste en dessous** du pane focusé dans sa colonne.
+**Cmd+Shift+D** — inserts a new pane **right below** the focused pane in its column.
 
 ```
 [A | B], focus A → Cmd+Shift+D →  [ A  | B ]
                                    [NEW |   ]
 ```
 
-**Cmd+Shift+E** — ajoute un nouveau pane **en bas de la colonne**.
+**Cmd+Shift+E** — adds a new pane **at the bottom of the column**.
 
 ```
 [ A  | B ]                         [ A  | B ]
@@ -90,189 +90,189 @@ Le nouveau pane hérite du CWD du pane focusé (via `proc_pidinfo`).
                                    [NEW |   ]
 ```
 
-Même logique que Cmd+D/E pour l'horizontal : **D = après le pane courant, E = à la fin**.
+Same logic as Cmd+D/E for horizontal: **D = after the current pane, E = at the end**.
 
-Poids de la nouvelle ligne = `sum(existing_row_weights) / n_existing` (la moyenne). Les lignes existantes gardent leurs poids.
+Weight of the new row = `sum(existing_row_weights) / n_existing` (the average). Existing rows keep their weights.
 
-## Supprimer un pane
+## Removing a pane
 
-Quand un pane est fermé (`exit` / `Cmd+W`) :
+When a pane is closed (`exit` / `Cmd+W`):
 
-1. **Pane seul dans sa colonne** (1 pane, 1 colonne) → retirer la colonne et son poids du Vec. Le poids retiré est redistribué proportionnellement aux colonnes restantes.
-2. **Pane dans une colonne multi-lignes** → retirer le pane et son `row_weight` du Vec. Le poids retiré est redistribué proportionnellement aux lignes restantes de la colonne.
-3. **Dernier pane de la dernière colonne** → fermer le tab. Dernier tab → fermer la fenêtre.
+1. **Pane alone in its column** (1 pane, 1 column) → remove the column and its weight from the Vec. The removed weight is redistributed proportionally to the remaining columns.
+2. **Pane in a multi-row column** → remove the pane and its `row_weight` from the Vec. The removed weight is redistributed proportionally to the remaining rows of the column.
+3. **Last pane of the last column** → close the tab. Last tab → close the window.
 
-Focus après suppression : pane suivant (même logique qu'actuellement).
+Focus after removal: next pane (same logic as today).
 
 ## Resizing
 
-Trois modes distincts, jamais mélangés.
+Three distinct modes, never mixed.
 
 ### Mode 1 — Column/ratio resize (Cmd+Ctrl+Arrows)
 
-**Horizontal (Cmd+Ctrl+Left/Right)** — déplace le bord contrôlé de la colonne focusée.
+**Horizontal (Cmd+Ctrl+Left/Right)** — moves the controlled edge of the focused column.
 
-Le **bord contrôlé** est le bord droit de la colonne, sauf pour la dernière colonne (bord gauche).
+The **controlled edge** is the column's right edge, except for the last column (left edge).
 
 | Position | `Cmd+Ctrl+Right` | `Cmd+Ctrl+Left` |
 |---|---|---|
-| Première ou milieu | Bord droit → : colonne grandit | Bord droit ← : colonne rétrécit |
-| Dernière | Bord gauche → : colonne rétrécit | Bord gauche ← : colonne grandit |
+| First or middle | Right edge → : column grows | Right edge ← : column shrinks |
+| Last | Left edge → : column shrinks | Left edge ← : column grows |
 
-- Poids minimum par colonne : correspond à `min_split_width` en pixels.
-- Pas de fallback : tous les cas sont couverts par le bord contrôlé.
+- Minimum weight per column: matches `min_split_width` in pixels.
+- No fallback: every case is covered by the controlled edge.
 
-**Vertical (Cmd+Ctrl+Up/Down)** — déplace le bord contrôlé du pane focusé dans sa colonne.
+**Vertical (Cmd+Ctrl+Up/Down)** — moves the controlled edge of the focused pane within its column.
 
-Le **bord contrôlé** est le bord bas du pane, sauf pour le dernier pane de la colonne (bord haut). Même logique que l'horizontal.
+The **controlled edge** is the pane's bottom edge, except for the last pane of the column (top edge). Same logic as horizontal.
 
 | Position | `Cmd+Ctrl+Down` | `Cmd+Ctrl+Up` |
 |---|---|---|
-| Premier ou milieu | Bord bas ↓ : pane grandit | Bord bas ↑ : pane rétrécit |
-| Dernier | Bord haut ↓ : pane rétrécit | Bord haut ↑ : pane grandit |
+| First or middle | Bottom edge ↓ : pane grows | Bottom edge ↑ : pane shrinks |
+| Last | Top edge ↓ : pane shrinks | Top edge ↑ : pane grows |
 
-- Poids minimum par ligne : 5% du total.
-- Bloqué si un pane voisin est complètement minimisé.
+- Minimum weight per row: 5% of the total.
+- Blocked if a neighboring pane is fully minimized.
 
 ### Mode 2 — Virtual width global (Ctrl+Option+Left/Right)
 
-Change `virtual_width_override` pour tout le tab. Tous les poids restent identiques — les colonnes grossissent/rétrécissent proportionnellement.
+Changes `virtual_width_override` for the whole tab. All weights stay identical — columns grow/shrink proportionally.
 
-| Raccourci | Action |
+| Shortcut | Action |
 |---|---|
-| `Ctrl+Option+Right` | Augmente virtual width de 200pt × scale |
-| `Ctrl+Option+Left` | Diminue (min = screen width, puis override reset à 0) |
+| `Ctrl+Option+Right` | Increases virtual width by 200pt × scale |
+| `Ctrl+Option+Left` | Decreases (min = screen width, then override reset to 0) |
 
-Le scroll horizontal s'active quand `virtual_width > screen_width`. Auto-scroll pour garder le pane focusé visible.
+Horizontal scroll kicks in when `virtual_width > screen_width`. Auto-scroll keeps the focused pane visible.
 
 ### Mode 3 — Edge grow (Cmd+Ctrl+Option+Left/Right)
 
-Grow/shrink d'une seule colonne. Les autres gardent leur taille pixel.
+Grow/shrink a single column. The others keep their pixel size.
 
-| Raccourci | Action |
+| Shortcut | Action |
 |---|---|
-| `Cmd+Ctrl+Option+Right` | Colonne focusée grandit : virtual width augmente, poids ajustés pour que les autres colonnes gardent leur largeur pixel |
-| `Cmd+Ctrl+Option+Left` | Inverse. No-op si `virtual_width_override` est déjà 0 |
+| `Cmd+Ctrl+Option+Right` | Focused column grows: virtual width increases, weights adjusted so the other columns keep their pixel width |
+| `Cmd+Ctrl+Option+Left` | The reverse. No-op if `virtual_width_override` is already 0 |
 
-Seul l'axe horizontal pour l'instant.
+Horizontal axis only for now.
 
 ### Equalize (Cmd+Shift+=)
 
-Reset tous les `column_weights` à `1.0` et `custom_weights` à `false` (toutes les colonnes de même largeur, aucune pinnée). Reset aussi tous les `row_weights` à `1.0` et `custom_row_weights` à `false` dans toutes les colonnes.
+Resets all `column_weights` to `1.0` and `custom_weights` to `false` (all columns the same width, none pinned). Also resets all `row_weights` to `1.0` and `custom_row_weights` to `false` in every column.
 
 ### Status bar feedback
 
-Sur tout resize (3 modes) : la status bar affiche le mode actif, screen width et virtual width. Disparaît après 2 secondes.
+On any resize (3 modes): the status bar shows the active mode, screen width and virtual width. Disappears after 2 seconds.
 
-### Colonnes/lignes pinnées (`custom_weight` / `custom_row_weight`)
+### Pinned columns/rows (`custom_weight` / `custom_row_weight`)
 
-Une colonne (ou ligne) avec `custom_weight = true` a été redimensionnée manuellement. Elle conserve son poids lors des redistributions automatiques. Les règles sont identiques pour les deux axes.
+A column (or row) with `custom_weight = true` was resized manually. It keeps its weight during automatic redistributions. The rules are identical for both axes.
 
-**Quand une colonne/ligne devient pinnée :**
+**When a column/row becomes pinned:**
 
-- Drag souris d'un séparateur → seule la colonne/ligne **du côté direct** (celle qu'on pousse/tire explicitement) devient pinnée.
-- Resize clavier mode 1 → la **colonne/ligne focusée** devient pinnée (c'est elle que l'utilisateur redimensionne intentionnellement). Les autres qui s'adaptent ne changent pas de statut.
+- Mouse drag of a separator → only the column/row **on the direct side** (the one explicitly pushed/pulled) becomes pinned.
+- Keyboard resize mode 1 → the **focused column/row** becomes pinned (it is the one the user intentionally resizes). The others that adapt don't change status.
 
-**Quand une colonne/ligne est dépinnée :**
+**When a column/row is unpinned:**
 
-- Equalize (Cmd+Shift+=) → tout reset à `false`.
-- Nouvelle colonne/ligne créée → la nouvelle a `custom_weight = false`. Les existantes gardent leur état.
+- Equalize (Cmd+Shift+=) → everything reset to `false`.
+- New column/row created → the new one has `custom_weight = false`. Existing ones keep their state.
 
-**Persistance :** `custom_weight` et `custom_row_weight` sont sauvegardés/restaurés avec la session.
+**Persistence:** `custom_weight` and `custom_row_weight` are saved/restored with the session.
 
-### Redistribution (colonnes et lignes)
+### Redistribution (columns and rows)
 
-L'algorithme de redistribution est **identique** pour les deux axes (colonnes horizontalement, lignes verticalement). Dans cette section, "élément" désigne une colonne ou une ligne selon l'axe.
+The redistribution algorithm is **identical** for both axes (columns horizontally, rows vertically). In this section, "element" means a column or a row depending on the axis.
 
-#### Algorithme (drag souris)
+#### Algorithm (mouse drag)
 
-Drag du séparateur entre éléments `i` et `i+1`, delta en pixels :
+Drag of the separator between elements `i` and `i+1`, delta in pixels:
 
-1. **Élément poussé** : l'élément du côté vers lequel le séparateur se déplace. Son poids diminue du delta. Il devient pinné.
+1. **Pushed element**: the element on the side the separator moves toward. Its weight decreases by the delta. It becomes pinned.
 
-2. **Côté libre** : l'espace est redistribué entre les éléments non-pinnés de l'autre côté.
-   - Les non-pinnés reçoivent une part égale.
-   - Les pinnés gardent leur poids inchangé.
-   - Aucun ne change de statut pinné.
+2. **Free side**: the space is redistributed among the non-pinned elements on the other side.
+   - Non-pinned ones receive an equal share.
+   - Pinned ones keep their weight unchanged.
+   - None changes pinned status.
 
-3. **Fallback** : si **tous** les éléments du côté libre sont pinnés, seul l'adjacent absorbe.
+3. **Fallback**: if **all** elements on the free side are pinned, only the adjacent one absorbs.
 
-4. **Minimum** : aucun élément ne peut descendre en dessous de 5% du poids total.
+4. **Minimum**: no element can go below 5% of the total weight.
 
-#### Algorithme (clavier mode 1)
+#### Algorithm (keyboard mode 1)
 
-Le **bord contrôlé** est le bord extérieur de l'élément focusé (droit pour les colonnes, bas pour les lignes), sauf pour le **dernier** élément (bord gauche / haut).
+The **controlled edge** is the outer edge of the focused element (right for columns, bottom for rows), except for the **last** element (left / top edge).
 
-**Grandir** (pousser le bord vers l'extérieur) :
-- L'élément focusé grandit et devient pinné.
-- La perte est redistribuée parmi les non-pinnés du côté extérieur.
+**Grow** (push the edge outward):
+- The focused element grows and becomes pinned.
+- The loss is redistributed among the non-pinned elements on the outer side.
 
-**Rétrécir** (tirer le bord vers l'intérieur) :
-- L'élément focusé rétrécit (reste pinné s'il l'était).
-- Le gain est redistribué parmi les non-pinnés du côté extérieur.
+**Shrink** (pull the edge inward):
+- The focused element shrinks (stays pinned if it was).
+- The gain is redistributed among the non-pinned elements on the outer side.
 
-#### Exemples (horizontaux)
+#### Examples (horizontal)
 
-- `A | B | C`, focus B, `Right` : B grandit, C (+ au-delà) cède
-- `A | B | C`, focus B, `Left` : B rétrécit, C (+ au-delà) absorbe
-- `A | B | C`, focus C (dernière), `Left` : C grandit (bord gauche ←), A et B cèdent
+- `A | B | C`, focus B, `Right`: B grows, C (+ beyond) gives way
+- `A | B | C`, focus B, `Left`: B shrinks, C (+ beyond) absorbs
+- `A | B | C`, focus C (last), `Left`: C grows (left edge ←), A and B give way
 
-#### Exemples (verticaux)
+#### Examples (vertical)
 
 ```
 A
 B
 C
 ```
-- Focus B, `Down` : B grandit, C (+ au-delà) cède
-- Focus B, `Up` : B rétrécit, C (+ au-delà) absorbe
-- Focus C (dernière), `Up` : C grandit (bord haut ↑), A et B cèdent
+- Focus B, `Down`: B grows, C (+ beyond) gives way
+- Focus B, `Up`: B shrinks, C (+ beyond) absorbs
+- Focus C (last), `Up`: C grows (top edge ↑), A and B give way
 
 ### Mouse drag
 
-**Curseur souris** : au survol d'un séparateur (±3px autour de la ligne de 1px), le curseur change :
-- Séparateur vertical (entre colonnes) → `resizeLeftRight` (↔)
-- Séparateur horizontal (entre lignes d'une colonne) → `resizeUpDown` (↕)
+**Mouse cursor**: when hovering a separator (±3px around the 1px line), the cursor changes:
+- Vertical separator (between columns) → `resizeLeftRight` (↔)
+- Horizontal separator (between rows of a column) → `resizeUpDown` (↕)
 
-Le curseur revient à la flèche par défaut quand la souris quitte la zone de tolérance.
+The cursor goes back to the default arrow when the mouse leaves the tolerance zone.
 
-**Hit-testing** : séparateurs verticaux (entre colonnes) et horizontaux (entre lignes d'une colonne).
+**Hit-testing**: vertical separators (between columns) and horizontal ones (between rows of a column).
 
-**Drag séparateur vertical** : voir "Redistribution" ci-dessus (axe colonnes).
+**Vertical separator drag**: see "Redistribution" above (columns axis).
 
-**Drag séparateur horizontal** : voir "Redistribution" ci-dessus (axe lignes).
+**Horizontal separator drag**: see "Redistribution" above (rows axis).
 
 ### Max pane width invariant
 
-**Invariant** : aucun pane ne doit dépasser `screen_width` en largeur pixel. Vérifié après chaque resize via post-validation.
+**Invariant**: no pane may exceed `screen_width` in pixel width. Checked after every resize via post-validation.
 
-- **Mode 1** : les poids utilisateur sont préservés. Si un pane dépasse, `virtual_width_override` est réduit.
-- **Modes 2 & 3** : les poids sont ajustés d'abord pour capper les colonnes trop larges. Si ça ne suffit pas, `virtual_width_override` est réduit en dernier recours.
+- **Mode 1**: user weights are preserved. If a pane exceeds, `virtual_width_override` is reduced.
+- **Modes 2 & 3**: weights are adjusted first to cap columns that are too wide. If that is not enough, `virtual_width_override` is reduced as a last resort.
 
 ## Navigation
 
 ### Left/Right (Cmd+Option+Left/Right)
 
-Trouver la colonne `i` du pane focusé. Aller à la colonne `i-1` (Left) ou `i+1` (Right). Dans la colonne cible, choisir le pane le plus proche verticalement (par centre de viewport).
+Find the column `i` of the focused pane. Go to column `i-1` (Left) or `i+1` (Right). In the target column, pick the vertically closest pane (by viewport center).
 
 ### Up/Down (Cmd+Option+Up/Down)
 
-Naviguer dans la liste de panes de la colonne courante. Si déjà au premier/dernier, rester.
+Navigate the pane list of the current column. If already at the first/last, stay.
 
 ### Swap (Cmd+Shift+Arrows)
 
-- **Left/Right** : swap la colonne entière `i` avec la colonne `i±1` (swap éléments dans le Vec + swap les poids).
-- **Up/Down** : swap le pane focusé avec son voisin dans la colonne (swap dans le Vec + swap les row_weights).
+- **Left/Right**: swap the whole column `i` with column `i±1` (swap elements in the Vec + swap the weights).
+- **Up/Down**: swap the focused pane with its neighbor in the column (swap in the Vec + swap the row_weights).
 
 ### Reparent (Cmd+Ctrl+Shift+Arrows)
 
-- **Left/Right** : déplacer le pane focusé dans la colonne adjacente (ajouté en bas de la colonne cible). Si la colonne source se retrouve vide, la retirer.
-- **Up/Down** : déplacer le pane vers la colonne la plus proche au-dessus/en-dessous (si cross-column vertical layout le permet).
+- **Left/Right**: move the focused pane into the adjacent column (added at the bottom of the target column). If the source column ends up empty, remove it.
+- **Up/Down**: move the pane to the nearest column above/below (if a cross-column vertical layout allows it).
 
-## Séparateurs visuels
+## Visual separators
 
-- **Séparateurs verticaux** (1px) : entre chaque colonne. Position = somme des largeurs des colonnes 0..i.
-- **Séparateurs horizontaux** (1px) : entre chaque pane d'une colonne multi-lignes.
+- **Vertical separators** (1px): between each column. Position = sum of the widths of columns 0..i.
+- **Horizontal separators** (1px): between each pane of a multi-row column.
 
 ## Virtual width
 
@@ -280,14 +280,14 @@ Naviguer dans la liste de panes de la colonne courante. Si déjà au premier/der
 auto_virtual_width = max(columns.len() * min_split_width, screen_width)
 ```
 
-Si `virtual_width_override > 0` :
+If `virtual_width_override > 0`:
 ```
 virtual_width = max(virtual_width_override, screen_width)
 ```
 
 ## Session persistence
 
-### Format de sauvegarde
+### Save format
 
 ```rust
 struct SavedPane {
@@ -313,29 +313,29 @@ struct SavedTab {
 }
 ```
 
-### Migration ancien format
+### Old format migration
 
-Deux anciens formats à supporter :
+Two old formats to support:
 
-1. **v2 — `SavedTree` (HSplit/VSplit)** : aplatir les HSplits en colonnes, aplatir les VSplits en lignes. Ratios binaires → poids proportionnels.
+1. **v2 — `SavedTree` (HSplit/VSplit)**: flatten HSplits into columns, flatten VSplits into rows. Binary ratios → proportional weights.
 
-2. **v3 — `SavedColumn` (enum Leaf/VSplit)** : aplatir les VSplits en lignes. Les colonnes sont déjà plates. Ratios binaires → poids proportionnels. `custom_ratio` → `custom_row_weight`.
+2. **v3 — `SavedColumn` (enum Leaf/VSplit)**: flatten VSplits into rows. Columns are already flat. Binary ratios → proportional weights. `custom_ratio` → `custom_row_weight`.
 
-Les deux migrations produisent le format v4 (listes plates colonnes + lignes).
+Both migrations produce the v4 format (flat lists of columns + rows).
 
 ## Configuration
 
 ```toml
 [splits]
-min_width = 300.0   # Largeur minimum d'une colonne en points
+min_width = 300.0   # Minimum column width in points
 
 [keys]
-# Colonnes
-vsplit = "cmd+d"             # Nouvelle colonne après le pane focusé
-vsplit_root = "cmd+e"        # Nouvelle colonne à la fin
+# Columns
+vsplit = "cmd+d"             # New column after the focused pane
+vsplit_root = "cmd+e"        # New column at the end
 # Vertical
-hsplit = "cmd+shift+d"       # Split vertical après le pane focusé
-hsplit_root = "cmd+shift+e"  # Split vertical en bas de la colonne
+hsplit = "cmd+shift+d"       # Vertical split after the focused pane
+hsplit_root = "cmd+shift+e"  # Vertical split at the bottom of the column
 # Resize mode 1
 resize_left = "cmd+ctrl+left"
 resize_right = "cmd+ctrl+right"

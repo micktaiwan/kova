@@ -60,7 +60,7 @@ pub struct Session {
     /// own does NOT count — see `parse_session_file`.
     pub name: Option<String>,
     /// The `name` field as Claude Code wrote it, derived or not: the address
-    /// other Claude sessions give `SendMessage` / `ListAgents` ("lempire-f1").
+    /// other Claude sessions give `SendMessage` / `ListAgents` ("myproject-f1").
     /// Unlike `name`, a derived one is kept, because it is exactly what a peer
     /// has to type to reach a session nobody renamed.
     pub peer_name: Option<String>,
@@ -362,8 +362,8 @@ mod tests {
         );
     }
 
-    /// Shape of a real file, taken from a live session on 2026-08-09.
-    const LIVE_FILE: &str = r#"{"pid":10487,"sessionId":"430e0c8f","cwd":"/Users/x/vigie",
+    /// Shape of a real file, taken from a live session.
+    const LIVE_FILE: &str = r#"{"pid":10487,"sessionId":"430e0c8f","cwd":"/Users/x/projects/app",
         "startedAt":1786280230040,"version":"2.1.226","kind":"interactive",
         "entrypoint":"cli","name":"images","nameSource":"user","status":"busy"}"#;
 
@@ -412,10 +412,10 @@ mod tests {
         // The pane title ignores a derived name, but it is the name another
         // session passes to SendMessage, so `peer_name` keeps it.
         let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000,
-            "cwd":"/Users/x/lempire","name":"lempire-f1","nameSource":"derived"}"#;
+            "cwd":"/Users/x/myproject","name":"myproject-f1","nameSource":"derived"}"#;
         let session = parse_session_file(data).unwrap().2;
         assert_eq!(session.name, None);
-        assert_eq!(session.peer_name.as_deref(), Some("lempire-f1"));
+        assert_eq!(session.peer_name.as_deref(), Some("myproject-f1"));
     }
 
     #[test]

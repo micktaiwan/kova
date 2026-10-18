@@ -165,14 +165,14 @@ pub struct Prompt {
 /// Most `type: "user"` records are not the user talking: tool results, skill
 /// bodies and system reminders all come back under the same type. Recent Claude
 /// Code versions settle it with `promptSource: "typed"`; older transcripts
-/// (56 files out of 1364 here) have no such field, and there the tell is a
+/// (a small minority of files) have no such field, and there the tell is a
 /// string `content` that is not a machine-injected block — those all open with
 /// a `<` tag.
 ///
 /// Two kinds of typed prompts do not fit that mould and are read apart:
-///   - a slash command (`/agent analyse la recherche`) is stored without
-///     `promptSource`, wrapped in `<command-name>`/`<command-args>` tags — 398
-///     of them in two weeks here, arguments often the whole request;
+///   - a slash command (`/review the search results`) is stored without
+///     `promptSource`, wrapped in `<command-name>`/`<command-args>` tags — they
+///     are frequent, arguments often the whole request;
 ///   - a prompt sent with an image has an array `content`, its text in the
 ///     `text` parts.
 pub fn typed_prompt(line: &str) -> Option<Prompt> {
@@ -254,8 +254,8 @@ fn slash_command(content: &str) -> Option<String> {
 
 /// Cut a query into the terms a session must ALL carry.
 ///
-/// One word is rarely enough here: "oui" matches 379 sessions of 1365. Matching
-/// the query as a single string would make "dust mcp" find nothing at all (the
+/// One word is rarely enough here: a common word matches a large share of all sessions. Matching
+/// the query as a single string would make "parser mcp" find nothing at all (the
 /// two words never sit side by side), so the space — and the comma, which is how
 /// one naturally lists keywords — separates terms instead, and a session has to
 /// contain every one of them. Order does not matter, and the terms may come from
@@ -631,10 +631,10 @@ mod tests {
 
     #[test]
     fn a_typed_prompt_is_kept_with_its_cwd() {
-        let line = r#"{"type":"user","promptSource":"typed","cwd":"/Users/x/projects/cto","message":{"role":"user","content":"  je trouve plus la session avec Dust  "}}"#;
+        let line = r#"{"type":"user","promptSource":"typed","cwd":"/Users/x/projects/app","message":{"role":"user","content":"  cannot find the session about the parser  "}}"#;
         let p = typed_prompt(line).expect("a typed prompt");
-        assert_eq!(p.text, "je trouve plus la session avec Dust");
-        assert_eq!(p.cwd.as_deref(), Some("/Users/x/projects/cto"));
+        assert_eq!(p.text, "cannot find the session about the parser");
+        assert_eq!(p.cwd.as_deref(), Some("/Users/x/projects/app"));
     }
 
     #[test]
@@ -734,9 +734,9 @@ mod tests {
 
     #[test]
     fn a_query_is_cut_into_terms_that_must_all_match() {
-        assert_eq!(split_terms("  Dust   MCP "), vec!["dust", "mcp"]);
-        assert_eq!(split_terms("dust, mcp"), vec!["dust", "mcp"]);
-        assert_eq!(split_terms("dust"), vec!["dust"]);
+        assert_eq!(split_terms("  Parser   MCP "), vec!["parser", "mcp"]);
+        assert_eq!(split_terms("parser, mcp"), vec!["parser", "mcp"]);
+        assert_eq!(split_terms("parser"), vec!["parser"]);
         assert!(split_terms("   ").is_empty());
     }
 
@@ -803,10 +803,10 @@ mod tests {
     #[ignore]
     fn indexes_the_real_transcripts() {
         let t0 = std::time::Instant::now();
-        let found = search("dust", &[]);
+        let found = search("parser", &[]);
         let cold = t0.elapsed();
         let t1 = std::time::Instant::now();
-        let again = search("dust", &[]);
+        let again = search("parser", &[]);
         println!(
             "cold pass {:?}, warm pass {:?}, {} shown of {} matches",
             cold, t1.elapsed(), found.hits.len(), found.total
@@ -821,8 +821,8 @@ mod tests {
         println!("\"oui\": {} shown of {} matches in {:?}", common.hits.len(), common.total, t2.elapsed());
         assert!(common.hits.len() <= MAX_RESULTS);
         let t3 = std::time::Instant::now();
-        let narrowed = search("dust mcp", &[]);
-        println!("\"dust mcp\": {} matches in {:?}", narrowed.total, t3.elapsed());
+        let narrowed = search("parser mcp", &[]);
+        println!("\"parser mcp\": {} matches in {:?}", narrowed.total, t3.elapsed());
         assert!(narrowed.total <= found.total);
         assert_eq!(found.total, again.total);
     }
@@ -831,15 +831,15 @@ mod tests {
     fn a_label_names_the_project_then_the_prompt() {
         let hit = Hit {
             id: "abc".into(),
-            cwd: "/Users/x/projects/cto".into(),
-            title: "relis le thread".into(),
+            cwd: "/Users/x/projects/app".into(),
+            title: "reread the thread".into(),
             last_active: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
         };
         let label = hit_label(&hit);
-        assert!(label.starts_with("cto · "), "got {}", label);
-        assert!(label.ends_with("· relis le thread"), "got {}", label);
+        assert!(label.starts_with("app · "), "got {}", label);
+        assert!(label.ends_with("· reread the thread"), "got {}", label);
     }
 }

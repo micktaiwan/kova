@@ -135,10 +135,10 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "minimized": false,
   "agent": "claude",
   "agent_session_id": "0b6f…",
-  "agent_session_name": "subscribe côté Kova",
+  "agent_session_name": "subscribe on the Kova side",
   "claude_session_id": "0b6f…",
-  "claude_session_name": "subscribe côté Kova",
-  "peer_name": "subscribe côté Kova"
+  "claude_session_name": "subscribe on the Kova side",
+  "peer_name": "subscribe on the Kova side"
 }
 ```
 
@@ -148,7 +148,7 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 
 `claude_session_id` is the id of the Claude Code conversation running in the pane — the argument `claude --resume` takes — and `claude_session_name` is the name its `/rename` set (`null` until the user sets one). Both are `null` in a pane with no Claude session. They are read from `~/.claude/sessions/<pid>.json`, on the same throttled probe as the rest, and they matter because **the id is the only identifier here that outlives the pane**: a client tying a pane to a subject must key on it rather than on `id` or `cwd`. A pane id dies with its tab, and a directory is shared by every unrelated conversation started in the same repository. The name also appears inside `title`, but only as one candidate among five (see `display_title`), where it cannot be told apart from an OSC title or a directory name.
 
-`peer_name` is the name other Claude Code sessions use to reach this one with `SendMessage` / `ListAgents` (e.g. `"lempire-f1"`). It is the session file's `name` field as Claude Code wrote it, **including a name it derived on its own** (`nameSource: "derived"`), which `claude_session_name` deliberately drops so that it never shadows the pane title. After a `/rename` the two fields carry the same value. It is `null` in a pane with no Claude session, for Codex, and while Claude Code has not yet written a name. It comes from the same cached scan of `~/.claude/sessions/` as `claude_session_id`, with no extra filesystem pass.
+`peer_name` is the name other Claude Code sessions use to reach this one with `SendMessage` / `ListAgents` (e.g. `"myproject-f1"`). It is the session file's `name` field as Claude Code wrote it, **including a name it derived on its own** (`nameSource: "derived"`), which `claude_session_name` deliberately drops so that it never shadows the pane title. After a `/rename` the two fields carry the same value. It is `null` in a pane with no Claude session, for Codex, and while Claude Code has not yet written a name. It comes from the same cached scan of `~/.claude/sessions/` as `claude_session_id`, with no extra filesystem pass.
 
 `agent` is `"claude"`, `"codex"`, or `null`. `agent_session_id` and `agent_session_name` expose the detected conversation's id and name for either agent; the name is `null` when absent. The `claude_*` fields remain `null` for Codex, including named Codex sessions. Codex resumes with `codex resume <id>`.
 
@@ -277,7 +277,7 @@ drops the banner.
 
 ```json
 { "cmd": "ask", "question": {
-    "id": "6f1c…-uuid", "message": "Send the reply to Robin?",
+    "id": "6f1c…-uuid", "message": "Deploy to staging?",
     "actions": ["OK", "KO"], "input": true, "asked_at": 1792000000,
     "from": { "name": "routine", "session_id": "…", "pane_id": 12,
               "kova_socket": "/tmp/kova-123.sock", "cwd": "/Users/…/project" } } }
@@ -306,7 +306,7 @@ the way and Kova delivers it to the conversation itself:
    Enter (it exits at once on "No conversation found"), and the answer stays
    on disk, retried at the next launch.
 
-A pane of a library host (Kana) names that host's socket, which answers `ask`
+A pane of a library host (an app that embeds Kova) names that host's socket, which answers `ask`
 with `command not supported by this host` (or `unknown command: ask` for a
 build older than `ask`): `kova ask` then asks Kova.app.
 
@@ -319,11 +319,78 @@ supported by this host`, which sends `kova ask` on to Kova.app.
 
 ---
 
+### `list-asks` — the questions waiting on the card
+
+```json
+{ "cmd": "list-asks" }
+```
+
+For a client that answers somewhere else than the card, such as a companion app
+that shows them on a phone. Response:
+`{"ok":true,"data":{"asks":[…]}}`, oldest first (the one on the card comes
+first), each entry the `question` object of `ask` exactly as it was asked, plus
+`"buttons"`: the buttons the card shows, in order (`["Reply"]` when `actions` is
+empty), so a client never re-derives that default. `"asks": []` when nothing
+waits. Questions restored after a restart are listed like the others.
+
+Kova.app only: a library host answers `command not supported by this host`.
+
+---
+
+### `answer-ask` — answer a pending question as if on the card
+
+```json
+{ "cmd": "answer-ask", "id": "6f1c…-uuid", "action": "OK", "text": "go ahead" }
+```
+
+`text` is optional (default `""`) and trimmed, as the card trims its field. The answer takes the card's own path: the
+waiting `kova ask` client gets it (or it is delivered late, exactly as described
+under `ask`), and the card moves on to the next question or disappears. An
+answer given here is indistinguishable from a click. Response:
+`{"ok":true,"data":{"id":…,"action":"OK","text":"go ahead"}}`.
+
+Errors:
+
+- `"id" must be a UUID`;
+- `no pending question <id>`: already answered (on the Mac, or by another
+  client), or never asked here;
+- `"action" must be one of: OK, KO`: `action` is not one of that question's
+  `buttons` (case matters);
+- `"text" must be empty: this question has no text field`: the question was
+  asked with `input: false`.
+
+Kova.app only: a library host answers `command not supported by this host`.
+
+---
+
+### `withdraw-asks` — take back a conversation's questions, answered elsewhere
+
+```json
+{ "cmd": "withdraw-asks", "session_id": "6e67ffdd-…" }
+```
+
+The user answered in the conversation itself (typed a prompt in its pane, or
+from a remote client) rather than on the card: every question that
+conversation (`from.session_id`) still has on the card is taken off it and off
+disk, and **nothing is delivered late** — a click twenty minutes later would
+only retype a stale answer. A `kova ask` still waiting gets the error
+`withdrawn: the user answered in the conversation instead of on the card` and
+exits with code 3. Answers already given and waiting for delivery are not
+touched. Response: `{"ok":true,"data":{"withdrawn":1}}` (0 when nothing was
+pending).
+
+Sent by a Claude Code `UserPromptSubmit` hook running
+`kova ask --withdraw --session -` (it reads the hook's JSON input for the
+`session_id`, prints nothing and always exits 0). Kova.app only: a library host
+answers `command not supported by this host`, and the client then asks Kova.app.
+
+---
+
 ### `set-anchor` — put a conversation at the head of the anchors
 
 ```json
 { "cmd": "set-anchor", "pane_id": 42 }
-{ "cmd": "set-anchor", "cwd": "/Users/x/projects/prez", "session_id": "abc123", "agent": "claude", "label": "Prez steerco" }
+{ "cmd": "set-anchor", "cwd": "/Users/x/projects/prez", "session_id": "abc123", "agent": "claude", "label": "Release notes" }
 ```
 
 The anchors are the few conversations today is for: they open `Cmd+P` in their
@@ -344,7 +411,7 @@ from outside always lands, where `Cmd+Shift+A` on a full list refuses instead
 (you are there to drop one). An anchored conversation stops appearing among
 the bookmarks below, even when it is bookmarked too.
 
-Response: `{ "ok": true, "data": { "label": "Prez steerco", "anchors": 3, "dropped": null } }`.
+Response: `{ "ok": true, "data": { "label": "Release notes", "anchors": 3, "dropped": null } }`.
 
 Errors rather than a surprise: a request naming neither `pane_id` nor `cwd`, a
 `pane_id` that is not open (or holds neither a conversation nor a directory), and

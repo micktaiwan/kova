@@ -2322,10 +2322,10 @@ mod tests {
         // derived peer name is still exposed for SendMessage.
         pane.agent_session.replace(Some(AgentSession {
             agent: Agent::Claude, id: "claude-id".into(), name: None,
-            peer_name: Some("lempire-f1".into()),
+            peer_name: Some("myproject-f1".into()),
         }));
         assert_eq!(pane.claude_session_name(), None);
-        assert_eq!(pane.claude_peer_name().as_deref(), Some("lempire-f1"));
+        assert_eq!(pane.claude_peer_name().as_deref(), Some("myproject-f1"));
         assert_eq!(pane.display_title("shell"), "Codex");
     }
 

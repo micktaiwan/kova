@@ -5,7 +5,7 @@
 //! it to the main thread. There, `dispatch` runs the commands that only need
 //! "the panes and tabs this app holds" against an `IpcHost`, and gives every
 //! other command back to the app. Kova.app implements `IpcHost` over its
-//! windows (`crate::app`); another host (Kana, one tab per note) implements the
+//! windows (`crate::app`); another host (a library host, one tab per document) implements the
 //! same trait and gets the same commands, the same JSON and the same errors.
 //!
 //! What a command does to one pane (`send_keys_to`, `pane_text_entry`…) is
@@ -48,7 +48,7 @@ pub enum IpcCloseTabResult {
     NotFound,
 }
 
-/// One `list-tabs` entry. The shape is the host-independent contract Kite reads
+/// One `list-tabs` entry. The shape is the host-independent contract a remote client reads
 /// (`tab_json`); a host fills it from whatever it calls a tab.
 pub struct TabInfo {
     pub id: u32,

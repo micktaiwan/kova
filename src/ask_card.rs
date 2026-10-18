@@ -1,6 +1,6 @@
 //! The card an agent's question appears on (`crate::ask`).
 //!
-//! A port of Kova Float's `QuestionCard.swift`, whose look the user validated:
+//! A port of an earlier Swift prototype's `QuestionCard.swift`, whose look the user validated:
 //! same classes, sizes, colours, fonts and corner radii — do not redesign it here.
 //!
 //! The card sits top-right of the screen, over everything, without taking the
