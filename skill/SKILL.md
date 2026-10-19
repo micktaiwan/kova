@@ -107,6 +107,10 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 
 ## Reading `list-panes`
 
+The answer is `{"ok": true, "data": [ … ]}`: `data` is a flat list of pane objects, not a dict.
+To find pane N:
+`printf '%s' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET" | python3 -c 'import json,sys; print(next(p for p in json.load(sys.stdin)["data"] if p["id"]==N))'`.
+
 Each pane carries `id`, `window`, `tab`, `cwd`, `title`, `focused`, `pid`, `child_processes`,
 `is_idle` (no child process: free for a new command), `minimized`, and:
 
