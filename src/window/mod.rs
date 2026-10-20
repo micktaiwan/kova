@@ -3,7 +3,7 @@ use attention::{do_history_step, pane_history_state};
 mod duplicates;
 mod geometry;
 mod ipc_handlers;
-mod overlays;
+pub(crate) mod overlays;
 use overlays::{FilterState, RenamePaneState, RenameTabState};
 pub use ipc_handlers::{IpcMergeTabResult, IpcSwapPaneResult};
 mod recent_projects_overlay;
@@ -32,7 +32,8 @@ use crate::config::{Config, TerminalConfig};
 use crate::input::{self, MouseAction, MouseResult};
 use crate::keybindings::{Action, Keybindings, KeyCombo};
 use crate::pane::{alloc_tab_id, NavDirection, Pane, PaneId, SplitDirection, Tab, TabId};
-use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
+use crate::renderer::{PaneViewport, Renderer};
+use crate::resize_repair::ResizeRepair;
 use crate::terminal::pty::ProcessInfo;
 use crate::terminal::FilterMatch;
 
@@ -81,6 +82,10 @@ pub struct KovaViewIvars {
     hovered_url: RefCell<Option<(PaneId, Vec<(usize, u16, u16)>, String)>>,
     /// Whether Cmd key is currently held (for URL hover detection)
     cmd_held: Cell<bool>,
+    /// The pointer position and content the URL hover was computed against:
+    /// `tick` re-runs the hover when output or a scroll moved the text under a
+    /// still pointer (`refresh_stale_url_hover`).
+    url_hover_tracker: RefCell<crate::input::HoverTracker>,
     /// Terminal input from AppKit events, for the focused pane (or the pane
     /// under the pointer): composition, drag auto-scroll, scroll axis lock.
     input: AppKitInput,
@@ -151,28 +156,10 @@ pub struct KovaViewIvars {
     pane_switcher: RefCell<Option<PaneSwitcherState>>,
     /// Highlight a pane after a search-palette jump (decremented per tick).
     pane_flash: RefCell<Option<PaneFlash>>,
-    /// Deferred PTY winsize restore after a Cmd+R nudge (decremented per tick).
-    pty_restore: RefCell<Vec<PtyRestore>>,
-    /// Recent pane sizes (bounded history per pane) for round-trip
-    /// detection: a rapid return to ANY recently-seen size can coalesce the
-    /// SIGWINCHs — the child reads an unchanged winsize and skips its
-    /// repaint while our grid went through a lossy reflow round-trip.
-    recent_resizes: RefCell<std::collections::HashMap<PaneId, Vec<((u16, u16), std::time::Instant)>>>,
-    /// Debounce countdown (frames) per pane until a post-resize robust repaint
-    /// fires. Reset on every resize; when it hits 0 (the resize burst has
-    /// settled) Kova runs the Cmd+R repaint (soft_reset + winsize nudge) once,
-    /// so a differential TUI (Claude Code) fully repaints against a clean
-    /// state instead of leaving stale blank bands after a resize.
-    resize_settle: RefCell<std::collections::HashMap<PaneId, u32>>,
-    /// Countdown (frames) per pane until a post-nudge-restore hole check runs:
-    /// the app may answer the restore SIGWINCH with a clear-screen followed by
-    /// a PARTIAL differential repaint (skipping rows it wrongly believes
-    /// unchanged), leaving a permanent blank band. ~0.5s after each restore we
-    /// scan the grid and force another repaint if a band is found.
-    post_restore_checks: RefCell<Vec<PtyRestore>>,
-    /// Band-repair repaints already fired per pane since its last real resize,
-    /// bounding the nudge → broken frame → re-nudge loop (see MAX_BAND_REPAIRS).
-    band_repair_attempts: RefCell<std::collections::HashMap<PaneId, u32>>,
+    /// The repairs that follow a resize or a Cmd+R nudge: deferred winsize
+    /// restore, round-trip nudge, debounced settle repaint, post-restore hole
+    /// check (`crate::resize_repair`, shared with the library's panes).
+    resize_repair: RefCell<ResizeRepair>,
     /// Original `SavedTab` for tabs that are still placeholders or whose
     /// deferred restoration failed. Looked up by `TabId` at save time so we
     /// snapshot the placeholder's *original* data rather than its empty live
@@ -256,16 +243,6 @@ fn flash_label_parts(cwd: &str, home: &str) -> (String, String) {
     }
 }
 
-/// Pending restore of a PTY winsize after the Cmd+R repaint nudge.
-/// The restore must NOT happen back-to-back with the nudge: two immediate
-/// TIOCSWINSZ calls coalesce their SIGWINCHs, and the foreground program
-/// then reads a winsize identical to its cached one — programs that compare
-/// old == new size skip the redraw entirely.
-#[derive(Clone, Copy)]
-struct PtyRestore {
-    pane_id: PaneId,
-    remaining_frames: u32,
-}
 
 
 
@@ -518,7 +495,14 @@ define_class!(
 
             // When recent projects overlay is shown, route keys through the overlay handler
             if self.ivars().recent_projects.borrow().is_some() {
-                self.handle_recent_projects_key(event);
+                if matches!(keybindings.window_map.get(&combo), Some(Action::Paste)) {
+                    let pasteboard = NSPasteboard::generalPasteboard();
+                    if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+                        self.paste_into_recent_projects(&text.to_string());
+                    }
+                } else {
+                    self.handle_recent_projects_key(event);
+                }
                 return objc2::runtime::Bool::YES;
             }
 
@@ -965,6 +949,7 @@ impl KovaView {
             drag_tab: Cell::new(None),
             hovered_url: RefCell::new(None),
             cmd_held: Cell::new(false),
+            url_hover_tracker: RefCell::new(crate::input::HoverTracker::default()),
             input: AppKitInput::new(),
             closing: Cell::new(false),
             skip_session_save: Cell::new(false),
@@ -993,11 +978,7 @@ impl KovaView {
             search_palette: RefCell::new(None),
             pane_switcher: RefCell::new(None),
             pane_flash: RefCell::new(None),
-            pty_restore: RefCell::new(Vec::new()),
-            recent_resizes: RefCell::new(std::collections::HashMap::new()),
-            resize_settle: RefCell::new(std::collections::HashMap::new()),
-            post_restore_checks: RefCell::new(Vec::new()),
-            band_repair_attempts: RefCell::new(std::collections::HashMap::new()),
+            resize_repair: RefCell::new(ResizeRepair::default()),
             tab_backup: RefCell::new(std::collections::HashMap::new()),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -1141,18 +1122,11 @@ impl KovaView {
             term.soft_reset();
             term.reset_rows_touched();
         }
-        let nudged = if rows > 1 { rows - 1 } else { rows + 1 };
-        pane.pty.resize(cols, nudged);
+        pane.pty.resize(cols, crate::resize_repair::nudged_rows(rows));
         // ~50ms @60fps before restoring the real winsize, so the foreground
-        // program sees two distinct SIGWINCHs with two distinct sizes.
-        {
-            // One slot per pane: a second Cmd+R re-arms its own pane's restore
-            // without dropping another pane's pending restore (a dropped
-            // restore would leave that PTY one row short permanently).
-            let mut restores = self.ivars().pty_restore.borrow_mut();
-            restores.retain(|r| r.pane_id != pane_id);
-            restores.push(PtyRestore { pane_id, remaining_frames: 3 });
-        }
+        // program sees two distinct SIGWINCHs with two distinct sizes. One
+        // slot per pane: a second Cmd+R re-arms its own pane's restore only.
+        self.ivars().resize_repair.borrow_mut().schedule_restore(pane_id);
         self.set_pane_flash(pane_id, 20, None);
     }
 
@@ -1213,7 +1187,38 @@ impl KovaView {
         let modifiers = event.modifierFlags();
         let cmd = modifiers.contains(NSEventModifierFlags::Command);
         self.ivars().cmd_held.set(cmd);
+        let (px, py) = self.event_to_pixel(event);
+        self.update_hovered_url_at(cmd, px, py);
+        let stamp = if self.ivars().hovered_url.borrow().is_some() { self.url_hover_stamp_at(px, py) } else { None };
+        self.ivars().url_hover_tracker.borrow_mut().seen((px, py), stamp);
+    }
 
+    /// What the cells under `(px, py)` depend on (`input::HoverStamp`): the
+    /// pane there, its content generation, its scroll and its viewport.
+    fn url_hover_stamp_at(&self, px: f32, py: f32) -> Option<crate::input::HoverStamp> {
+        let tabs = self.ivars().tabs.borrow();
+        let tab = tabs.get(self.ivars().active_tab.get())?;
+        let (pane, vp) = tab.hit_test(px, py, self.panes_viewport_for_tab(tab))?;
+        let term = pane.terminal.read();
+        Some(crate::input::HoverStamp::of(&term, [vp.x, vp.y, vp.width, vp.height]))
+    }
+
+    /// Once per tick: when output, a scroll or a layout change moved the text
+    /// under a still pointer, compute the URL hover again at the last pointer
+    /// position, so the underline never stays on text that slid under it.
+    /// Free when nothing is hovered or nothing changed.
+    pub(super) fn refresh_stale_url_hover(&self) {
+        let hovering = self.ivars().hovered_url.borrow().is_some();
+        let point = self.ivars().url_hover_tracker.borrow_mut()
+            .recheck(hovering, |(px, py)| self.url_hover_stamp_at(px, py));
+        if let Some((px, py)) = point {
+            // A hover only exists while Cmd is held (`flagsChanged:` drops it).
+            self.update_hovered_url_at(true, px, py);
+        }
+    }
+
+    /// The hover update at a pixel position, `cmd` telling whether Cmd is held.
+    fn update_hovered_url_at(&self, cmd: bool, px: f32, py: f32) {
         if !cmd {
             let had_hover = self.ivars().hovered_url.borrow().is_some();
             if had_hover {
@@ -1224,7 +1229,6 @@ impl KovaView {
             return;
         }
 
-        let (px, py) = self.event_to_pixel(event);
         let tabs = self.ivars().tabs.borrow();
         let idx = self.ivars().active_tab.get();
         let tab = match tabs.get(idx) {
@@ -1252,7 +1256,9 @@ impl KovaView {
             let term = pane.terminal.read();
             if let Some((segments, url)) = term.url_at(visible_row, col) {
                 let old = self.ivars().hovered_url.borrow().clone();
-                let changed = old.as_ref().map_or(true, |o| o.1 != segments);
+                // Same cells, other text (output slid another URL under a
+                // still pointer) is a new hover too: Cmd+click opens `url`.
+                let changed = old.as_ref().map_or(true, |o| o.0 != pane.id || o.1 != segments || o.2 != url);
                 if changed {
                     *self.ivars().hovered_url.borrow_mut() = Some((pane.id, segments, url));
                     NSCursor::pointingHandCursor().set();
@@ -1681,12 +1687,7 @@ impl KovaView {
                 // If filter is active, copy all filtered lines
                 let filter = self.ivars().filter.borrow();
                 if let Some(state) = filter.as_ref() {
-                    if !state.matches.is_empty() {
-                        let mut text = String::new();
-                        for (i, m) in state.matches.iter().enumerate() {
-                            if i > 0 { text.push('\n'); }
-                            text.push_str(&m.text);
-                        }
+                    if let Some(text) = overlays::filter_copy_text(state) {
                         drop(filter);
                         copy_to_pasteboard(&text);
                         // Close filter after copying — through close_filter, so
@@ -2225,22 +2226,6 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, act
 }
 
 
-/// Minimum height (rows) of an interior blank band before it is treated as a
-/// hole worth repairing. Real holes span dozens of rows; small gaps are
-/// normal UI spacing.
-const BAND_MIN_ROWS: usize = 8;
-/// Row-coverage fraction above which the settle nudge is skipped: the app
-/// demonstrably repainted (almost) the whole screen since the last winsize
-/// change, so nudging again is pure risk — the winsize flap it causes can
-/// make Claude Code emit a clear-screen followed by a partial repaint (the
-/// hole, see notes/display-glitches.md round 5).
-const SETTLE_SKIP_COVERAGE: f32 = 0.8;
-/// Frames (~0.5s at 60fps) after a winsize restore before scanning the grid
-/// for a leftover hole.
-const POST_RESTORE_CHECK_FRAMES: u32 = 30;
-/// Max automatic band-repair repaints per pane between real resizes, so a
-/// program that keeps answering nudges with broken frames can't loop us.
-const MAX_BAND_REPAIRS: u32 = 2;
 
 
 

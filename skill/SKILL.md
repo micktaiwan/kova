@@ -104,6 +104,10 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
   without `pane_id` the click only brings Kova forward. Kova posts it itself because only Kova can
   act on the click (`terminal-notifier --execute` still uses an API macOS removed, so its command
   never runs).
+- **From a pane of a library host** (an app embedding Kova), `KOVA_SOCKET` names that host: it
+  answers the pane commands, `subscribe` (same events; one tab per pane, `focus` follows the
+  pane that has the keyboard in the host) and `notify` (handed to the host, which posts it; an
+  error when the host registered no handler). Window, layout and `ask` commands are Kova.app's.
 
 ## Reading `list-panes`
 

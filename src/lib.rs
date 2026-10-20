@@ -29,6 +29,7 @@ mod pane_history;
 mod raf;
 mod recent_projects;
 mod renderer;
+mod resize_repair;
 mod search_history;
 mod surface;
 mod tab_colors;

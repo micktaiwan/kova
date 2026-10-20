@@ -188,7 +188,13 @@ pub struct RecentProjectEntry {
 
 /// Data passed to the renderer for drawing recent projects overlay.
 pub struct RecentProjectsRenderData<'a> {
+    /// The rows the filter keeps.
     pub entries: &'a [&'a RecentProjectEntry],
+    /// Filter typed in the input field, and the caret in it (in chars).
+    pub query: &'a str,
+    pub cursor: usize,
+    /// Closed tabs before filtering, to tell "none at all" from "none match".
+    pub total: usize,
     pub selected: usize,
     pub scroll: usize,
 }
@@ -1655,99 +1661,7 @@ impl Renderer {
         vp: &PaneViewport,
         filter: &FilterRenderData,
     ) {
-        let cell_w = self.ctx.atlas.cell_width;
-        let cell_h = self.ctx.atlas.cell_height;
-
-        // 1. Semi-transparent dark overlay covering the entire pane
-        push_bg_quad_alpha(vertices, vp.x, vp.y, vp.width, vp.height, [0.0, 0.0, 0.0], 0.85);
-
-        let no_bg = [0.0, 0.0, 0.0, 0.0];
-
-        // 2. Search bar background
-        let bar_bg = [0.2, 0.2, 0.25];
-        push_bg_quad(vertices, vp.x, vp.y, vp.width, cell_h, bar_bg);
-
-        // 3. Search bar text: "/ query▏"
-        let bar_text = format!("/ {}▏", &filter.query);
-        let bar_fg = [1.0, 0.8, 0.2, 1.0]; // accent yellow
-        self.ctx.render_status_text(vertices, &bar_text, vp.x + self.ctx.h_padding(), vp.y, vp.x + vp.width - cell_w, bar_fg, no_bg);
-
-        // Match count — or, on an empty query, how to recall an earlier one.
-        let count_text = match &filter.hint {
-            Some(h) => h.clone(),
-            None => format!("{} matches", filter.matches.len()),
-        };
-        let count_fg = [0.6, 0.6, 0.6, 1.0];
-        let count_w = count_text.chars().count() as f32 * cell_w;
-        self.ctx.render_status_text(vertices, &count_text, vp.x + vp.width - count_w - self.ctx.h_padding(), vp.y, vp.x + vp.width, count_fg, no_bg);
-
-        // 4. List matched lines — truncate text to visible columns to limit vertices
-        let max_visible = ((vp.height / cell_h).floor() as usize).saturating_sub(1);
-        let match_fg = [0.85, 0.85, 0.85, 1.0];
-        let highlight_fg = [1.0, 0.8, 0.2, 1.0];
-        let query_lower = filter.query.to_lowercase();
-        let max_chars = ((vp.width - 2.0 * self.ctx.h_padding()) / cell_w) as usize;
-
-        for (i, m) in filter.matches.iter().take(max_visible).enumerate() {
-            let y = vp.y + (i + 1) as f32 * cell_h;
-            let max_x = vp.x + vp.width - self.ctx.h_padding();
-
-            // Line number prefix
-            let prefix = format!("{:>6}: ", m.abs_line);
-            let prefix_fg = [0.5, 0.5, 0.5, 1.0];
-            let after_prefix = self.ctx.render_status_text(vertices, &prefix, vp.x + self.ctx.h_padding(), y, max_x, prefix_fg, no_bg);
-
-            // Truncate line text to what fits on screen
-            let prefix_chars = prefix.chars().count();
-            let text_limit = max_chars.saturating_sub(prefix_chars);
-            let display_text: String = m.text.chars().take(text_limit).collect();
-
-            if query_lower.is_empty() {
-                self.ctx.render_status_text(vertices, &display_text, after_prefix, y, max_x, match_fg, no_bg);
-            } else {
-                // Split text into spans: alternating normal/highlighted.
-                // to_lowercase() is not byte-length-preserving ('İ' is 2
-                // bytes, lowercases to 3), so byte offsets found in the
-                // lowercased copy can't slice display_text directly — build
-                // a map from each text_lower byte back to the byte offset of
-                // its source char in display_text.
-                let mut text_lower = String::with_capacity(display_text.len());
-                let mut lower_to_orig: Vec<usize> = Vec::with_capacity(display_text.len() + 1);
-                for (orig_idx, ch) in display_text.char_indices() {
-                    for lc in ch.to_lowercase() {
-                        text_lower.push(lc);
-                        lower_to_orig.resize(text_lower.len(), orig_idx);
-                    }
-                }
-                lower_to_orig.push(display_text.len());
-
-                let mut spans: Vec<(&str, bool)> = Vec::new();
-                let mut pos = 0; // byte position in text_lower
-                while pos < text_lower.len() {
-                    if let Some(found) = text_lower[pos..].find(&query_lower) {
-                        let m_start = pos + found;
-                        let m_end = m_start + query_lower.len();
-                        let o_pos = lower_to_orig[pos];
-                        let o_start = lower_to_orig[m_start];
-                        let o_end = lower_to_orig[m_end];
-                        if o_start > o_pos {
-                            spans.push((&display_text[o_pos..o_start], false));
-                        }
-                        spans.push((&display_text[o_start..o_end], true));
-                        pos = m_end;
-                    } else {
-                        spans.push((&display_text[lower_to_orig[pos]..], false));
-                        break;
-                    }
-                }
-
-                let mut x = after_prefix;
-                for (span, is_hl) in spans {
-                    let fg = if is_hl { highlight_fg } else { match_fg };
-                    x = self.ctx.render_status_text(vertices, span, x, y, max_x, fg, no_bg);
-                }
-            }
-        }
+        build_filter_overlay(&mut self.ctx, vertices, vp, filter);
     }
 
     pub fn rebuild_atlas(&mut self, scale: f64) {
@@ -2406,6 +2320,28 @@ impl Renderer {
         self.ctx.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
         y += scaled_cell_h * 2.0;
 
+        let left_margin = scaled_cell_w * 3.0;
+        let right_margin = viewport_w - scaled_cell_w * 3.0;
+
+        // Filter input: same box as the search palette's, focused on open.
+        let input_h = row_height;
+        push_bg_quad(vertices, left_margin - scaled_cell_w, y, right_margin - left_margin + scaled_cell_w * 2.0, input_h, [0.18, 0.18, 0.22]);
+        let prompt = "› ";
+        let input_text_y = y + (input_h - scaled_cell_h) / 2.0;
+        self.ctx.render_text(vertices, prompt, left_margin, input_text_y, right_margin, dim_fg, no_bg, body_scale);
+        let prompt_w = prompt.chars().count() as f32 * scaled_cell_w;
+        let visible_chars = ((right_margin - left_margin - prompt_w) / scaled_cell_w).floor().max(1.0) as usize;
+        let input_scroll = input_scroll(data.cursor, visible_chars);
+        if data.query.is_empty() {
+            self.ctx.render_text(vertices, "Type to filter by name or path", left_margin + prompt_w, input_text_y, right_margin, dim_fg, no_bg, body_scale);
+        } else {
+            let shown: String = data.query.chars().skip(input_scroll).collect();
+            self.ctx.render_text(vertices, &shown, left_margin + prompt_w, input_text_y, right_margin, label_fg, no_bg, body_scale);
+        }
+        let caret_x = left_margin + prompt_w + ((data.cursor - input_scroll) as f32) * scaled_cell_w;
+        push_bg_quad(vertices, caret_x, input_text_y, 1.5, scaled_cell_h, [1.0, 1.0, 1.0]);
+        y += input_h + scaled_cell_h;
+
         let content_top = y;
         let content_bottom = viewport_h - cell_h * 2.0;
         let max_visible = ((content_bottom - content_top) / row_height) as usize;
@@ -2417,11 +2353,8 @@ impl Renderer {
             data.scroll
         };
 
-        let left_margin = scaled_cell_w * 3.0;
-        let right_margin = viewport_w - scaled_cell_w * 3.0;
-
         if data.entries.is_empty() {
-            let msg = "No closed tabs to reopen";
+            let msg = if data.total == 0 { "No closed tabs to reopen" } else { "No closed tab matches" };
             let msg_w = msg.chars().count() as f32 * scaled_cell_w;
             let msg_x = (viewport_w - msg_w) / 2.0;
             self.ctx.render_text(vertices, msg, msg_x, content_top + row_height, viewport_w, dim_fg, no_bg, body_scale);
@@ -2780,6 +2713,111 @@ pub(super) fn fade_toward(c: [f32; 3], bg: [f32; 3], t: f32) -> [f32; 3] {
         c[1] + (bg[1] - c[1]) * t,
         c[2] + (bg[2] - c[2]) * t,
     ]
+}
+
+/// The Ctrl+F filter overlay over the pane at `vp`: a dark veil, the query
+/// bar with the match count (or the recall hint), then one row per match,
+/// the query highlighted. Kova.app draws it over its focused pane, the
+/// library over its pane alone (`layer::LayerRenderer`).
+pub(super) fn build_filter_overlay(
+    ctx: &mut RenderContext,
+    vertices: &mut Vec<Vertex>,
+    vp: &PaneViewport,
+    filter: &FilterRenderData,
+) {
+    let cell_w = ctx.atlas.cell_width;
+    let cell_h = ctx.atlas.cell_height;
+
+    // 1. Semi-transparent dark overlay covering the entire pane
+    push_bg_quad_alpha(vertices, vp.x, vp.y, vp.width, vp.height, [0.0, 0.0, 0.0], 0.85);
+
+    let no_bg = [0.0, 0.0, 0.0, 0.0];
+
+    // 2. Search bar background
+    let bar_bg = [0.2, 0.2, 0.25];
+    push_bg_quad(vertices, vp.x, vp.y, vp.width, cell_h, bar_bg);
+
+    // 3. Search bar text: "/ query▏"
+    let bar_text = format!("/ {}▏", &filter.query);
+    let bar_fg = [1.0, 0.8, 0.2, 1.0]; // accent yellow
+    ctx.render_status_text(vertices, &bar_text, vp.x + ctx.h_padding(), vp.y, vp.x + vp.width - cell_w, bar_fg, no_bg);
+
+    // Match count — or, on an empty query, how to recall an earlier one.
+    let count_text = match &filter.hint {
+        Some(h) => h.clone(),
+        None => format!("{} matches", filter.matches.len()),
+    };
+    let count_fg = [0.6, 0.6, 0.6, 1.0];
+    let count_w = count_text.chars().count() as f32 * cell_w;
+    ctx.render_status_text(vertices, &count_text, vp.x + vp.width - count_w - ctx.h_padding(), vp.y, vp.x + vp.width, count_fg, no_bg);
+
+    // 4. List matched lines — truncate text to visible columns to limit vertices
+    let max_visible = ((vp.height / cell_h).floor() as usize).saturating_sub(1);
+    let match_fg = [0.85, 0.85, 0.85, 1.0];
+    let highlight_fg = [1.0, 0.8, 0.2, 1.0];
+    let query_lower = filter.query.to_lowercase();
+    let max_chars = ((vp.width - 2.0 * ctx.h_padding()) / cell_w) as usize;
+
+    for (i, m) in filter.matches.iter().take(max_visible).enumerate() {
+        let y = vp.y + (i + 1) as f32 * cell_h;
+        let max_x = vp.x + vp.width - ctx.h_padding();
+
+        // Line number prefix
+        let prefix = format!("{:>6}: ", m.abs_line);
+        let prefix_fg = [0.5, 0.5, 0.5, 1.0];
+        let after_prefix = ctx.render_status_text(vertices, &prefix, vp.x + ctx.h_padding(), y, max_x, prefix_fg, no_bg);
+
+        // Truncate line text to what fits on screen
+        let prefix_chars = prefix.chars().count();
+        let text_limit = max_chars.saturating_sub(prefix_chars);
+        let display_text: String = m.text.chars().take(text_limit).collect();
+
+        if query_lower.is_empty() {
+            ctx.render_status_text(vertices, &display_text, after_prefix, y, max_x, match_fg, no_bg);
+        } else {
+            // Split text into spans: alternating normal/highlighted.
+            // to_lowercase() is not byte-length-preserving ('İ' is 2
+            // bytes, lowercases to 3), so byte offsets found in the
+            // lowercased copy can't slice display_text directly — build
+            // a map from each text_lower byte back to the byte offset of
+            // its source char in display_text.
+            let mut text_lower = String::with_capacity(display_text.len());
+            let mut lower_to_orig: Vec<usize> = Vec::with_capacity(display_text.len() + 1);
+            for (orig_idx, ch) in display_text.char_indices() {
+                for lc in ch.to_lowercase() {
+                    text_lower.push(lc);
+                    lower_to_orig.resize(text_lower.len(), orig_idx);
+                }
+            }
+            lower_to_orig.push(display_text.len());
+
+            let mut spans: Vec<(&str, bool)> = Vec::new();
+            let mut pos = 0; // byte position in text_lower
+            while pos < text_lower.len() {
+                if let Some(found) = text_lower[pos..].find(&query_lower) {
+                    let m_start = pos + found;
+                    let m_end = m_start + query_lower.len();
+                    let o_pos = lower_to_orig[pos];
+                    let o_start = lower_to_orig[m_start];
+                    let o_end = lower_to_orig[m_end];
+                    if o_start > o_pos {
+                        spans.push((&display_text[o_pos..o_start], false));
+                    }
+                    spans.push((&display_text[o_start..o_end], true));
+                    pos = m_end;
+                } else {
+                    spans.push((&display_text[lower_to_orig[pos]..], false));
+                    break;
+                }
+            }
+
+            let mut x = after_prefix;
+            for (span, is_hl) in spans {
+                let fg = if is_hl { highlight_fg } else { match_fg };
+                x = ctx.render_status_text(vertices, span, x, y, max_x, fg, no_bg);
+            }
+        }
+    }
 }
 
 pub(super) fn push_bg_quad(
@@ -3556,6 +3594,44 @@ mod vertex_snapshots {
         type_lines(&mut t, &["http://a.b/c"]);
         r.hovered_url = Some(vec![(0, 0, 12), (1, 0, 3)]);
         check("hovered_url", &build(&mut r, &t, true));
+    }
+
+    /// Register a synthetic glyph for every char of `texts` (overlay text goes
+    /// through the same atlas as the cells).
+    fn fake_text(r: &mut Renderer, texts: &[&str]) {
+        for t in texts {
+            for c in t.chars() {
+                let wide = unicode_width::UnicodeWidthChar::width(c) == Some(2);
+                r.ctx.atlas.fake_glyph(c, slot(c as u32, wide));
+            }
+        }
+    }
+
+    /// The Ctrl+F filter overlay over a pane: the bar, the count (or the
+    /// recall hint), the listed lines with the query highlighted
+    /// case-insensitively — Kova.app's and the library pane's.
+    #[test]
+    fn filter_overlay() {
+        let mut r = renderer();
+        let vp = PaneViewport { x: 100.0, y: 50.0, width: 300.0, height: 90.0 };
+        let filter = FilterRenderData {
+            query: "err".into(),
+            matches: vec![
+                FilterMatch { abs_line: 3, text: "an error here".into() },
+                FilterMatch { abs_line: 12, text: "ERR \u{130}x err".into() },
+                FilterMatch { abs_line: 40, text: "third err".into() },
+                FilterMatch { abs_line: 41, text: "not shown".into() },
+            ],
+            hint: None,
+        };
+        fake_text(&mut r, &["/ err\u{258F}", "4 matches 0123456789: ", "an error here", "ERR \u{130}x err", "third", "not shown", "\u{2191} recall"]);
+        let mut vs = Vec::new();
+        r.build_filter_overlay_vertices(&mut vs, &vp, &filter);
+        check("filter_overlay", &vs);
+        let hinted = FilterRenderData { query: String::new(), matches: Vec::new(), hint: Some("\u{2191} recall".into()) };
+        let mut vs = Vec::new();
+        r.build_filter_overlay_vertices(&mut vs, &vp, &hinted);
+        check("filter_overlay_hint", &vs);
     }
 
     #[test]

@@ -16,9 +16,20 @@
  *   created with or without a view. With one, the library adds its own
  *   subview to the parent NSView you give: that view takes AppKit input
  *   itself (keys, text input and accents, mouse, scroll, Edit > Copy/Paste)
- *   and draws the pane alone into its own CAMetalLayer. The typed input
- *   functions below are for a host that routes events itself; a host using
- *   the library's view does not need them.
+ *   and draws the pane alone into its own CAMetalLayer. Two of Kova.app's
+ *   window features come with it: Cmd+hover underlines the URL under the
+ *   pointer (the status bar shows it) and Cmd+click opens it (NSWorkspace);
+ *   Ctrl+F opens Kova.app's filter over the pane (typing filters its lines,
+ *   Up/Down recall earlier queries, Enter or a click scrolls to a match,
+ *   Escape or Ctrl+F closes; Edit > Copy copies the matches, Edit > Paste
+ *   goes into the query). It opens the accent
+ *   and IME candidate window on the terminal cursor's cell, wherever the view
+ *   sits in its window. Becoming or resigning first responder tells the
+ *   program, when it turned focus events on (DEC mode 1004), with CSI I /
+ *   CSI O, once per real change; the app being activated or not plays no
+ *   part. The typed input functions below are for a host that routes events
+ *   itself; a host using the library's view does not need them (such a host
+ *   gets no focus events: there is no function for them).
  *
  * Clock
  *   Nothing runs on its own. The host calls, from its own timer (60 Hz is
@@ -44,6 +55,7 @@
 #ifndef KOVA_H
 #define KOVA_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -119,7 +131,8 @@ void *kova_pane_view(KovaPaneId pane);
 int kova_pane_set_frame(KovaPaneId pane, double x, double y, double width, double height);
 
 /* Set the grid of a pane without view (the PTY is told). -1 with a view:
- * its grid follows its frame. */
+ * its grid follows its frame. Either way a grid change arms the repairs
+ * kova_pane_tick runs after a resize. */
 int kova_pane_resize(KovaPaneId pane, uint16_t cols, uint16_t rows);
 
 /* The current grid; either pointer may be NULL. */
@@ -138,7 +151,14 @@ int kova_pane_get_size(KovaPaneId pane, uint16_t *cols, uint16_t *rows);
  * auto-scroll a selection dragged past the edge, probe the foreground
  * process / Claude session / waiting flag (every 0.5 s), the git branch of
  * the status bar (every 2 s), acknowledge bell and completion while the view
- * is focused — then what changed since the previous call (KOVA_EVENT_*).
+ * is focused, and Kova.app's repairs after a grid change: about 150 ms after
+ * the last change, unless the program already repainted most of the screen,
+ * a soft reset and a winsize one row short (SIGWINCH), the real winsize
+ * restored about 50 ms later, and a check 0.5 s after that which repeats the
+ * repaint (twice at most) if a full-screen program left a blank band; a
+ * return within 0.5 s to a size the pane just had is nudged at once. These
+ * delays are real time, whatever the host's tick rate (frames of the config's
+ * fps) — then what changed since the previous call (KOVA_EVENT_*).
  * CLOSE_REQUESTED and FOCUS_REQUESTED are requests: the library neither
  * closes nor focuses anything, the host does (kova_pane_free, showing the
  * note and making the view first responder). 0 for an unknown pane. */
@@ -173,10 +193,16 @@ typedef struct KovaKeyEvent {
 #define KOVA_KEY_COMPOSE 1 /* run it through your text input (interpretKeyEvents:),
                               then kova_pane_text for committed text or
                               kova_pane_send_key for doCommandBySelector: */
-#define KOVA_KEY_HOST    2 /* a Kova.app window key (Ctrl+F, Ctrl+Option+arrows):
-                              nothing was sent */
+#define KOVA_KEY_HOST    2 /* taken by the pane itself, nothing was sent: Ctrl+F
+                              opens or closes its filter, every key typed while
+                              the filter is open edits it, Ctrl+Option+arrows
+                              (Kova.app's virtual width) do nothing */
 
-/* A key press. Ctrl+L also clears the scrollback (not in alt-screen). */
+/* A key press. Ctrl+L also clears the scrollback (not in alt-screen). While
+ * the pane's filter is open, every key goes to it (KOVA_KEY_HOST). A pane
+ * created without a view opens the filter too, but nothing draws it: a
+ * viewless host that forwards Ctrl+F gets its keys taken until Escape or
+ * Ctrl+F closes it. */
 int kova_pane_key(KovaPaneId pane, const KovaKeyEvent *event);
 
 /* A key your text input did not turn into text: encode it for the PTY
@@ -189,7 +215,8 @@ int kova_pane_send_key(KovaPaneId pane, const KovaKeyEvent *event);
 int kova_pane_text(KovaPaneId pane, const char *utf8);
 
 /* A paste: wrapped in bracketed-paste markers when the app asked for them
- * (a terminator inside the text is stripped). Text only. */
+ * (a terminator inside the text is stripped). Text only. While the pane's
+ * filter is open, its first line goes into the filter's query instead. */
 int kova_pane_paste(KovaPaneId pane, const char *utf8);
 
 /* The text being composed (marked text); NULL or "" ends the composition.
@@ -210,8 +237,9 @@ int kova_pane_preedit(KovaPaneId pane, const char *utf8);
  * release that ends a selection copies it to the general pasteboard. -1
  * without a view (the cell size comes from it). mods: Shift, Control and
  * Option go into the mouse reports of an app that asked for them;
- * KOVA_MOD_COMMAND is ignored here and in kova_pane_scroll: Kova.app's
- * Cmd+hover / Cmd+click on a URL belongs to its window, not to the library. */
+ * KOVA_MOD_COMMAND is ignored here and in kova_pane_scroll: Cmd+hover and
+ * Cmd+click on a URL, and clicks in the open filter, are handled by the
+ * library's view only. */
 int kova_pane_mouse(KovaPaneId pane, int action, int button, uint32_t mods,
                     double x, double y, int click_count);
 
@@ -262,9 +290,21 @@ int kova_pane_is_working(KovaPaneId pane);
  * pane (tab id = pane id, window 0). Answered: list-panes, send-keys,
  * get-pane-content, count-pane-content, wait-for-completion, focus-pane and
  * close-pane / close-tab (as KOVA_EVENT_* requests), set-pane-status,
- * mark-completed, mark-started, bell, list-tabs. Everything else (window
- * and layout commands, subscribe, notify) gets an error. Requests are
- * answered only inside kova_ipc_poll. Panes created after this call get
+ * mark-completed, mark-started, bell, list-tabs, subscribe, and notify when
+ * a handler is registered (kova_set_notify_handler). Everything else
+ * (window and layout commands, ask) gets an error. Requests are answered
+ * only inside kova_ipc_poll.
+ *
+ * subscribe streams the same events as Kova.app (docs/ipc.md): the focused
+ * pane is the one whose library view is the first responder of the key
+ * window; "app_active" is whether the host app is the active app.
+ * focus/"no-key-window" therefore means the host is frontmost but no library
+ * view has the keyboard (the user is elsewhere in the host), "app-inactive"
+ * that the host went to the background; moving between two panes reads
+ * "tab" (one tab per pane). The pane sweep runs every fps/4 calls of
+ * kova_ipc_poll (fps from Kova's config): about 4 Hz when it is called at
+ * that rate. Events are queued on this thread and written by the
+ * connection's own thread, never inside kova_ipc_poll. Panes created after this call get
  * KOVA_SOCKET=path. The socket is bound before this returns (a stale file at
  * path is replaced, the new one is owner-only). -1 when this thread already
  * serves a socket or the bind fails (missing directory, path too long…). */
@@ -279,6 +319,22 @@ int kova_ipc_poll(void);
 
 /* Stop answering and remove the socket file. */
 int kova_ipc_stop(void);
+
+/* Posts a notification the socket's notify asked for: pane is the pane it
+ * is about (0: none, not checked: it may be gone), title defaults to "Kova",
+ * message is the request's (required, possibly empty). The
+ * strings are valid for the call only. The host posts the notification
+ * itself and handles its click (showing the document that holds the pane,
+ * making its view first responder): the library posts nothing. */
+typedef void (*KovaNotifyHandler)(void *ctx, KovaPaneId pane, const char *title,
+                                  const char *message, bool sound);
+
+/* Register the handler the socket's notify requests go to, for this thread
+ * (NULL removes it; ctx is passed back as is). It is called from
+ * kova_ipc_poll, after the request was answered "ok", once per
+ * notification, outside any library lock: it may call the library. Without
+ * a handler, notify answers "notify is not supported by this host". */
+void kova_set_notify_handler(KovaNotifyHandler handler, void *ctx);
 
 #ifdef __cplusplus
 }

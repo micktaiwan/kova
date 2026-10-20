@@ -16,14 +16,7 @@ impl KovaView {
         let rel_y = py - vp.y;
 
         let term = pane.terminal.read();
-        let y_offset = term.y_offset_rows();
-        let col = (rel_x / cell_w).floor() as i32;
-        let visible_row = (rel_y / cell_h).floor() as i32 - y_offset as i32;
-
-        if visible_row < 0 || col < 0 || visible_row >= term.rows as i32 {
-            return None;
-        }
-        Some((visible_row as usize, (col as u16).min(term.cols.saturating_sub(1))))
+        crate::input::visible_row_col(rel_x, rel_y, (cell_w, cell_h), term.y_offset_rows(), term.rows, term.cols)
     }
 
     /// Viewport for panes (below tab bar), reading scroll state from the active tab.

@@ -3,8 +3,11 @@
 //!
 //! Kova.app keeps its own path (`Renderer::render_panes`): one layer per
 //! window, every pane and the window chrome in one image. Here a layer holds a
-//! single pane and nothing else — no tab bar, no global status bar, no overlay
-//! — and the pane is built by the very same `PaneRenderer` Kova.app uses.
+//! single pane and nothing else — no tab bar, no global status bar — and the
+//! pane is built by the very same `PaneRenderer` Kova.app uses. Two things of
+//! Kova.app's window come along, drawn by the same code: the Cmd+hover URL
+//! underline, and the Ctrl+F filter overlay (`build_filter_overlay`), which
+//! takes the whole layer while it is open, as it takes Kova.app's focused pane.
 //!
 //! What every library pane of the process shares is a `SharedRender` per
 //! display scale: the Metal device, command queue, pipeline, glyph atlas
@@ -34,7 +37,7 @@ use super::blink::CursorBlink;
 use super::context::RenderContext;
 use super::pane_renderer::{PaneDrawKey, PaneRenderer, PaneStyle};
 use super::vertex::Vertex;
-use super::PaneRenderData;
+use super::{FilterRenderData, PaneRenderData};
 use crate::config::Config;
 
 /// The pixel format of every library layer (the same as Kova.app's).
@@ -90,6 +93,17 @@ fn shared_for(scale: f64, config: &Config) -> Option<Rc<RefCell<SharedRender>>> 
 #[cfg(test)]
 pub fn live_shared_contexts() -> usize {
     SHARED.with(|table| table.borrow().iter().filter(|w| w.strong_count() > 0).count())
+}
+
+/// What a library pane shows over its terminal, besides the grid itself.
+#[derive(Default, Clone, Copy)]
+pub struct PaneExtras<'a> {
+    /// The URL under the pointer while Cmd is held: its segments
+    /// (`(visible_row, col_start, col_end)`) and its text, shown in the
+    /// status bar as Kova.app does.
+    pub hovered_url: Option<(&'a [(usize, u16, u16)], &'a str)>,
+    /// The Ctrl+F filter, when it is open.
+    pub filter: Option<&'a FilterRenderData>,
 }
 
 /// Draws one pane into one layer. Owned by the library pane; dropping it
@@ -177,35 +191,40 @@ impl LayerRenderer {
         pane.is_focused.then(|| pane.terminal.read().cursor_move_epoch.load(Ordering::Relaxed))
     }
 
-    fn draw_key(&self, pane: &PaneRenderData, blink_on: bool) -> PaneDrawKey {
-        PaneRenderer::draw_key(pane, None, None, blink_on, self.shared.borrow().ctx.atlas.generation)
+    fn draw_key(&self, pane: &PaneRenderData, extras: &PaneExtras, blink_on: bool) -> PaneDrawKey {
+        let (segments, text) = split_hover(extras);
+        PaneRenderer::draw_key(pane, segments, text, blink_on, self.shared.borrow().ctx.atlas.generation)
     }
 
     /// Whether the next `draw` would present a frame: the terminal changed,
     /// something its build reads moved (cursor blink, focus, size, the atlas
-    /// another pane grew…), the shell is still loading, or a synchronized
-    /// update is in progress. Never consumes anything.
-    pub fn wants_frame(&self, pane: &PaneRenderData) -> bool {
+    /// another pane grew, the hovered URL…), the shell is still loading, a
+    /// synchronized update is in progress, or the filter is open (redrawn on
+    /// every frame, as Kova.app does). Never consumes anything.
+    pub fn wants_frame(&self, pane: &PaneRenderData, extras: &PaneExtras) -> bool {
         let blink_on = self.blink.peek(Instant::now(), Self::cursor_epoch(pane), self.cursor_blink_frames, self.frame_rate);
-        self.wants_frame_with(pane, blink_on)
+        self.wants_frame_with(pane, extras, blink_on)
     }
 
-    fn wants_frame_with(&self, pane: &PaneRenderData, blink_on: bool) -> bool {
+    fn wants_frame_with(&self, pane: &PaneRenderData, extras: &PaneExtras, blink_on: bool) -> bool {
+        if extras.filter.is_some() {
+            return true;
+        }
         if !pane.shell_ready || !self.pane.is_built() || PaneRenderer::in_sync_window(pane) {
             return true;
         }
         if pane.terminal.read().dirty.load(Ordering::Relaxed) {
             return true;
         }
-        self.pane.key_changed(&self.draw_key(pane, blink_on))
+        self.pane.key_changed(&self.draw_key(pane, extras, blink_on))
     }
 
     /// Draw `pane` into `layer` when `wants_frame` (or `force`) says so, and
     /// present it. The pane fills the whole drawable. Returns whether a frame
     /// was presented (false: nothing changed, or no drawable was available).
-    pub fn draw(&mut self, layer: &CAMetalLayer, pane: &PaneRenderData, force: bool) -> bool {
+    pub fn draw(&mut self, layer: &CAMetalLayer, pane: &PaneRenderData, extras: &PaneExtras, force: bool) -> bool {
         let (blink_on, _) = self.blink.sample(Instant::now(), Self::cursor_epoch(pane), self.cursor_blink_frames, self.frame_rate);
-        if !force && !self.wants_frame_with(pane, blink_on) {
+        if !force && !self.wants_frame_with(pane, extras, blink_on) {
             return false;
         }
         let Some(drawable) = layer.nextDrawable() else { return false };
@@ -227,23 +246,33 @@ impl LayerRenderer {
 
         let mut shared = self.shared.borrow_mut();
         let SharedRender { ctx, style, .. } = &mut *shared;
-        let mut zones = Vec::new();
-        // Retried when the build rasterized new glyphs: UVs computed before the
-        // atlas changed would point into the wrong place (as in Kova.app's
-        // `rebuild_pane_draws`).
-        for _pass in 0..3 {
-            let generation = ctx.atlas.generation;
-            let key = PaneRenderer::draw_key(&pane, None, None, blink_on, generation);
-            zones.clear();
-            self.pane.prepare(ctx, style, &pane, None, None, key, in_sync, dirty, &mut zones);
-            if ctx.atlas.generation == generation {
-                break;
-            }
+        let mut overlay: Vec<Vertex> = Vec::new();
+        if let Some(filter) = extras.filter {
+            // The overlay covers the pane, which is not built under it (as
+            // Kova.app skips its focused pane): the cache is dropped so the
+            // grid is rebuilt once the filter closes.
             self.pane = PaneRenderer::default();
+            super::build_filter_overlay(ctx, &mut overlay, &pane.viewport, filter);
+        } else {
+            let (segments, text) = split_hover(extras);
+            let mut zones = Vec::new();
+            // Retried when the build rasterized new glyphs: UVs computed before the
+            // atlas changed would point into the wrong place (as in Kova.app's
+            // `rebuild_pane_draws`).
+            for _pass in 0..3 {
+                let generation = ctx.atlas.generation;
+                let key = PaneRenderer::draw_key(&pane, segments, text, blink_on, generation);
+                zones.clear();
+                self.pane.prepare(ctx, style, &pane, segments, text, key, in_sync, dirty, &mut zones);
+                if ctx.atlas.generation == generation {
+                    break;
+                }
+                self.pane = PaneRenderer::default();
+            }
         }
         ctx.sync_atlas_size();
 
-        let verts: &[Vertex] = self.pane.vertices();
+        let verts: &[Vertex] = if extras.filter.is_some() { &overlay } else { self.pane.vertices() };
         let viewport = [viewport_w, viewport_h];
         if viewport != self.last_viewport {
             self.last_viewport = viewport;
@@ -315,6 +344,14 @@ impl LayerRenderer {
         cmd_buf.presentDrawable(mtl_drawable);
         cmd_buf.commit();
         true
+    }
+}
+
+/// The hover of `extras` as the pane build takes it: segments and text apart.
+fn split_hover<'a>(extras: &PaneExtras<'a>) -> (Option<&'a [(usize, u16, u16)]>, Option<&'a str>) {
+    match extras.hovered_url {
+        Some((segments, text)) => (Some(segments), Some(text)),
+        None => (None, None),
     }
 }
 

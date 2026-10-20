@@ -263,7 +263,8 @@ pub extern "C" fn kova_pane_draw(pane: u32, force: c_int) -> c_int {
 
 // ─── Input ──────────────────────────────────────────────────────────────────
 
-/// A key press: `KOVA_KEY_SENT` (0), `KOVA_KEY_COMPOSE` (1), `KOVA_KEY_HOST` (2).
+/// A key press: `KOVA_KEY_SENT` (0), `KOVA_KEY_COMPOSE` (1), `KOVA_KEY_HOST`
+/// (2: taken by the pane's filter, or a Kova.app window key; nothing sent).
 ///
 /// # Safety
 /// `event` is valid, its strings NULL or NUL-terminated.
@@ -271,7 +272,12 @@ pub extern "C" fn kova_pane_draw(pane: u32, force: c_int) -> c_int {
 pub unsafe extern "C" fn kova_pane_key(pane: u32, event: *const KovaKeyEvent) -> c_int {
     guard("kova_pane_key", -1, || {
         let (Some(p), Some(ev)) = (embed::find(pane), unsafe { event.as_ref() }) else { return -1 };
-        match p.key(&unsafe { key_event(ev) }) {
+        let key = unsafe { key_event(ev) };
+        // The view's order: the filter (or Ctrl+F opening it) first.
+        if p.filter_key(&key) {
+            return 2;
+        }
+        match p.key(&key) {
             KeyResult::Sent => 0,
             KeyResult::Compose => 1,
             KeyResult::Host(_) => 2,
@@ -313,7 +319,10 @@ pub unsafe extern "C" fn kova_pane_text(pane: u32, utf8: *const c_char) -> c_int
 pub unsafe extern "C" fn kova_pane_paste(pane: u32, utf8: *const c_char) -> c_int {
     guard("kova_pane_paste", -1, || {
         let (Some(p), Some(t)) = (embed::find(pane), unsafe { text(utf8) }) else { return -1 };
-        p.surface.paste(&t);
+        // The open filter owns the paste, as with the view's Edit > Paste.
+        if !p.paste_into_filter(&t) {
+            p.surface.paste(&t);
+        }
         0
     })
 }
@@ -452,6 +461,31 @@ pub extern "C" fn kova_ipc_stop() -> c_int {
     guard("kova_ipc_stop", -1, || done(embed::ipc_stop()))
 }
 
+/// `KovaNotifyHandler` of `include/kova.h`: `(ctx, pane or 0, title,
+/// message, sound)`, the strings valid for the call only.
+pub type KovaNotifyHandler = extern "C" fn(*mut c_void, u32, *const c_char, *const c_char, bool);
+
+/// A Rust string for the length of a C call; an interior NUL (never sent by
+/// the socket's JSON parser, but possible in principle) ends it there.
+fn c_string(s: &str) -> CString {
+    let end = s.find('\0').unwrap_or(s.len());
+    CString::new(&s[..end]).unwrap_or_default()
+}
+
+/// Register the handler the socket's `notify` requests go to (NULL removes
+/// it). Called from `kova_ipc_poll`, on this thread, once per notification.
+#[unsafe(no_mangle)]
+pub extern "C" fn kova_set_notify_handler(handler: Option<KovaNotifyHandler>, ctx: *mut c_void) {
+    guard("kova_set_notify_handler", (), || {
+        embed::set_notify_handler(handler.map(|f| -> embed::NotifyHandler {
+            std::rc::Rc::new(move |pane: Option<u32>, title: &str, message: &str, sound: bool| {
+                let (title, message) = (c_string(title), c_string(message));
+                f(ctx, pane.unwrap_or(0), title.as_ptr(), message.as_ptr(), sound);
+            })
+        }))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     //! The C API driven through its `extern "C"` functions, as a host calls
@@ -588,10 +622,13 @@ mod tests {
     #[test]
     fn host_keys_and_text_paste_preedit() {
         let (pane, reader) = embed::create_capture(80, 24);
-        // Ctrl+F belongs to Kova.app's window: nothing reaches the PTY.
+        // Ctrl+F opens (then closes) the pane's filter: nothing reaches the PTY.
         let (f, ctrl_f) = (c("\u{6}"), c("f"));
         let ev = KovaKeyEvent { keycode: 0x03, mods: KOVA_MOD_CONTROL, characters: f.as_ptr(), characters_ignoring_modifiers: ctrl_f.as_ptr() };
         assert_eq!(unsafe { kova_pane_key(pane, &ev) }, 2);
+        assert!(embed::find(pane).unwrap().filter_open());
+        assert_eq!(unsafe { kova_pane_key(pane, &ev) }, 2);
+        assert!(!embed::find(pane).unwrap().filter_open());
         assert!(drain(&reader).is_empty());
 
         let typed = c("ls -la é");
@@ -895,6 +932,116 @@ mod tests {
         assert_eq!(answer["data"]["completed"], true);
         assert_eq!(answer["data"]["timed_out"], false);
         assert_eq!(kova_pane_free(a), 0);
+        assert_eq!(kova_ipc_stop(), 0);
+    }
+
+    /// What the notify handler below was called with.
+    type NotifyLog = std::cell::RefCell<Vec<(usize, u32, String, String, bool)>>;
+
+    extern "C" fn record_notify(ctx: *mut c_void, pane: u32, title: *const c_char, message: *const c_char, sound: bool) {
+        let log = unsafe { &*(ctx as *const NotifyLog) };
+        let s = |p: *const c_char| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+        log.borrow_mut().push((ctx as usize, pane, s(title), s(message), sound));
+    }
+
+    /// `subscribe` and `notify` over the socket of a library host: the
+    /// snapshot of this thread's panes, then a `pane-open` when one is
+    /// created; `notify` refused without a handler, handed to the handler
+    /// registered with `kova_set_notify_handler` (pane 0 = none) once
+    /// `kova_ipc_poll` answered it.
+    #[test]
+    fn the_socket_streams_events_and_hands_notifications_to_the_host() {
+        let path = socket_path("events");
+        let cpath = c(path.to_str().unwrap());
+        assert_eq!(unsafe { kova_ipc_start(cpath.as_ptr()) }, 0);
+        let (a, _reader_a) = embed::create_capture(20, 4);
+
+        let log: NotifyLog = std::cell::RefCell::new(Vec::new());
+        let ctx = &log as *const NotifyLog as *mut c_void;
+        // Commands on one connection, the event stream on another.
+        let run = |requests: Vec<String>| {
+            let client_path = path.clone();
+            let client = std::thread::spawn(move || {
+                let stream = std::os::unix::net::UnixStream::connect(&client_path).unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut answers = Vec::new();
+                for r in requests {
+                    writeln!(writer, "{r}").unwrap();
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    answers.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                }
+                answers
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !client.is_finished() {
+                assert!(std::time::Instant::now() < deadline, "client never finished");
+                kova_ipc_poll();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            client.join().unwrap()
+        };
+
+        let notify = format!(r#"{{"cmd":"notify","pane_id":{a},"title":"Claude Code","message":"done","sound":true}}"#);
+        assert_eq!(run(vec![notify.clone()])[0]["error"], "notify is not supported by this host");
+        kova_set_notify_handler(Some(record_notify), ctx);
+        let answers = run(vec![notify, r#"{"cmd":"notify","message":"bare"}"#.to_string()]);
+        assert_eq!(answers[0]["ok"], true);
+        assert_eq!(answers[1]["ok"], true);
+        kova_ipc_poll();
+        assert_eq!(
+            *log.borrow(),
+            [
+                (ctx as usize, a, "Claude Code".to_string(), "done".to_string(), true),
+                (ctx as usize, 0, "Kova".to_string(), "bare".to_string(), false),
+            ]
+        );
+        kova_set_notify_handler(None, std::ptr::null_mut());
+        assert_eq!(run(vec![r#"{"cmd":"notify","message":"x"}"#.to_string()])[0]["error"], "notify is not supported by this host");
+
+        // The subscriber: snapshot first, then events, one JSON per line.
+        let client_path = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+        std::thread::spawn(move || {
+            let stream = std::os::unix::net::UnixStream::connect(&client_path).unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            writeln!(writer, r#"{{"cmd":"subscribe","events":["pane-open","pane-close"]}}"#).unwrap();
+            for line in BufReader::new(stream).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(serde_json::from_str(&line).unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        let next = |want: &dyn Fn(&serde_json::Value) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                assert!(std::time::Instant::now() < deadline, "no such line came");
+                kova_ipc_poll();
+                if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(2)) {
+                    if want(&v) {
+                        return v;
+                    }
+                }
+            }
+        };
+        let snapshot = next(&|v| v.get("ok").is_some());
+        assert_eq!(snapshot["data"]["events"], serde_json::json!(["pane-open", "pane-close"]));
+        let ids: Vec<u64> = snapshot["data"]["panes"].as_array().unwrap().iter().map(|p| p["id"].as_u64().unwrap()).collect();
+        assert_eq!(ids, [a as u64], "this thread's panes");
+        assert!(snapshot["data"].get("app_active").is_some());
+        // Subscribers are process-wide: other tests' panes may show up too,
+        // so the lines are picked by pane id.
+        let (b, _reader_b) = embed::create_capture(20, 4);
+        let opened = next(&|v| v["event"] == "pane-open" && v["pane"]["id"].as_u64() == Some(b as u64));
+        assert_eq!(opened["pane"]["window"], 0);
+        assert_eq!(opened["pane"]["tab"], 1);
+        assert_eq!(kova_pane_free(a), 0);
+        let closed = next(&|v| v["event"] == "pane-close" && v["pane_id"].as_u64() == Some(a as u64));
+        assert_eq!(closed["tab"], 0);
+
+        assert_eq!(kova_pane_free(b), 0);
         assert_eq!(kova_ipc_stop(), 0);
     }
 }

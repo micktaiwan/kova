@@ -526,7 +526,6 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 // Restore
 // ---------------------------------------------------------------
 
-/// Restore a flat column (v4 format).
 /// The command line to pre-type into a restored pane.
 ///
 /// A pane that was running an agent when the snapshot was taken gets that
@@ -535,26 +534,47 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 /// last command happens to name, because that older line can be several
 /// restarts old while the recorded id is the conversation that was live at quit.
 ///
-/// Nothing is executed: the caller writes the command without a newline, so it
-/// waits for the user to press Enter.
+/// Nothing is executed here: the caller writes the command without a newline,
+/// so it waits for the user to press Enter — except an agent's resume line at
+/// app launch (`runs_on_launch`).
 fn restore_command(sp: &SavedPane) -> Option<String> {
+    // A refused id (see `is_safe_session_id`) leaves the pane exactly where a
+    // pane that was never running an agent lands: its own last command.
+    agent_resume_line(sp).or_else(|| sp.last_command.clone())
+}
+
+/// The resume line of the agent the pane was running at snapshot time, if any.
+fn agent_resume_line(sp: &SavedPane) -> Option<String> {
     // A file written before v6 only knew about Claude.
     let session = sp.agent_session.clone().or_else(|| {
         sp.claude_session.as_ref().map(|id| SavedAgentSession {
             agent: crate::agent_session::Agent::Claude,
             id: id.clone(),
         })
-    });
-    match session {
-        // A refused id (see `is_safe_session_id`) leaves the pane exactly where a
-        // pane that was never running an agent lands: its own last command.
-        Some(s) => crate::agent_session::resume_command(s.agent, &s.id, sp.last_command.as_deref())
-            .or_else(|| sp.last_command.clone()),
-        None => sp.last_command.clone(),
-    }
+    })?;
+    crate::agent_session::resume_command(session.agent, &session.id, sp.last_command.as_deref())
 }
 
-fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &Config) -> Option<(Column, Vec<PaneId>)> {
+/// Whether Kova presses Enter on the restored line itself, at app launch.
+///
+/// Only an agent's resume line qualifies, never a pane's last command: that one
+/// can be named by any program printing an OSC 7777 on its tty. And the resume
+/// line keeps the flags of the `claude …` that was last run, which come from the
+/// same place — so the whole line must be plain words, nothing the shell would
+/// expand or redirect (`$(…)`, backticks, `>`, quotes). Anything else waits for
+/// the user's Enter, as before.
+fn runs_on_launch(sp: &SavedPane) -> bool {
+    agent_resume_line(sp).is_some_and(|line| is_plain_command(&line))
+}
+
+fn is_plain_command(line: &str) -> bool {
+    line.chars().all(|c| c == ' ' || c.is_ascii_alphanumeric() || "-_./=:,@+".contains(c))
+}
+
+/// Restore a flat column (v4 format).
+/// `at_launch`: the tab comes back with the app (not from Cmd+O), so the
+/// agents it was running are resumed without waiting for Enter.
+fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &Config, at_launch: bool) -> Option<(Column, Vec<PaneId>)> {
     let mut panes = Vec::new();
     let mut ids = Vec::new();
     for sp in &saved.panes {
@@ -574,6 +594,9 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
                 term.last_command = Some(cmd);
             }
             term.title = sp.title.clone();
+        }
+        if at_launch && runs_on_launch(sp) {
+            pane.run_pending_command();
         }
         pane.custom_title = sp.custom_title.clone();
         pane.minimized = sp.minimized;
@@ -751,8 +774,9 @@ pub fn count_panes_in_saved_tab(tab: &SavedTab) -> usize {
     }
 }
 
-/// Restore a single saved tab. Used by recent projects and session restore.
-pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config) -> Option<Tab> {
+/// Restore a single saved tab. Used by recent projects and session restore;
+/// `at_launch` is true only for the latter (see `restore_flat_column`).
+pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config, at_launch: bool) -> Option<Tab> {
     let (columns, column_weights, custom_weights, pane_ids) = if let Some(ref flat_cols) = saved.flat_columns {
         // New flat format (v4)
         let weights = saved.column_weights.clone()
@@ -764,7 +788,7 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         let mut all_ids = Vec::new();
         let mut cols_vec = Vec::new();
         for fc in flat_cols {
-            let (col, ids) = restore_flat_column(fc, cols, rows, config)?;
+            let (col, ids) = restore_flat_column(fc, cols, rows, config, at_launch)?;
             cols_vec.push(col);
             all_ids.extend(ids);
         }
@@ -835,14 +859,14 @@ fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>,
     let active_idx = ws.active_tab.min(total - 1);
 
     // Restore the active tab first (priority)
-    let active_tab = match restore_saved_tab(&ws.tabs[active_idx], cols, rows, config) {
+    let active_tab = match restore_saved_tab(&ws.tabs[active_idx], cols, rows, config, true) {
         Some(tab) => tab,
         None => {
             log::warn!("Failed to restore active tab, falling back to sequential restore");
             // Fallback: try all tabs sequentially
             let mut tabs = Vec::new();
             for saved_tab in &ws.tabs {
-                if let Some(tab) = restore_saved_tab(saved_tab, cols, rows, config) {
+                if let Some(tab) = restore_saved_tab(saved_tab, cols, rows, config, true) {
                     tabs.push(tab);
                 }
             }
@@ -1039,4 +1063,36 @@ mod tests {
         assert_eq!(restore_command(&sp), None);
     }
 
+    #[test]
+    fn only_a_plain_agent_resume_line_runs_by_itself_at_launch() {
+        let mut sp = pane("/a");
+        sp.last_command = Some("claude --model opus".into());
+        sp.claude_session = Some("live-id".into());
+        assert!(runs_on_launch(&sp), "a resume line with plain flags runs");
+
+        let mut codex = pane("/a");
+        codex.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Codex,
+            id: "codex-id".into(),
+        });
+        assert!(runs_on_launch(&codex));
+
+        // A shell command, even a harmless one, still waits for Enter.
+        let mut shell = pane("/a");
+        shell.last_command = Some("npm run dev".into());
+        assert!(!runs_on_launch(&shell));
+
+        // A refused id falls back to the last command: not run.
+        let mut bad_id = pane("/a");
+        bad_id.last_command = Some("ls".into());
+        bad_id.claude_session = Some("live-id\nrm -rf ~".into());
+        assert!(!runs_on_launch(&bad_id));
+
+        // Flags carried from the last `claude …` that the shell would expand.
+        let mut expands = pane("/a");
+        expands.last_command = Some("claude --append-system-prompt $(cat ~/.ssh/id_rsa)".into());
+        expands.claude_session = Some("live-id".into());
+        assert!(restore_command(&expands).is_some_and(|l| l.contains("$(")), "the line is still offered");
+        assert!(!runs_on_launch(&expands), "but not run");
+    }
 }

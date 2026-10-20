@@ -153,13 +153,9 @@ impl KovaView {
 
         self.extend_drag_selection();
 
-        self.fire_due_pty_restores();
-
-        // --- Debounced robust repaint after a resize burst settles ---
-        self.fire_resize_settle_repaints();
-
-        // --- Post-restore hole check: repair clear+partial-repaint frames ---
-        self.fire_post_restore_band_checks();
+        // --- Deferred winsize restores, debounced robust repaint after a
+        // resize burst settles, post-restore hole check ---
+        self.tick_resize_repairs();
 
         self.poll_git_branches();
 
@@ -218,18 +214,13 @@ impl KovaView {
         let show_help = ivars.show_help.get();
         let show_mem_report = ivars.show_mem_report.get();
 
-        // Build filter render data if active
+        // Build filter render data if active. Re-run the search first if the
+        // pane's content changed: the matches hold absolute line indices that
+        // shift as output trims the scrollback or a resize reflows it.
+        self.refresh_filter_matches();
         let filter_data = {
             let filter = ivars.filter.borrow();
-            filter.as_ref().map(|f| FilterRenderData {
-                query: f.query.clone(),
-                matches: f.matches.clone(),
-                // Only while the input is empty: once the user types, the match
-                // count is the useful number.
-                hint: (f.query.is_empty()
-                    && !crate::search_history::is_empty(crate::search_history::Scope::Filter))
-                .then(|| "↑ recent".to_string()),
-            })
+            filter.as_ref().map(|f| f.render_data())
         };
 
         // Compute left_inset from traffic light buttons
@@ -248,6 +239,8 @@ impl KovaView {
             ivars.tab_bar_left_inset.set(inset);
             inset
         };
+        // Output or a scroll may have slid other text under a still pointer.
+        self.refresh_stale_url_hover();
         let (hover_segments, hover_text, hover_pane_id) = {
             let h = ivars.hovered_url.borrow();
             (
@@ -271,11 +264,14 @@ impl KovaView {
         // Build recent projects render data if overlay is active (uses cached data)
         let rp_guard = ivars.recent_projects.borrow();
         let rp_entries: Vec<&crate::renderer::RecentProjectEntry> = rp_guard.as_ref()
-            .map(|state| state.items.iter().map(|item| &item.render).collect())
+            .map(|state| state.visible.iter().map(|&i| &state.items[i].render).collect())
             .unwrap_or_default();
         let rp_data = rp_guard.as_ref().map(|state| {
             crate::renderer::RecentProjectsRenderData {
                 entries: &rp_entries,
+                query: &state.query,
+                cursor: state.cursor,
+                total: state.items.len(),
                 selected: state.selected,
                 scroll: state.scroll,
             }
@@ -535,7 +531,7 @@ impl KovaView {
                     let config = ivars.config.get().unwrap();
                     let cols = config.terminal.columns;
                     let rows = config.terminal.rows;
-                    match crate::session::restore_saved_tab(&saved_tab, cols, rows, config) {
+                    match crate::session::restore_saved_tab(&saved_tab, cols, rows, config, true) {
                         Some(mut tab) => {
                             tab.adopt_geometry_scale(self.backing_scale());
                             loading += pane_count as u32;
@@ -584,53 +580,6 @@ impl KovaView {
                     if let Some(pane) = tab.pane(tab.focused_pane) {
                         pane.autoscroll_selection(speed);
                     }
-                }
-            }
-        }
-    }
-
-    /// Re-send the winsize to the panes whose `Cmd+R` nudge has come due.
-    fn fire_due_pty_restores(&self) {
-        let ivars = self.ivars();
-        {
-            let mut due: Vec<PaneId> = Vec::new();
-            {
-                let mut restores = ivars.pty_restore.borrow_mut();
-                for r in restores.iter_mut() {
-                    r.remaining_frames = r.remaining_frames.saturating_sub(1);
-                    if r.remaining_frames == 0 {
-                        due.push(r.pane_id);
-                    }
-                }
-                restores.retain(|r| r.remaining_frames > 0);
-            }
-            if !due.is_empty() {
-                // Dims are re-read at fire time: a window resize in between
-                // already set the PTY to the new size, and the terminal grid
-                // is the source of truth for what the winsize should be.
-                let tabs = ivars.tabs.borrow();
-                for tab in tabs.iter() {
-                    tab.for_each_pane(&mut |pane| {
-                        if due.contains(&pane.id) {
-                            let (cols, rows) = {
-                                let t = pane.terminal.read();
-                                (t.cols, t.rows)
-                            };
-                            pane.pty.resize(cols, rows);
-                            // Measure the app's response to this restore
-                            // SIGWINCH from a clean slate.
-                            pane.terminal.write().reset_rows_touched();
-                        }
-                    });
-                }
-                drop(tabs);
-                // The app's answer to a winsize restore is the frame that can
-                // carry the hole (clear + partial repaint). Schedule a grid
-                // scan once that frame has certainly landed.
-                let mut checks = ivars.post_restore_checks.borrow_mut();
-                for &pane_id in &due {
-                    checks.retain(|c| c.pane_id != pane_id);
-                    checks.push(PtyRestore { pane_id, remaining_frames: POST_RESTORE_CHECK_FRAMES });
                 }
             }
         }
@@ -962,14 +911,10 @@ impl KovaView {
             let mtm = MainThreadMarker::new_unchecked();
             let app = NSApplication::sharedApplication(mtm);
             let focused = app.isActive();
-            let prev = ivars.last_focused.get();
-            if focused != prev {
-                ivars.last_focused.set(focused);
-                if focus_reporting {
-                    if let Some(pty_ptr) = pty_ptr {
-                        let seq = if focused { b"\x1b[I" as &[u8] } else { b"\x1b[O" };
-                        (*pty_ptr).write(seq);
-                    }
+            let prev = ivars.last_focused.replace(focused);
+            if let Some(seq) = crate::input::focus_report(prev, focused, focus_reporting) {
+                if let Some(pty_ptr) = pty_ptr {
+                    (*pty_ptr).write(seq);
                 }
             }
         }

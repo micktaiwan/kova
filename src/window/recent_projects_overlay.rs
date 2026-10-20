@@ -11,9 +11,61 @@ pub(super) struct RecentProjectItem {
 
 pub(super) struct RecentProjectsState {
     pub(super) items: Vec<RecentProjectItem>,
+    /// Filter typed in the input field, matched live against name and path.
+    pub(super) query: String,
+    /// Caret position in `query`, in chars.
+    pub(super) cursor: usize,
+    /// Indices into `items` of the rows the query keeps, in list order.
+    pub(super) visible: Vec<usize>,
+    /// Index into `visible`.
     pub(super) selected: usize,
-    /// Scroll offset (index of first visible entry).
+    /// Scroll offset (index into `visible` of the first row on screen).
     pub(super) scroll: usize,
+}
+
+impl RecentProjectsState {
+    fn new(items: Vec<RecentProjectItem>) -> Self {
+        let visible = (0..items.len()).collect();
+        Self { items, query: String::new(), cursor: 0, visible, selected: 0, scroll: 0 }
+    }
+
+    /// Recompute the rows the query keeps and select the first one: after an
+    /// edit the best candidate is the top of the new list.
+    fn refilter(&mut self) {
+        self.visible = matching_indices(&self.items, &self.query);
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    fn selected_item(&self) -> Option<&RecentProjectItem> {
+        self.visible.get(self.selected).and_then(|&i| self.items.get(i))
+    }
+
+    fn insert_at_cursor(&mut self, text: &str) {
+        let byte_idx = self.query.char_indices()
+            .nth(self.cursor).map(|(i, _)| i)
+            .unwrap_or(self.query.len());
+        self.query.insert_str(byte_idx, text);
+        self.cursor += text.chars().count();
+        self.refilter();
+    }
+}
+
+/// Rows whose name or path contains every word of `query`, case-insensitive.
+/// An empty query keeps everything.
+fn matching_indices(items: &[RecentProjectItem], query: &str) -> Vec<usize> {
+    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    items.iter().enumerate()
+        .filter(|(_, item)| {
+            let haystack = format!(
+                "{} {}",
+                item.render.title.as_deref().unwrap_or(""),
+                item.render.path,
+            ).to_lowercase();
+            terms.iter().all(|t| haystack.contains(t.as_str()))
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 fn build_items(entries: Vec<crate::recent_projects::RecentProject>) -> Vec<RecentProjectItem> {
@@ -60,11 +112,20 @@ impl KovaView {
             .filter(|p| !open_keys.contains(&p.key()))
             .collect();
 
-        *self.ivars().recent_projects.borrow_mut() = Some(RecentProjectsState {
-            items: build_items(entries),
-            selected: 0,
-            scroll: 0,
-        });
+        *self.ivars().recent_projects.borrow_mut() = Some(RecentProjectsState::new(build_items(entries)));
+        self.mark_dirty();
+    }
+
+    /// Cmd+V while the overlay is open: the clipboard's first line goes into
+    /// the filter at the caret.
+    pub(super) fn paste_into_recent_projects(&self, text: &str) {
+        let pasted = super::overlays::line_paste_text(text);
+        if pasted.is_empty() {
+            return;
+        }
+        if let Some(state) = self.ivars().recent_projects.borrow_mut().as_mut() {
+            state.insert_at_cursor(&pasted);
+        }
         self.mark_dirty();
     }
 
@@ -84,7 +145,7 @@ impl KovaView {
             let entry = {
                 let state = self.ivars().recent_projects.borrow();
                 state.as_ref().and_then(|s| {
-                    let item = s.items.get(s.selected)?;
+                    let item = s.selected_item()?;
                     if !item.render.invalid { Some(item.entry.clone()) } else { None }
                 })
             };
@@ -95,7 +156,8 @@ impl KovaView {
             return;
         }
 
-        // Cmd+Backspace — remove entry
+        // Backspace: Cmd+Backspace removes the selected entry from the list,
+        // a plain Backspace edits the filter.
         if keycode == 0x33 {
             let has_cmd = event.modifierFlags().contains(NSEventModifierFlags::Command);
             if has_cmd {
@@ -105,22 +167,34 @@ impl KovaView {
                         Some(s) => s,
                         None => return,
                     };
-                    if state.selected >= state.items.len() {
+                    let Some(&idx) = state.visible.get(state.selected) else {
                         return;
-                    }
-                    let key = state.items[state.selected].entry.key();
-                    state.items.remove(state.selected);
+                    };
+                    let key = state.items[idx].entry.key();
+                    state.items.remove(idx);
                     if state.items.is_empty() {
                         *guard = None;
-                    } else if state.selected >= state.items.len() {
-                        state.selected = state.items.len() - 1;
+                    } else {
+                        // Keep the selection where it was in the filtered list.
+                        let selected = state.selected;
+                        state.visible = matching_indices(&state.items, &state.query);
+                        state.selected = selected.min(state.visible.len().saturating_sub(1));
+                        state.scroll = state.scroll.min(state.selected);
                     }
                     key
                 };
                 crate::recent_projects::remove(&key);
-                self.mark_dirty();
-                return;
+            } else if let Some(state) = self.ivars().recent_projects.borrow_mut().as_mut() {
+                if state.cursor > 0 {
+                    if let Some((byte_idx, _)) = state.query.char_indices().nth(state.cursor - 1) {
+                        state.query.remove(byte_idx);
+                        state.cursor -= 1;
+                        state.refilter();
+                    }
+                }
             }
+            self.mark_dirty();
+            return;
         }
 
         // Arrow keys
@@ -140,9 +214,25 @@ impl KovaView {
                     }
                 }
                 0x7D => { // Down
-                    if state.selected + 1 < state.items.len() {
+                    if state.selected + 1 < state.visible.len() {
                         state.selected += 1;
                     }
+                }
+                0x7B => { // Left: move the caret
+                    if state.cursor > 0 { state.cursor -= 1; }
+                }
+                0x7C => { // Right
+                    if state.cursor < state.query.chars().count() { state.cursor += 1; }
+                }
+                // Typing goes into the filter. Cmd or Ctrl with a letter is a
+                // shortcut, not typing; insert what the layout composed
+                // (Option+( = { on a French keyboard), not the bare key.
+                _ if !super::search_palette::is_shortcut(event) => {
+                    let text = super::search_palette::typed_text(event);
+                    if text.is_empty() {
+                        return; // a dead key waiting for its second stroke
+                    }
+                    state.insert_at_cursor(&text);
                 }
                 _ => {}
             }
@@ -156,7 +246,7 @@ impl KovaView {
         let cols = config.terminal.columns;
         let rows = config.terminal.rows;
 
-        match crate::session::restore_saved_tab(&entry.tab, cols, rows, config) {
+        match crate::session::restore_saved_tab(&entry.tab, cols, rows, config, false) {
             Some(mut tab) => {
                 tab.adopt_geometry_scale(self.backing_scale());
                 let mut tabs = self.ivars().tabs.borrow_mut();
@@ -216,5 +306,25 @@ mod tests {
         // The entry itself is carried through untouched, since selecting the
         // row restores it.
         assert_eq!(items[1].entry.path, "/kova-no-such-directory");
+    }
+
+    #[test]
+    fn the_filter_keeps_rows_matching_every_word_in_name_or_path() {
+        let entry = |title: Option<&str>, path: &str| {
+            let mut tab = saved_tab_with_panes(1);
+            tab.custom_title = title.map(String::from);
+            crate::recent_projects::RecentProject { path: path.into(), last_opened: 0, tab }
+        };
+        let items = build_items(vec![
+            entry(Some("Kova"), "/Users/me/projects/perso/kova"),
+            entry(None, "/Users/me/projects/acme/app"),
+            entry(Some("Notes"), "/tmp"),
+        ]);
+        assert_eq!(matching_indices(&items, ""), vec![0, 1, 2], "an empty filter keeps everything");
+        assert_eq!(matching_indices(&items, "KOVA"), vec![0], "case-insensitive");
+        assert_eq!(matching_indices(&items, "acme"), vec![1], "matches the path of an unnamed tab");
+        assert_eq!(matching_indices(&items, "notes tmp"), vec![2], "name and path words combine");
+        assert_eq!(matching_indices(&items, "projects app"), vec![1], "every word must match");
+        assert!(matching_indices(&items, "zzz").is_empty());
     }
 }

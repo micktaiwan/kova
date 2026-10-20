@@ -8,6 +8,11 @@
 //! module keeps the last published state and diffs it on the render tick:
 //! one place to get right, and nothing can change behind its back.
 //!
+//! The diff reads the panes through an `EventSource` and publishes through an
+//! `EventSink`: Kova.app's windows (`WindowsSource`) and a library host's
+//! panes (`crate::embed`) feed the same state machine, and the subscribers'
+//! queues (`IpcSink`) are the one sink outside tests.
+//!
 //! Cost discipline, because this runs inside the render loop:
 //! - nobody subscribed → one relaxed atomic load and we are done;
 //! - focus is compared on every tick, but that is two `RefCell` reads;
@@ -24,6 +29,7 @@ use crate::ipc::topic;
 use crate::pane::PaneId;
 
 /// The per-pane state the diff watches. Everything here is cheap to read.
+#[derive(Clone, Debug)]
 pub struct PaneFlags {
     pub window: usize,
     pub tab: usize,
@@ -39,14 +45,80 @@ pub struct PaneFlags {
 /// focus anywhere, and a client that only hears about pane changes would learn of
 /// it only when you happen to leave and come back.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct FocusKey {
-    window: usize,
-    tab: usize,
-    pane: PaneId,
-    session: Option<String>,
+pub struct FocusKey {
+    pub window: usize,
+    pub tab: usize,
+    pub pane: PaneId,
+    pub session: Option<String>,
     /// The name `/rename` gave it. Part of the identity for the same reason as the id: renaming a
     /// conversation is how you declare it is about something else now.
-    session_name: Option<String>,
+    pub session_name: Option<String>,
+}
+
+/// What the diff reads from the app that holds the panes.
+pub trait EventSource {
+    /// The pane the keyboard would reach right now, the app being active;
+    /// `None` when no pane holds it (no key window, nothing focused).
+    fn focus(&self) -> Option<FocusKey>;
+    /// The flags of every pane. Must not cost a syscall: it runs on a timer.
+    fn collect_flags(&self, out: &mut HashMap<PaneId, PaneFlags>);
+    /// The full JSON of one pane (`list-panes`' shape), built on an edge only.
+    fn pane_json(&self, window: usize, pane: PaneId) -> Option<serde_json::Value>;
+    /// Every pane's JSON, in `list-panes` order, for the snapshot.
+    fn collect_panes(&self, out: &mut Vec<serde_json::Value>);
+}
+
+/// Where the events go.
+pub trait EventSink {
+    /// Whether any subscriber wants one of `topics`.
+    fn wants(&self, topics: u32) -> bool;
+    /// Push one event to the subscribers of `topic`. Never blocks.
+    fn publish(&mut self, topic: u32, event: serde_json::Value);
+}
+
+/// The subscribers' bounded queues (`crate::ipc::publish`), drained by their
+/// connection threads: the main thread never writes to a socket.
+pub struct IpcSink;
+
+impl EventSink for IpcSink {
+    fn wants(&self, topics: u32) -> bool {
+        crate::ipc::has_subscribers(topics)
+    }
+
+    fn publish(&mut self, topic: u32, event: serde_json::Value) {
+        crate::ipc::publish(topic, event);
+    }
+}
+
+/// Kova.app's windows, as the diff reads them.
+pub struct WindowsSource<'a>(pub &'a RefCell<Vec<Retained<NSWindow>>>);
+
+impl EventSource for WindowsSource<'_> {
+    fn focus(&self) -> Option<FocusKey> {
+        current_focus(self.0)
+    }
+
+    fn collect_flags(&self, out: &mut HashMap<PaneId, PaneFlags>) {
+        let wins = self.0.borrow();
+        for (idx, win) in wins.iter().enumerate() {
+            if let Some(view) = crate::app::kova_view(win) {
+                view.events_collect_flags(idx, out);
+            }
+        }
+    }
+
+    fn pane_json(&self, window: usize, pane: PaneId) -> Option<serde_json::Value> {
+        pane_json(self.0, window, pane)
+    }
+
+    fn collect_panes(&self, out: &mut Vec<serde_json::Value>) {
+        let wins = self.0.borrow();
+        for (idx, win) in wins.iter().enumerate() {
+            if let Some(view) = crate::app::kova_view(win) {
+                view.ipc_collect_panes(idx, win.isKeyWindow(), out);
+            }
+        }
+    }
 }
 
 /// The last state published to subscribers.
@@ -89,7 +161,19 @@ impl EventState {
         fps: u32,
         force: bool,
     ) {
-        if !crate::ipc::has_subscribers(topic::ALL) {
+        self.poll_with(&WindowsSource(windows), &mut IpcSink, app_active, fps, force);
+    }
+
+    /// `poll` against any source and sink.
+    pub fn poll_with(
+        &mut self,
+        source: &impl EventSource,
+        sink: &mut impl EventSink,
+        app_active: bool,
+        fps: u32,
+        force: bool,
+    ) {
+        if !sink.wants(topic::ALL) {
             // Nobody is listening. Drop the state so the next subscriber is
             // seeded from the truth of its own moment rather than diffed against
             // a world that may have moved on for hours without us watching.
@@ -102,11 +186,11 @@ impl EventState {
         let silent = !self.seeded;
         self.seeded = true;
 
-        self.poll_focus(windows, app_active, silent);
+        self.poll_focus(source, sink, app_active, silent);
 
         if force || self.countdown == 0 {
             self.countdown = pane_poll_interval(fps);
-            self.poll_panes(windows, silent);
+            self.poll_panes(source, sink, silent);
         } else {
             self.countdown -= 1;
         }
@@ -114,7 +198,8 @@ impl EventState {
 
     fn poll_focus(
         &mut self,
-        windows: &RefCell<Vec<Retained<NSWindow>>>,
+        source: &impl EventSource,
+        sink: &mut impl EventSink,
         app_active: bool,
         silent: bool,
     ) {
@@ -122,19 +207,19 @@ impl EventState {
         // user's attention has left the terminal entirely. Collapsing both facts
         // into one stream is the whole point — a client should not have to join
         // our focus with the system's active app to know whether you are here.
-        let next = if app_active { current_focus(windows) } else { None };
+        let next = if app_active { source.focus() } else { None };
         if next == self.focus {
             return;
         }
         let previous = self.focus.take();
         self.focus = next.clone();
-        if silent || !crate::ipc::has_subscribers(topic::FOCUS) {
+        if silent || !sink.wants(topic::FOCUS) {
             return;
         }
         let pane = next
             .as_ref()
-            .and_then(|key| pane_json(windows, key.window, key.pane));
-        crate::ipc::publish(
+            .and_then(|key| source.pane_json(key.window, key.pane));
+        sink.publish(
             topic::FOCUS,
             serde_json::json!({
                 "event": "focus",
@@ -145,24 +230,17 @@ impl EventState {
         );
     }
 
-    fn poll_panes(&mut self, windows: &RefCell<Vec<Retained<NSWindow>>>, silent: bool) {
+    fn poll_panes(&mut self, source: &impl EventSource, sink: &mut impl EventSink, silent: bool) {
         let mut current: HashMap<PaneId, PaneFlags> = HashMap::new();
-        {
-            let wins = windows.borrow();
-            for (idx, win) in wins.iter().enumerate() {
-                if let Some(view) = crate::app::kova_view(win) {
-                    view.events_collect_flags(idx, &mut current);
-                }
-            }
-        }
+        source.collect_flags(&mut current);
 
         if !silent {
             for (id, flags) in &current {
                 match self.panes.get(id) {
                     None => {
-                        if crate::ipc::has_subscribers(topic::PANE_OPEN) {
-                            let pane = pane_json(windows, flags.window, *id);
-                            crate::ipc::publish(
+                        if sink.wants(topic::PANE_OPEN) {
+                            let pane = source.pane_json(flags.window, *id);
+                            sink.publish(
                                 topic::PANE_OPEN,
                                 serde_json::json!({ "event": "pane-open", "pane": pane }),
                             );
@@ -170,7 +248,7 @@ impl EventState {
                     }
                     Some(previous) => {
                         if previous.working != flags.working {
-                            crate::ipc::publish(
+                            sink.publish(
                                 topic::PANE_WORKING,
                                 serde_json::json!({
                                     "event": "pane-working",
@@ -180,7 +258,7 @@ impl EventState {
                             );
                         }
                         if previous.awaiting != flags.awaiting {
-                            crate::ipc::publish(
+                            sink.publish(
                                 topic::PANE_STATUS,
                                 serde_json::json!({
                                     "event": "pane-status",
@@ -197,7 +275,7 @@ impl EventState {
                 if !current.contains_key(id) {
                     // No payload beyond the id: the pane is gone, there is
                     // nothing left to introspect.
-                    crate::ipc::publish(
+                    sink.publish(
                         topic::PANE_CLOSE,
                         serde_json::json!({
                             "event": "pane-close",
@@ -276,19 +354,17 @@ pub fn snapshot(
     app_active: bool,
     topics: u32,
 ) -> serde_json::Value {
+    snapshot_with(&WindowsSource(windows), app_active, topics)
+}
+
+/// `snapshot` against any source.
+pub fn snapshot_with(source: &impl EventSource, app_active: bool, topics: u32) -> serde_json::Value {
     let mut panes = Vec::new();
+    source.collect_panes(&mut panes);
     let mut focus = serde_json::Value::Null;
-    {
-        let wins = windows.borrow();
-        for (idx, win) in wins.iter().enumerate() {
-            if let Some(view) = crate::app::kova_view(win) {
-                view.ipc_collect_panes(idx, win.isKeyWindow(), &mut panes);
-            }
-        }
-    }
     if app_active {
-        if let Some(key) = current_focus(windows) {
-            if let Some(pane) = pane_json(windows, key.window, key.pane) {
+        if let Some(key) = source.focus() {
+            if let Some(pane) = source.pane_json(key.window, key.pane) {
                 focus = pane;
             }
         }
@@ -311,6 +387,113 @@ mod tests {
 
     fn key_with_session(window: usize, tab: usize, pane: PaneId, session: &str) -> FocusKey {
         FocusKey { window, tab, pane, session: Some(session.to_string()), session_name: None }
+    }
+
+    /// A world the test sets by hand.
+    #[derive(Default)]
+    struct FakeSource {
+        focus: Option<FocusKey>,
+        panes: Vec<(PaneId, PaneFlags)>,
+    }
+
+    impl EventSource for FakeSource {
+        fn focus(&self) -> Option<FocusKey> {
+            self.focus.clone()
+        }
+        fn collect_flags(&self, out: &mut HashMap<PaneId, PaneFlags>) {
+            out.extend(self.panes.iter().cloned());
+        }
+        fn pane_json(&self, window: usize, pane: PaneId) -> Option<serde_json::Value> {
+            Some(serde_json::json!({ "id": pane, "window": window }))
+        }
+        fn collect_panes(&self, out: &mut Vec<serde_json::Value>) {
+            out.extend(self.panes.iter().map(|(id, f)| serde_json::json!({ "id": id, "window": f.window })));
+        }
+    }
+
+    /// Records what would go to the subscribers of `mask`.
+    struct Recorder {
+        mask: u32,
+        events: Vec<serde_json::Value>,
+    }
+
+    impl EventSink for Recorder {
+        fn wants(&self, topics: u32) -> bool {
+            self.mask & topics != 0
+        }
+        fn publish(&mut self, topic: u32, event: serde_json::Value) {
+            if self.wants(topic) {
+                self.events.push(event);
+            }
+        }
+    }
+
+    fn flags(working: bool, awaiting: bool) -> PaneFlags {
+        PaneFlags { window: 0, tab: 0, working, awaiting, awaiting_since: awaiting.then_some(7) }
+    }
+
+    /// The diff, run against a hand-set world: the first pass is silent, then
+    /// every edge goes out once, the sweep throttled to `pane_poll_interval`
+    /// ticks unless forced.
+    #[test]
+    fn the_diff_publishes_each_edge_once() {
+        let mut state = EventState::new();
+        let mut sink = Recorder { mask: topic::ALL, events: Vec::new() };
+        let mut world = FakeSource { focus: Some(key(0, 0, 1)), panes: vec![(1, flags(false, false))] };
+        state.poll_with(&world, &mut sink, true, 4, false);
+        assert!(sink.events.is_empty(), "the seeding pass announces nothing");
+
+        world.panes.push((2, flags(false, false)));
+        world.panes[0].1 = flags(true, true);
+        state.poll_with(&world, &mut sink, true, 4, false);
+        assert!(sink.events.is_empty(), "throttled: the sweep waits");
+        state.poll_with(&world, &mut sink, true, 4, true);
+        let mut names: Vec<String> = sink.events.iter().map(|e| e["event"].as_str().unwrap().to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["pane-open", "pane-status", "pane-working"]);
+        let status = sink.events.iter().find(|e| e["event"] == "pane-status").unwrap();
+        assert_eq!(status["awaiting_since"], 7);
+        sink.events.clear();
+
+        state.poll_with(&world, &mut sink, true, 4, true);
+        assert!(sink.events.is_empty(), "no change, nothing");
+
+        world.focus = Some(key(0, 1, 2));
+        world.panes.remove(0);
+        state.poll_with(&world, &mut sink, true, 4, true);
+        assert_eq!(sink.events[0]["event"], "focus", "focus first");
+        assert_eq!(sink.events[0]["reason"], "tab");
+        assert_eq!(sink.events[0]["pane"]["id"], 2);
+        assert_eq!(sink.events[1], serde_json::json!({"event": "pane-close", "pane_id": 1, "window": 0, "tab": 0}));
+        sink.events.clear();
+
+        state.poll_with(&world, &mut sink, false, 4, false);
+        assert_eq!(sink.events[0]["reason"], "app-inactive");
+        assert_eq!(sink.events[0]["pane"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn nobody_listening_drops_the_state() {
+        let mut state = EventState::new();
+        let world = FakeSource { focus: Some(key(0, 0, 1)), panes: vec![(1, flags(false, false))] };
+        let mut deaf = Recorder { mask: 0, events: Vec::new() };
+        state.poll_with(&world, &mut deaf, true, 60, true);
+        assert!(!state.seeded);
+        let mut sink = Recorder { mask: topic::PANE_OPEN, events: Vec::new() };
+        state.poll_with(&world, &mut sink, true, 60, true);
+        assert!(sink.events.is_empty(), "a new subscriber is seeded, not told of every pane");
+    }
+
+    #[test]
+    fn the_snapshot_reads_the_source() {
+        let world = FakeSource { focus: Some(key(0, 0, 2)), panes: vec![(2, flags(false, false))] };
+        let snap = snapshot_with(&world, true, topic::FOCUS | topic::PANE_CLOSE);
+        assert_eq!(snap["events"], serde_json::json!(["focus", "pane-close"]));
+        assert_eq!(snap["focus"]["id"], 2);
+        assert_eq!(snap["panes"].as_array().unwrap().len(), 1);
+        let away = snapshot_with(&world, false, topic::ALL);
+        assert_eq!(away["app_active"], false);
+        assert_eq!(away["focus"], serde_json::Value::Null);
     }
 
     #[test]

@@ -325,6 +325,14 @@ pub struct TerminalState {
     /// them blank — exactly the desync this tracks. Used to decide whether
     /// the post-resize settle nudge is needed (see window.rs).
     rows_touched: Vec<bool>,
+    /// Bumped whenever the text content may have changed: every batch of PTY
+    /// output (`VteHandler::apply_ops`), every line pushed to the scrollback
+    /// (which can drop the oldest one and shift every absolute line index),
+    /// every resize (reflow rebuilds the lines) and every clear. Consumers that
+    /// cache results keyed by absolute line indices (the Ctrl+F filter matches)
+    /// compare it to the value they saw to know when to recompute. Coarse on
+    /// purpose: a false positive costs one recompute, a miss a wrong jump.
+    content_generation: u64,
 }
 
 /// A single line matching a filter query.
@@ -406,7 +414,19 @@ impl TerminalState {
             current_hyperlink: 0,
             hyperlinks: vec![String::new()], // slot 0 = no hyperlink
             rows_touched: vec![false; rows as usize],
+            content_generation: 0,
         }
+    }
+
+    /// See the `content_generation` field: changes whenever cached absolute
+    /// line indices into this terminal may have gone stale.
+    pub fn content_generation(&self) -> u64 {
+        self.content_generation
+    }
+
+    /// Mark the content as changed (see `content_generation`).
+    pub fn bump_content_generation(&mut self) {
+        self.content_generation = self.content_generation.wrapping_add(1);
     }
 
     pub fn kitty_flags(&self) -> u8 {
@@ -569,6 +589,17 @@ impl TerminalState {
             log::info!("SCROLL-START term_id={} sb_len={} offset={} cwd={:?} first_sb=\"{}\"",
                 self.terminal_id, self.scrollback.len(), self.scroll_offset,
                 self.cwd, first_sb_text);
+        }
+        // One line per page scrolled, with the text actually at the top of the
+        // view: tells whether foreign content seen while scrolled is in this
+        // terminal's own scrollback or only on screen.
+        if scroll_crossed_page(old_offset, self.scroll_offset, self.rows) {
+            let top = (self.scrollback.len() as i32 - self.scroll_offset).max(0) as usize;
+            let top_text: String = self.scrollback.get(top)
+                .map(|r| r.cells.iter().take(60).map(|c| c.c).filter(|&c| c != '\0').collect())
+                .unwrap_or_default();
+            log::info!("SCROLL-AT term_id={} sb_len={} offset={} top=\"{}\"",
+                self.terminal_id, self.scrollback.len(), self.scroll_offset, top_text);
         }
         self.user_scrolled = self.scroll_offset > 0;
         self.cursor_moved();
@@ -1003,6 +1034,7 @@ impl TerminalState {
     fn push_to_scrollback(&mut self, mut row: Row) {
         row.trim_trailing_blanks(self.default_fg, self.default_bg);
         self.scrollback.push_back(row);
+        self.bump_content_generation();
         if self.scrollback.len() > self.scrollback_limit {
             // Buffer at its limit: drop the oldest line. All absolute line
             // indices shift up by one — move the selection with its content,
@@ -1236,6 +1268,7 @@ impl TerminalState {
     /// (`custom_title`) is deliberate and survives.
     pub fn clear_scrollback_and_screen(&mut self) {
         self.dirty.store(true, Ordering::Relaxed);
+        self.bump_content_generation();
         self.title = None;
         self.scrollback.clear();
         self.reset_scroll();
@@ -1719,6 +1752,7 @@ impl TerminalState {
         // Reflow rebuilds the scrollback/grid — absolute line indices held by
         // the selection no longer point at the same content.
         self.selection = None;
+        self.bump_content_generation();
         self.rows_touched = vec![false; new_rows as usize];
 
         let old_cols = self.cols;
@@ -2494,33 +2528,36 @@ impl TerminalState {
         }
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
-        let sb_len = self.scrollback.len();
-
-        let row_text = |row: &Row| -> String {
-            row.cells.iter().map(|c| {
+        // One reusable buffer per search instead of a String per cell: this
+        // runs over the whole scrollback, and the filter overlay re-runs it
+        // while output streams in.
+        let mut buf = String::new();
+        let mut lower = String::new();
+        let rows = self.scrollback.iter().chain(self.grid.iter());
+        for (i, row) in rows.enumerate() {
+            buf.clear();
+            for c in &row.cells {
                 if let Some(ref cluster) = c.cluster {
-                    cluster.to_string()
-                } else if c.c == '\0' {
-                    String::new()
-                } else {
-                    c.c.to_string()
+                    buf.push_str(cluster);
+                } else if c.c != '\0' {
+                    buf.push(c.c);
                 }
-            }).collect::<String>().trim_end().to_string()
-        };
-
-        // Search scrollback
-        for (i, row) in self.scrollback.iter().enumerate() {
-            let text = row_text(row);
-            if text.to_lowercase().contains(&query_lower) {
-                results.push(FilterMatch { abs_line: i, text });
             }
-        }
-
-        // Search grid
-        for (i, row) in self.grid.iter().enumerate() {
-            let text = row_text(row);
-            if text.to_lowercase().contains(&query_lower) {
-                results.push(FilterMatch { abs_line: sb_len + i, text });
+            let text = buf.trim_end();
+            // ASCII lines (the common case) lowercase in place without the
+            // per-line allocation of `to_lowercase`.
+            let hit = if text.is_ascii() {
+                lower.clear();
+                lower.push_str(text);
+                lower.make_ascii_lowercase();
+                lower.contains(&query_lower)
+            } else {
+                text.to_lowercase().contains(&query_lower)
+            };
+            if hit {
+                // Scrollback rows come first, then the grid: the chained
+                // index is the absolute line (grid row j = sb_len + j).
+                results.push(FilterMatch { abs_line: i, text: text.to_string() });
             }
         }
 
@@ -2751,9 +2788,26 @@ impl TerminalState {
     }
 }
 
+/// True when a scroll from `old` to `new` (offsets in lines) moves into a new
+/// page of `rows` lines going up — the cadence of the `SCROLL-AT` log line.
+fn scroll_crossed_page(old: i32, new: i32, rows: u16) -> bool {
+    let page = (rows as i32).max(1);
+    new > old && new / page > old / page
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_crossed_page_fires_once_per_page_going_up() {
+        assert!(!scroll_crossed_page(0, 3, 24));
+        assert!(scroll_crossed_page(20, 24, 24));
+        assert!(!scroll_crossed_page(24, 30, 24));
+        assert!(scroll_crossed_page(0, 100, 24));
+        assert!(!scroll_crossed_page(48, 20, 24), "scrolling down never logs");
+        assert!(scroll_crossed_page(0, 1, 0), "zero rows counts as one-line pages");
+    }
 
     const FG: [u8; 3] = DEFAULT_FG;
     const BG: [u8; 3] = DEFAULT_BG;
@@ -4225,5 +4279,79 @@ two");
             t.scroll(t.scrollback_len() as i32);
             assert_eq!(t.url_at(0, 2).unwrap().1, "https://old.example");
         }
+    }
+
+    // --- content_generation: what the Ctrl+F filter keys its matches on ---
+
+    /// Push `n` numbered lines ("line 0", "line 1", ...) through the grid.
+    fn push_lines(t: &mut TerminalState, from: usize, n: usize) {
+        for i in from..from + n {
+            t.carriage_return();
+            put_str(t, &format!("line {}", i));
+            t.newline();
+        }
+    }
+
+    #[test]
+    fn content_generation_moves_when_full_scrollback_trims() {
+        // 3 rows, scrollback of 5: after 10 lines the buffer is full and every
+        // new line drops the oldest one, shifting all absolute indices.
+        let mut t = TerminalState::new(20, 3, 5, FG, BG);
+        push_lines(&mut t, 0, 10);
+        assert_eq!(t.scrollback_len(), 5);
+        let before = t.search_lines("line 7");
+        assert_eq!(before.len(), 1);
+        let g0 = t.content_generation();
+
+        push_lines(&mut t, 10, 1);
+        assert_eq!(t.scrollback_len(), 5, "1-in/1-out");
+        assert_ne!(t.content_generation(), g0, "a trim must invalidate cached indices");
+        let after = t.search_lines("line 7");
+        assert_eq!(
+            after[0].abs_line + 1,
+            before[0].abs_line,
+            "the same line now sits one index higher: the old index is stale"
+        );
+    }
+
+    #[test]
+    fn content_generation_stable_without_changes() {
+        let mut t = term(20, 3);
+        push_lines(&mut t, 0, 4);
+        let g0 = t.content_generation();
+        let _ = t.search_lines("line");
+        t.scroll(1);
+        assert_eq!(t.content_generation(), g0, "reading and scrolling change no content");
+    }
+
+    #[test]
+    fn content_generation_moves_on_reflow_and_clear() {
+        let mut t = term(20, 3);
+        push_lines(&mut t, 0, 6);
+        let g0 = t.content_generation();
+        t.resize(20, 3);
+        assert_eq!(t.content_generation(), g0, "same size is a no-op");
+        t.resize(10, 3);
+        let after_resize = t.content_generation();
+        assert_ne!(after_resize, g0, "a reflow rebuilds the lines");
+        t.clear_scrollback_and_screen();
+        assert_ne!(t.content_generation(), after_resize);
+    }
+
+    #[test]
+    fn search_lines_indexes_scrollback_then_grid_case_insensitively() {
+        let mut t = term(20, 3);
+        push_lines(&mut t, 0, 5); // lines 0..=2 in scrollback, 3..=4 on the grid
+        let sb = t.scrollback_len();
+        assert_eq!(sb, 3);
+        let hits = t.search_lines("LINE 4");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].abs_line, sb + 1, "grid row 1 = scrollback length + 1");
+        assert_eq!(hits[0].text, "line 4");
+        assert_eq!(t.search_lines("Line 0")[0].abs_line, 0);
+        // Non-ASCII lines take the Unicode lowercasing path.
+        t.carriage_return();
+        put_str(&mut t, "ÉCOLE");
+        assert_eq!(t.search_lines("école").len(), 1);
     }
 }

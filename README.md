@@ -21,7 +21,7 @@ Every frame is drawn on the GPU via Apple's Metal API. Glyph atlas with on-deman
 
 ### Session persistence
 
-Layout (tabs, splits, CWD) is saved on quit and restored on launch. Window position is remembered automatically.
+Layout (tabs, splits, CWD) is saved on quit and restored on launch. Panes that were running Claude Code or Codex resume their conversation by themselves at launch; a tab reopened with Cmd+O pre-types the resume line and waits for Enter. Window position is remembered automatically.
 
 ### Clickable URLs
 
@@ -139,7 +139,7 @@ focus_border_color = [0.4, 0.6, 1.0]
 | Cmd+A | Go to the first anchor |
 | Cmd+J | Jump to the next unread pane |
 | Cmd+Shift+Option+Left/Right | Walk the panes you visited, back and forward |
-| Cmd+O | Reopen a closed tab |
+| Cmd+O | Reopen a closed tab (type to filter by name or path) |
 | Cmd+Shift+W | Close tab |
 | Cmd+Shift+C | Copy selection (raw) |
 | Cmd+C | Copy selection |

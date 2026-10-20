@@ -176,6 +176,28 @@ impl AppKitInput {
         }
     }
 
+    /// `firstRectForCharacterRange:actualRange:` for a view that shows one
+    /// surface alone, at any depth in its window and flipped or not (a
+    /// library pane, `embed::KovaPaneView`): the terminal cursor's cell in
+    /// screen coordinates, so the accent window opens on the caret. `cell` is
+    /// the cell size and `pad_x` the left padding, in pixels.
+    pub fn cursor_rect_on_screen(&self, view: &NSView, surface: &Surface, cell: (f32, f32), pad_x: f32) -> CGRect {
+        let Some(window) = view.window() else { return CGRect::ZERO };
+        let bounds = view.bounds();
+        let geometry = CellGeometry {
+            scale: window.backingScaleFactor(),
+            cell_w: cell.0,
+            cell_h: cell.1,
+            pad_x,
+            view_height: bounds.size.height,
+            flipped: view.isFlipped(),
+        };
+        let in_view = cursor_rect_in_view(surface, &geometry);
+        let in_window: CGRect =
+            unsafe { msg_send![view, convertRect: in_view, toView: std::ptr::null::<objc2::runtime::AnyObject>()] };
+        window.convertRectToScreen(in_window)
+    }
+
     /// `characterIndexForPoint:`.
     pub fn character_index_for_point(&self) -> usize {
         objc2_foundation::NSNotFound as usize
@@ -312,6 +334,52 @@ pub fn event_to_pixel(view: &NSView, event: &NSEvent) -> (f32, f32) {
     (pixel_x, pixel_y)
 }
 
+/// What `cursor_cell_rect` needs to know about the view a surface fills.
+#[derive(Clone, Copy, Debug)]
+pub struct CellGeometry {
+    /// Backing scale: pixels per point.
+    pub scale: f64,
+    /// Cell size and left padding, in pixels.
+    pub cell_w: f32,
+    pub cell_h: f32,
+    pub pad_x: f32,
+    /// The view's height in points, and whether its y axis points down.
+    pub view_height: f64,
+    pub flipped: bool,
+}
+
+/// The cell at column `col` of on-screen row `screen_row` (the cursor's row
+/// plus the scrollback offset, as the renderer draws it), in the view's own
+/// coordinates (points). Rows are placed as the renderer places them: from
+/// the top, `y_offset` pixels down (`content_y_offset`). A cursor scrolled
+/// out of sight is clamped to the nearest visible row, so the accent window
+/// stays on the pane.
+pub fn cursor_cell_rect(col: u16, screen_row: i32, rows: u16, y_offset: f32, g: &CellGeometry) -> CGRect {
+    let row = screen_row.clamp(0, rows.max(1) as i32 - 1);
+    let scale = if g.scale > 0.0 { g.scale } else { 1.0 };
+    let x_px = g.pad_x as f64 + col as f64 * g.cell_w as f64;
+    let top_px = y_offset as f64 + row as f64 * g.cell_h as f64;
+    let (w, h) = (g.cell_w as f64 / scale, g.cell_h as f64 / scale);
+    let top = top_px / scale;
+    let y = if g.flipped { top } else { g.view_height - top - h };
+    CGRect { origin: CGPoint { x: x_px / scale, y }, size: CGSize { width: w, height: h } }
+}
+
+/// The terminal cursor's cell in the view's own coordinates (points), where
+/// the renderer draws it: rows from the top, shell output pushed down by the
+/// bottom gravity (`TerminalState::y_offset_rows`, `content_y_offset`), the
+/// scrollback offset applied.
+pub fn cursor_rect_in_view(surface: &Surface, g: &CellGeometry) -> CGRect {
+    let t = surface.terminal.read();
+    let y_offset = crate::renderer::pane_renderer::content_y_offset(
+        t.rows,
+        t.y_offset_rows(),
+        g.cell_h,
+        (g.view_height * g.scale) as f32,
+    );
+    cursor_cell_rect(t.cursor_x, t.scroll_offset() + t.cursor_y as i32, t.rows, y_offset, g)
+}
+
 /// Extract a String from an NSTextInputClient input object (NSString or NSAttributedString).
 unsafe fn nsstring_from_input(obj: &objc2::runtime::AnyObject) -> String {
     let responds: bool = unsafe { msg_send![obj, respondsToSelector: objc2::sel!(string)] };
@@ -346,5 +414,76 @@ pub fn copy_to_pasteboard(text: &str) {
     let ns_str = NSString::from_str(text);
     unsafe {
         pasteboard.setString_forType(&ns_str, objc2_app_kit::NSPasteboardTypeString);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 200-point-high view at 2x, 10×20 px cells, 8 px padding, no offset.
+    fn geometry(flipped: bool) -> CellGeometry {
+        CellGeometry { scale: 2.0, cell_w: 10.0, cell_h: 20.0, pad_x: 8.0, view_height: 200.0, flipped }
+    }
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
+        CGRect { origin: CGPoint { x, y }, size: CGSize { width: w, height: h } }
+    }
+
+    #[test]
+    fn the_cursor_cell_in_a_view_whose_origin_is_bottom_left() {
+        // Column 3, row 2: x = (8 + 30) / 2, top = 40 / 2 = 20 pt from the
+        // top, so the cell's bottom edge sits 200 - 20 - 10 = 170 pt up.
+        assert_eq!(cursor_cell_rect(3, 2, 24, 0.0, &geometry(false)), rect(19.0, 170.0, 5.0, 10.0));
+        assert_eq!(cursor_cell_rect(0, 0, 24, 0.0, &geometry(false)), rect(4.0, 190.0, 5.0, 10.0));
+    }
+
+    #[test]
+    fn the_cursor_cell_in_a_flipped_view() {
+        assert_eq!(cursor_cell_rect(3, 2, 24, 0.0, &geometry(true)), rect(19.0, 20.0, 5.0, 10.0));
+    }
+
+    #[test]
+    fn the_cursor_cell_follows_the_content_offset() {
+        // Content pushed 40 px (20 pt) down, as the renderer draws it.
+        assert_eq!(cursor_cell_rect(0, 0, 24, 40.0, &geometry(true)), rect(4.0, 20.0, 5.0, 10.0));
+    }
+
+    #[test]
+    fn a_cursor_scrolled_out_of_sight_stays_on_the_pane() {
+        // Scrolled back so far the cursor's row is below the last one.
+        assert_eq!(cursor_cell_rect(0, 40, 24, 0.0, &geometry(true)), cursor_cell_rect(0, 23, 24, 0.0, &geometry(true)));
+        assert_eq!(cursor_cell_rect(0, -3, 24, 0.0, &geometry(true)), cursor_cell_rect(0, 0, 24, 0.0, &geometry(true)));
+    }
+
+    /// A host app's measured case (14/10/2026): a 650×231 pt pane at 2x, 16×32 px
+    /// cells, 13 rows plus the status bar, a shell that printed two prompts
+    /// and sits on the third line (logical row 2). Shell output is pushed to
+    /// the bottom (10 blank rows above it), so the cursor is drawn on the
+    /// last grid row, just above the status bar: 23 pt up from the view's
+    /// bottom edge — the y the host app measured (pane at y 200, rect at y 223).
+    #[test]
+    fn the_cursor_rect_follows_the_bottom_gravity_of_shell_output() {
+        let (surface, _reader) = Surface::capture(40, 13);
+        {
+            let mut t = surface.terminal.write();
+            for (i, line) in ["$ true", "$ true", "$ "].iter().enumerate() {
+                if i > 0 {
+                    t.newline();
+                    t.carriage_return();
+                }
+                line.chars().for_each(|c| t.put_char(c));
+            }
+            assert_eq!((t.cursor_x, t.cursor_y), (2, 2));
+            assert_eq!(t.y_offset_rows(), 10, "three lines of shell flow in 13 rows");
+        }
+        let g = CellGeometry { scale: 2.0, cell_w: 16.0, cell_h: 32.0, pad_x: 8.0, view_height: 231.0, flipped: false };
+        // Top of the drawn row: 10 + 2 = 12 rows down = 384 px = 192 pt.
+        assert_eq!(cursor_rect_in_view(&surface, &g), rect(20.0, 231.0 - 192.0 - 16.0, 8.0, 16.0));
+        // The same pane in a flipped view: measured from the top instead.
+        assert_eq!(cursor_rect_in_view(&surface, &CellGeometry { flipped: true, ..g }), rect(20.0, 192.0, 8.0, 16.0));
+        // A full-screen program (alt screen) has no gravity: logical row 2.
+        surface.terminal.write().in_alt_screen = true;
+        assert_eq!(cursor_rect_in_view(&surface, &g), rect(20.0, 231.0 - 32.0 - 16.0, 8.0, 16.0));
     }
 }

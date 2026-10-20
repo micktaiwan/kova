@@ -246,6 +246,9 @@ impl VteHandler {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             term.last_activity_secs.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+            // Any op may rewrite cells or shift lines: let index-keyed caches
+            // (the Ctrl+F filter matches) know they must recompute.
+            term.bump_content_generation();
             for op in self.ops.drain(..) {
                 match op {
                     TermOp::Print(buf) => {
@@ -528,7 +531,10 @@ fn copy_to_clipboard(text: String) {
     if cfg!(test) { return; }
     std::thread::spawn(move || {
         use std::io::Write;
+        // pbcopy decodes stdin with the locale's encoding. Kova launched from the Dock has no
+        // LANG, so without this it reads the UTF-8 bytes as Mac Roman: "é" lands as "√©".
         let child = std::process::Command::new("/usr/bin/pbcopy")
+            .env("LANG", "en_US.UTF-8")
             .stdin(std::process::Stdio::piped())
             .spawn();
         match child {

@@ -127,7 +127,8 @@ fn save(projects: &RecentProjects) {
     }
     match serde_json::to_string_pretty(projects) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
+            // Owner-only like session.json: it lists every project and its commands.
+            if let Err(e) = crate::session::write_owner_only(&path, &json) {
                 log::warn!("Failed to write recent projects: {}", e);
             }
         }

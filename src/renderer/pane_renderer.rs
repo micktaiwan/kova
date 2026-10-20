@@ -366,9 +366,7 @@ impl PaneBuild<'_> {
         let oy = vp.y;
 
         // Push content to bottom when screen isn't full (single source of truth in Terminal)
-        let y_offset_rows = term.y_offset_rows() as f32;
-        let content_height = (term.rows as f32 - y_offset_rows) * cell_h;
-        let y_offset = (y_offset_rows * cell_h).min((vp.height - content_height).max(0.0));
+        let y_offset = content_y_offset(term.rows, term.y_offset_rows(), cell_h, vp.height);
 
         let mut vertices = Vec::with_capacity(display.len() * term.cols as usize * 6);
 
@@ -814,8 +812,32 @@ impl PaneBuild<'_> {
     }
 }
 
+/// How far down the pane's first row is drawn, in pixels: content is pushed
+/// to the bottom while the screen is not full (`TerminalState::y_offset_rows`,
+/// the single source of truth), never past the viewport's height. The
+/// renderer and the text-input cursor rect (`appkit_input::cursor_cell_rect`)
+/// both place rows with it.
+pub fn content_y_offset(rows: u16, y_offset_rows: usize, cell_h: f32, vp_height: f32) -> f32 {
+    let y_offset_rows = y_offset_rows as f32;
+    let content_height = (rows as f32 - y_offset_rows) * cell_h;
+    (y_offset_rows * cell_h).min((vp_height - content_height).max(0.0))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn content_is_pushed_down_only_while_the_screen_is_not_full() {
+        use super::content_y_offset;
+        // 24 rows of 20 px, the first 4 not yet reached: the 20 rows of
+        // content (400 px) are pushed down by the 4 empty rows (80 px)...
+        assert_eq!(content_y_offset(24, 4, 20.0, 480.0), 80.0);
+        assert_eq!(content_y_offset(24, 4, 20.0, 520.0), 80.0);
+        // ...but never past the viewport's bottom edge.
+        assert_eq!(content_y_offset(24, 4, 20.0, 450.0), 50.0);
+        assert_eq!(content_y_offset(24, 4, 20.0, 400.0), 0.0);
+        assert_eq!(content_y_offset(24, 0, 20.0, 520.0), 0.0);
+    }
+
     use super::*;
     use objc2_metal::{MTLCreateSystemDefaultDevice, MTLPixelFormat};
     use parking_lot::RwLock;

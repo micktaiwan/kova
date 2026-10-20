@@ -271,6 +271,13 @@ The first notification of a fresh install triggers the system permission prompt;
 if the user declines, `notify` still answers `{ "ok": true }` and macOS silently
 drops the banner.
 
+A library host (an app that embeds Kova, `include/kova.h`) posts the notification
+itself: it registers a handler with `kova_set_notify_handler`, which receives the
+pane, title, message and sound, and handles the click (it knows which of its
+documents holds the pane). The answer is `{ "ok": true }` once the request is
+queued for that handler; a library host that registered none answers
+`notify is not supported by this host`.
+
 ---
 
 ### `ask` — put an agent's question on the user's screen and wait for the answer
@@ -785,6 +792,13 @@ Notes that matter when writing a client:
   up to ~250 ms, while `focus` is reported on the next frame.
 - **The socket name carries Kova's pid**, so a Kova restart moves it. A long-lived
   subscriber needs to re-glob `/tmp/kova-*.sock` and re-subscribe.
+- **A library host serves it too**, over its panes in the socket's model (window 0,
+  one tab per pane). Its `focus` is the pane whose view has the keyboard in the
+  host's key window, and `app_active` is the host app being frontmost: `app-inactive`
+  means the host went to the background, `no-key-window` that the host is in front
+  but the keyboard is elsewhere in it (an editor next to the terminal), and moving
+  between two panes reads `tab`. Its sweep runs every fps/4 calls of the host's
+  poll, so the ~250 ms holds when the host polls at Kova's frame rate.
 
 ## Common patterns
 

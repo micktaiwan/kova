@@ -5,7 +5,8 @@
 // resize), the socket (list-panes and get-pane-content from a client thread,
 // answered by kova_ipc_poll), and a pane with a view inside an NSView that
 // is in no window (the library's subview, its CAMetalLayer, a forced draw,
-// a frame change that changes the grid), a socket path that cannot be bound,
+// a frame change that changes the grid, the Ctrl+F filter drawn over it), a
+// notify handed to the host's handler, a socket path that cannot be bound,
 // and kova_shutdown leaving no process behind (a shell and a job that both
 // ignore SIGHUP, one pane freed before, one closed by it). The shell is
 // /bin/sh so the user's zsh setup plays no part, and PTY capture files are
@@ -63,6 +64,24 @@ static char *wait_for_text(KovaPaneId pane, const char *needle, double timeout) 
         usleep(10 * 1000);
     }
     return kova_pane_copy_text(pane, KOVA_TEXT_ALL, 1);
+}
+
+// What the notify handler was last called with.
+static struct {
+    int calls;
+    KovaPaneId pane;
+    char title[64];
+    char message[64];
+    bool sound;
+} notified;
+
+static void on_notify(void *ctx, KovaPaneId pane, const char *title, const char *message, bool sound) {
+    (void)ctx;
+    notified.calls++;
+    notified.pane = pane;
+    snprintf(notified.title, sizeof(notified.title), "%s", title);
+    snprintf(notified.message, sizeof(notified.message), "%s", message);
+    notified.sound = sound;
 }
 
 static int alive(pid_t pid) { return kill(pid, 0) == 0 || errno == EPERM; }
@@ -224,6 +243,16 @@ int main(int argc, char **argv) {
         ask(sock, request, reply, sizeof(reply));
         printf("close-tab -> %s", reply);
         CHECK(kova_pane_tick(a) & KOVA_EVENT_CLOSE_REQUESTED, "close-tab reaches the host as KOVA_EVENT_CLOSE_REQUESTED");
+        ask(sock, "{\"cmd\":\"notify\",\"message\":\"m\"}", reply, sizeof(reply));
+        CHECK(strstr(reply, "not supported") != NULL, "notify without a handler is refused: %s", reply);
+        kova_set_notify_handler(on_notify, NULL);
+        snprintf(request, sizeof(request), "{\"cmd\":\"notify\",\"pane_id\":%u,\"title\":\"T\",\"message\":\"done\",\"sound\":true}", a);
+        ask(sock, request, reply, sizeof(reply));
+        kova_ipc_poll();
+        CHECK(strstr(reply, "\"ok\":true") && notified.calls == 1 && notified.pane == a &&
+                  !strcmp(notified.title, "T") && !strcmp(notified.message, "done") && notified.sound,
+              "notify reaches the host's handler (pane %u, \"%s\", \"%s\")", notified.pane, notified.title, notified.message);
+        kova_set_notify_handler(NULL, NULL);
 
         // ── A pane with a view ───────────────────────────────────────────
         [NSApplication sharedApplication];
@@ -254,6 +283,13 @@ int main(int argc, char **argv) {
         CHECK(kova_pane_mouse(b, KOVA_MOUSE_PRESS, 0, 0, 30, 10, 1) == KOVA_MOUSE_LOCAL, "mouse press (local)");
         CHECK(kova_pane_mouse(b, KOVA_MOUSE_RELEASE, 0, 0, 30, 10, 1) == KOVA_MOUSE_LOCAL, "mouse release (local)");
         CHECK(kova_pane_scroll(b, 3.0, 0, 0, 30, 10) == 0, "scroll");
+        KovaKeyEvent ctrl_f = {.keycode = 0x03, .mods = KOVA_MOD_CONTROL, .characters = "\x06",
+                               .characters_ignoring_modifiers = "f"};
+        CHECK(kova_pane_key(b, &ctrl_f) == KOVA_KEY_HOST, "Ctrl+F opens the pane's filter");
+        CHECK(kova_pane_needs_draw(b) == 1 && kova_pane_draw(b, 0) == 1, "the open filter is drawn");
+        KovaKeyEvent esc = {.keycode = 0x35, .characters = "\x1b", .characters_ignoring_modifiers = "\x1b"};
+        CHECK(kova_pane_key(b, &esc) == KOVA_KEY_HOST, "Escape closes it, nothing sent");
+        CHECK(kova_pane_draw(b, 0) == 1, "the pane is drawn again");
 
         // ── Closing ──────────────────────────────────────────────────────
         CHECK(kova_pane_free(a) == 0, "kova_pane_free(%u)", a);

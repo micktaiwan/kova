@@ -181,6 +181,41 @@ Mouse (known text on screen, then `pbpaste` after each gesture):
    outside the host app: Rust tests on the C functions (including the whole frozen key table)
    and `tests/c_smoke/smoke.m`, an Objective-C program that links the library, launches two
    panes (one of them in an off-window `NSView`, drawn) and queries the socket.
+   Closed on 14/10/2026, three gaps between the library view and `KovaView` found by reading
+   the code: (a) the accent and IME window opens on the cursor cell
+   (`AppKitInput::cursor_rect_on_screen`, pure computation `cursor_cell_rect` in
+   `src/appkit_input.rs`, converted by `convertRect:toView:nil` then `convertRectToScreen`);
+   the old computation, window origin plus view origin, only held for a content view at 0,0.
+   `KovaView` keeps the old computation (validated behavior, unchanged). (b) The repairs that
+   follow a resize (nudge on a size round trip under 500 ms, "settle" repaint ~150 ms after the
+   last size, deferred winsize restore, empty-band search after restore) live in
+   `src/resize_repair.rs`, shared: Kova.app advances its counters by one frame per tick, a
+   library pane by the number of frames (at the config's fps) elapsed since its previous tick
+   (`FrameClock`). (c) Mode 1004: the view sends `CSI I` / `CSI O` when it becomes or stops
+   being first responder, once per real change (`input::focus_report`, the same function as
+   Kova.app's activation).
+   Added on 20/10/2026, four Kova.app features brought to the library pane through the code
+   Kova.app runs: (a) Cmd+hover underlines the URL under the pointer and Cmd+click opens it,
+   re-checked at the click (`input::url_at_point`, `input::url_hover_update`; the view
+   tracks mouse moves and `flagsChanged:`; the URL opens through `NSWorkspace`, not Kova.app's
+   `open` child, which a host would have to reap). (b) Ctrl+F opens Kova.app's filter over
+   the pane: the state, the key rules, the click row, the copy and paste and the 150 ms
+   refresh are `window::overlays`' (`FilterState`, `filter_key`, `filter_click_row`), the
+   drawing is `renderer::build_filter_overlay`, which the layer draws instead of the pane while
+   it is open. `kova_pane_key` routes keys the same way (`KOVA_KEY_HOST` while the filter has
+   them); Ctrl+Option+arrows still do nothing. (c) `subscribe`: the event diff of
+   `src/events.rs` now reads an `EventSource` and writes to an `EventSink`; Kova.app's windows
+   and the library's panes (`embed::LibEvents`) are two sources of the same state machine,
+   published to the same bounded queues. Focus is the pane whose view is the first responder
+   of the key window; `app_active` is `NSRunningApplication.currentApplication.isActive`
+   for the host process, so `no-key-window` means "the host is in front, the keyboard is
+   elsewhere in it". The pane sweep (working/awaiting/status edges) runs every `fps / 4`
+   ticks, counted in the host's calls, not in time: a host that ticks slower than the
+   configured fps (for instance 4 times a second while no pane is on screen) delays those
+   edges in proportion, up to a few seconds. (d) `notify`: the host registers a handler
+   (`kova_set_notify_handler`), called from `kova_ipc_poll` once the request is answered and
+   the socket state released; the host posts the notification and handles its click, since
+   it knows which document holds the pane. No handler: the error as before.
 4. The host app: the pane view, linking the library in its build, the socket, the note →
    session table (path and inode), the three hooks (SessionStart, UserPromptSubmit,
    PreToolUse), an edit command, the command that receives a new session id, watching the
@@ -198,8 +233,16 @@ Mouse (known text on screen, then `pbpaste` after each gesture):
 
 ## Not verified
 
+- On a real screen, in the host app: where the accent window opens (the computation is tested
+  on a fake geometry, not in a real window), and that the first resize of a new pane (default
+  size to the view's size), which also arms the "settle" repaint, doesn't disturb the shell
+  that is starting.
 - That a Rust view provided by the library fits without friction into the host app's AppKit
   window (first responder, focus between the editor and the terminal).
 - That a remote client copes with a server that answers `list-tabs` with one tab per note.
+- In a real host window: the pointing-hand cursor set on a Cmd+hover (the host's own cursor
+  rects may set another one back), and the filter overlay drawn at the host's tick rate. Both
+  are covered by tests only through their pure parts (hit at a point, hover rule, key rules,
+  click row, overlay vertices) and `tests/c_smoke/smoke.m`.
 - That keeping one image per window or switching to one layer per pane changes anything
   measurable: nothing has been measured.

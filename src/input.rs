@@ -233,6 +233,17 @@ pub fn pane_key_action(ctrl: bool, option: bool, cmd: bool, unmod: Option<&str>,
     PaneKeyAction::Send { wipe_scrollback, direct }
 }
 
+/// What to tell a program about a focus change (DEC mode 1004): `CSI I` on
+/// gaining focus, `CSI O` on losing it — only when the focus really changed
+/// (`was` != `now`) and the program turned the mode on. Kova.app reports the
+/// app's activation with it, a library pane its view's first-responder state.
+pub fn focus_report(was: bool, now: bool, reporting: bool) -> Option<&'static [u8]> {
+    if was == now || !reporting {
+        return None;
+    }
+    Some(if now { b"\x1b[I" } else { b"\x1b[O" })
+}
+
 /// SGR mouse modifier bits: shift=4, option=8, ctrl=16.
 pub fn mouse_modifiers(shift: bool, option: bool, ctrl: bool) -> u8 {
     let mut m: u8 = 0;
@@ -313,6 +324,129 @@ pub fn host_key(key: &KeyEvent) -> Option<HostKey> {
         PaneKeyAction::ToggleFilter => Some(HostKey::ToggleFilter),
         PaneKeyAction::AdjustVirtualWidth(dir) => Some(HostKey::AdjustVirtualWidth(dir)),
         PaneKeyAction::Send { .. } => None,
+    }
+}
+
+/// The visible cell under a point `(rel_x, rel_y)` pixels from the pane's text
+/// origin (left padding already taken off), for cells of `cell` pixels: the
+/// row on screen (`url_at`'s `visible_row`, bottom gravity taken off) and the
+/// column, clamped to the last one. `None` above, left of or below the grid.
+pub fn visible_row_col(rel_x: f32, rel_y: f32, cell: (f32, f32), y_offset_rows: usize, rows: u16, cols: u16) -> Option<(usize, u16)> {
+    let (cell_w, cell_h) = cell;
+    let col = (rel_x / cell_w).floor() as i32;
+    let visible_row = (rel_y / cell_h).floor() as i32 - y_offset_rows as i32;
+    if visible_row < 0 || col < 0 || visible_row >= rows as i32 {
+        return None;
+    }
+    Some((visible_row as usize, (col as u16).min(cols.saturating_sub(1))))
+}
+
+/// The URL under a point of the pane (see `visible_row_col`): its segments
+/// (`(visible_row, col_start, col_end)`, one per wrapped row) and its text.
+/// What Cmd+hover underlines and Cmd+click opens, in Kova.app and in a
+/// library pane.
+pub fn url_at_point(term: &crate::terminal::TerminalState, rel_x: f32, rel_y: f32, cell: (f32, f32)) -> Option<(Vec<(usize, u16, u16)>, String)> {
+    let (row, col) = visible_row_col(rel_x, rel_y, cell, term.y_offset_rows(), term.rows, term.cols)?;
+    term.url_at(row, col)
+}
+
+/// What a mouse move or a modifier change does to a pane's hovered URL.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HoverUpdate {
+    /// Nothing changed: no redraw, no cursor change.
+    Keep,
+    /// A new URL is under the pointer with Cmd held: underline it, show the
+    /// pointing hand.
+    Set(Vec<(usize, u16, u16)>, String),
+    /// The hover is gone (Cmd released, or no URL under the pointer).
+    Clear,
+}
+
+/// Kova.app's Cmd+hover rule: a URL is underlined only while Cmd is held and
+/// the pointer is on it; the same URL (same segments, same text) stays as
+/// is. `hit` is only asked for with Cmd held. `current` is the segments and
+/// text hovered now. Another URL over the same cells (output slid it under a
+/// still pointer) is a new hover: its text is what the status bar shows and
+/// what Cmd+click opens.
+pub fn url_hover_update(
+    cmd: bool,
+    hit: impl FnOnce() -> Option<(Vec<(usize, u16, u16)>, String)>,
+    current: Option<(&[(usize, u16, u16)], &str)>,
+) -> HoverUpdate {
+    let found = if cmd { hit() } else { None };
+    match found {
+        Some((segments, url)) if current == Some((segments.as_slice(), url.as_str())) => HoverUpdate::Keep,
+        Some((segments, url)) => HoverUpdate::Set(segments, url),
+        None if current.is_some() => HoverUpdate::Clear,
+        None => HoverUpdate::Keep,
+    }
+}
+
+/// What the cells under a still pointer depend on. When any of it changes —
+/// new output (`content_generation`), the user scrolling the scrollback, the
+/// pane laid out elsewhere, another pane under the pointer — the text under
+/// the pointer may have moved, and a hovered URL must be checked again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HoverStamp {
+    pub terminal_id: u32,
+    pub generation: u64,
+    pub scroll_offset: i32,
+    /// Where the pane's text sits, in pixels (its viewport in Kova.app's
+    /// window, the cell size and padding in a library pane).
+    pub layout: [f32; 4],
+}
+
+impl HoverStamp {
+    pub fn of(term: &crate::terminal::TerminalState, layout: [f32; 4]) -> Self {
+        HoverStamp {
+            terminal_id: term.terminal_id,
+            generation: term.content_generation(),
+            scroll_offset: term.scroll_offset(),
+            layout,
+        }
+    }
+}
+
+/// Keeps a Cmd+hover honest while the pointer does not move: the underline
+/// is computed on a mouse move, but output or a scroll can slide other text
+/// under the pointer afterwards. Remembers the last pointer position and the
+/// content the hover was computed against; once per tick, `recheck` says
+/// whether the hover must be computed again at that position.
+#[derive(Debug, Default)]
+pub struct HoverTracker {
+    point: Option<(f32, f32)>,
+    stamp: Option<HoverStamp>,
+}
+
+impl HoverTracker {
+    /// The pointer is at `point` and the hover was just computed there,
+    /// against the content `stamp` describes (`None` when nothing is hovered).
+    pub fn seen(&mut self, point: (f32, f32), stamp: Option<HoverStamp>) {
+        self.point = Some(point);
+        self.stamp = stamp;
+    }
+
+    /// Once per tick. `hovering`: whether a URL is underlined now;
+    /// `stamp_at` describes the content under a point (`None`: no pane
+    /// there), and is only called while hovering. Returns the point to
+    /// compute the hover at again when the content under it changed since the
+    /// hover was computed, `None` when nothing changed (the cheap case).
+    pub fn recheck(
+        &mut self,
+        hovering: bool,
+        stamp_at: impl FnOnce((f32, f32)) -> Option<HoverStamp>,
+    ) -> Option<(f32, f32)> {
+        if !hovering {
+            self.stamp = None;
+            return None;
+        }
+        let point = self.point?;
+        let now = stamp_at(point);
+        if now.is_some() && now == self.stamp {
+            return None;
+        }
+        self.stamp = now;
+        Some(point)
     }
 }
 
@@ -434,6 +568,15 @@ impl Surface {
         // Typing into a pane answers it: it is no longer waiting on us.
         self.clear_awaiting();
         write_key(key, &self.pty, cursor_keys_app, keybindings, kitty_flags);
+    }
+
+    /// The pane's focus went from `was` to `now`: tell the program when it
+    /// asked to hear about it (`focus_report`).
+    pub fn report_focus(&self, was: bool, now: bool) {
+        let reporting = self.terminal.read().focus_reporting;
+        if let Some(seq) = focus_report(was, now, reporting) {
+            self.pty.write(seq);
+        }
     }
 
     /// Text committed by the platform's text input (macOS `insertText:`):
@@ -1011,7 +1154,7 @@ pub(crate) mod tests {
         t.kitty_keyboard_flags = if kitty > 0 { vec![kitty] } else { Vec::new() };
     }
 
-    fn typed(chars: &str, unmod: &str, keycode: u16, mods: &str) -> KeyEvent {
+    pub(crate) fn typed(chars: &str, unmod: &str, keycode: u16, mods: &str) -> KeyEvent {
         appkit_input::key_event(&key_event(chars, unmod, keycode, mods))
     }
 
@@ -1320,5 +1463,215 @@ pub(crate) mod tests {
         assert_eq!(s.terminal.read().scroll_offset(), 0, "the scrollback does not move");
         s.scroll(&wheel(4.0, true), CELL, 6.0, 0);
         assert_eq!(drain(&reader), b"", "less than a line: nothing yet");
+    }
+
+    #[test]
+    fn focus_is_reported_only_on_a_real_change_with_mode_1004() {
+        assert_eq!(focus_report(false, true, true), Some(&b"\x1b[I"[..]));
+        assert_eq!(focus_report(true, false, true), Some(&b"\x1b[O"[..]));
+        assert_eq!(focus_report(true, true, true), None, "no change, nothing sent");
+        assert_eq!(focus_report(false, false, true), None);
+        assert_eq!(focus_report(false, true, false), None, "mode 1004 off");
+        assert_eq!(focus_report(true, false, false), None);
+    }
+
+    #[test]
+    fn a_surface_reports_focus_once_the_program_turned_mode_1004_on() {
+        let (s, reader) = Surface::capture(80, 24);
+        s.report_focus(false, true);
+        assert_eq!(drain(&reader), b"", "mode off: nothing");
+        s.terminal.write().focus_reporting = true;
+        s.report_focus(false, true);
+        assert_eq!(drain(&reader), b"\x1b[I");
+        s.report_focus(true, true);
+        assert_eq!(drain(&reader), b"", "no change: nothing");
+        s.report_focus(true, false);
+        assert_eq!(drain(&reader), b"\x1b[O");
+    }
+
+    // --- Cmd+hover / Cmd+click on a URL: the hit at a point, shared by
+    // Kova.app's window and the library pane ---
+
+    #[test]
+    fn visible_row_col_maps_points_to_cells() {
+        let cell = (10.0, 20.0);
+        assert_eq!(visible_row_col(0.0, 0.0, cell, 0, 3, 8), Some((0, 0)));
+        assert_eq!(visible_row_col(25.0, 45.0, cell, 0, 3, 8), Some((2, 2)));
+        assert_eq!(visible_row_col(9.9, 19.9, cell, 0, 3, 8), Some((0, 0)), "a cell's own pixels");
+        assert_eq!(visible_row_col(500.0, 0.0, cell, 0, 3, 8), Some((0, 7)), "past the right edge: last column");
+        assert_eq!(visible_row_col(-1.0, 0.0, cell, 0, 3, 8), None, "in the left padding");
+        assert_eq!(visible_row_col(0.0, -1.0, cell, 0, 3, 8), None, "above the grid");
+        assert_eq!(visible_row_col(0.0, 60.0, cell, 0, 3, 8), None, "below the grid");
+        // Bottom gravity: two blank rows drawn on top shift every row down.
+        assert_eq!(visible_row_col(0.0, 45.0, cell, 2, 3, 8), Some((0, 0)));
+        assert_eq!(visible_row_col(0.0, 25.0, cell, 2, 3, 8), None, "in the gravity band");
+    }
+
+    #[test]
+    fn url_at_point_finds_the_url_under_the_pointer() {
+        let (s, _fd) = surface(30, 3, &["see https://a.example/x now", "plain"]);
+        let t = s.terminal.read();
+        let y_off = t.y_offset_rows() as f32;
+        let cell = (10.0, 20.0);
+        let row0 = y_off * 20.0 + 5.0;
+        let (segments, url) = url_at_point(&t, 4.0 * 10.0 + 1.0, row0, cell).expect("on the URL");
+        assert_eq!(url, "https://a.example/x");
+        assert_eq!(segments, vec![(0, 4, 23)]);
+        assert_eq!(url_at_point(&t, 25.0 * 10.0, row0, cell), None, "after it");
+        assert_eq!(url_at_point(&t, 1.0, row0 + 20.0, cell), None, "the next line");
+    }
+
+    #[test]
+    fn url_hover_follows_cmd_and_the_pointer() {
+        let hit = || Some((vec![(0, 4, 23)], "https://a.example/x".to_string()));
+        let segments = [(0usize, 4u16, 23u16)];
+        let current = Some((&segments[..], "https://a.example/x"));
+        assert_eq!(url_hover_update(true, hit, None), HoverUpdate::Set(vec![(0, 4, 23)], "https://a.example/x".into()));
+        assert_eq!(url_hover_update(true, hit, current), HoverUpdate::Keep, "same URL: no redraw");
+        assert_eq!(url_hover_update(true, || None, current), HoverUpdate::Clear, "moved off it");
+        assert_eq!(url_hover_update(true, || None, None), HoverUpdate::Keep);
+        let never = || -> Option<(Vec<(usize, u16, u16)>, String)> { panic!("no hit test without Cmd") };
+        assert_eq!(url_hover_update(false, never, current), HoverUpdate::Clear, "Cmd released");
+        assert_eq!(url_hover_update(false, never, None), HoverUpdate::Keep);
+        let other = [(1usize, 0u16, 5u16)];
+        assert!(matches!(url_hover_update(true, hit, Some((&other[..], "https://a.example/x"))), HoverUpdate::Set(..)), "another URL");
+        // Same cells, other text: output slid another URL of the same length
+        // under the pointer. Keeping it would open the old URL on Cmd+click.
+        assert_eq!(
+            url_hover_update(true, hit, Some((&segments[..], "https://b.example/y"))),
+            HoverUpdate::Set(vec![(0, 4, 23)], "https://a.example/x".into()),
+        );
+    }
+
+    // --- The hover under a still pointer, re-checked when the text moves ---
+
+    const LAYOUT: [f32; 4] = [0.0, 0.0, 300.0, 60.0];
+
+    /// One tick of the hover refresh, as Kova.app's and the library pane's
+    /// ticks run it: recheck, then (if asked) the same update a mouse move
+    /// does, with Cmd held. Returns the update, `None` when not re-run.
+    fn tick_hover(
+        tracker: &mut HoverTracker,
+        hover: &mut Option<(Vec<(usize, u16, u16)>, String)>,
+        t: &crate::terminal::TerminalState,
+        cell: (f32, f32),
+    ) -> Option<HoverUpdate> {
+        let (px, py) = tracker.recheck(hover.is_some(), |_| Some(HoverStamp::of(t, LAYOUT)))?;
+        let current = hover.clone();
+        let update = url_hover_update(true, || url_at_point(t, px, py, cell), current.as_ref().map(|(s, u)| (s.as_slice(), u.as_str())));
+        match &update {
+            HoverUpdate::Set(segs, url) => *hover = Some((segs.clone(), url.clone())),
+            HoverUpdate::Clear => *hover = None,
+            HoverUpdate::Keep => {}
+        }
+        Some(update)
+    }
+
+    /// A hover computed at a mouse move, with its stamp, as the views do.
+    fn hover_at(
+        tracker: &mut HoverTracker,
+        t: &crate::terminal::TerminalState,
+        point: (f32, f32),
+        cell: (f32, f32),
+    ) -> Option<(Vec<(usize, u16, u16)>, String)> {
+        let hover = url_at_point(t, point.0, point.1, cell);
+        tracker.seen(point, hover.as_ref().map(|_| HoverStamp::of(t, LAYOUT)));
+        hover
+    }
+
+    fn push_line(t: &mut crate::terminal::TerminalState, line: &str) {
+        t.newline();
+        t.carriage_return();
+        for c in line.chars() {
+            t.put_char(c);
+        }
+        // What every batch of PTY output does (`VteHandler::apply_ops`).
+        t.bump_content_generation();
+    }
+
+    #[test]
+    fn hover_is_not_recomputed_while_nothing_moves() {
+        let (s, _fd) = surface(30, 3, &["see https://a.example/x now", "plain", "end"]);
+        let t = s.terminal.read();
+        let cell = (10.0, 20.0);
+        let point = (41.0, 5.0);
+        let mut tracker = HoverTracker::default();
+        let mut hover = hover_at(&mut tracker, &t, point, cell);
+        assert!(hover.is_some());
+        for _ in 0..3 {
+            assert_eq!(tick_hover(&mut tracker, &mut hover, &t, cell), None, "same generation, same scroll: no hit test");
+        }
+        let mut called = false;
+        assert_eq!(tracker.recheck(false, |_| { called = true; None }), None, "nothing hovered: nothing to check");
+        assert!(!called, "no stamp built while nothing is hovered");
+    }
+
+    #[test]
+    fn hover_follows_output_that_slides_text_under_the_pointer() {
+        let (s, _fd) = surface(40, 3, &["see https://a.example/x now", "plain", "end"]);
+        let cell = (10.0, 20.0);
+        let point = (41.0, 5.0); // row 0, column 4: on the URL
+        let mut tracker = HoverTracker::default();
+        let mut hover = hover_at(&mut tracker, &s.terminal.read(), point, cell);
+        assert_eq!(hover.as_ref().map(|h| h.1.as_str()), Some("https://a.example/x"));
+
+        // One line of output: "plain" is now on row 0, under the pointer.
+        push_line(&mut s.terminal.write(), "more");
+        let t = s.terminal.read();
+        assert_eq!(tick_hover(&mut tracker, &mut hover, &t, cell), Some(HoverUpdate::Clear));
+        assert_eq!(hover, None, "the underline does not stay on the text that took its place");
+        assert_eq!(tick_hover(&mut tracker, &mut hover, &t, cell), None, "cleared: nothing left to check");
+    }
+
+    #[test]
+    fn hover_moves_to_the_url_that_slid_under_the_pointer() {
+        let (s, _fd) = surface(40, 3, &["see https://a.example/x now", "see https://b.example/y", "end"]);
+        let cell = (10.0, 20.0);
+        let point = (41.0, 5.0);
+        let mut tracker = HoverTracker::default();
+        let mut hover = hover_at(&mut tracker, &s.terminal.read(), point, cell);
+        assert_eq!(hover.as_ref().map(|h| h.1.as_str()), Some("https://a.example/x"));
+
+        push_line(&mut s.terminal.write(), "more");
+        let t = s.terminal.read();
+        match tick_hover(&mut tracker, &mut hover, &t, cell) {
+            Some(HoverUpdate::Set(_, url)) => assert_eq!(url, "https://b.example/y"),
+            other => panic!("expected the new URL, got {other:?}"),
+        }
+        assert_eq!(tick_hover(&mut tracker, &mut hover, &t, cell), None, "stamp taken: no second recompute");
+    }
+
+    #[test]
+    fn hover_follows_a_scroll_of_the_scrollback() {
+        let (s, _fd) = surface(40, 3, &["old line", "see https://a.example/x now", "b", "c"]);
+        let cell = (10.0, 20.0);
+        let point = (41.0, 5.0); // row 0 = "see https://…" once "old line" is in the scrollback
+        let mut tracker = HoverTracker::default();
+        let mut hover = hover_at(&mut tracker, &s.terminal.read(), point, cell);
+        assert!(hover.is_some());
+
+        // The user scrolls one line up: "old line" is under the pointer, and
+        // no output arrived (the generation did not move).
+        let g = s.terminal.read().content_generation();
+        s.terminal.write().scroll(1);
+        let t = s.terminal.read();
+        assert_eq!(t.content_generation(), g);
+        assert_eq!(tick_hover(&mut tracker, &mut hover, &t, cell), Some(HoverUpdate::Clear));
+    }
+
+    #[test]
+    fn hover_rechecks_when_the_pane_is_gone_or_laid_out_elsewhere() {
+        let (s, _fd) = surface(40, 3, &["see https://a.example/x now"]);
+        let t = s.terminal.read();
+        let stamp = HoverStamp::of(&t, LAYOUT);
+        let mut tracker = HoverTracker::default();
+        tracker.seen((1.0, 2.0), Some(stamp));
+        assert_eq!(tracker.recheck(true, |_| Some(stamp)), None);
+        let moved = HoverStamp { layout: [10.0, 0.0, 300.0, 60.0], ..stamp };
+        assert_eq!(tracker.recheck(true, |_| Some(moved)), Some((1.0, 2.0)), "resized or moved pane");
+        assert_eq!(tracker.recheck(true, |_| None), Some((1.0, 2.0)), "no pane under the pointer any more");
+        assert_eq!(tracker.recheck(true, |_| None), Some((1.0, 2.0)), "still none: the hover check clears it");
+        let fresh = HoverTracker::default().recheck(true, |_| Some(stamp));
+        assert_eq!(fresh, None, "no pointer position known: nothing to recompute from");
     }
 }
