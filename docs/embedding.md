@@ -173,7 +173,9 @@ Mouse (known text on screen, then `pbpaste` after each gesture):
    `src/embed.rs`: a pane is a `Surface` plus, if the host gives an `NSView`, a library subview
    (the shared input component) that draws the pane alone in its `CAMetalLayer`
    (`src/renderer/layer.rs`, the same `PaneRenderer` as Kova.app; one `RenderContext` per
-   scale, shared, freed with the last pane). The clock stays with the host (`kova_pane_tick`,
+   scale, shared, freed with the last pane). It never draws Kova.app's focus outline: only the
+   host knows whether the pane is alone on screen, so marking focus is left to the host. The
+   clock stays with the host (`kova_pane_tick`,
    `kova_pane_draw`), and `kova_ipc_start` serves the socket over the host's panes, one tab per
    pane (bound before returning: a `bind` failure comes back as -1). On quit, the host calls
    `kova_shutdown`, which waits until shells and foreground jobs are dead; `kova_pane_free`

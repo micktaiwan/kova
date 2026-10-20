@@ -543,6 +543,9 @@ impl LibPane {
             viewport: PaneViewport { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
             shell_ready: s.is_ready(),
             is_focused: self.is_focused(),
+            // The host marks which of its views has the keyboard: the
+            // library cannot know whether this pane is the only one shown.
+            outlined: false,
             pane_id: s.id,
             custom_title: None,
             has_completion,

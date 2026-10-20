@@ -477,6 +477,11 @@ pub struct PaneRenderData {
     pub viewport: PaneViewport,
     pub shell_ready: bool,
     pub is_focused: bool,
+    /// Draw the focus outline around this pane. Only the caller knows whether
+    /// the outline tells anything: Kova.app sets it on the focused pane of a
+    /// tab with more than one visible pane, the library never (the host app
+    /// shows which of its views has the keyboard).
+    pub outlined: bool,
     pub pane_id: PaneId,
     pub custom_title: Option<String>,
     pub has_completion: bool,
@@ -740,6 +745,7 @@ impl Renderer {
         vp: &PaneViewport,
         blink_on: bool,
         is_focused: bool,
+        outlined: bool,
         custom_title: Option<&str>,
         attention: PaneAttention,
         pane_input_chars: u64,
@@ -754,7 +760,7 @@ impl Renderer {
             hovered_url_text: self.hovered_url_text.as_deref(),
             zones: &mut self.tooltip_zones,
         }
-        .build_vertices(term, vp, blink_on, is_focused, custom_title, attention, pane_input_chars, pane_id, fg_process, bookmarked)
+        .build_vertices(term, vp, blink_on, is_focused, outlined, custom_title, attention, pane_input_chars, pane_id, fg_process, bookmarked)
     }
 
     /// Build per-pane vertex lists into the cache and return the draw list
@@ -2950,6 +2956,7 @@ mod tests {
         PaneDrawKey {
             vp: [0.0, 0.0, 800.0, 600.0],
             is_focused: false,
+            outlined: false,
             show_blink: true,
             hover: None,
             custom_title: None,
@@ -3442,7 +3449,7 @@ mod vertex_snapshots {
 
     fn build(r: &mut Renderer, t: &TerminalState, focused: bool) -> Vec<Vertex> {
         fill_atlas(r, t);
-        r.build_vertices(t, &vp(), true, focused, None, PaneAttention::None, 0, 1, None, false)
+        r.build_vertices(t, &vp(), true, focused, focused, None, PaneAttention::None, 0, 1, None, false)
     }
 
     fn dump(vs: &[Vertex]) -> String {
@@ -3651,12 +3658,24 @@ mod vertex_snapshots {
         let mut t = term(12, 3);
         type_lines(&mut t, &["ab"]);
         fill_atlas(&mut r, &t);
-        let on = r.build_vertices(&t, &vp(), true, true, None, PaneAttention::None, 0, 1, None, false);
-        let off = r.build_vertices(&t, &vp(), false, true, None, PaneAttention::None, 0, 1, None, false);
+        let on = r.build_vertices(&t, &vp(), true, true, true, None, PaneAttention::None, 0, 1, None, false);
+        let off = r.build_vertices(&t, &vp(), false, true, true, None, PaneAttention::None, 0, 1, None, false);
         assert_eq!(on.len() - off.len(), 6, "blink off drops exactly the cursor quad");
         t.cursor_visible = false;
-        let hidden = r.build_vertices(&t, &vp(), true, true, None, PaneAttention::None, 0, 1, None, false);
+        let hidden = r.build_vertices(&t, &vp(), true, true, true, None, PaneAttention::None, 0, 1, None, false);
         assert_eq!(hidden.len(), off.len());
+    }
+
+    #[test]
+    fn a_focused_pane_without_the_outline_flag_draws_no_outline() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["ab"]);
+        fill_atlas(&mut r, &t);
+        let outlined = r.build_vertices(&t, &vp(), true, true, true, None, PaneAttention::None, 0, 1, None, false);
+        let plain = r.build_vertices(&t, &vp(), true, true, false, None, PaneAttention::None, 0, 1, None, false);
+        assert_eq!(outlined.len() - plain.len(), 4 * 6, "the outline is exactly four quads");
+        assert_eq!(dump(&outlined[..plain.len()]), dump(&plain), "nothing else changes");
     }
 
     #[test]

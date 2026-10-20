@@ -14,6 +14,18 @@ fn active_tab_after_removals(active: usize, removed: &[usize], remaining: usize)
 
 use crate::surface::pane_attention;
 
+/// The focus outline only tells which pane has the keyboard when there is
+/// another pane on screen to tell it from; around a lone pane it is noise.
+fn outlines_focused_pane(panes_on_screen: usize) -> bool {
+    panes_on_screen > 1
+}
+
+/// Whether a pane is drawn this frame: not minimized and not scrolled
+/// entirely out of the strip (the test `Renderer::rebuild_pane_draws` skips on).
+fn is_on_screen(minimized: bool, x: f32, width: f32, screen_width: f32) -> bool {
+    !minimized && x + width > 0.0 && x < screen_width
+}
+
 /// How many panes sit entirely off-screen, left and right of the visible strip.
 ///
 /// Fed `(x, width, minimized)` per pane, in the tab's own pixel space. Minimized
@@ -758,6 +770,8 @@ impl KovaView {
                         viewport: vp,
                         shell_ready: pane.is_ready(),
                         is_focused,
+                        // Set below, once every pane's viewport is known.
+                        outlined: false,
                         pane_id: pane.id,
                         custom_title: pane.custom_title.clone(),
                         has_completion: completed,
@@ -782,6 +796,16 @@ impl KovaView {
                         },
                     });
                 });
+
+                let on_screen = pane_data
+                    .iter()
+                    .filter(|p| is_on_screen(p.minimized, p.viewport.x, p.viewport.width, screen_width))
+                    .count();
+                if outlines_focused_pane(on_screen) {
+                    for entry in pane_data.iter_mut().filter(|p| p.is_focused) {
+                        entry.outlined = true;
+                    }
+                }
 
                 // Propagate OSC 1 sticky titles to pane custom_title
                 for entry in &mut pane_data {
@@ -1015,6 +1039,23 @@ mod tests {
         tab.first_pane().terminal.read().ack_completion();
         assert!(!tab.check_completion());
         assert!(tab.first_pane().terminal.read().command_completed.load(Relaxed));
+    }
+
+    #[test]
+    fn the_focus_outline_needs_a_second_visible_pane() {
+        assert!(!outlines_focused_pane(0));
+        assert!(!outlines_focused_pane(1));
+        assert!(outlines_focused_pane(2));
+        assert!(outlines_focused_pane(5));
+    }
+
+    #[test]
+    fn a_pane_scrolled_out_or_minimized_is_not_on_screen() {
+        assert!(is_on_screen(false, 0.0, 500.0, 1000.0));
+        assert!(is_on_screen(false, -300.0, 500.0, 1000.0), "partly visible counts");
+        assert!(!is_on_screen(false, -500.0, 500.0, 1000.0), "touching the left edge is out");
+        assert!(!is_on_screen(false, 1000.0, 500.0, 1000.0), "touching the right edge is out");
+        assert!(!is_on_screen(true, 0.0, 500.0, 1000.0));
     }
 
     #[test]

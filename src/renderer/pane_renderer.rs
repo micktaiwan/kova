@@ -98,6 +98,7 @@ struct PaneVertexEntry {
 pub(super) struct PaneDrawKey {
     pub(super) vp: [f32; 4],
     pub(super) is_focused: bool,
+    pub(super) outlined: bool,
     pub(super) show_blink: bool,
     pub(super) hover: Option<(Vec<(usize, u16, u16)>, Option<String>)>,
     pub(super) custom_title: Option<String>,
@@ -168,6 +169,7 @@ impl PaneRenderer {
         PaneDrawKey {
             vp: [vp.x, vp.y, vp.width, vp.height],
             is_focused: pane.is_focused,
+            outlined: pane.outlined,
             show_blink: if pane.is_focused { blink_on } else { true },
             hover,
             custom_title: pane.custom_title.clone(),
@@ -243,7 +245,7 @@ impl PaneRenderer {
             let pane_attention = PaneAttention::from_flags(pane.has_bell, pane.has_completion);
             let mut verts = if pane.shell_ready {
                 let t = pane.terminal.read();
-                build.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin, pane.pane_id, pane.fg_process.as_deref(), pane.bookmarked)
+                build.build_vertices(&t, vp, show_blink, pane.is_focused, pane.outlined, pane.custom_title.as_deref(), pane_attention, pin, pane.pane_id, pane.fg_process.as_deref(), pane.bookmarked)
             } else {
                 build.build_loading_vertices(vp)
             };
@@ -292,6 +294,7 @@ impl PaneBuild<'_> {
         vp: &PaneViewport,
         blink_on: bool,
         is_focused: bool,
+        outlined: bool,
         custom_title: Option<&str>,
         attention: PaneAttention,
         pane_input_chars: u64,
@@ -605,7 +608,9 @@ impl PaneBuild<'_> {
         }
 
         // Outline around the focused pane, drawn last so nothing covers it.
-        if is_focused && self.style.focus_border_width > 0.0 {
+        // `outlined`, not `is_focused`: the caller decides whether there is
+        // another pane to tell this one from (`PaneRenderData::outlined`).
+        if outlined && self.style.focus_border_width > 0.0 {
             let w = self.style.focus_border_width.min(vp.width * 0.5).min(vp.height * 0.5);
             let c = self.style.focus_border_color;
             push_bg_quad(&mut vertices, vp.x, vp.y, vp.width, w, c);
@@ -876,6 +881,7 @@ mod tests {
             viewport: vp,
             shell_ready: true,
             is_focused: true,
+            outlined: true,
             pane_id: 7,
             custom_title: None,
             has_completion: false,
@@ -983,7 +989,7 @@ mod tests {
         let mut zones = Vec::new();
         let mut build = |vp: PaneViewport| {
             PaneBuild { ctx: &mut ctx, style: &style, hovered_url: None, hovered_url_text: None, zones: &mut zones }
-                .build_vertices(&t, &vp, true, true, None, PaneAttention::None, 0, 7, None, false)
+                .build_vertices(&t, &vp, true, true, true, None, PaneAttention::None, 0, 7, None, false)
         };
         let in_place = build(vp_at(100.5, 30.0));
         let at_origin = build(vp_at(0.0, 30.0));

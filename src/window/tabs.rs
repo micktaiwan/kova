@@ -58,6 +58,9 @@ impl KovaView {
             pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         });
         drop(tabs);
+        // A rename started on the old tab would otherwise keep owning the keyboard
+        // and land on the new tab on Enter.
+        *self.ivars().rename_tab.borrow_mut() = None;
         self.ivars().active_tab.set(idx);
         // Clear bell/attention indicator on the newly focused tab
         {

@@ -16,7 +16,9 @@
  *   created with or without a view. With one, the library adds its own
  *   subview to the parent NSView you give: that view takes AppKit input
  *   itself (keys, text input and accents, mouse, scroll, Edit > Copy/Paste)
- *   and draws the pane alone into its own CAMetalLayer. Two of Kova.app's
+ *   and draws the pane alone into its own CAMetalLayer, without Kova.app's
+ *   focus outline: showing which view has the keyboard is the host's job.
+ *   Two of Kova.app's
  *   window features come with it: Cmd+hover underlines the URL under the
  *   pointer (the status bar shows it) and Cmd+click opens it (NSWorkspace);
  *   Ctrl+F opens Kova.app's filter over the pane (typing filters its lines,
