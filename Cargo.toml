@@ -1,6 +1,6 @@
 [package]
 name = "kova"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 
 # The terminal is a library (src/lib.rs) with two clients: the `kova` binary

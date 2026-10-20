@@ -1,7 +1,7 @@
-# 2.0.0
+# 2.0.1
 
-- Kova is now also a terminal library: another app can host Kova panes through a C API, with the same terminal code as Kova.app
-- Cmd+digit switches tabs on AZERTY keyboards too
-- The attention banner shows the Claude session name, and `list-panes` gives each pane's SendMessage address
-- Cmd+Shift+F finds words typed in open Claude panes, whole words first, closed sessions by date
-- Wide fallback glyphs such as circled digits fit in their cell, and the cursor blinks on real time even when frames drop
+- Kova ask: agents can put a question on a card and get your answer back, even after their turn ended
+- Cmd+P lists memory per pane (m) and your bookmarks (b); Cmd+Shift+F finds matching bookmarks
+- Text copied by a program (OSC 52) keeps its accents, and a folder with a space in its name is tracked correctly
+- The focus outline only shows when two panes or more are on screen, and switching tabs cancels a rename in progress
+- Cmd+O filters recent projects by their path
