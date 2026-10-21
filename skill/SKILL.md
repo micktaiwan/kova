@@ -190,12 +190,22 @@ right now (a question waiting on screen).
 
 ## "Merge pane N" = bring its conversation here, so it can be closed
 
-1. Read the whole conversation (recipe above). Never the screen.
+1. Read the whole conversation (recipe above). Never the screen. A long session easily weighs
+   200 KB of text once the turns are extracted, far above what one `Read` returns (about 25k
+   tokens): extract the turns into a file, check its size (`wc -c`, `wc -l`), list the turn
+   headers with their line numbers, then read it in slices of a few hundred lines. Skipping
+   `tool_result` blocks and skill bodies keeps the file small; agent results arriving as
+   `<task-notification>` user messages are part of the conversation and are read too.
 2. Report here in short prose: what was said and decided, new facts (in the user's words when they
-   matter), drafted texts and their status (sent or not), what is still open. Not a turn-by-turn
-   summary.
+   matter), drafted texts, what is still open. Not a turn-by-turn summary.
+   ⚠️ **The transcript only says what that session saw, not the state of the world now.** Anything
+   outside the conversation (a message sent or not, a task created or not, a PR merged, a file
+   committed) is re-read at the moment you report it, and the command you ran is cited in the
+   same sentence; otherwise the sentence says "not verified". A pane's "proposed, not created" or
+   "drafted, not sent" may have changed since, in another session or by the user's own hand.
 3. Say in one line what is written nowhere else: once the pane is closed, this conversation is the
-   only one that carries it.
+   only one that carries it. That line is a state claim too: check it (git status of the files the
+   session wrote, the task list, the channel) before writing it.
 4. Never close the pane yourself (`close-pane` only if asked), and never write into that pane's
    session.
 

@@ -448,4 +448,79 @@ mod tests {
         };
         assert_eq!(parse_key_combo("cmd+1"), combo);
     }
+
+    /// Keycodes of the letter and punctuation keys: their position moves with
+    /// the layout (AZERTY's `m` is QWERTY's `;`, its `a` is QWERTY's `q`), so
+    /// comparing one of them reads the wrong key on half the keyboards. Digits
+    /// (0x12..0x1D) are left out on purpose: see `keycode_to_digit`.
+    const LAYOUT_DEPENDENT_KEYCODES: &[u16] = &[
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0B, 0x0C, 0x0D, 0x0E,
+        0x0F, 0x10, 0x11, 0x18, 0x1B, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x25, 0x26, 0x27,
+        0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x32,
+    ];
+
+    /// The hex keycodes a line of key-handling code tests: `keycode == 0x2E`
+    /// or a `0x2E =>` match arm.
+    fn compared_keycodes(line: &str) -> Vec<u16> {
+        let code = line.split("//").next().unwrap_or("");
+        let mut found = Vec::new();
+        let mut rest = code;
+        while let Some(i) = rest.find("0x") {
+            let after = &rest[i + 2..];
+            let hex: String = after.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            let before = rest[..i].trim_end();
+            let tail = after[hex.len()..].trim_start();
+            let compared = before.ends_with("==") || before.ends_with('|') || tail.starts_with("=>") || tail.starts_with('|');
+            if compared {
+                if let Ok(v) = u16::from_str_radix(&hex, 16) {
+                    found.push(v);
+                }
+            }
+            rest = &after[hex.len()..];
+        }
+        found
+    }
+
+    #[test]
+    fn compared_keycodes_reads_comparisons_and_match_arms_only() {
+        assert_eq!(compared_keycodes("if keycode == 0x2E {"), vec![0x2E]);
+        assert_eq!(compared_keycodes("            0x0B => Some(View::Bookmarks),"), vec![0x0B]);
+        assert_eq!(compared_keycodes("0x00 | 0x0C => x,"), vec![0x00, 0x0C]);
+        assert_eq!(compared_keycodes("let ev = Ev { keycode: 0x03 };"), Vec::<u16>::new());
+        assert_eq!(compared_keycodes("x // keycode == 0x2E"), Vec::<u16>::new());
+    }
+
+    /// Every letter or punctuation shortcut is read from the typed character
+    /// (`charactersIgnoringModifiers`), never from `keyCode()`. Scans the
+    /// non-test code of each file that reads `keyCode()`.
+    #[test]
+    fn no_letter_key_is_matched_by_its_keycode() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        assert!(files.len() > 10, "the scan found the sources");
+        let mut offenders = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            if !text.contains("keyCode()") {
+                continue;
+            }
+            let body = text.split("#[cfg(test)]").next().unwrap_or("");
+            for (n, line) in body.lines().enumerate() {
+                if compared_keycodes(line).iter().any(|k| LAYOUT_DEPENDENT_KEYCODES.contains(k)) {
+                    offenders.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "letter keys matched by keycode (read charactersIgnoringModifiers instead):\n{}", offenders.join("\n"));
+    }
 }

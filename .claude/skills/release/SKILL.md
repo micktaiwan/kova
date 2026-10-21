@@ -37,9 +37,11 @@ Argument: `$ARGUMENTS` must be one of `major`, `minor`, or `patch`. If missing o
 
 9. **Build and test** (warnings are errors):
    ```bash
-   RUSTFLAGS="-D warnings" cargo build --release && RUSTFLAGS="-D warnings" cargo test
+   RUSTFLAGS="-D warnings" ./build.sh && RUSTFLAGS="-D warnings" cargo test
    ```
    Abort if either fails. Do not tag a version that doesn't compile, has warnings, or fails tests.
+   `./build.sh`, not `cargo build --release`: it also installs the released binary and Info.plist
+   into `/Applications/Kova.app`, so the app carries the version being tagged.
 
 10. **Generate release commit message:** Use `git log` since the last tag to summarize changes. Format:
     ```

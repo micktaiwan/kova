@@ -198,6 +198,17 @@ pub(super) fn toggled_view(current: SwitcherView, wanted: SwitcherView) -> Switc
     if current == wanted { SwitcherView::Panes } else { wanted }
 }
 
+/// The list a letter asks for, read from the typed character
+/// (`charactersIgnoringModifiers`) and not the keycode: on AZERTY the `m` key
+/// is QWERTY's `;`, and QWERTY's `m` key types `,`.
+pub(super) fn view_for_key(unmodified: Option<&str>) -> Option<SwitcherView> {
+    match unmodified?.to_lowercase().as_str() {
+        "b" => Some(SwitcherView::Bookmarks),
+        "m" => Some(SwitcherView::Memory),
+        _ => None,
+    }
+}
+
 /// A byte count the way the memory list shows it: "312 MB", "1.4 GB".
 pub(super) fn format_memory(bytes: u64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
@@ -895,11 +906,8 @@ impl KovaView {
         // attention-only list, which answers a different question and has no
         // bookmark half.
         // `m` does the same with the memory list.
-        let wanted = match keycode {
-            0x0B => Some(SwitcherView::Bookmarks),
-            0x2E => Some(SwitcherView::Memory),
-            _ => None,
-        };
+        let unmodified = event.charactersIgnoringModifiers().map(|s| s.to_string());
+        let wanted = view_for_key(unmodified.as_deref());
         if let Some(wanted) = wanted.filter(|_| !event.modifierFlags().contains(NSEventModifierFlags::Command)) {
             let (filtered, view) = self.pane_switcher_modes();
             if !filtered {
@@ -912,7 +920,7 @@ impl KovaView {
         let opens_filtered = self.ivars().keybindings.get().is_some_and(|kb| {
             matches!(kb.window_map.get(&opens_filtered), Some(Action::OpenUnreadSwitcher))
         });
-        if keycode == 0x20 || opens_filtered {
+        if unmodified.as_deref().is_some_and(|c| c.eq_ignore_ascii_case("u")) || opens_filtered {
             let (filtered, view) = self.pane_switcher_modes();
             self.open_pane_switcher(!filtered, view);
             return;
@@ -1764,5 +1772,16 @@ mod tests {
         assert_eq!(toggled_view(Bookmarks, Memory), Memory);
         assert_eq!(toggled_view(Memory, Bookmarks), Bookmarks);
         assert_eq!(toggled_view(Bookmarks, Bookmarks), Panes);
+    }
+
+    #[test]
+    fn b_and_m_are_read_from_the_typed_letter_whatever_the_layout() {
+        use SwitcherView::*;
+        assert_eq!(view_for_key(Some("m")), Some(Memory));
+        assert_eq!(view_for_key(Some("M")), Some(Memory));
+        assert_eq!(view_for_key(Some("b")), Some(Bookmarks));
+        // QWERTY's `m` key on AZERTY types a comma: not the memory list.
+        assert_eq!(view_for_key(Some(",")), None);
+        assert_eq!(view_for_key(None), None);
     }
 }
