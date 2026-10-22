@@ -242,6 +242,16 @@ pub struct Surface {
     /// search palette's resume command), or the `command` a library host
     /// passed to `kova_pane_new`, which that host answers for.
     run_pending: Cell<bool>,
+    /// The agent conversation a launch restore left asleep in this pane: its
+    /// resume line waits in `pending_command`, neither typed nor run, until
+    /// the pane is first on screen (`wake`). Kept here because no agent runs
+    /// yet, so `agent_session` is `None` and the session file would otherwise
+    /// forget the conversation (`session::snapshot_flat_column`).
+    dormant: RefCell<Option<(crate::agent_session::Agent, String)>>,
+    /// The conversation `wake` just started, until the probe sees its agent
+    /// running (`set_agent_session`). Between the two, `agent_session` is still
+    /// `None`: without this, a quit in that gap would save the pane empty.
+    woken: RefCell<Option<(crate::agent_session::Agent, String)>>,
     /// Open-latency instrumentation (time-to-rectangle / time-to-prompt).
     pub open_timer: Arc<PaneOpenTimer>,
     /// The app in this pane told us it is waiting for the user (Claude Code
@@ -377,6 +387,8 @@ impl Surface {
             scroll_accumulator: Cell::new(0.0),
             pending_command: Cell::new(None),
             run_pending: Cell::new(false),
+            dormant: RefCell::new(None),
+            woken: RefCell::new(None),
             open_timer,
             awaiting: Cell::new(AwaitingFlag::default()),
             agent_session: RefCell::new(None),
@@ -481,6 +493,9 @@ impl Surface {
     /// Store what the probe found, remembering a Claude conversation's id in
     /// `last_claude_session` so it outlives the session itself.
     pub(crate) fn set_agent_session(&self, found: Option<crate::agent_session::AgentSession>) {
+        if found.is_some() {
+            self.woken.replace(None);
+        }
         if let Some(s) = found.as_ref().filter(|s| s.agent == crate::agent_session::Agent::Claude) {
             self.last_claude_session.replace(Some(s.id.clone()));
         }
@@ -677,7 +692,7 @@ impl Surface {
     /// — without \r so the user can review before pressing Enter, unless
     /// `run_pending_command` asked for it to run.
     pub fn inject_pending_command(&self) {
-        if !self.is_ready() {
+        if !self.is_ready() || self.dormant.borrow().is_some() {
             return;
         }
         let cmd = self.pending_command.take();
@@ -695,6 +710,49 @@ impl Surface {
             self.run_pending.set(true);
         }
         self.pending_command.set(cmd);
+    }
+
+    /// Leave the pending resume line of conversation `id` asleep until `wake`:
+    /// a launch restore does this instead of `run_pending_command`, so fifty
+    /// restored agents do not all start at once.
+    pub fn sleep_until_shown(&self, agent: crate::agent_session::Agent, id: String) {
+        *self.dormant.borrow_mut() = Some((agent, id));
+    }
+
+    /// The conversation still asleep in this pane, if any (see `dormant`).
+    pub fn dormant_session(&self) -> Option<(crate::agent_session::Agent, String)> {
+        self.dormant.borrow().clone()
+    }
+
+    pub fn dormant_session_id(&self) -> Option<String> {
+        self.dormant.borrow().as_ref().map(|(_, id)| id.clone())
+    }
+
+    /// The pane is shown: run the resume line it was keeping. False when it was
+    /// not asleep, so calling it on every frame costs a borrow.
+    pub fn wake(&self) -> bool {
+        let Some(session) = self.dormant.borrow_mut().take() else {
+            return false;
+        };
+        self.woken.replace(Some(session));
+        self.run_pending_command();
+        true
+    }
+
+    /// Someone else took over this sleeping pane (keys sent over IPC): forget
+    /// the resume line, so the first time the pane is shown does not type it
+    /// into whatever they started. A pane that was not asleep is untouched.
+    pub fn cancel_sleep(&self) {
+        if self.dormant.borrow_mut().take().is_some() {
+            self.pending_command.set(None);
+        }
+    }
+
+    /// The conversation to save for this pane while no agent is seen running
+    /// in it: the one still asleep, or the one just woken whose agent has not
+    /// registered yet.
+    pub fn unregistered_session(&self) -> Option<(crate::agent_session::Agent, String)> {
+        self.dormant.borrow().clone().or_else(|| self.woken.borrow().clone())
     }
 }
 
@@ -945,6 +1003,67 @@ mod tests {
         assert_eq!(derive_display_title(None, None, None, None, None, "shell"), "shell");
         // Empty OSC title with no cwd must also reach the fallback, never blank.
         assert_eq!(derive_display_title(None, None, Some(""), None, None, "shell"), "shell");
+    }
+
+    #[test]
+    fn a_sleeping_resume_line_is_neither_typed_nor_run_until_woken() {
+        use crate::agent_session::Agent;
+        use crate::input::tests::drain;
+        let (surface, reader) = super::Surface::capture(80, 24);
+        surface.pending_command.set(Some("claude --resume abc".into()));
+        surface.sleep_until_shown(Agent::Claude, "abc".into());
+        assert_eq!(surface.dormant_session_id().as_deref(), Some("abc"));
+
+        surface.inject_pending_command();
+        assert!(drain(&reader).is_empty(), "asleep: nothing reaches the shell");
+
+        assert!(surface.wake());
+        assert_eq!(surface.dormant_session(), None);
+        surface.inject_pending_command();
+        assert_eq!(drain(&reader), b"claude --resume abc\r", "woken: typed and run");
+
+        assert!(!surface.wake(), "a second wake is a no-op");
+        surface.inject_pending_command();
+        assert!(drain(&reader).is_empty());
+    }
+
+    #[test]
+    fn keys_sent_to_a_sleeping_pane_cancel_its_resume_line() {
+        use crate::agent_session::Agent;
+        use crate::input::tests::drain;
+        let (surface, reader) = super::Surface::capture(80, 24);
+        surface.pending_command.set(Some("claude --resume abc".into()));
+        surface.sleep_until_shown(Agent::Claude, "abc".into());
+        surface.cancel_sleep();
+        assert_eq!(surface.dormant_session(), None);
+        assert!(!surface.wake(), "nothing left to wake");
+        surface.inject_pending_command();
+        assert!(drain(&reader).is_empty(), "the resume line is gone");
+
+        let (awake, reader) = super::Surface::capture(80, 24);
+        awake.pending_command.set(Some("make".into()));
+        awake.cancel_sleep();
+        awake.inject_pending_command();
+        assert_eq!(drain(&reader), b"make", "a pane that was not asleep keeps its line");
+    }
+
+    #[test]
+    fn a_woken_conversation_is_kept_until_its_agent_registers() {
+        use crate::agent_session::{Agent, AgentSession};
+        let (surface, _reader) = super::Surface::capture(80, 24);
+        surface.pending_command.set(Some("claude --resume abc".into()));
+        surface.sleep_until_shown(Agent::Claude, "abc".into());
+        assert!(surface.wake());
+        assert_eq!(surface.dormant_session(), None);
+        assert_eq!(
+            surface.unregistered_session().map(|(_, id)| id).as_deref(),
+            Some("abc"),
+            "claude not registered yet: a quit now still saves the conversation"
+        );
+        surface.set_agent_session(None);
+        assert!(surface.unregistered_session().is_some(), "an empty probe forgets nothing");
+        surface.set_agent_session(Some(AgentSession { agent: Agent::Claude, id: "abc".into(), name: None, peer_name: None }));
+        assert_eq!(surface.unregistered_session(), None, "the live session takes over");
     }
 
     #[test]

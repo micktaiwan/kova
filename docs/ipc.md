@@ -138,7 +138,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "agent_session_name": "subscribe on the Kova side",
   "claude_session_id": "0b6f…",
   "claude_session_name": "subscribe on the Kova side",
-  "peer_name": "subscribe on the Kova side"
+  "peer_name": "subscribe on the Kova side",
+  "dormant_session_id": null
 }
 ```
 
@@ -146,7 +147,7 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 
 `child_processes[].name` is the program's name as it was invoked (argv[0], what `ps` shows), not the kernel's `p_comm`. The difference matters for anything installed under a versioned filename: Claude Code's binary is `~/.local/share/claude/versions/2.1.226`, so `p_comm` there is `2.1.226` and the name would say nothing about which program is running. `version` carries that number when the executable's own filename is one, and is `null` otherwise — so a Claude Code pane reads `{"name": "claude", "version": "2.1.226"}`.
 
-`claude_session_id` is the id of the Claude Code conversation running in the pane — the argument `claude --resume` takes — and `claude_session_name` is the name its `/rename` set (`null` until the user sets one). Both are `null` in a pane with no Claude session. They are read from `~/.claude/sessions/<pid>.json`, on the same throttled probe as the rest, and they matter because **the id is the only identifier here that outlives the pane**: a client tying a pane to a subject must key on it rather than on `id` or `cwd`. A pane id dies with its tab, and a directory is shared by every unrelated conversation started in the same repository. The name also appears inside `title`, but only as one candidate among five (see `display_title`), where it cannot be told apart from an OSC title or a directory name.
+`claude_session_id` is the id of the Claude Code conversation running in the pane — the argument `claude --resume` takes — and `claude_session_name` is the name its `/rename` set (`null` until the user sets one). Both are `null` in a pane with no Claude session. They are read from `~/.claude/sessions/<pid>.json`, on the same throttled probe as the rest, and they matter because **the id is the only identifier here that outlives the pane**: a client tying a pane to a subject must key on it rather than on `id` or `cwd`. A pane id dies with its tab and does not survive a Kova relaunch either (every restored pane is numbered afresh, so an id noted before the relaunch may name another pane), and a directory is shared by every unrelated conversation started in the same repository. The name also appears inside `title`, but only as one candidate among five (see `display_title`), where it cannot be told apart from an OSC title or a directory name.
 
 `peer_name` is the name other Claude Code sessions use to reach this one with `SendMessage` / `ListAgents` (e.g. `"myproject-f1"`). It is the session file's `name` field as Claude Code wrote it, **including a name it derived on its own** (`nameSource: "derived"`), which `claude_session_name` deliberately drops so that it never shadows the pane title. After a `/rename` the two fields carry the same value. It is `null` in a pane with no Claude session, for Codex, and while Claude Code has not yet written a name. It comes from the same cached scan of `~/.claude/sessions/` as `claude_session_id`, with no extra filesystem pass.
 
@@ -155,6 +156,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 Codex names come from `~/.codex/session_index.jsonl`, joined by session id to the live process detection. The last valid entry for an id wins; a blank name clears it. Reads share the detection's one-second cache, and missing or malformed entries leave the normal title fallback available. Unlike Claude's session files, this index does not distinguish automatic names from explicit `/rename` names: Kova displays the latest persisted name in both cases.
 
 The pane switcher, open-pane search results, IPC `title`, and automatic tab titles use the conversation name before the pane's custom title, OSC title, foreground process, and directory. An explicitly named tab keeps its own title. The per-pane status bar has its own existing rule (hovered URL, custom pane title, OSC title), and does not read the conversation name directly.
+
+`dormant_session_id` is the conversation a relaunch left asleep in the pane. After a relaunch, Kova resumes a restored Claude Code or Codex conversation only the first time its pane is drawn in the active tab of a window (focused or not; a pane minimized or scrolled out of view does not count, but a window hidden behind others, on another Space or in the Dock still wakes its active tab), or on `wake-pane`, or when a late `ask` answer is delivered to it. Until then the pane is a bare shell: its resume line is neither typed nor run, `agent`, the `*_session_id` fields and `peer_name` are `null`, and the session does not appear in `ListAgents`, so `SendMessage` cannot reach it. A tab reopened with Cmd+O is not concerned: its line is typed and waits for Enter. A `send-keys` to a sleeping pane cancels its sleep instead: the client is using the pane, so the resume line is dropped and will never be typed over what it started; `wake-pane` is the way to get the conversation back. `null` once the pane is woken or for any other pane. A sleeping pane, or one woken whose agent has not reported its session yet, is still saved with its conversation on quit, and the global status bar counts the sleeping ones as `◌N`.
 
 `minimized` is `true` for a pane collapsed with `minimize-pane` (`Cmd+M` by default). Such a pane still runs and is still listed here; it simply takes no layout space and is not drawn. Kova marks it with a `⊟` glyph in the pane switcher and counts it in the status bar. A remote client should keep showing it and mark it the same way rather than filter it out.
 
@@ -245,6 +248,20 @@ command does not. Response: `{ "ok": true }`.
 
 ---
 
+### `wake-pane` — resume the conversation asleep in a pane
+
+```json
+{ "cmd": "wake-pane", "pane_id": 42 }
+```
+
+Runs the resume line of a pane whose `dormant_session_id` is set (see
+`list-panes`), where it is, without focusing it or switching tab. Response:
+`{ "ok": true, "data": { "woken": true } }`; `woken` is `false` when the pane
+was not asleep, and nothing was done. The agent reports its session in
+`list-panes` once it has started, a few seconds later.
+
+---
+
 ### `notify` — post a desktop notification that focuses a pane when clicked
 
 ```json
@@ -302,11 +319,18 @@ the user does — there is no server-side timeout. The response is
 write the line `ack` within 2 s: without it, the answer is considered lost on
 the way and Kova delivers it to the conversation itself:
 
-1. typed into the asker's pane, if that pane still runs the asker's Claude
+1. if the conversation sleeps in a pane since a relaunch (`dormant_session_id`,
+   looked up in the asker's Kova and in the one delivering), Kova wakes that
+   pane (`wake-pane`), waits up to 60 s for its agent to report the session,
+   and types the answer there; if the wake fails or the agent does not come
+   up, the answer stays on disk, retried at the next launch. Steps 2
+   to 4 are skipped then: a resume in a new tab would run the conversation twice
+   once the sleeping pane is shown;
+2. typed into the asker's pane, if that pane still runs the asker's Claude
    conversation (same `claude_session_id`, or the conversation's process
    descends from the pane's shell);
-2. if the conversation is open in another process, Kova waits for it to end;
-3. then reopens it in a new tab: `claude --dangerously-skip-permissions --resume
+3. if the conversation is open in another process, Kova waits for it to end;
+4. then reopens it in a new tab: `claude --dangerously-skip-permissions --resume
    <session_id> '<the answer>'`, in the directory the conversation ran in (read
    from its transcript, which `claude --resume` needs; not the asker's `cwd`).
    No transcript, or `claude` no longer running in the new pane 10 s after

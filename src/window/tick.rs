@@ -26,6 +26,14 @@ fn is_on_screen(minimized: bool, x: f32, width: f32, screen_width: f32) -> bool 
     !minimized && x + width > 0.0 && x < screen_width
 }
 
+/// The panes of `(id, minimized, x, width)` this frame draws (`is_on_screen`).
+fn shown_pane_ids(panes: impl Iterator<Item = (PaneId, bool, f32, f32)>, screen_width: f32) -> Vec<PaneId> {
+    panes
+        .filter(|&(_, minimized, x, width)| is_on_screen(minimized, x, width, screen_width))
+        .map(|(id, ..)| id)
+        .collect()
+}
+
 /// How many panes sit entirely off-screen, left and right of the visible strip.
 ///
 /// Fed `(x, width, minimized)` per pane, in the tab's own pixel space. Minimized
@@ -83,6 +91,7 @@ struct FramePanes {
     active_tab_name: String,
     working_agents: usize,
     unread_panes: usize,
+    sleeping_panes: usize,
 }
 
 impl KovaView {
@@ -195,6 +204,7 @@ impl KovaView {
             active_tab_name,
             working_agents,
             unread_panes,
+            sleeping_panes,
         } = match self.collect_frame_panes(&renderer, &layer, active_idx, split_min_w) {
             Some(f) => f,
             None => return false,
@@ -203,6 +213,8 @@ impl KovaView {
         self.report_app_focus(focus_reporting, pty_ptr);
 
         self.sync_window_title(&pane_data);
+
+        self.wake_shown_panes(active_idx, &pane_data, screen_width);
 
         // Collect split separators from active tab
         let separators = {
@@ -369,15 +381,17 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None },
-                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref(), bookmarked: *bookmarked, anchored: *anchored, raf_todo: raf_todo.as_deref(), raf_idea: raf_idea.as_deref() },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false },
+                // A subject header opens its box; an empty subject's closes it too.
+                SwitcherRow::SubjectHeader { name, empty, .. } => crate::renderer::PaneSwitcherRowRender { text: name.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: true, in_subject: false, box_top: true, box_bottom: *empty },
+                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, subject, last_in_subject, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref(), bookmarked: *bookmarked, anchored: *anchored, raf_todo: raf_todo.as_deref(), raf_idea: raf_idea.as_deref(), subject_header: false, in_subject: subject.is_some(), box_top: false, box_bottom: *last_in_subject },
                 // A bookmark row borrows the pane row's shape: its title on the
                 // left, the project and agent dim on the right.
-                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false, anchored: false, raf_todo: None, raf_idea: None },
+                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false },
                 // An anchor row is the same shape, painted like a saved
                 // conversation: it is one, and its section header is what says
                 // it is today's.
-                SwitcherRow::Anchor { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: true, anchored: true, raf_todo: None, raf_idea: None },
+                SwitcherRow::Anchor { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: true, anchored: true, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -487,7 +501,7 @@ impl KovaView {
             }
         }
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_agents, unread_panes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_agents, unread_panes, sleeping_panes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 
@@ -500,6 +514,26 @@ impl KovaView {
                 tab.for_each_pane(&mut |pane| {
                     pane.inject_pending_command();
                 });
+            }
+        }
+    }
+
+    /// Resume the agents a launch restore left asleep (`Surface::wake`) in the
+    /// panes this frame draws. "Shown" is on screen in the window's active tab,
+    /// focused or not: both halves of a split are in view, and a pane left
+    /// asleep there would sit as a bare prompt next to the one being read.
+    /// Click, Cmd+P, Cmd+J, a notification, a tab switch and `focus-pane` all
+    /// end with the pane on screen, so this one place covers them.
+    fn wake_shown_panes(&self, active_idx: usize, pane_data: &[crate::renderer::PaneRenderData], screen_width: f32) {
+        let shown = shown_pane_ids(
+            pane_data.iter().map(|p| (p.pane_id, p.minimized, p.viewport.x, p.viewport.width)),
+            screen_width,
+        );
+        let tabs = self.ivars().tabs.borrow();
+        let Some(tab) = tabs.get(active_idx) else { return };
+        for id in shown {
+            if tab.pane(id).is_some_and(|pane| pane.wake()) {
+                log::info!("Restore: pane {} shown, resuming its agent", id);
             }
         }
     }
@@ -901,9 +935,12 @@ impl KovaView {
                 // that finished while the eye was elsewhere — the same signal as the
                 // per-pane dot and as Cmd+J's first tier.
                 let mut unread_panes = 0usize;
+                // Agent panes a launch restore left asleep (`Surface::wake`).
+                let mut sleeping_panes = 0usize;
                 for t in tabs.iter() {
                     t.for_each_pane(&mut |p| {
                         if p.is_working() { working_agents += 1; }
+                        if p.dormant_session_id().is_some() { sleeping_panes += 1; }
                         let term = p.terminal.read();
                         if term.bell.load(std::sync::atomic::Ordering::Relaxed) || term.unread_completion() {
                             unread_panes += 1;
@@ -924,6 +961,7 @@ impl KovaView {
             active_tab_name,
             working_agents,
             unread_panes,
+            sleeping_panes,
         })
     }
 
@@ -1069,6 +1107,18 @@ mod tests {
             (1000.0, 300.0, false),
         ];
         assert_eq!(hidden_pane_counts(panes.into_iter(), 1000.0), (1, 1));
+    }
+
+    #[test]
+    fn every_pane_on_screen_is_shown_focused_or_not() {
+        // Two splits in view, one scrolled out to the right, one minimized.
+        let panes = [
+            (1, false, 0.0, 500.0),
+            (2, false, 500.0, 500.0),
+            (3, false, 1000.0, 500.0),
+            (4, true, 0.0, 0.0),
+        ];
+        assert_eq!(shown_pane_ids(panes.into_iter(), 1000.0), vec![1, 2]);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 # Cmd+P: sorting panes into categories?
 
-Nothing is decided or coded: this is an open design question to pick up later.
+Decided and coded on 2026-10-21: see "The decision: subjects" at the end. The sections
+before it are the reasoning that led there.
 
 ## The starting point
 
@@ -58,8 +59,33 @@ That direction got no answer: the reply was about tabs (projects, not states).
 The imagined categories might therefore be **states** (active / paused / to close),
 not themes. Not confirmed.
 
-## Where to pick up
+## The question that was open
 
-The question left open: in the largest tab (about 25 panes), how many are really finished? If
-it is half, the need is end-of-life triage (closing), not sorting. If almost none, the need
-is sub-grouping inside a project.
+In the largest tab (about 25 panes), how many are really finished? If half, the need is
+end-of-life triage (closing); if almost none, sub-grouping inside a project. The answer was
+sub-grouping: see below.
+
+## The decision: subjects (2026-10-21)
+
+The need, in the user's words: list the work in progress better, and see which panes belong to
+it. A tab is a broad project tied to a directory; inside it, the user works on several
+**subjects** (ongoing pieces of work). A subject is a second level of grouping, under the tab.
+
+- **Display in Cmd+P**: the panes of a subject sit in a box, under the subject's name in bold,
+  one per line, indented with a dash. Panes with no subject are shown as today.
+- **Filing is manual**, like indenting a line:
+  - **Cmd+→** files the selected pane into the subject right above it. If there is none, Kova
+    prompts for a name and creates the subject with this pane.
+  - **Cmd+←** takes the pane out of its subject.
+  - **Cmd+↑ / Cmd+↓** keep moving the pane, as today.
+- **Cmd+D** is unchanged (new column on the right); the new pane inherits the subject of the
+  pane it was split from.
+- **A subject lives in one tab.**
+- **An empty subject stays**, moved to the top of its tab's list.
+- **Subjects survive a restart** (saved with the session).
+- **Rename and delete** (asked the same day): a subject's header is selectable. Enter (or a
+  click) renames it, the current name filled in; a name the tab already has merges the two.
+  Cmd+Backspace deletes it; its panes stay open where they are, out of the box. An empty
+  subject goes at once, one holding panes asks first.
+- **The list's text is the terminal's glyphs at their own size**: it used to be stretched by
+  1.3, which blurred it on a 1x display.

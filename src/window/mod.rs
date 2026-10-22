@@ -2136,6 +2136,37 @@ pub fn confirm_choice(
     alert.runModal() == 1000 // NSAlertFirstButtonReturn
 }
 
+/// The same alert with a one-line text field under its text: what was typed
+/// on the first button, `None` on Cancel. Untrimmed — the caller decides what
+/// an empty answer means.
+pub fn prompt_text(
+    mtm: MainThreadMarker,
+    message: &str,
+    informative: &str,
+    confirm_button: &str,
+    placeholder: &str,
+    initial: &str,
+) -> Option<String> {
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Informational);
+    alert.setMessageText(&NSString::from_str(message));
+    alert.setInformativeText(&NSString::from_str(informative));
+    alert.addButtonWithTitle(&NSString::from_str(confirm_button));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let field = objc2_app_kit::NSTextField::new(mtm);
+    field.setFrame(CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 280.0, height: 24.0 } });
+    field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+    field.setStringValue(&NSString::from_str(initial));
+    let view: &objc2_app_kit::NSView = &field;
+    alert.setAccessoryView(Some(view));
+    // Typing goes straight into the field, no click first.
+    alert.window().setInitialFirstResponder(Some(view));
+    if alert.runModal() != 1000 {
+        return None;
+    }
+    Some(field.stringValue().to_string())
+}
+
 /// Create a new Kova window with the given tabs.
 pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, active_tab: usize, deferred_tabs: Vec<(usize, crate::session::SavedTab)>) -> Retained<NSWindow> {
     let content_rect = CGRect {

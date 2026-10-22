@@ -760,6 +760,7 @@ fn handle_ipc_command_sync(
             handle_ipc_set_anchor(windows, pane_id, cwd, session_id, agent, label)
         }
         IpcCommand::ClearAnchors => handle_ipc_clear_anchors(windows),
+        IpcCommand::WakePane(pane_id) => handle_ipc_wake_pane(windows, pane_id),
         IpcCommand::ReloadConfig => {
             handle_ipc_reload_config(windows)
         }
@@ -1139,6 +1140,24 @@ fn handle_ipc_clear_anchors(
     }
     log::info!("IPC: cleared {} anchor(s)", removed);
     crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "removed": removed })) }
+}
+
+/// IPC: resume the agent asleep in `pane_id` where it is, focus untouched.
+/// `woken` is false when the pane was not asleep (already running, or never
+/// restored with an agent): nothing was done.
+fn handle_ipc_wake_pane(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+) -> crate::ipc::IpcResponse {
+    for win in windows.borrow().iter() {
+        if let Some(woken) = kova_view(win).and_then(|view| view.ipc_wake_pane(pane_id)) {
+            if woken {
+                log::info!("IPC: woke pane {}", pane_id);
+            }
+            return crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "woken": woken })) };
+        }
+    }
+    crate::ipc::IpcResponse::Error { message: format!("pane {} not found", pane_id) }
 }
 
 /// IPC: re-read the config file and push its appearance half into every open

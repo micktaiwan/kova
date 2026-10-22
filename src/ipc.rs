@@ -52,6 +52,9 @@ pub enum IpcCommand {
     SendKeys { pane_id: u32, text: String },
     /// Focus a pane by its ID (switching tab/window if needed).
     FocusPane(u32),
+    /// Resume the agent a launch restore left asleep in a pane, without
+    /// focusing it (`Surface::wake`).
+    WakePane(u32),
     /// Create a new tab with an optional CWD and command.
     NewTab {
         cwd: Option<String>,
@@ -610,6 +613,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "close-pane" => &["pane_id"],
         "send-keys" => &["pane_id", "text"],
         "focus-pane" => &["pane_id"],
+        "wake-pane" => &["pane_id"],
         "new-tab" => &["cwd", "command"],
         "set-tab-title" => &["pane_id", "title"],
         "set-tab-color" => &["pane_id", "color"],
@@ -729,6 +733,10 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
         "focus-pane" => {
             let pane_id = required_u32(&v, "pane_id")?;
             Ok(IpcCommand::FocusPane(pane_id))
+        }
+        "wake-pane" => {
+            let pane_id = required_u32(&v, "pane_id")?;
+            Ok(IpcCommand::WakePane(pane_id))
         }
         "new-tab" => {
             let cwd = v.get("cwd").and_then(|c| c.as_str()).map(String::from);
@@ -1509,6 +1517,13 @@ mod tests {
         assert!(parse_command(r#"{"cmd":"set-anchor","cwd":"/w","agent":"aider"}"#).is_err());
         assert!(parse_command(r#"{"cmd":"set-anchor","cwd":""}"#).is_err());
         assert!(parse_command(r#"{"cmd":"set-anchor","cwd":"/w","project":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn wake_pane_takes_a_pane_id() {
+        assert!(matches!(parse_command(r#"{"cmd":"wake-pane","pane_id":4}"#), Ok(IpcCommand::WakePane(4))));
+        assert!(parse_command(r#"{"cmd":"wake-pane"}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"wake-pane","pane_id":4,"focus":true}"#).is_err());
     }
 
     #[test]

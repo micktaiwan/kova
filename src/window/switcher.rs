@@ -8,6 +8,10 @@ use super::*;
 pub(super) enum SwitcherRow {
     /// A tab name — not selectable.
     TabHeader(String),
+    /// A subject of the tab above: the first line of its box. Selectable:
+    /// Enter renames the subject, Cmd+Backspace deletes it. `empty` when no
+    /// pane is filed under it: the box then holds this line alone.
+    SubjectHeader { name: String, empty: bool, tab: TabId },
     /// A pane entry — selectable, focuses the pane on Enter/click.
     /// `minimized` panes are restored (unhidden) when selected.
     Pane {
@@ -37,6 +41,12 @@ pub(super) enum SwitcherRow {
         /// when the count is zero or the pane holds no Claude conversation.
         raf_todo: Option<String>,
         raf_idea: Option<String>,
+        /// The subject box this row is drawn in, under the header that names
+        /// it. `None` outside a box — and always on the
+        /// attention-only and memory lists, which have no subjects.
+        subject: Option<String>,
+        /// Last row of its subject's box: the frame closes under it.
+        last_in_subject: bool,
     },
     /// An anchored conversation — selectable, and always listed, even when a
     /// pane still holds it: the anchors are what today is for, so the section
@@ -65,8 +75,9 @@ impl SwitcherRow {
         matches!(self, SwitcherRow::Pane { .. })
     }
 
-    /// Rows Enter and the arrow keys can land on: panes, and bookmarks.
-    /// Headers are the only thing the selection skips.
+    /// Rows Enter and the arrow keys can land on: panes, bookmarks, anchors,
+    /// and subject headers (renamed or deleted from there). Tab headers are
+    /// the only thing the selection skips.
     fn is_selectable(&self) -> bool {
         !matches!(self, SwitcherRow::TabHeader(_))
     }
@@ -95,11 +106,235 @@ pub(super) fn retain_attention_rows(groups: Vec<Vec<SwitcherRow>>) -> Vec<Vec<Sw
     groups
         .into_iter()
         .filter_map(|group| {
-            let kept: Vec<SwitcherRow> =
-                group.into_iter().filter(|r| !r.is_pane() || r.needs_attention()).collect();
+            // Subject headers go too: this list has no subjects.
+            let kept: Vec<SwitcherRow> = group
+                .into_iter()
+                .filter(|r| match r {
+                    SwitcherRow::SubjectHeader { .. } => false,
+                    r => !r.is_pane() || r.needs_attention(),
+                })
+                .collect();
             kept.iter().any(|r| r.is_pane()).then_some(kept)
         })
         .collect()
+}
+
+/// One line of a tab's outline in Cmd+P: a subject's header, or one of the
+/// tab's panes by its index in the tab's order (`Tab::pane_subjects`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OutlineItem {
+    /// The header of a subject's box. `empty`: no pane is filed under it.
+    Subject { name: String, empty: bool },
+    /// A pane, drawn inside `subject`'s box when it has one; `last` closes
+    /// the box under it.
+    Pane { index: usize, subject: Option<String>, last: bool },
+}
+
+/// The order Cmd+P draws a tab in, from the tab's subjects and each pane's
+/// subject (`panes`, in the tab's order).
+///
+/// Empty subjects come first, each a box of its own header. Then the panes in
+/// order, a pane without a subject exactly where it is; the first member of a
+/// subject met opens its box — header, then every member of that subject in
+/// order. The gestures keep a subject's members next to each other in the
+/// layout, but a split at the end or an IPC move can tear them apart: the
+/// list gathers them under the first one rather than drawing two boxes, and
+/// the panes on screen are left where they are.
+pub(super) fn subject_outline(subjects: &[String], panes: &[Option<String>]) -> Vec<OutlineItem> {
+    let mut out = Vec::new();
+    for name in subjects {
+        if !panes.iter().any(|s| s.as_deref() == Some(name.as_str())) {
+            out.push(OutlineItem::Subject { name: name.clone(), empty: true });
+        }
+    }
+    let mut opened: Vec<&str> = Vec::new();
+    for (i, s) in panes.iter().enumerate() {
+        match s.as_deref() {
+            None => out.push(OutlineItem::Pane { index: i, subject: None, last: false }),
+            Some(name) if opened.contains(&name) => {}
+            Some(name) => {
+                opened.push(name);
+                out.push(OutlineItem::Subject { name: name.to_string(), empty: false });
+                let members: Vec<usize> =
+                    (i..panes.len()).filter(|&j| panes[j].as_deref() == Some(name)).collect();
+                let n = members.len();
+                for (k, index) in members.into_iter().enumerate() {
+                    out.push(OutlineItem::Pane { index, subject: Some(name.to_string()), last: k + 1 == n });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A tab's pane rows laid out as its outline: subject headers inserted, each
+/// pane row tagged with the box it is drawn in. `rows[i]` is the pane whose
+/// subject is `panes[i]`; `tab` is the tab they all belong to.
+pub(super) fn subject_rows(
+    tab: TabId,
+    subjects: &[String],
+    rows: Vec<SwitcherRow>,
+    panes: &[Option<String>],
+) -> Vec<SwitcherRow> {
+    let mut slots: Vec<Option<SwitcherRow>> = rows.into_iter().map(Some).collect();
+    subject_outline(subjects, panes)
+        .into_iter()
+        .filter_map(|item| match item {
+            OutlineItem::Subject { name, empty } => Some(SwitcherRow::SubjectHeader { name, empty, tab }),
+            OutlineItem::Pane { index, subject, last } => {
+                let mut row = slots.get_mut(index)?.take()?;
+                if let SwitcherRow::Pane { subject: s, last_in_subject, .. } = &mut row {
+                    *s = subject;
+                    *last_in_subject = last;
+                }
+                Some(row)
+            }
+        })
+        .collect()
+}
+
+/// The subject of the line drawn right above the pane at `p` — its header, or
+/// one of its members — which Cmd+Right files the pane under. `None` when that
+/// line is the tab's header or a pane without a subject: Cmd+Right then asks
+/// for a name.
+pub(super) fn subject_above(subjects: &[String], panes: &[Option<String>], p: usize) -> Option<String> {
+    let outline = subject_outline(subjects, panes);
+    let pos = outline.iter().position(|it| matches!(it, OutlineItem::Pane { index, .. } if *index == p))?;
+    match outline.get(pos.checked_sub(1)?)? {
+        OutlineItem::Subject { name, .. } => Some(name.clone()),
+        OutlineItem::Pane { subject, .. } => subject.clone(),
+    }
+}
+
+/// How many steps forward Cmd+Left moves the pane at `p` as it leaves its
+/// subject: past the subject's last member, so it lands right under the box.
+/// Zero when it already is the last one, or has no subject.
+pub(super) fn outdent_steps(panes: &[Option<String>], p: usize) -> usize {
+    let Some(name) = panes.get(p).and_then(|s| s.as_deref()) else { return 0 };
+    panes
+        .iter()
+        .enumerate()
+        .skip(p + 1)
+        .filter(|(_, s)| s.as_deref() == Some(name))
+        .map(|(j, _)| j - p)
+        .last()
+        .unwrap_or(0)
+}
+
+/// What Cmd+Up/Down does to the pane at `p` in a tab with subjects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SubjectMove {
+    /// Nothing to do: the edge of the tab, or of the pane's box.
+    Stay,
+    /// Trade places with the pane at this index: the previous or next member
+    /// of the same subject.
+    Swap(usize),
+    /// Step this many times in the direction asked (`Tab::move_pane_in_order`).
+    Steps(usize),
+}
+
+/// Cmd+Up/Down with subjects. A pane in a subject moves among its members only,
+/// and stops at the edge of its box (leaving it is Cmd+Left). A pane outside
+/// moves one line of the list, and a box in the way is jumped over whole. The
+/// empty boxes at the top are not places in the layout: a pane stops under
+/// them, at the first position, as it always did.
+///
+/// Without any subject this is exactly one step, as before subjects existed.
+pub(super) fn subject_move(subjects: &[String], panes: &[Option<String>], p: usize, forward: bool) -> SubjectMove {
+    let Some(own) = panes.get(p) else { return SubjectMove::Stay };
+    if let Some(name) = own.as_deref() {
+        let same = |j: &usize| panes[*j].as_deref() == Some(name);
+        let other = if forward { (p + 1..panes.len()).find(same) } else { (0..p).rev().find(same) };
+        return other.map_or(SubjectMove::Stay, SubjectMove::Swap);
+    }
+    let outline = subject_outline(subjects, panes);
+    let Some(pos) = outline.iter().position(|it| matches!(it, OutlineItem::Pane { index, .. } if *index == p)) else {
+        return SubjectMove::Stay;
+    };
+    let members = |name: &str| -> Vec<usize> {
+        (0..panes.len()).filter(|&j| panes[j].as_deref() == Some(name)).collect()
+    };
+    let target = if forward {
+        match outline.get(pos + 1) {
+            Some(OutlineItem::Pane { index, subject: None, .. }) => Some(*index),
+            Some(OutlineItem::Pane { subject: Some(name), .. } | OutlineItem::Subject { name, .. }) => members(name).last().copied(),
+            None => None,
+        }
+    } else {
+        match pos.checked_sub(1).and_then(|i| outline.get(i)) {
+            Some(OutlineItem::Pane { index, subject: None, .. }) => Some(*index),
+            Some(OutlineItem::Subject { empty: true, .. }) | None => None,
+            Some(OutlineItem::Pane { subject: Some(name), .. } | OutlineItem::Subject { name, .. }) => members(name).first().copied(),
+        }
+    };
+    let steps = match target {
+        Some(t) if forward && t > p => t - p,
+        Some(t) if !forward && t < p => p - t,
+        _ => 0,
+    };
+    if steps == 0 { SubjectMove::Stay } else { SubjectMove::Steps(steps) }
+}
+
+/// What Cmd+Up/Down does with a subject's header selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SubjectBlockMove {
+    /// The edge of the tab, or of the empty boxes at its top.
+    Stay,
+    /// The tab's panes in their new order, as indices into the old one: the
+    /// box traded places with the line or box next to it.
+    Panes(Vec<usize>),
+    /// An empty subject: the tab's subject list in its new order.
+    Subjects(Vec<String>),
+}
+
+/// Cmd+Up/Down on the header of `name`: the whole box moves one line of the
+/// list, over the pane or the box next to it, its members coming out next to
+/// each other. An empty box moves among the other empty ones at the top of the
+/// tab — they are not places in the layout, so a box with panes never goes
+/// above them and an empty one never goes below them.
+pub(super) fn subject_block_move(
+    subjects: &[String],
+    panes: &[Option<String>],
+    name: &str,
+    forward: bool,
+) -> SubjectBlockMove {
+    let filed = |s: &str| panes.iter().any(|p| p.as_deref() == Some(s));
+    if !filed(name) {
+        let empties: Vec<&String> = subjects.iter().filter(|s| !filed(s)).collect();
+        let Some(i) = empties.iter().position(|s| *s == name) else { return SubjectBlockMove::Stay };
+        let j = if forward { i + 1 } else { match i.checked_sub(1) { Some(j) => j, None => return SubjectBlockMove::Stay } };
+        let Some(other) = empties.get(j) else { return SubjectBlockMove::Stay };
+        let mut out = subjects.to_vec();
+        let (a, b) = (
+            out.iter().position(|s| s == name).unwrap(),
+            out.iter().position(|s| s == *other).unwrap(),
+        );
+        out.swap(a, b);
+        return SubjectBlockMove::Subjects(out);
+    }
+    // The list as blocks: a lone pane, or a box with its members.
+    let mut blocks: Vec<Vec<usize>> = Vec::new();
+    let mut own = None;
+    for item in subject_outline(subjects, panes) {
+        match item {
+            OutlineItem::Subject { empty: true, .. } => {}
+            OutlineItem::Subject { name: n, .. } => {
+                if n == name {
+                    own = Some(blocks.len());
+                }
+                blocks.push(Vec::new());
+            }
+            OutlineItem::Pane { index, subject: None, .. } => blocks.push(vec![index]),
+            OutlineItem::Pane { index, .. } => blocks.last_mut().unwrap().push(index),
+        }
+    }
+    let Some(i) = own else { return SubjectBlockMove::Stay };
+    let j = if forward { i + 1 } else { match i.checked_sub(1) { Some(j) => j, None => return SubjectBlockMove::Stay } };
+    if j >= blocks.len() {
+        return SubjectBlockMove::Stay;
+    }
+    blocks.swap(i, j);
+    SubjectBlockMove::Panes(blocks.into_iter().flatten().collect())
 }
 
 /// The conversation a pane is *about* to reopen: the id that follows `--resume`
@@ -177,6 +412,8 @@ enum SwitcherTarget {
     Pane(PaneId),
     Bookmark(usize),
     Anchor(usize),
+    /// A subject header: its tab and name, and where its row sits.
+    Subject(TabId, String, usize, usize),
 }
 
 /// Which list the full switcher shows. The attention-only list (`u`) has no
@@ -426,7 +663,12 @@ impl KovaView {
         let mut found = None;
         for tab in tabs.iter() {
             tab.for_each_pane(&mut |pane| {
-                if found.is_none() && pane.agent_session_id().as_deref() == Some(session_id) {
+                // A pane still asleep since launch holds it too: focusing it
+                // wakes that one instead of resuming the session a second time.
+                if found.is_none()
+                    && (pane.agent_session_id().as_deref() == Some(session_id)
+                        || pane.dormant_session_id().as_deref() == Some(session_id))
+                {
                     found = Some(pane.id);
                 }
             });
@@ -464,6 +706,7 @@ impl KovaView {
             tab.for_each_pane(&mut |pane| {
                 if found.is_none()
                     && pane.agent_session_id().is_none()
+                    && pane.dormant_session_id().is_none()
                     && pane.cwd().as_deref() == Some(bm.cwd.as_str())
                 {
                     found = Some(pane.id);
@@ -582,27 +825,32 @@ impl KovaView {
         out
     }
 
-    /// Rebuild the pane switcher if it is open, keeping the selected pane
-    /// selected: its rows are a snapshot taken when it opened, so a change
-    /// that arrives meanwhile would not show.
+    /// Rebuild the pane switcher if it is open, keeping the selected pane — or
+    /// subject header — selected: its rows are a snapshot taken when it
+    /// opened, so a change that arrives meanwhile would not show.
     pub(super) fn refresh_open_pane_switcher(&self) {
-        let selected_pane = {
+        let selected = {
             let guard = self.ivars().pane_switcher.borrow();
             let Some(state) = guard.as_ref() else { return };
             match state.columns.get(state.selected_col).and_then(|c| c.get(state.selected_row)) {
-                Some(SwitcherRow::Pane { pane_id, .. }) => Some(*pane_id),
+                Some(SwitcherRow::Pane { pane_id, .. }) => Some(Ok(*pane_id)),
+                Some(SwitcherRow::SubjectHeader { name, tab, .. }) => Some(Err((*tab, name.clone()))),
                 _ => None,
             }
         };
         let (filtered, view) = self.pane_switcher_modes();
         self.open_pane_switcher(filtered, view);
-        let Some(target) = selected_pane else { return };
+        let Some(target) = selected else { return };
         {
             let mut guard = self.ivars().pane_switcher.borrow_mut();
             let Some(state) = guard.as_mut() else { return };
             let spot = state.columns.iter().enumerate().find_map(|(c, col)| {
                 col.iter()
-                    .position(|r| matches!(r, SwitcherRow::Pane { pane_id, .. } if *pane_id == target))
+                    .position(|r| match (r, &target) {
+                        (SwitcherRow::Pane { pane_id, .. }, Ok(id)) => pane_id == id,
+                        (SwitcherRow::SubjectHeader { name, tab, .. }, Err((t, n))) => tab == t && name == n,
+                        _ => false,
+                    })
                     .map(|r| (c, r))
             });
             if let Some((c, r)) = spot {
@@ -674,6 +922,9 @@ impl KovaView {
         // the anchor mark.
         let mut open_sessions: std::collections::HashSet<String> = Default::default();
         let mut groups: Vec<Vec<SwitcherRow>> = Vec::new();
+        // Subject boxes are drawn on the full list of open panes only: the
+        // attention-only and memory lists answer other questions.
+        let show_subjects = !filtered && view == SwitcherView::Panes;
         {
             let tabs = self.ivars().tabs.borrow();
             let active = self.ivars().active_tab.get();
@@ -681,6 +932,8 @@ impl KovaView {
                 let mut rows: Vec<SwitcherRow> = Vec::new();
                 rows.push(SwitcherRow::TabHeader(format!("{}  {}", ti + 1, tab.title())));
                 let focused_pane = tab.focused_pane;
+                let mut pane_rows: Vec<SwitcherRow> = Vec::new();
+                let mut pane_subjects: Vec<Option<String>> = Vec::new();
                 tab.for_each_pane(&mut |pane| {
                     let is_current = ti == active && pane.id == focused_pane;
                     // Attention (unread) mirrors the per-pane status-bar dot: bell
@@ -747,12 +1000,22 @@ impl KovaView {
                         anchored: anchored_pane,
                         raf_todo,
                         raf_idea,
+                        subject: None,
+                        last_in_subject: false,
                     };
                     match memory {
                         Some(bytes) => memory_rows.push((bytes, row)),
-                        None => rows.push(row),
+                        None => {
+                            pane_rows.push(row);
+                            pane_subjects.push(pane.subject.clone());
+                        }
                     }
                 });
+                if show_subjects {
+                    rows.extend(subject_rows(tab.id, &tab.subjects, pane_rows, &pane_subjects));
+                } else {
+                    rows.extend(pane_rows);
+                }
                 groups.push(rows);
             }
         }
@@ -882,6 +1145,7 @@ impl KovaView {
     /// Handle key events in the tab/pane switcher overlay.
     pub(super) fn handle_pane_switcher_key(&self, event: &NSEvent) {
         let keycode = event.keyCode();
+        log::debug!("pane switcher key: keycode={:#x} flags={:#x}", keycode, event.modifierFlags().0);
 
         // Escape → close
         if keycode == 0x35 {
@@ -890,9 +1154,13 @@ impl KovaView {
             return;
         }
 
-        // Enter → focus selected pane
+        // Enter → focus selected pane; on a subject header, rename the subject.
         if keycode == 0x24 {
-            self.pane_switcher_focus_selected();
+            if let Some((tab, name)) = self.pane_switcher_selected_subject() {
+                self.pane_switcher_rename_subject(tab, &name);
+            } else {
+                self.pane_switcher_focus_selected();
+            }
             return;
         }
 
@@ -944,14 +1212,60 @@ impl KovaView {
             && event.modifierFlags().contains(NSEventModifierFlags::Command)
             && (keycode == 0x7E || keycode == 0x7D)
         {
-            self.pane_switcher_move_selected(keycode == 0x7D);
+            // On a subject's header the whole box moves.
+            if let Some((tab, name)) = self.pane_switcher_selected_subject() {
+                self.pane_switcher_move_subject(tab, &name, keycode == 0x7D);
+            } else {
+                self.pane_switcher_move_selected(keycode == 0x7D);
+            }
+            return;
+        }
+
+        // Cmd+→ files the selected pane under the subject drawn right above it
+        // (or asks for a new one's name); Cmd+← takes it out. Only where the
+        // boxes are drawn: the full list of open panes.
+        let subjects_shown = self
+            .ivars()
+            .pane_switcher
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| !s.filtered && s.view == SwitcherView::Panes);
+        // Cmd alone: Cmd+Option+←/→ is pane navigation, and must not file or
+        // unfile anything on its way through.
+        let flags = event.modifierFlags();
+        let cmd_only = flags.contains(NSEventModifierFlags::Command)
+            && !flags.intersects(
+                NSEventModifierFlags::Option | NSEventModifierFlags::Control | NSEventModifierFlags::Shift,
+            );
+        if subjects_shown
+            && cmd_only
+            && (keycode == 0x7C || keycode == 0x7B)
+        {
+            if keycode == 0x7C {
+                self.pane_switcher_indent_selected(false);
+            } else {
+                self.pane_switcher_outdent_selected();
+            }
+            return;
+        }
+        // Cmd+Shift+→ always asks for a name: the way to open a new subject
+        // right under a box, where Cmd+→ would join that box.
+        let cmd_shift = flags.contains(NSEventModifierFlags::Command | NSEventModifierFlags::Shift)
+            && !flags.intersects(NSEventModifierFlags::Option | NSEventModifierFlags::Control);
+        if subjects_shown && cmd_shift && keycode == 0x7C {
+            self.pane_switcher_indent_selected(true);
             return;
         }
 
         // Cmd+Backspace on a bookmark row → remove it, after confirmation. Same
-        // key as the closed-tabs list (Cmd+O). Pane rows ignore it.
+        // key as the closed-tabs list (Cmd+O). On a subject header it deletes
+        // the subject. Pane rows ignore it.
         if keycode == 0x33 && event.modifierFlags().contains(NSEventModifierFlags::Command) {
-            self.pane_switcher_remove_selected_bookmark();
+            if let Some((tab, name)) = self.pane_switcher_selected_subject() {
+                self.pane_switcher_delete_subject(tab, &name);
+            } else {
+                self.pane_switcher_remove_selected_bookmark();
+            }
             return;
         }
 
@@ -1052,7 +1366,7 @@ impl KovaView {
             }
             // An anchor row has its own key (Cmd+Shift+A); Cmd+B on it would
             // bookmark what is already saved under a stronger promise.
-            SwitcherTarget::Anchor(_) => {}
+            SwitcherTarget::Anchor(_) | SwitcherTarget::Subject(..) => {}
             SwitcherTarget::Pane(pane_id) => {
                 self.toggle_pane_bookmark(pane_id);
                 let (filtered, view) = self.pane_switcher_modes();
@@ -1102,6 +1416,8 @@ impl KovaView {
                 self.set_transient_status(&format!("Removed anchor {}", anchor.label));
             }
             SwitcherTarget::Pane(pane_id) => self.toggle_pane_anchor(pane_id),
+            // Never built from a subject header, which this key ignores.
+            SwitcherTarget::Subject(..) => return,
             // A bookmark row is promoted rather than ignored: it is the row you
             // are most likely to be pointing at when you decide what today is
             // for. It stays bookmarked, and moves up under the anchors.
@@ -1175,34 +1491,18 @@ impl KovaView {
         self.mark_dirty();
     }
 
-    /// Move the pane on the selected switcher row one step in its tab's order.
-    ///
-    /// The overlay is rebuilt afterwards rather than patched in place — the
-    /// list is a snapshot of the panes, and the tab groups it packs into
-    /// columns depend on the order — then the selection is put back on the pane
-    /// that moved, wherever the rebuild landed it.
-    fn pane_switcher_move_selected(&self, forward: bool) {
-        let pane_id = {
-            let guard = self.ivars().pane_switcher.borrow();
-            match guard.as_ref().and_then(|s| {
-                s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row))
-            }) {
-                Some(SwitcherRow::Pane { pane_id, .. }) => *pane_id,
-                _ => return,
-            }
-        };
-        let moved = {
-            let mut tabs = self.ivars().tabs.borrow_mut();
-            match tabs.iter_mut().find(|t| t.pane(pane_id).is_some()) {
-                Some(tab) => tab.move_pane_in_order(pane_id, forward),
-                None => false,
-            }
-        };
-        if !moved {
-            return;
+    /// The pane on the selected switcher row, if the selection is on one.
+    fn pane_switcher_selected_pane(&self) -> Option<PaneId> {
+        let guard = self.ivars().pane_switcher.borrow();
+        match guard.as_ref().and_then(|s| s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row))) {
+            Some(SwitcherRow::Pane { pane_id, .. }) => Some(*pane_id),
+            _ => None,
         }
-        self.resize_all_panes();
+    }
 
+    /// Rebuild the open switcher and put the selection back on `pane_id`,
+    /// wherever the rebuild landed it.
+    fn pane_switcher_reselect(&self, pane_id: PaneId) {
         let (filtered, view) = self.pane_switcher_modes();
         self.open_pane_switcher(filtered, view);
         if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
@@ -1218,6 +1518,280 @@ impl KovaView {
         }
         self.pane_switcher_clamp_scroll();
         self.mark_dirty();
+    }
+
+    /// Move the pane on the selected switcher row one step in its tab's order.
+    ///
+    /// With subjects, a step is one line of the list (`subject_move`): a pane
+    /// in a box trades places with the previous or next member, a pane outside
+    /// jumps over a whole box. Without any, it is one step of the tab's order.
+    ///
+    /// The overlay is rebuilt afterwards rather than patched in place — the
+    /// list is a snapshot of the panes, and the tab groups it packs into
+    /// columns depend on the order — then the selection is put back on the pane
+    /// that moved, wherever the rebuild landed it.
+    fn pane_switcher_move_selected(&self, forward: bool) {
+        let Some(pane_id) = self.pane_switcher_selected_pane() else { return };
+        let moved = {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            match tabs.iter_mut().find(|t| t.pane(pane_id).is_some()) {
+                Some(tab) => {
+                    let order = tab.pane_subjects();
+                    let subjects: Vec<Option<String>> = order.iter().map(|(_, s)| s.clone()).collect();
+                    let p = order.iter().position(|(id, _)| *id == pane_id).unwrap_or(0);
+                    match subject_move(&tab.subjects, &subjects, p, forward) {
+                        SubjectMove::Stay => false,
+                        SubjectMove::Swap(q) => tab.swap_pane_positions(pane_id, order[q].0),
+                        SubjectMove::Steps(n) => {
+                            let mut moved = false;
+                            for _ in 0..n {
+                                if !tab.move_pane_in_order(pane_id, forward) {
+                                    break;
+                                }
+                                moved = true;
+                            }
+                            moved
+                        }
+                    }
+                }
+                None => false,
+            }
+        };
+        if !moved {
+            return;
+        }
+        self.resize_all_panes();
+        self.pane_switcher_reselect(pane_id);
+    }
+
+    /// Cmd+Right: file the selected pane under the subject drawn right above
+    /// it. With none there — the tab's header, or a pane outside any box — ask
+    /// for a name: an existing subject of the tab is joined, a new one is
+    /// created. A pane already in a subject stays put. Nothing moves on screen.
+    ///
+    /// With `ask` (Cmd+Shift+Right), the name is always asked for, even under a
+    /// box, and a pane already in a subject moves to the one typed.
+    fn pane_switcher_indent_selected(&self, ask: bool) {
+        let selected = self.pane_switcher_selected_pane();
+        log::debug!("pane switcher indent: ask={} selected={:?}", ask, selected);
+        let Some(pane_id) = selected else { return };
+        let above = {
+            let tabs = self.ivars().tabs.borrow();
+            let Some(tab) = tabs.iter().find(|t| t.pane(pane_id).is_some()) else { return };
+            let order = tab.pane_subjects();
+            let p = order.iter().position(|(id, _)| *id == pane_id).unwrap_or(0);
+            if ask {
+                None
+            } else if order[p].1.is_some() {
+                return;
+            } else {
+                let subjects: Vec<Option<String>> = order.into_iter().map(|(_, s)| s).collect();
+                subject_above(&tab.subjects, &subjects, p)
+            }
+        };
+        let name = match above {
+            Some(name) => name,
+            None => {
+                // No borrow is held past this point: the alert pumps events.
+                let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                let Some(typed) = prompt_text(
+                    mtm,
+                    "New subject",
+                    "Name the subject this pane is filed under in Cmd+P. A name the tab already has joins that subject.",
+                    "Create",
+                    "Subject name",
+                    "",
+                ) else {
+                    return;
+                };
+                let typed = typed.trim().to_string();
+                if typed.is_empty() {
+                    return;
+                }
+                typed
+            }
+        };
+        {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            // Found again: the alert may have let the pane move or close.
+            let Some(tab) = tabs.iter_mut().find(|t| t.pane(pane_id).is_some()) else { return };
+            if !tab.subjects.contains(&name) {
+                tab.subjects.push(name.clone());
+            }
+            if let Some(pane) = tab.pane_mut(pane_id) {
+                pane.subject = Some(name);
+            }
+        }
+        if self.ivars().pane_switcher.borrow().is_none() {
+            return;
+        }
+        self.pane_switcher_reselect(pane_id);
+    }
+
+    /// Cmd+Left: take the selected pane out of its subject. A pane from the
+    /// middle of the box moves past its last member, so it lands right under
+    /// the box. The subject stays, even left empty.
+    fn pane_switcher_outdent_selected(&self) {
+        let Some(pane_id) = self.pane_switcher_selected_pane() else { return };
+        let moved = {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let Some(tab) = tabs.iter_mut().find(|t| t.pane(pane_id).is_some()) else { return };
+            let order = tab.pane_subjects();
+            let p = order.iter().position(|(id, _)| *id == pane_id).unwrap_or(0);
+            if order[p].1.is_none() {
+                return;
+            }
+            let subjects: Vec<Option<String>> = order.into_iter().map(|(_, s)| s).collect();
+            let steps = outdent_steps(&subjects, p);
+            if let Some(pane) = tab.pane_mut(pane_id) {
+                pane.subject = None;
+            }
+            let mut moved = false;
+            for _ in 0..steps {
+                if !tab.move_pane_in_order(pane_id, true) {
+                    break;
+                }
+                moved = true;
+            }
+            moved
+        };
+        if moved {
+            self.resize_all_panes();
+        }
+        self.pane_switcher_reselect(pane_id);
+    }
+
+    /// The subject whose header is selected, with the tab it belongs to.
+    fn pane_switcher_selected_subject(&self) -> Option<(TabId, String)> {
+        let guard = self.ivars().pane_switcher.borrow();
+        match guard.as_ref().and_then(|s| s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row))) {
+            Some(SwitcherRow::SubjectHeader { name, tab, .. }) => Some((*tab, name.clone())),
+            _ => None,
+        }
+    }
+
+    /// Rebuild the open switcher and put the selection on the header of
+    /// `name` in `tab`.
+    fn pane_switcher_reselect_subject(&self, tab: TabId, name: &str) {
+        let (filtered, view) = self.pane_switcher_modes();
+        self.open_pane_switcher(filtered, view);
+        if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
+            let spot = state.columns.iter().enumerate().find_map(|(c, col)| {
+                col.iter()
+                    .position(|row| {
+                        matches!(row, SwitcherRow::SubjectHeader { name: n, tab: t, .. } if *t == tab && n == name)
+                    })
+                    .map(|r| (c, r))
+            });
+            if let Some((c, r)) = spot {
+                state.selected_col = c;
+                state.selected_row = r;
+            }
+        }
+        self.pane_switcher_clamp_scroll();
+        self.mark_dirty();
+    }
+
+    /// Cmd+Up/Down on a subject header: move the whole box one line of the
+    /// list (`subject_block_move`), and keep the header selected.
+    fn pane_switcher_move_subject(&self, tab: TabId, name: &str, forward: bool) {
+        let moved_layout = {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let Some(t) = tabs.iter_mut().find(|t| t.id == tab) else { return };
+            let order = t.pane_subjects();
+            let subjects: Vec<Option<String>> = order.iter().map(|(_, s)| s.clone()).collect();
+            match subject_block_move(&t.subjects, &subjects, name, forward) {
+                SubjectBlockMove::Stay => return,
+                SubjectBlockMove::Subjects(list) => {
+                    t.subjects = list;
+                    false
+                }
+                SubjectBlockMove::Panes(indices) => {
+                    let ids: Vec<PaneId> = indices.iter().map(|&i| order[i].0).collect();
+                    t.reorder_panes(&ids)
+                }
+            }
+        };
+        if moved_layout {
+            self.resize_all_panes();
+        }
+        self.pane_switcher_reselect_subject(tab, name);
+    }
+
+    /// Enter on a subject header: ask for a new name, the current one filled
+    /// in. A name the tab already has merges the two subjects.
+    fn pane_switcher_rename_subject(&self, tab: TabId, old: &str) {
+        // No borrow is held past this point: the alert pumps events.
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let Some(typed) = prompt_text(
+            mtm,
+            "Rename subject",
+            "A name this tab already has merges the two subjects.",
+            "Rename",
+            "Subject name",
+            old,
+        ) else {
+            return;
+        };
+        let new = typed.trim().to_string();
+        if new.is_empty() || new == old {
+            return;
+        }
+        {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let Some(t) = tabs.iter_mut().find(|t| t.id == tab) else { return };
+            t.rename_subject(old, &new);
+        }
+        self.set_transient_status(&format!("Renamed subject {} to {}", old, new));
+        if self.ivars().pane_switcher.borrow().is_some() {
+            self.pane_switcher_reselect_subject(tab, &new);
+        }
+    }
+
+    /// Cmd+Backspace on a subject header: delete the subject. Its panes stay
+    /// open where they are, out of the box. An empty subject goes at once; one
+    /// that holds panes asks first.
+    fn pane_switcher_delete_subject(&self, tab: TabId, name: &str) {
+        let members = {
+            let tabs = self.ivars().tabs.borrow();
+            let Some(t) = tabs.iter().find(|t| t.id == tab) else { return };
+            t.pane_subjects().iter().filter(|(_, s)| s.as_deref() == Some(name)).count()
+        };
+        if members > 0 {
+            // No borrow is held past this point: the alert pumps events.
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            let informative = format!(
+                "\u{ab}{}\u{bb} holds {} pane{}. They stay open, out of the box.",
+                name,
+                members,
+                if members == 1 { "" } else { "s" }
+            );
+            if !confirm_action(mtm, "Delete this subject?", &informative, "Delete") {
+                return;
+            }
+        }
+        {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let Some(t) = tabs.iter_mut().find(|t| t.id == tab) else { return };
+            t.delete_subject(name);
+        }
+        self.set_transient_status(&format!("Deleted subject {}", name));
+        if self.ivars().pane_switcher.borrow().is_none() {
+            return;
+        }
+        // The selection goes to the tab's first pane: the rows are rebuilt and
+        // may change columns, so no saved position would still be right.
+        let first = {
+            let tabs = self.ivars().tabs.borrow();
+            tabs.iter().find(|t| t.id == tab).and_then(|t| t.pane_subjects().first().map(|(id, _)| *id))
+        };
+        match first {
+            Some(pane_id) => self.pane_switcher_reselect(pane_id),
+            None => {
+                let (filtered, view) = self.pane_switcher_modes();
+                self.open_pane_switcher(filtered, view);
+            }
+        }
     }
 
     /// Act on the currently-selected switcher row and close the overlay: focus
@@ -1245,7 +1819,7 @@ impl KovaView {
             }
             Some(SwitcherTarget::Bookmark(index)) => self.open_bookmark(index),
             Some(SwitcherTarget::Anchor(index)) => self.open_anchor(index),
-            None => {}
+            Some(SwitcherTarget::Subject(..)) | None => {}
         }
         self.mark_dirty();
     }
@@ -1319,6 +1893,9 @@ impl KovaView {
                 } else {
                     let idx = state.scroll.get(col).copied().unwrap_or(0) + vis;
                     match state.columns[col].get(idx) {
+                        Some(SwitcherRow::SubjectHeader { name, tab, .. }) => {
+                            Some(SwitcherTarget::Subject(*tab, name.clone(), col, idx))
+                        }
                         Some(SwitcherRow::Pane { pane_id, .. }) => {
                             Some(SwitcherTarget::Pane(*pane_id))
                         }
@@ -1333,6 +1910,17 @@ impl KovaView {
                 }
             }
         };
+        // A subject header is not something to go to: a click on it does what
+        // Enter does there, and the list stays open.
+        if let Some(SwitcherTarget::Subject(tab, name, c, r)) = target {
+            if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
+                state.selected_col = c;
+                state.selected_row = r;
+            }
+            self.mark_dirty();
+            self.pane_switcher_rename_subject(tab, &name);
+            return;
+        }
         *self.ivars().pane_switcher.borrow_mut() = None;
         match target {
             Some(SwitcherTarget::Pane(pid)) => {
@@ -1340,7 +1928,7 @@ impl KovaView {
             }
             Some(SwitcherTarget::Bookmark(index)) => self.open_bookmark(index),
             Some(SwitcherTarget::Anchor(index)) => self.open_anchor(index),
-            None => {}
+            Some(SwitcherTarget::Subject(..)) | None => {}
         }
         self.mark_dirty();
     }
@@ -1377,6 +1965,8 @@ mod tests {
                             anchored: c == 'a',
                             raf_todo: None,
                             raf_idea: None,
+                            subject: None,
+                            last_in_subject: false,
                         },
                     })
                     .collect()
@@ -1394,6 +1984,7 @@ mod tests {
                 col.iter()
                     .map(|r| match r {
                         SwitcherRow::TabHeader(_) => 'h',
+                        SwitcherRow::SubjectHeader { .. } => 's',
                         SwitcherRow::Pane { has_bell: true, .. } => 'b',
                         SwitcherRow::Pane { has_completion: true, .. } => 'c',
                         SwitcherRow::Pane { .. } => '.',
@@ -1666,6 +2257,8 @@ mod tests {
             anchored: false,
             raf_todo: None,
             raf_idea: None,
+            subject: None,
+            last_in_subject: false,
         };
         assert!(!working.needs_attention());
     }
@@ -1724,8 +2317,8 @@ mod tests {
 
     fn pane_titled(title: &str) -> SwitcherRow {
         match switcher_grid(&["."]).remove(0).remove(0) {
-            SwitcherRow::Pane { pane_id, is_current, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, .. } => {
-                SwitcherRow::Pane { pane_id, title: title.into(), is_current, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea }
+            SwitcherRow::Pane { pane_id, is_current, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, subject, last_in_subject, .. } => {
+                SwitcherRow::Pane { pane_id, title: title.into(), is_current, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, subject, last_in_subject }
             }
             _ => unreachable!(),
         }
@@ -1783,5 +2376,183 @@ mod tests {
         // QWERTY's `m` key on AZERTY types a comma: not the memory list.
         assert_eq!(view_for_key(Some(",")), None);
         assert_eq!(view_for_key(None), None);
+    }
+
+    fn subs(spec: &[Option<&str>]) -> Vec<Option<String>> {
+        spec.iter().map(|s| s.map(str::to_string)).collect()
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// An outline in short: `[name` opens a box (`[name]` an empty one), a
+    /// number is a pane by its index, `-3` a member and `-3]` the box's last.
+    fn outline_spec(items: &[OutlineItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|it| match it {
+                OutlineItem::Subject { name, empty: true } => format!("[{}]", name),
+                OutlineItem::Subject { name, empty: false } => format!("[{}", name),
+                OutlineItem::Pane { index, subject: None, .. } => index.to_string(),
+                OutlineItem::Pane { index, last: false, .. } => format!("-{}", index),
+                OutlineItem::Pane { index, last: true, .. } => format!("-{}]", index),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn without_subjects_the_outline_is_the_pane_order() {
+        let panes = subs(&[None, None, None]);
+        assert_eq!(outline_spec(&subject_outline(&[], &panes)), ["0", "1", "2"]);
+    }
+
+    #[test]
+    fn empty_subjects_open_the_tab_then_boxes_sit_at_their_first_member() {
+        let panes = subs(&[None, Some("a"), Some("a"), None]);
+        let outline = subject_outline(&names(&["a", "idle", "later"]), &panes);
+        assert_eq!(outline_spec(&outline), ["[idle]", "[later]", "0", "[a", "-1", "-2]", "3"]);
+    }
+
+    #[test]
+    fn members_torn_apart_are_gathered_under_the_first_one() {
+        // A split at the end of the tab, or an IPC move, put another pane
+        // between two members: one box, at the first member, in pane order.
+        let panes = subs(&[Some("a"), None, Some("a")]);
+        assert_eq!(outline_spec(&subject_outline(&names(&["a"]), &panes)), ["[a", "-0", "-2]", "1"]);
+    }
+
+    #[test]
+    fn subject_rows_insert_the_headers_and_tag_each_member() {
+        let rows = switcher_grid(&["...."]).remove(0);
+        let panes = subs(&[None, Some("a"), Some("a"), None]);
+        let out = subject_rows(7, &names(&["a", "idle"]), rows, &panes);
+        assert_eq!(switcher_spec(&[out]), vec!["s.s...".to_string()]);
+        let out = subject_rows(7, &names(&["a", "idle"]), switcher_grid(&["...."]).remove(0), &panes);
+        let tags: Vec<(Option<&str>, bool)> = out
+            .iter()
+            .filter_map(|r| match r {
+                SwitcherRow::Pane { subject, last_in_subject, .. } => Some((subject.as_deref(), *last_in_subject)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tags, [(None, false), (Some("a"), false), (Some("a"), true), (None, false)]);
+        match &out[0] {
+            SwitcherRow::SubjectHeader { name, empty, tab } => assert!(name == "idle" && *empty && *tab == 7),
+            _ => panic!("the empty subject comes first"),
+        }
+    }
+
+    #[test]
+    fn a_subject_header_is_selectable_and_leaves_the_attention_list() {
+        let header = SwitcherRow::SubjectHeader { name: "a".into(), empty: true, tab: 0 };
+        assert!(header.is_selectable(), "Enter renames it, Cmd+Backspace deletes it");
+        assert!(!header.is_pane());
+        let mut group = switcher_grid(&["hb"]).remove(0);
+        group.insert(1, header);
+        assert_eq!(switcher_spec(&retain_attention_rows(vec![group])), vec!["hb".to_string()]);
+    }
+
+    #[test]
+    fn cmd_right_files_under_the_subject_drawn_right_above() {
+        let subjects = names(&["a", "idle"]);
+        let panes = subs(&[None, Some("a"), Some("a"), None, None]);
+        // Right under the box's last member: joins it.
+        assert_eq!(subject_above(&subjects, &panes, 3).as_deref(), Some("a"));
+        // Right under a pane outside any box: a name is asked for.
+        assert_eq!(subject_above(&subjects, &panes, 4), None);
+        // The first pane sits under the empty subjects: it joins the last one.
+        assert_eq!(subject_above(&subjects, &panes, 0).as_deref(), Some("idle"));
+        // Right under the tab's header: a name is asked for.
+        assert_eq!(subject_above(&[], &subs(&[None, None]), 0), None);
+        // A box's first member sits under the header of its own box.
+        assert_eq!(subject_above(&subjects, &panes, 1).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn cmd_left_moves_a_member_past_the_rest_of_its_box() {
+        let panes = subs(&[None, Some("a"), Some("a"), Some("a"), None]);
+        assert_eq!(outdent_steps(&panes, 1), 2, "from the top of the box, under its last member");
+        assert_eq!(outdent_steps(&panes, 2), 1);
+        assert_eq!(outdent_steps(&panes, 3), 0, "the last member is already right above the outside");
+        assert_eq!(outdent_steps(&panes, 0), 0, "not in a subject");
+    }
+
+    #[test]
+    fn without_subjects_cmd_up_down_is_still_one_step() {
+        let panes = subs(&[None, None, None]);
+        assert_eq!(subject_move(&[], &panes, 1, true), SubjectMove::Steps(1));
+        assert_eq!(subject_move(&[], &panes, 1, false), SubjectMove::Steps(1));
+        assert_eq!(subject_move(&[], &panes, 0, false), SubjectMove::Stay);
+        assert_eq!(subject_move(&[], &panes, 2, true), SubjectMove::Stay);
+    }
+
+    #[test]
+    fn a_box_moves_whole_over_the_pane_or_box_next_to_it() {
+        use SubjectBlockMove::*;
+        // 0, [a: 1 2], 3, [b: 4]
+        let panes = subs(&[None, Some("a"), Some("a"), None, Some("b")]);
+        let list = names(&["a", "b"]);
+        assert_eq!(subject_block_move(&list, &panes, "a", false), Panes(vec![1, 2, 0, 3, 4]));
+        assert_eq!(subject_block_move(&list, &panes, "a", true), Panes(vec![0, 3, 1, 2, 4]));
+        assert_eq!(subject_block_move(&list, &panes, "b", false), Panes(vec![0, 1, 2, 4, 3]));
+        assert_eq!(subject_block_move(&list, &panes, "b", true), Stay, "the end of the tab");
+        // Two boxes trade places whole.
+        let panes = subs(&[Some("a"), Some("b"), Some("b")]);
+        assert_eq!(subject_block_move(&list, &panes, "b", false), Panes(vec![1, 2, 0]));
+        assert_eq!(subject_block_move(&list, &panes, "a", false), Stay, "the top of the tab");
+    }
+
+    #[test]
+    fn a_box_torn_apart_comes_out_whole() {
+        // [a: 0 2], 1 — moving a down gathers its members after 1.
+        let panes = subs(&[Some("a"), None, Some("a")]);
+        assert_eq!(
+            subject_block_move(&names(&["a"]), &panes, "a", true),
+            SubjectBlockMove::Panes(vec![1, 0, 2])
+        );
+    }
+
+    #[test]
+    fn empty_boxes_move_among_themselves_only() {
+        use SubjectBlockMove::*;
+        let panes = subs(&[Some("a"), None]);
+        let list = names(&["x", "a", "y"]);
+        assert_eq!(subject_block_move(&list, &panes, "y", false), Subjects(names(&["y", "a", "x"])));
+        assert_eq!(subject_block_move(&list, &panes, "x", false), Stay);
+        assert_eq!(subject_block_move(&list, &panes, "y", true), Stay, "never below the empty ones");
+        assert_eq!(subject_block_move(&list, &panes, "a", false), Stay, "a box with panes stays under them");
+    }
+
+    #[test]
+    fn inside_a_box_cmd_up_down_trades_places_with_a_member_and_stops_at_the_edge() {
+        let subjects = names(&["a"]);
+        let panes = subs(&[None, Some("a"), Some("a"), None]);
+        assert_eq!(subject_move(&subjects, &panes, 1, true), SubjectMove::Swap(2));
+        assert_eq!(subject_move(&subjects, &panes, 2, false), SubjectMove::Swap(1));
+        assert_eq!(subject_move(&subjects, &panes, 1, false), SubjectMove::Stay, "leaving is Cmd+Left");
+        assert_eq!(subject_move(&subjects, &panes, 2, true), SubjectMove::Stay);
+        // Members torn apart: the next member, wherever it is.
+        let torn = subs(&[Some("a"), None, Some("a")]);
+        assert_eq!(subject_move(&subjects, &torn, 0, true), SubjectMove::Swap(2));
+    }
+
+    #[test]
+    fn outside_a_box_cmd_up_down_jumps_over_the_whole_box() {
+        let subjects = names(&["a"]);
+        let panes = subs(&[None, Some("a"), Some("a"), None]);
+        assert_eq!(subject_move(&subjects, &panes, 0, true), SubjectMove::Steps(2));
+        assert_eq!(subject_move(&subjects, &panes, 3, false), SubjectMove::Steps(2));
+        // Two panes outside, side by side: one line, as before.
+        let plain = subs(&[None, None, Some("a")]);
+        assert_eq!(subject_move(&subjects, &plain, 1, false), SubjectMove::Steps(1));
+    }
+
+    #[test]
+    fn empty_subjects_at_the_top_are_not_a_place_to_move_to() {
+        let subjects = names(&["idle"]);
+        let panes = subs(&[None, None]);
+        assert_eq!(subject_move(&subjects, &panes, 0, false), SubjectMove::Stay);
+        assert_eq!(subject_move(&subjects, &panes, 1, false), SubjectMove::Steps(1));
     }
 }

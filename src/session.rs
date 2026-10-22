@@ -63,6 +63,9 @@ pub struct SavedTab {
     /// this field existed: they are then taken as already matching.
     #[serde(default)]
     pub geometry_scale: Option<f32>,
+    /// The tab's subjects in creation order, empty ones included (`Tab::subjects`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
 }
 
 /// Flat column format (v4): a column is a list of panes with row weights.
@@ -103,6 +106,9 @@ pub struct SavedPane {
     /// prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<SavedAgentSession>,
+    /// The subject of its tab the pane is filed under (`Pane::subject`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
 }
 
 /// The conversation a pane was holding, and which agent to hand it back to.
@@ -173,8 +179,8 @@ fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
             // its session file on exit, and a dead Codex no longer holds its
             // transcript open, so this is unreadable once the PTYs are reaped.
             // `will_terminate` saves before `shutdown_all` for this.
-            agent_session: crate::agent_session::for_shell(p.pty.pid())
-                .map(|s| SavedAgentSession { agent: s.agent, id: s.id }),
+            agent_session: session_to_save(crate::agent_session::for_shell(p.pty.pid()), p.unregistered_session()),
+            subject: p.subject.clone(),
         }).collect(),
         row_weights: col.row_weights.clone(),
         custom_row_weights: if col.custom_row_weights.iter().any(|&cw| cw) {
@@ -183,6 +189,18 @@ fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
             None
         },
     }
+}
+
+/// The conversation a pane is saved with: the agent running in it, or else the
+/// one a launch restore left asleep there, or woke but whose agent has not
+/// registered yet (`Surface::unregistered_session`) — no agent is seen running,
+/// but that is the conversation to bring back next time too.
+fn session_to_save(
+    live: Option<crate::agent_session::AgentSession>,
+    dormant: Option<(crate::agent_session::Agent, String)>,
+) -> Option<SavedAgentSession> {
+    live.map(|s| SavedAgentSession { agent: s.agent, id: s.id })
+        .or_else(|| dormant.map(|(agent, id)| SavedAgentSession { agent, id }))
 }
 
 /// Find the flat leaf index of a pane by id across all columns.
@@ -215,6 +233,7 @@ pub fn snapshot_tab(tab: &Tab) -> SavedTab {
         virtual_width_override: if tab.virtual_width_override > 0.0 { Some(tab.virtual_width_override) } else { None },
         scroll_offset_x: if tab.scroll_offset_x != 0.0 { Some(tab.scroll_offset_x) } else { None },
         geometry_scale: if tab.geometry_scale > 0.0 { Some(tab.geometry_scale) } else { None },
+        subjects: tab.subjects.clone(),
     }
 }
 
@@ -545,14 +564,19 @@ fn restore_command(sp: &SavedPane) -> Option<String> {
 
 /// The resume line of the agent the pane was running at snapshot time, if any.
 fn agent_resume_line(sp: &SavedPane) -> Option<String> {
+    let session = saved_agent_session(sp)?;
+    crate::agent_session::resume_command(session.agent, &session.id, sp.last_command.as_deref())
+}
+
+/// The agent conversation the pane was running at snapshot time, if any.
+fn saved_agent_session(sp: &SavedPane) -> Option<SavedAgentSession> {
     // A file written before v6 only knew about Claude.
-    let session = sp.agent_session.clone().or_else(|| {
+    sp.agent_session.clone().or_else(|| {
         sp.claude_session.as_ref().map(|id| SavedAgentSession {
             agent: crate::agent_session::Agent::Claude,
             id: id.clone(),
         })
-    })?;
-    crate::agent_session::resume_command(session.agent, &session.id, sp.last_command.as_deref())
+    })
 }
 
 /// Whether Kova presses Enter on the restored line itself, at app launch.
@@ -573,7 +597,8 @@ fn is_plain_command(line: &str) -> bool {
 
 /// Restore a flat column (v4 format).
 /// `at_launch`: the tab comes back with the app (not from Cmd+O), so the
-/// agents it was running are resumed without waiting for Enter.
+/// agents it was running resume without waiting for Enter — each one the
+/// first time its pane is on screen (`Surface::wake`), not all at launch.
 fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &Config, at_launch: bool) -> Option<(Column, Vec<PaneId>)> {
     let mut panes = Vec::new();
     let mut ids = Vec::new();
@@ -596,10 +621,13 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
             term.title = sp.title.clone();
         }
         if at_launch && runs_on_launch(sp) {
-            pane.run_pending_command();
+            if let Some(session) = saved_agent_session(sp) {
+                pane.sleep_until_shown(session.agent, session.id);
+            }
         }
         pane.custom_title = sp.custom_title.clone();
         pane.minimized = sp.minimized;
+        pane.subject = sp.subject.clone();
         panes.push(pane);
         ids.push(id);
     }
@@ -843,7 +871,9 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         // converts them to the display it actually lands on.
         geometry_scale: saved.geometry_scale.unwrap_or(0.0),
         cell_h: std::cell::Cell::new(0.0),
+        subjects: saved.subjects.clone(),
     };
+    tab.heal_subjects();
     tab.rebuild_minimized_stack();
     Some(tab)
 }
@@ -956,6 +986,7 @@ mod tests {
             title: None,
             claude_session: None,
             agent_session: None,
+            subject: None,
         }
     }
 
@@ -976,6 +1007,40 @@ mod tests {
         let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
         assert!(!keys.contains(&&"title".to_string()), "unexpected keys: {keys:?}");
         assert!(!keys.contains(&&"claude_session".to_string()), "unexpected keys: {keys:?}");
+    }
+
+    #[test]
+    fn subjects_survive_a_save_and_old_files_load_without_them() {
+        let old: SavedTab = serde_json::from_str(
+            r#"{"flat_columns":[{"panes":[{"cwd":"/a"}],"row_weights":[1.0]}],"focused_leaf_index":0,"custom_title":null,"color":null}"#,
+        )
+        .expect("a tab saved before subjects must still parse");
+        assert!(old.subjects.is_empty());
+        assert_eq!(old.flat_columns.as_ref().unwrap()[0].panes[0].subject, None);
+
+        let mut tab = old.clone();
+        tab.subjects = vec!["auth".into(), "empty one".into()];
+        tab.flat_columns.as_mut().unwrap()[0].panes[0].subject = Some("auth".into());
+        let back: SavedTab = serde_json::from_str(&serde_json::to_string(&tab).unwrap()).unwrap();
+        assert_eq!(back.subjects, ["auth", "empty one"], "empty subjects are kept too");
+        assert_eq!(back.flat_columns.unwrap()[0].panes[0].subject.as_deref(), Some("auth"));
+
+        // Nothing filed: the file does not grow.
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("subjects").is_none());
+        assert!(serde_json::to_value(pane("/a")).unwrap().get("subject").is_none());
+    }
+
+    #[test]
+    fn a_pane_still_asleep_is_saved_with_its_conversation() {
+        use crate::agent_session::{Agent, AgentSession};
+        let asleep = Some((Agent::Codex, "sleeping".to_string()));
+        let saved = session_to_save(None, asleep.clone()).expect("not forgotten");
+        assert_eq!((saved.agent, saved.id.as_str()), (Agent::Codex, "sleeping"));
+
+        let live = AgentSession { agent: Agent::Claude, id: "live".into(), name: None, peer_name: None };
+        assert_eq!(session_to_save(Some(live), asleep).unwrap().id, "live", "a running agent wins");
+        assert!(session_to_save(None, None).is_none());
     }
 
     #[test]

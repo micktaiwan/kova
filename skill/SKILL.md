@@ -36,8 +36,11 @@ socket of that Kova) and `$KOVA_PANE_ID` (the pane the shell runs in). Hook proc
 printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 ```
 
-- Outside a Kova pane, `$KOVA_SOCKET` is empty. With one Kova running, `ls /tmp/kova-*.sock` finds
-  the socket. Its name changes when Kova restarts.
+- Outside a Kova pane, `$KOVA_SOCKET` is empty. `ls /tmp/kova-*.sock` lists candidates, not live
+  instances: a Kova that died leaves its socket file behind, and an app embedding Kova (a browser
+  side panel, a notes app) has its own socket there too. A dead one answers nothing, so a loop
+  over them gets an empty reply and a JSON parser fails on it: skip empty replies, or keep only
+  the sockets whose `<pid>` is a running process. The name changes when Kova restarts.
 - Every answer is `{"ok":true}` (with a `data` payload for the commands that return something) or
   `{"ok":false,"error":"…"}`. Pipe it into `jq`.
 - Fields are validated strictly: a field a command does not accept fails the request
@@ -60,8 +63,9 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 | Type into a pane | `{"cmd":"send-keys","pane_id":42,"text":"make\n"}` (end with `\n` or it is typed, not run) |
 | Wait for the command | `{"cmd":"wait-for-completion","pane_id":42,"timeout_ms":300000}` |
 | Focus / close a pane | `{"cmd":"focus-pane","pane_id":42}`, `{"cmd":"close-pane","pane_id":42}` |
+| Resume a pane asleep since a relaunch, focus untouched | `{"cmd":"wake-pane","pane_id":42}` |
 | Layout | `resize-pane`, `swap-pane`, `merge-tab`, `merge-window`, `close-tab` |
-| Names and colors | `rename-pane`, `set-tab-title`, `set-tab-color` |
+| Names and colors | `{"cmd":"rename-pane","pane_id":42,"title":"x"}` (the field is `title`, not `name`), `set-tab-title`, `set-tab-color` |
 | Any keyboard shortcut | `{"cmd":"dispatch-action","action":"equalize"}` |
 | Notify, the click focuses the pane | `{"cmd":"notify","pane_id":42,"title":"Claude Code","message":"done"}` |
 | Follow changes live | `{"cmd":"subscribe","events":["focus","pane-working"]}` |
@@ -139,6 +143,20 @@ Each pane carries `id`, `window`, `tab`, `cwd`, `title`, `focused`, `pid`, `chil
   never `send-keys` (typed text is not submitted the way a message is). It carries the name Claude
   Code derived from the directory even before any `/rename`, which `claude_session_name` does not.
   `null` for Codex and for a pane without Claude.
+- `dormant_session_id`: **after a Kova relaunch, a restored agent resumes only once its pane is
+  on screen in the active tab** (or on `wake-pane`). Until then the pane is a bare shell with this
+  field set, and `agent`, the session ids and `peer_name` are `null`: the session is not in
+  `ListAgents`, so `SendMessage` cannot reach it. To talk to it, `wake-pane` first, then wait for
+  its `peer_name` in `list-panes`. Never `send-keys` into a sleeping pane: it cancels the resume
+  for good and leaves a bare shell.
+
+**Kova can restart under a running session, and pane ids do not survive it.** The user relaunches
+it (after a build, for instance) while sessions run in its panes; the tabs come back, but every
+pane gets a new id, numbered afresh at launch, and its agent sleeps until shown (see
+`dormant_session_id`). A pane id or a `#N` the user named before the restart can then point to
+another pane or to nothing. Never reuse one across a restart: list the panes
+again and find the pane by its conversation, `claude_session_id` or, while it sleeps,
+`dormant_session_id`.
 
 The conversation name outranks the pane's custom title in `Cmd+P`, open-pane search, the IPC
 `title` and automatic tab titles; an explicitly renamed tab keeps its title. A `/rename` in the
@@ -183,6 +201,13 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET" |
 # 3. read the turns: the "text" blocks of user and assistant messages. The body of an invoked
 #    skill arrives as a user message and weighs a lot: skip it.
 ```
+
+**"Which open sessions talk about X"** = one call, not a hand-written loop over the transcripts:
+`python3 ~/projects/perso/kova/scripts/grep-sessions.py '<regex>'`. It searches only what was
+written (user prompts, assistant text), skips task notifications, cross-session messages,
+compaction summaries and skill bodies (they repeat the same words in every session), skips the
+calling session, and prints per pane the user hits plus the last assistant hits. `--json` for
+the raw list, `--all` for every assistant hit.
 
 `get-pane-content` stays the right answer for an ordinary shell pane (a running command, an output
 to reread) and for the last screen of a Claude pane when what you want is precisely what is shown
@@ -230,6 +255,10 @@ action, or `action: text` when the user typed something.
 - **Offered choices end with an "Other" button** (`--actions "Retry,Call,Other"`), never two closed
   options alone: the card has a text field, but without a button announcing it the card reads as a
   forced choice. A yes/no validation (`OK,KO`) is the exception.
+- **Break a long question into short lines**: one idea per line, a blank line between blocks, a
+  list as one item per line. The card shows line breaks as they are, but only real ones: inside
+  `"…"` a `\n` stays a backslash and an `n` on the card. Put actual line breaks inside the quotes,
+  or use `$'Sort done.\n\nArchive 8: …\nKeep 15: …\n\nGo?'`.
 - `--no-input` (buttons only), `--from <name>` (name on the card), `--json`, `--socket <path>`.
   Outside a Kova pane the client finds Kova.app's socket on its own; from a pane of a library host
   (an app embedding Kova), it falls back to Kova.app too.

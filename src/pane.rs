@@ -387,6 +387,16 @@ fn step_in_order(
     }
 }
 
+/// Append to `subjects` the names in `named` it does not hold yet, in the
+/// order they come, each once.
+pub fn heal_subject_list(subjects: &mut Vec<String>, named: impl IntoIterator<Item = String>) {
+    for name in named {
+        if !subjects.contains(&name) {
+            subjects.push(name);
+        }
+    }
+}
+
 pub struct Tab {
     pub id: TabId,
     pub columns: Vec<Column>,
@@ -421,6 +431,10 @@ pub struct Tab {
     /// Cell height in pixels, used to snap row heights to cell boundaries.
     /// Set by the window before layout; 0.0 = no snapping.
     pub cell_h: Cell<f32>,
+    /// Subjects of work filed in this tab, in creation order — empty ones
+    /// included: Cmd+P lists them at the top of the tab until something is
+    /// filed in them again. A pane names its own in `Pane::subject`.
+    pub subjects: Vec<String>,
 }
 
 /// Pixel conversion factor between the display a tab's geometry was expressed in
@@ -530,6 +544,7 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            subjects: Vec::new(),
         })
     }
 
@@ -563,6 +578,7 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            subjects: Vec::new(),
         }
     }
 
@@ -588,6 +604,7 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            subjects: Vec::new(),
         })
     }
 
@@ -612,6 +629,7 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            subjects: Vec::new(),
         })
     }
 
@@ -1259,7 +1277,14 @@ impl Tab {
     }
 
     /// Extract a pane by id, returning it separately. The tab retains the remainder.
+    /// The pane leaves its subject behind: subjects belong to this tab.
     pub fn extract_pane(&mut self, id: PaneId) -> Option<Pane> {
+        let mut pane = self.extract_pane_keeping_subject(id)?;
+        pane.subject = None;
+        Some(pane)
+    }
+
+    fn extract_pane_keeping_subject(&mut self, id: PaneId) -> Option<Pane> {
         let col_idx = self.column_index_of(id)?;
 
         if self.columns[col_idx].panes.len() == 1 {
@@ -1448,6 +1473,94 @@ impl Tab {
         true
     }
 
+    /// Exchange two panes of this tab in place, each landing where the other
+    /// was — what Cmd+Up/Down does inside a subject whose members are not
+    /// adjacent in the layout. False when either pane is not in this tab.
+    pub fn swap_pane_positions(&mut self, a: PaneId, b: PaneId) -> bool {
+        match (self.position_of(a), self.position_of(b)) {
+            (Some(pa), Some(pb)) if pa != pb => {
+                self.swap_positions(pa, pb);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Put the tab's panes in `order` (every pane id of the tab, each once),
+    /// in traversal order. The layout keeps its shape: only the occupants of
+    /// its places change, one swap at a time. False when `order` is not a
+    /// permutation of the tab's panes; nothing moves then.
+    pub fn reorder_panes(&mut self, order: &[PaneId]) -> bool {
+        let current: Vec<PaneId> = self.pane_subjects().into_iter().map(|(id, _)| id).collect();
+        let mut sorted_a = current.clone();
+        let mut sorted_b = order.to_vec();
+        sorted_a.sort_unstable();
+        sorted_b.sort_unstable();
+        if sorted_a != sorted_b {
+            return false;
+        }
+        for (i, &want) in order.iter().enumerate() {
+            let here = self.pane_subjects()[i].0;
+            if here != want {
+                self.swap_pane_positions(here, want);
+            }
+        }
+        true
+    }
+
+    /// Every pane's id and subject, in traversal order — the order Cmd+P
+    /// lists and `move_pane_in_order` walks.
+    pub fn pane_subjects(&self) -> Vec<(PaneId, Option<String>)> {
+        let mut out = Vec::new();
+        self.for_each_pane(&mut |p| out.push((p.id, p.subject.clone())));
+        out
+    }
+
+    /// Add to `subjects` every subject a pane names that the tab does not list
+    /// yet: a session file edited by hand, or written by a build that lost the
+    /// list, still shows every pane in its box.
+    pub fn heal_subjects(&mut self) {
+        let named: Vec<String> = self.pane_subjects().into_iter().filter_map(|(_, s)| s).collect();
+        heal_subject_list(&mut self.subjects, named);
+    }
+
+    /// Rename a subject, its members following. A name the tab already has
+    /// merges the two: the renamed subject's panes join the other one, which
+    /// keeps its place in the list.
+    pub fn rename_subject(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        if self.subjects.iter().any(|s| s == new) {
+            self.subjects.retain(|s| s != old);
+        } else if let Some(s) = self.subjects.iter_mut().find(|s| *s == old) {
+            *s = new.to_string();
+        }
+        for col in &mut self.columns {
+            for p in &mut col.panes {
+                if p.subject.as_deref() == Some(old) {
+                    p.subject = Some(new.to_string());
+                }
+            }
+        }
+    }
+
+    /// Delete a subject. Its panes stay open where they are, out of any box.
+    /// Returns how many panes it held.
+    pub fn delete_subject(&mut self, name: &str) -> usize {
+        self.subjects.retain(|s| s != name);
+        let mut freed = 0;
+        for col in &mut self.columns {
+            for p in &mut col.panes {
+                if p.subject.as_deref() == Some(name) {
+                    p.subject = None;
+                    freed += 1;
+                }
+            }
+        }
+        freed
+    }
+
     /// Swap the focused pane with its neighbor. For Left/Right, swap entire columns.
     pub fn swap_panes(&mut self, id1: PaneId, id2: PaneId, dir: NavDirection) -> bool {
         if id1 == id2 { return false; }
@@ -1549,6 +1662,9 @@ pub struct Pane {
     pub custom_title: Option<String>,
     /// Whether this pane is minimized (collapsed to a thin bar).
     pub minimized: bool,
+    /// The subject of its tab this pane is filed under in Cmd+P, by name (one
+    /// of `Tab::subjects`). Filed by hand; a pane that leaves its tab loses it.
+    pub subject: Option<String>,
     /// Whether the idle agent session in this pane has been looked at since it
     /// last did anything. Backs Cmd+J's third tier (see `is_idle_agent_unseen`):
     /// an open session nobody is using is a candidate exactly once, then drops
@@ -1595,6 +1711,7 @@ impl Pane {
             surface,
             custom_title: None,
             minimized: false,
+            subject: None,
             idle_agent_seen: Cell::new(false),
             last_seen: Cell::new(0),
         }
@@ -2282,6 +2399,91 @@ mod tests {
         let b_id = tab.columns[1].panes[0].id;
         tab.pane(b_id).unwrap().shell_exited.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(!tab.check_running(false));
+    }
+
+    #[test]
+    fn a_pane_broken_out_of_its_tab_leaves_its_subject_behind() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let (mut b, _fb) = super::Pane::capture(10, 2);
+        b.subject = Some("auth".into());
+        let b_id = b.id;
+        let mut tab = super::Tab::with_columns(vec![vec![a, b]]);
+        tab.subjects.push("auth".into());
+        let out = tab.extract_pane(b_id).expect("the pane comes out");
+        assert_eq!(out.subject, None, "subjects belong to the tab");
+        assert_eq!(tab.subjects, vec!["auth".to_string()], "the subject stays, empty");
+    }
+
+    #[test]
+    fn renaming_a_subject_carries_its_panes_and_merges_into_an_existing_name() {
+        let (mut a, _fa) = super::Pane::capture(10, 2);
+        let (mut b, _fb) = super::Pane::capture(10, 2);
+        let (c, _fc) = super::Pane::capture(10, 2);
+        a.subject = Some("auth".into());
+        b.subject = Some("api".into());
+        let mut tab = super::Tab::with_columns(vec![vec![a, b, c]]);
+        tab.subjects = vec!["auth".into(), "api".into(), "idle".into()];
+
+        tab.rename_subject("auth", "login");
+        assert_eq!(tab.subjects, ["login", "api", "idle"], "renamed in place");
+        let subjects = |t: &super::Tab| t.pane_subjects().into_iter().map(|(_, s)| s).collect::<Vec<_>>();
+        assert_eq!(subjects(&tab), [Some("login".into()), Some("api".into()), None]);
+
+        tab.rename_subject("login", "api");
+        assert_eq!(tab.subjects, ["api", "idle"], "a taken name merges, the other keeps its place");
+        assert_eq!(subjects(&tab), [Some("api".into()), Some("api".into()), None]);
+    }
+
+    #[test]
+    fn deleting_a_subject_leaves_its_panes_open_out_of_any_box() {
+        let (mut a, _fa) = super::Pane::capture(10, 2);
+        let (b, _fb) = super::Pane::capture(10, 2);
+        a.subject = Some("auth".into());
+        let mut tab = super::Tab::with_columns(vec![vec![a, b]]);
+        tab.subjects = vec!["auth".into(), "idle".into()];
+        assert_eq!(tab.delete_subject("auth"), 1);
+        assert_eq!(tab.subjects, ["idle"]);
+        assert_eq!(tab.pane_subjects().len(), 2, "no pane closes");
+        assert!(tab.pane_subjects().iter().all(|(_, s)| s.is_none()));
+        assert_eq!(tab.delete_subject("idle"), 0, "an empty subject just goes");
+        assert!(tab.subjects.is_empty());
+    }
+
+    #[test]
+    fn reordering_panes_keeps_the_layout_shape() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let (b, _fb) = super::Pane::capture(10, 2);
+        let (c, _fc) = super::Pane::capture(10, 2);
+        let (ia, ib, ic) = (a.id, b.id, c.id);
+        let mut tab = super::Tab::with_columns(vec![vec![a, b], vec![c]]);
+        assert!(tab.reorder_panes(&[ic, ia, ib]));
+        let order: Vec<_> = tab.pane_subjects().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(order, vec![ic, ia, ib]);
+        assert_eq!(tab.columns.iter().map(|c| c.panes.len()).collect::<Vec<_>>(), [2, 1]);
+        assert!(!tab.reorder_panes(&[ia, ib]), "not every pane: nothing moves");
+        assert!(!tab.reorder_panes(&[ia, ia, ib]));
+        let order: Vec<_> = tab.pane_subjects().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(order, vec![ic, ia, ib]);
+    }
+
+    #[test]
+    fn swapping_two_panes_exchanges_their_places_and_nothing_else() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let (b, _fb) = super::Pane::capture(10, 2);
+        let (c, _fc) = super::Pane::capture(10, 2);
+        let (ia, ib, ic) = (a.id, b.id, c.id);
+        let mut tab = super::Tab::with_columns(vec![vec![a, b], vec![c]]);
+        assert!(tab.swap_pane_positions(ia, ic));
+        let order: Vec<_> = tab.pane_subjects().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(order, vec![ic, ib, ia]);
+        assert!(!tab.swap_pane_positions(ia, ia), "a pane does not swap with itself");
+    }
+
+    #[test]
+    fn healing_appends_the_subjects_panes_name_once_each() {
+        let mut subjects = vec!["a".to_string()];
+        super::heal_subject_list(&mut subjects, ["b", "a", "c", "b"].map(String::from));
+        assert_eq!(subjects, ["a", "b", "c"]);
     }
 
     #[test]

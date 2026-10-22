@@ -140,7 +140,7 @@ impl KovaView {
             None => return,
         };
 
-        let (focused_id, current_vp, focused_cwd) = {
+        let (focused_id, current_vp, focused_cwd, focused_subject) = {
             let tabs = self.ivars().tabs.borrow();
             let idx = self.ivars().active_tab.get();
             let tab = match tabs.get(idx) {
@@ -153,7 +153,8 @@ impl KovaView {
                 None => return,
             };
             let cwd = tab.pane(fid).and_then(|p| p.cwd());
-            (fid, vp, cwd)
+            let subject = tab.pane(fid).and_then(|p| p.subject.clone());
+            (fid, vp, cwd, subject)
         };
 
         let half_vp = match direction {
@@ -178,13 +179,17 @@ impl KovaView {
         };
         log::debug!("Split pane {}: direction={}, new size={}x{}", focused_id, dir_name, cols, rows);
 
-        let new_pane = match Pane::spawn(cols, rows, config, focused_cwd.as_deref()) {
+        let mut new_pane = match Pane::spawn(cols, rows, config, focused_cwd.as_deref()) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("failed to spawn pane for split: {}", e);
                 return;
             }
         };
+        // Joins the subject of the pane it was split from, so it shows in that
+        // pane's box in Cmd+P (gathered there even when the new column does not
+        // land right after it) — the split itself is unchanged.
+        new_pane.subject = focused_subject;
         let new_id = new_pane.id;
         let open_timer = new_pane.open_timer.clone();
 
@@ -759,6 +764,7 @@ impl KovaView {
                     virtual_width_override: 0.0,
                     geometry_scale: self.backing_scale(),
                     cell_h: std::cell::Cell::new(0.0),
+                    subjects: Vec::new(),
                 };
 
                 // Resize the source tab's remaining panes while it's still active
@@ -885,7 +891,12 @@ impl KovaView {
         let source_avg: f32 = source.column_weights.iter().sum::<f32>()
             / source.columns.len().max(1) as f32;
         let scale = if source_avg > 0.0 { target_avg / source_avg } else { 1.0 };
-        for (i, (col, weight)) in source.columns.into_iter().zip(source.column_weights.into_iter()).enumerate() {
+        for (i, (mut col, weight)) in source.columns.into_iter().zip(source.column_weights.into_iter()).enumerate() {
+            // The source tab's subjects die with it: a pane leaving its tab
+            // leaves its subject behind.
+            for pane in &mut col.panes {
+                pane.subject = None;
+            }
             tabs[target].columns.push(col);
             tabs[target].column_weights.push(weight * scale);
             tabs[target].custom_weights.push(

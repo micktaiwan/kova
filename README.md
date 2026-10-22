@@ -21,7 +21,7 @@ Every frame is drawn on the GPU via Apple's Metal API. Glyph atlas with on-deman
 
 ### Session persistence
 
-Layout (tabs, splits, CWD) is saved on quit and restored on launch. Panes that were running Claude Code or Codex resume their conversation by themselves at launch; a tab reopened with Cmd+O pre-types the resume line and waits for Enter. Window position is remembered automatically.
+Layout (tabs, splits, CWD) is saved on quit and restored on launch. Panes that were running Claude Code or Codex resume their conversation by themselves after a relaunch, each one the first time it is on screen in the active tab (focused or not), so fifty restored agents do not all start at once; a tab reopened with Cmd+O pre-types the resume line and waits for Enter. Window position is remembered automatically.
 
 ### Clickable URLs
 
@@ -41,9 +41,10 @@ Kova tracks which panes have something you have not seen — a bell, or a comman
 - Cmd+P opens the tab/pane switcher: every tab with its panes, arrows or click to pick, Enter to focus. `u` flips it to the panes asking for something; Cmd+Shift+J opens that filtered list directly.
 - A pane whose Claude conversation has open items in `~/.claude/raf/<session-id>.json` ends its Cmd+P row with them: `3 todo` in orange, `· 1 idea` dim (ideas alone show dim). Closing such a pane, tab or window (Cmd+W, Cmd+Shift+W, window close) lists up to five of its todos in the close confirmation — even after `claude` has exited in the pane, since Kova remembers the last Claude conversation each pane held. Ideas never warn; a pane with no running process and no open todos still closes without a dialog. Quitting Kova does not list todos (the sessions reopen at relaunch).
 - Inside the switcher, Cmd+Up/Down moves the selected pane up or down its tab's order, and Cmd+Backspace on a bookmark row removes that bookmark after a confirmation.
+- Subjects group a tab's panes in Cmd+P: a framed box with the subject's name on a tinted title bar and its panes listed under it. Inside the switcher, Cmd+Right files the selected pane under the subject drawn right above it, or asks for a name when there is none (a name the tab already has joins that subject); Cmd+Shift+Right always asks for a name, to start a new subject right under a box; Cmd+Left takes it out, moving it just below the box. Cmd+Up/Down moves a filed pane among its subject's panes only, and moves an unfiled one over a whole box at once. A pane opened with Cmd+D joins the subject of the pane it was split from. Empty subjects stay listed at the top of their tab. On a subject's header, Cmd+Up/Down moves the whole box one line (an empty one among the empty boxes at the top), Enter renames it (a name the tab already has merges the two) and Cmd+Backspace deletes it, its panes staying open out of the box (asked first when it holds any). Subjects belong to their tab and survive a relaunch; a pane moved to another tab loses its subject.
 - Cmd+B bookmarks the conversation in the focused pane (press again to drop it); bookmarks no pane holds are listed in Cmd+P, and picking one reopens the conversation and runs its resume line.
 - Cmd+Shift+A anchors the focused pane's conversation — the few things today is for. Anchors open Cmd+P in their own section, listed whether or not a pane still holds them, and Cmd+A goes straight to the first one, reopening it when nothing does. A conversation that is both only shows up under the anchors. The list is Kova's own; an outside tool can push into it with the `set-anchor` IPC command.
-- The status bar counts working Claude sessions (`✳N`) and unread panes (`●N`).
+- The status bar counts working Claude sessions (`✳N`), unread panes (`●N`), and agent panes restored asleep that have not been shown yet (`◌N`).
 - Cmd+Shift+Option+Left/Right walks the panes you visited, back then forward.
 - Desktop notifications are posted by Kova itself, so clicking one focuses the pane it came from.
 

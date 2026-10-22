@@ -127,6 +127,13 @@ const WORKING_FG: [f32; 4] = [0.6, 0.85, 0.6, 1.0];
 const RAF_TODO_FG: [f32; 4] = [0.95, 0.6, 0.3, 1.0];
 /// Between the todo and idea counts of a switcher row.
 const RAF_SEPARATOR: &str = " \u{b7} ";
+/// Frame of a subject's box in the pane switcher: the tab headers' blue,
+/// dimmed, so the box groups rows without competing with their text.
+const SUBJECT_FRAME: [f32; 3] = [0.4, 0.52, 0.72];
+/// Thickness of that frame, in drawable pixels.
+const SUBJECT_FRAME_PX: f32 = 2.0;
+/// A subject's name, on the tinted title bar of its box.
+const SUBJECT_TITLE_FG: [f32; 4] = [0.95, 0.95, 1.0, 1.0];
 
 /// Color of the status-bar unread counter. Same amber as the per-pane bell dot:
 /// the counter and the dots it sums must read as one signal.
@@ -265,6 +272,16 @@ pub struct PaneSwitcherRowRender<'a> {
     /// Open ideas of the same conversation (`"1 idea"`), drawn dim after the
     /// todos (` · ` between them), or alone when there are no todos.
     pub raf_idea: Option<&'a str>,
+    /// A subject's header (`is_header` is set too): its name on a tinted
+    /// title bar, first line of the subject's box.
+    pub subject_header: bool,
+    /// A pane filed under a subject: drawn inside the box.
+    pub in_subject: bool,
+    /// The box's frame opens above this row (a subject header).
+    pub box_top: bool,
+    /// The box's frame closes under this row (its last member, or the header
+    /// of an empty subject).
+    pub box_bottom: bool,
 }
 
 /// One column of the pane-switcher overlay: a vertical run of rows holding
@@ -863,6 +880,7 @@ impl Renderer {
         active_tab_name: &str,
         working_agents: usize,
         unread_panes: usize,
+        sleeping_panes: usize,
         minimized_counts: (usize, usize),
         show_help: bool,
         show_mem_report: bool,
@@ -1065,7 +1083,7 @@ impl Renderer {
         }
 
         // Draw global status bar
-        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, working_agents, unread_panes, minimized_counts.0, minimized_counts.1, help_hint_remaining, keys_config);
+        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, working_agents, unread_panes, sleeping_panes, minimized_counts.0, minimized_counts.1, help_hint_remaining, keys_config);
 
         // Attention banner over the focused pane's status bar. Drawn in the
         // overlay pass rather than inside the pane's own vertices: those are
@@ -1361,6 +1379,7 @@ impl Renderer {
         active_tab_name: &str,
         working_agents: usize,
         unread_panes: usize,
+        sleeping_panes: usize,
         minimized_current: usize,
         minimized_total: usize,
         help_hint_remaining: u32,
@@ -1481,7 +1500,7 @@ impl Renderer {
             left_edge = left_edge - proc_w - gap;
             let proc_str = self.cached_proc_str.clone();
             self.ctx.render_status_text(vertices, &proc_str, left_edge, bar_y, viewport_w, proc_fg, no_bg);
-            self.push_tooltip_zone(left_edge, bar_y, proc_w, cell_h, "Running child processes");
+            self.push_tooltip_zone(left_edge, bar_y, proc_w, cell_h, "Programs running in panes (an asleep agent pane starts its own when first shown)");
 
             // Number of panes whose Claude Code is actively working (OSC-title
             // activity marker present). Hidden when none are busy.
@@ -1490,7 +1509,7 @@ impl Renderer {
                 let agents_w = agents_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - agents_w - gap;
                 self.ctx.render_status_text(vertices, &agents_str, left_edge, bar_y, viewport_w, WORKING_FG, no_bg);
-                self.push_tooltip_zone(left_edge, bar_y, agents_w, cell_h, "Claude Code panes currently working");
+                self.push_tooltip_zone(left_edge, bar_y, agents_w, cell_h, "Claude Code panes working right now");
             }
 
             // Panes carrying output nobody has looked at yet — a bell, or a
@@ -1503,6 +1522,18 @@ impl Renderer {
                 left_edge = left_edge - unread_w - gap;
                 self.ctx.render_status_text(vertices, &unread_str, left_edge, bar_y, viewport_w, UNREAD_FG, no_bg);
                 self.push_tooltip_zone(left_edge, bar_y, unread_w, cell_h, "Panes with unread output (bell or finished command)");
+            }
+
+            // Agent panes restored asleep: their conversation resumes the first
+            // time each is on screen, so the ▶ count leaves them out. Hidden
+            // once every one has woken.
+            if sleeping_panes > 0 {
+                let sleep_str = format!("\u{25cc}{}", sleeping_panes);
+                let sleep_w = sleep_str.chars().count() as f32 * cell_w;
+                left_edge = left_edge - sleep_w - gap;
+                let sleep_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.6];
+                self.ctx.render_status_text(vertices, &sleep_str, left_edge, bar_y, viewport_w, sleep_fg, no_bg);
+                self.push_tooltip_zone(left_edge, bar_y, sleep_w, cell_h, "Agent panes still asleep — each resumes its conversation when first shown, and is saved on quit");
             }
 
             // Minimized panes: "⊟ current/total" (current tab / all windows).
@@ -1808,7 +1839,7 @@ impl Renderer {
                     ("Paste", kc.paste.as_str(), ""),
                     ("Find", kc.toggle_filter.as_str(), "search in this pane"),
                     ("Global Search", kc.open_search.as_str(), "panes + closed Claude sessions"),
-                    ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "quick switcher + bookmarks"),
+                    ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "switcher + bookmarks; \u{2318}\u{2190}\u{2192} file into subjects"),
                     ("Bookmark Pane", kc.toggle_bookmark.as_str(), "keep this conversation"),
                     ("Anchor Pane", kc.toggle_anchor.as_str(), "what today is for"),
                     ("Go To Anchor", kc.focus_anchor.as_str(), "back to the first anchor"),
@@ -1958,9 +1989,10 @@ impl Renderer {
     /// `build_pane_switcher_overlay_vertices` / `build_recent_projects_overlay_vertices`.
     pub fn overlay_list_geometry(&self, viewport_h: f32) -> OverlayListGeometry {
         let cell_h = self.ctx.atlas.cell_height;
-        // title at y=3·cell_h, +title_scale(1.8)·2 lines, +body_scale(1.3)·2 lines.
+        // title at y=3·cell_h, +title_scale(1.8)·2 lines, +the hint line and its gap.
         let content_top = cell_h * (3.0 + 1.8 * 2.0 + 1.3 * 2.0);
-        let row_height = cell_h * 1.3 * 1.6;
+        // Rows sized for the terminal's own glyphs (the list draws them at 1.0).
+        let row_height = cell_h * 1.7;
         let content_bottom = viewport_h - cell_h * 2.0;
         let max_visible = (((content_bottom - content_top) / row_height).floor().max(0.0)) as usize;
         OverlayListGeometry { content_top, row_height, max_visible }
@@ -1976,8 +2008,8 @@ impl Renderer {
         let cell_w = self.ctx.atlas.cell_width;
         let cell_h = self.ctx.atlas.cell_height;
 
-        // Semi-transparent dark overlay
-        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+        // Opaque backdrop: terminal text showing through competed with the list.
+        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.04, 0.04, 0.05], 1.0);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0];
@@ -1996,7 +2028,9 @@ impl Renderer {
         let bookmark_dim_fg = self.style.bookmarks.row_dim_fg;
 
         let title_scale = 1.8_f32;
-        let body_scale = 1.3_f32;
+        // 1.0: the terminal's glyphs at their own size. Any other factor
+        // stretches the bitmaps and blurs them, worst on a 1x display.
+        let body_scale = 1.0_f32;
         let scaled_cell_w = cell_w * body_scale;
 
         // Title centered. The unread count rides along so the number is read
@@ -2042,10 +2076,13 @@ impl Renderer {
                 n => format!("Switch Tab / Pane  —  {} unread", n),
             }
         };
+        // The title in the overlay font, rasterized at its own size: the
+        // terminal's glyphs stretched by `title_scale` came out blurred.
+        let overlay_cw = self.ctx.atlas.overlay_cell_width;
         let title_chars = title.chars().count() as f32;
-        let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
+        let title_x = ((viewport_w - title_chars * overlay_cw) / 2.0).max(0.0);
         let mut y = cell_h * 3.0;
-        self.ctx.render_text(vertices, &title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        self.ctx.render_overlay_text(vertices, &title, title_x, y, viewport_w, title_fg, no_bg, 1.0);
         y += cell_h * title_scale * 2.0;
 
         // Subtitle: the keys the overlay answers, each one a (key, what it does)
@@ -2082,6 +2119,9 @@ impl Renderer {
                 ("\u{21e5}", "Next unread"),
                 ("\u{23ce}", "Focus"),
                 ("\u{2318}\u{2191}\u{2193}", "Move"),
+                ("\u{2318}\u{2190}\u{2192}", "Subject"),
+                ("\u{2318}\u{21e7}\u{2192}", "New subject"),
+                ("\u{23ce}/\u{2318}\u{232b}", "Rename/delete subject"),
                 ("b", "Bookmarks"),
                 ("m", "Memory"),
                 ("\u{2318}B", "Bookmark"),
@@ -2125,18 +2165,62 @@ impl Renderer {
                 let row_y = content_top + vis_i as f32 * row_height;
                 let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
 
-                let is_selected = c == data.selected_col && i == data.selected_row && !row.is_header;
+                // A subject's header is selectable (Enter renames, Cmd+Backspace
+                // deletes); a tab's header never is.
+                let is_selected = c == data.selected_col
+                    && i == data.selected_row
+                    && (!row.is_header || row.subject_header);
                 let band = match (row.bookmarked, is_selected) {
                     (true, true) => Some(bookmark_selected_bg),
                     (true, false) => Some(bookmark_bg),
                     (false, true) => Some(selected_bg),
                     (false, false) => None,
                 };
+                // A subject's box: a thin frame around its header and members,
+                // drawn a row at a time so it scrolls with them. Its edges sit
+                // where the selection band's would, and the top and bottom lines
+                // are pulled in a little so two boxes in a row never touch.
+                let (x0, x1) = (left_margin - pad * 0.5, right_margin + pad * 0.5);
+                let inset = row_height * 0.12;
+                let y0 = row_y + if row.box_top { inset } else { 0.0 };
+                let y1 = row_y + row_height - if row.box_bottom { inset } else { 0.0 };
                 if let Some(color) = band {
-                    push_bg_quad_alpha(vertices, left_margin - pad * 0.5, row_y, right_margin - left_margin + pad, row_height, color, 0.8);
+                    if row.in_subject || row.subject_header {
+                        // Inside a box the band stays within the frame, a
+                        // couple of pixels clear of it, rather than covering it.
+                        let gap = SUBJECT_FRAME_PX + 2.0;
+                        let top = if row.box_top { y0 + gap } else { y0 };
+                        let bottom = if row.box_bottom { y1 - gap } else { y1 };
+                        push_bg_quad_alpha(vertices, x0 + gap, top, x1 - x0 - 2.0 * gap, bottom - top, color, 0.8);
+                    } else {
+                        push_bg_quad_alpha(vertices, x0, row_y, x1 - x0, row_height, color, 0.8);
+                    }
                 }
 
-                if row.is_header {
+                if row.subject_header || row.in_subject {
+                    push_bg_quad_alpha(vertices, x0, y0, SUBJECT_FRAME_PX, y1 - y0, SUBJECT_FRAME, 0.9);
+                    push_bg_quad_alpha(vertices, x1 - SUBJECT_FRAME_PX, y0, SUBJECT_FRAME_PX, y1 - y0, SUBJECT_FRAME, 0.9);
+                    if row.box_top {
+                        push_bg_quad_alpha(vertices, x0, y0, x1 - x0, SUBJECT_FRAME_PX, SUBJECT_FRAME, 0.9);
+                    }
+                    if row.box_bottom {
+                        push_bg_quad_alpha(vertices, x0, y1 - SUBJECT_FRAME_PX, x1 - x0, SUBJECT_FRAME_PX, SUBJECT_FRAME, 0.9);
+                    }
+                }
+
+                if row.subject_header {
+                    // The overlay font has no bold face, and drawing the glyphs
+                    // twice blurs them: the name stands out by a brighter colour
+                    // and the rule that closes its line.
+                    let gap = SUBJECT_FRAME_PX;
+                    let bar_bottom = if row.box_bottom { y1 - gap } else { y1 };
+                    // No fill: a filled bar read like a bookmarked row's band.
+                    // A rule under the name separates it from its panes.
+                    if !row.box_bottom {
+                        push_bg_quad_alpha(vertices, x0 + gap, bar_bottom - 1.0, x1 - x0 - 2.0 * gap, 1.0, SUBJECT_FRAME, 0.6);
+                    }
+                    self.ctx.render_text(vertices, row.text, left_margin + scaled_cell_w, text_y, right_margin, SUBJECT_TITLE_FG, no_bg, body_scale);
+                } else if row.is_header {
                     self.ctx.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
                 } else {
                     // No current-pane marker: the focused pane renders like any
@@ -2147,8 +2231,10 @@ impl Renderer {
                     let attention = PaneAttention::from_flags(row.has_bell, row.has_completion);
                     // The anchor mark is a wide glyph: on a row that wears one
                     // the title starts a cell further right, or the two touch.
-                    let text =
-                        if row.anchored { format!("     {}", row.text) } else { format!("    {}", row.text) };
+                    // A subject's members keep the same lead as any pane: the
+                    // frame and the title above already say they belong together.
+                    let lead = if row.anchored { "     " } else { "    " };
+                    let text = format!("{}{}", lead, row.text);
                     let (row_fg, row_dim_fg) = if row.bookmarked {
                         (if row.minimized { bookmark_dim_fg } else { bookmark_fg }, bookmark_dim_fg)
                     } else {

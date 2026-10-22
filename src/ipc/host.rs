@@ -375,6 +375,9 @@ pub fn poll_pending_waits(host: &impl IpcHost, waits: &mut Vec<PendingWait>) {
 pub fn send_keys_to(surface: &Surface, text: &str) {
     // Same rule as a keystroke: someone answered this pane.
     surface.clear_awaiting();
+    // A pane still asleep since a relaunch is being used by whoever sends
+    // this: its resume line must not be typed over their command once shown.
+    surface.cancel_sleep();
     // A submitted line starts a command or a turn: the finished
     // flag of the last one must not answer the wait that usually
     // follows. Cleared here rather than on the shell's 133;C or
@@ -441,6 +444,10 @@ pub fn surface_json(
         "agent_session_name": pane.agent_session_name(),
         "claude_session_id": pane.claude_session_id(),
         "claude_session_name": pane.claude_session_name(),
+        // A conversation a launch restore left asleep here: its resume line
+        // waits until the pane is on screen or `wake-pane`. No agent runs, so
+        // the session ids above are null and it has no `peer_name`.
+        "dormant_session_id": pane.dormant_session_id(),
         // The SendMessage / ListAgents address of the pane's Claude session,
         // derived names included — `claude_session_name` only carries /rename.
         "peer_name": pane.claude_peer_name(),

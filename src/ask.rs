@@ -437,11 +437,21 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
     let message = late_answer_message(question, answer);
     let asker = &question.from;
     let id = &question.id;
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let registry = PathBuf::from(home).join(".claude/sessions");
-    let live = asker.session_id.as_deref().and_then(|s| live_session_pid(s, &registry));
-    let holds = holding_pane(asker, live);
-    match delivery(asker, holds, live) {
+    let target = match wake_sleeping_asker(asker, own_socket) {
+        Some(Woken::Ready { socket, pane_id }) => Delivery::Pane { socket, pane_id },
+        Some(Woken::NotYet { pane_id }) => {
+            log::warn!("ask {}: pane {} holds the conversation asleep, its agent did not come up ({})", id, pane_id, kept());
+            return;
+        }
+        None => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let registry = PathBuf::from(home).join(".claude/sessions");
+            let live = asker.session_id.as_deref().and_then(|s| live_session_pid(s, &registry));
+            let holds = holding_pane(asker, live);
+            delivery(asker, holds, live)
+        }
+    };
+    match target {
         Delivery::Pane { socket, pane_id } => {
             // The text, then Enter on its own: Claude Code takes a pasted
             // newline as part of the message.
@@ -490,6 +500,71 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
             store.remove_delivery(id);
         }
     }
+}
+
+/// What waking a sleeping asker's pane gave (`wake_sleeping_asker`).
+enum Woken {
+    /// Its agent runs the conversation again: type the answer there.
+    Ready { socket: String, pane_id: u32 },
+    /// Woken, but its agent did not report the conversation in time.
+    NotYet { pane_id: u32 },
+}
+
+/// How long a woken agent gets to report its conversation in `list-panes`.
+const WAKE_WAIT: Duration = Duration::from_secs(60);
+
+/// The pane of `panes` where conversation `session_id` sleeps since a Kova
+/// relaunch (`dormant_session_id`), resume line not run yet.
+pub fn sleeping_pane(panes: &[serde_json::Value], session_id: &str) -> Option<u32> {
+    panes
+        .iter()
+        .find(|p| p.get("dormant_session_id").and_then(|v| v.as_str()) == Some(session_id))
+        .and_then(|p| p.get("id")?.as_u64()?.try_into().ok())
+}
+
+/// The pane `pane_id` of `panes` reports that it runs `session_id`.
+fn reports_session(panes: &[serde_json::Value], pane_id: u32, session_id: &str) -> bool {
+    panes.iter().any(|p| {
+        p.get("id").and_then(|v| v.as_u64()) == Some(pane_id as u64)
+            && p.get("agent_session_id").and_then(|v| v.as_str()) == Some(session_id)
+    })
+}
+
+fn list_panes(socket: &str) -> Option<Vec<serde_json::Value>> {
+    let reply = request(socket, serde_json::json!({"cmd": "list-panes"}), Duration::from_secs(3))?;
+    reply.get("data")?.as_array().cloned()
+}
+
+/// A Kova relaunch leaves restored agents asleep until their pane is shown. If
+/// the asker's conversation sleeps in a pane, wake that pane and wait for the
+/// agent: resuming it in a new tab would run the conversation twice once the
+/// sleeping pane is shown. Looked up in this Kova too, not only the asker's: a
+/// question asked before the relaunch names a socket that died with the old
+/// Kova. `None` when it sleeps nowhere.
+fn wake_sleeping_asker(asker: &Asker, own_socket: &str) -> Option<Woken> {
+    let session = asker.session_id.as_deref()?;
+    let (socket, pane_id) = asker
+        .kova_socket
+        .as_deref()
+        .into_iter()
+        .chain(std::iter::once(own_socket))
+        .find_map(|socket| Some((socket, sleeping_pane(&list_panes(socket)?, session)?)))?;
+    let woke = request(socket, serde_json::json!({"cmd": "wake-pane", "pane_id": pane_id}), Duration::from_secs(5));
+    if !reply_ok(&woke) {
+        // Still asleep there: a resume elsewhere would be the second one.
+        return Some(Woken::NotYet { pane_id });
+    }
+    log::info!("ask: session {} was asleep in pane {}, woke it", session, pane_id);
+    let deadline = std::time::Instant::now() + WAKE_WAIT;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_secs(1));
+        if list_panes(socket).is_some_and(|panes| reports_session(&panes, pane_id, session)) {
+            // Registered is not drawn yet: give the agent's input a moment.
+            std::thread::sleep(Duration::from_secs(2));
+            return Some(Woken::Ready { socket: socket.to_string(), pane_id });
+        }
+    }
+    Some(Woken::NotYet { pane_id })
 }
 
 /// Whether the asker's Kova pane still runs the asker's conversation, read now
@@ -1313,6 +1388,22 @@ mod tests {
         assert!(descends(me, parent));
         assert!(descends(me, me), "exec claude: the shell is the conversation");
         assert_eq!(parent_pid(999_999), None);
+    }
+
+    #[test]
+    fn a_sleeping_conversation_is_found_and_then_seen_running() {
+        let asleep = vec![
+            serde_json::json!({"id": 3, "agent_session_id": null, "dormant_session_id": "other"}),
+            serde_json::json!({"id": 7, "agent_session_id": null, "dormant_session_id": "abc-123"}),
+        ];
+        assert_eq!(sleeping_pane(&asleep, "abc-123"), Some(7));
+        assert_eq!(sleeping_pane(&asleep, "nowhere"), None);
+        assert!(!reports_session(&asleep, 7, "abc-123"), "asleep is not running");
+
+        let woken = vec![serde_json::json!({"id": 7, "agent_session_id": "abc-123", "dormant_session_id": null})];
+        assert!(reports_session(&woken, 7, "abc-123"));
+        assert!(!reports_session(&woken, 8, "abc-123"));
+        assert_eq!(sleeping_pane(&woken, "abc-123"), None);
     }
 
     #[test]

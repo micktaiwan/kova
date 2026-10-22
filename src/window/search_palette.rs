@@ -596,7 +596,10 @@ fn focus_pane_with_claude_session(session_id: &str) -> bool {
             let mut found = None;
             for tab in tabs.iter() {
                 tab.for_each_pane(&mut |pane| {
-                    if found.is_none() && pane.claude_session_id().as_deref() == Some(session_id) {
+                    // Asleep since launch counts: focusing it wakes it.
+                    let asleep = pane.dormant_session()
+                        .is_some_and(|(agent, id)| agent == crate::agent_session::Agent::Claude && id == session_id);
+                    if found.is_none() && (pane.claude_session_id().as_deref() == Some(session_id) || asleep) {
                         found = Some(pane.id);
                     }
                 });
@@ -825,7 +828,8 @@ impl KovaView {
                 let tab_title = tab.title();
                 tabs_snap.push(SearchTabSnapshot { tab_id: tab.id, title: tab_title.clone() });
                 tab.for_each_pane(&mut |pane| {
-                    if let Some(id) = pane.agent_session_id() {
+                    // Asleep since launch is open too: not a closed session.
+                    if let Some(id) = pane.agent_session_id().or_else(|| pane.dormant_session_id()) {
                         live_sessions.push(id);
                     }
                     panes_snap.push(SearchPaneSnapshot {

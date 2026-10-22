@@ -441,6 +441,13 @@ impl KovaView {
         true
     }
 
+    /// IPC: wake the agent asleep in `pane_id` (`Surface::wake`). `None` when
+    /// the pane is not in this window.
+    pub fn ipc_wake_pane(&self, pane_id: PaneId) -> Option<bool> {
+        let tabs = self.ivars().tabs.borrow();
+        tabs.iter().find_map(|t| t.pane(pane_id)).map(|pane| pane.wake())
+    }
+
     /// IPC: collect all pane IDs in this window (used to expand `panes: "all"`).
     pub fn ipc_collect_pane_ids(&self, out: &mut Vec<PaneId>) {
         collect_pane_ids_in(&self.ivars().tabs.borrow(), out);
@@ -931,7 +938,7 @@ mod tests {
         assert_eq!(keys, [
             "agent", "agent_session_id", "agent_session_name", "awaiting", "awaiting_seen",
             "awaiting_since", "child_processes", "claude_session_id", "claude_session_name",
-            "cwd", "focused", "id", "is_idle", "minimized", "peer_name", "pid", "tab", "title",
+            "cwd", "dormant_session_id", "focused", "id", "is_idle", "minimized", "peer_name", "pid", "tab", "title",
             "window", "working",
         ]);
         assert_eq!(v["id"], a.id);
