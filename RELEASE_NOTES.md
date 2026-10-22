@@ -1,7 +1,7 @@
-# 2.0.1
+# 2.0.2
 
-- Kova ask: agents can put a question on a card and get your answer back, even after their turn ended
-- Cmd+P lists memory per pane (m) and your bookmarks (b); Cmd+Shift+F finds matching bookmarks
-- Text copied by a program (OSC 52) keeps its accents, and a folder with a space in its name is tracked correctly
-- The focus outline only shows when two panes or more are on screen, and switching tabs cancels a rename in progress
-- Cmd+O filters recent projects by their path
+- Subjects: group a tab's panes under a named subject in Cmd+P (Cmd+Right files a pane, Cmd+Left takes it out); a subject survives a relaunch
+- Each subject gets its own color, and a strip under the tab bar names the subject over its panes
+- After a relaunch, agent conversations resume only when their pane is first shown (or on wake-pane), and the status bar counts the sleeping ones (◌N)
+- Resizing the window or dragging a separator no longer resizes every pane several times a frame, and panes scrolled off-screen catch up when shown
+- IPC: list-subjects, set-pane-subject, rename-subject, delete-subject, a subject field on each pane and a subjects event in subscribe

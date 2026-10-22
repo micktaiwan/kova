@@ -397,6 +397,30 @@ pub fn heal_subject_list(subjects: &mut Vec<String>, named: impl IntoIterator<It
     }
 }
 
+/// The palette entry a new subject gets: drawn at random among the colors
+/// the tab's other subjects use least, so two subjects look alike only once
+/// the palette is used up. `taken` holds those subjects' colors; `seed` is
+/// the randomness, passed in so the choice can be tested.
+pub fn pick_subject_color(taken: impl IntoIterator<Item = usize>, seed: u64) -> usize {
+    let n = crate::tab_colors::TAB_COLORS.len();
+    let mut uses = vec![0usize; n];
+    for c in taken {
+        uses[c % n] += 1;
+    }
+    let least = uses.iter().copied().min().unwrap_or(0);
+    let candidates: Vec<usize> = (0..n).filter(|&i| uses[i] == least).collect();
+    candidates[(seed % candidates.len() as u64) as usize]
+}
+
+/// A fresh random number for `pick_subject_color`, from the std's per-process
+/// random hash keys: Kova has no random crate, and a color needs no more.
+fn random_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    h.finish()
+}
+
 pub struct Tab {
     pub id: TabId,
     pub columns: Vec<Column>,
@@ -435,6 +459,10 @@ pub struct Tab {
     /// included: Cmd+P lists them at the top of the tab until something is
     /// filed in them again. A pane names its own in `Pane::subject`.
     pub subjects: Vec<String>,
+    /// Each subject's color, an index into `TAB_COLORS`: drawn at random when
+    /// the subject is created, then kept (saved with the session) so a
+    /// subject looks the same from one day to the next.
+    pub subject_colors: std::collections::HashMap<String, usize>,
 }
 
 /// Pixel conversion factor between the display a tab's geometry was expressed in
@@ -545,6 +573,7 @@ impl Tab {
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
             subjects: Vec::new(),
+            subject_colors: std::collections::HashMap::new(),
         })
     }
 
@@ -579,6 +608,7 @@ impl Tab {
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
             subjects: Vec::new(),
+            subject_colors: std::collections::HashMap::new(),
         }
     }
 
@@ -605,6 +635,7 @@ impl Tab {
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
             subjects: Vec::new(),
+            subject_colors: std::collections::HashMap::new(),
         })
     }
 
@@ -630,6 +661,7 @@ impl Tab {
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
             subjects: Vec::new(),
+            subject_colors: std::collections::HashMap::new(),
         })
     }
 
@@ -1522,6 +1554,43 @@ impl Tab {
     pub fn heal_subjects(&mut self) {
         let named: Vec<String> = self.pane_subjects().into_iter().filter_map(|(_, s)| s).collect();
         heal_subject_list(&mut self.subjects, named);
+        self.heal_subject_colors();
+    }
+
+    /// Give a color to every subject that has none (a session saved before
+    /// colors existed, a subject created by a path that only pushed its name),
+    /// and forget the colors of names the tab no longer has.
+    fn heal_subject_colors(&mut self) {
+        let subjects = &self.subjects;
+        self.subject_colors.retain(|name, _| subjects.contains(name));
+        for name in self.subjects.clone() {
+            if !self.subject_colors.contains_key(&name) {
+                let color = pick_subject_color(self.subject_colors.values().copied(), random_seed());
+                self.subject_colors.insert(name, color);
+            }
+        }
+    }
+
+    /// Add a subject to the tab, with its color. Returns false when the tab
+    /// already has it.
+    pub fn add_subject(&mut self, name: &str) -> bool {
+        if self.subjects.iter().any(|s| s == name) {
+            return false;
+        }
+        self.subjects.push(name.to_string());
+        self.heal_subject_colors();
+        true
+    }
+
+    /// Whether any pane of the tab is filed under a subject: the tab then
+    /// gives up one row, under the tab bar, to the subject strip.
+    pub fn has_filed_panes(&self) -> bool {
+        self.columns.iter().any(|c| c.panes.iter().any(|p| p.subject.is_some()))
+    }
+
+    /// The color of a subject of this tab, an index into `TAB_COLORS`.
+    pub fn subject_color(&self, name: &str) -> Option<usize> {
+        self.subject_colors.get(name).copied()
     }
 
     /// Rename a subject, its members following. A name the tab already has
@@ -1531,10 +1600,16 @@ impl Tab {
         if old == new {
             return;
         }
+        // The color follows the name; merged into another subject, it is
+        // that subject's color that stays.
+        let color = self.subject_colors.remove(old);
         if self.subjects.iter().any(|s| s == new) {
             self.subjects.retain(|s| s != old);
         } else if let Some(s) = self.subjects.iter_mut().find(|s| *s == old) {
             *s = new.to_string();
+            if let Some(color) = color {
+                self.subject_colors.insert(new.to_string(), color);
+            }
         }
         for col in &mut self.columns {
             for p in &mut col.panes {
@@ -1549,6 +1624,7 @@ impl Tab {
     /// Returns how many panes it held.
     pub fn delete_subject(&mut self, name: &str) -> usize {
         self.subjects.retain(|s| s != name);
+        self.subject_colors.remove(name);
         let mut freed = 0;
         for col in &mut self.columns {
             for p in &mut col.panes {
@@ -2432,6 +2508,44 @@ mod tests {
         tab.rename_subject("login", "api");
         assert_eq!(tab.subjects, ["api", "idle"], "a taken name merges, the other keeps its place");
         assert_eq!(subjects(&tab), [Some("api".into()), Some("api".into()), None]);
+    }
+
+    #[test]
+    fn a_new_subject_takes_a_color_the_tab_uses_least() {
+        let n = crate::tab_colors::TAB_COLORS.len();
+        // Every color but 2 taken once: 2 is the only least-used one.
+        let taken: Vec<usize> = (0..n).filter(|&c| c != 2).collect();
+        for seed in 0..20 {
+            assert_eq!(super::pick_subject_color(taken.clone(), seed), 2);
+        }
+        // Nothing taken: any color, chosen by the seed.
+        let picks: std::collections::HashSet<usize> = (0..50).map(|seed| super::pick_subject_color([], seed)).collect();
+        assert_eq!(picks.len(), n, "every color can come out");
+    }
+
+    #[test]
+    fn subject_colors_follow_creation_rename_merge_and_deletion() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let mut tab = super::Tab::with_columns(vec![vec![a]]);
+        assert!(tab.add_subject("auth"));
+        assert!(!tab.add_subject("auth"), "already there");
+        assert!(tab.add_subject("api"));
+        let (auth, api) = (tab.subject_color("auth").unwrap(), tab.subject_color("api").unwrap());
+        assert_ne!(auth, api, "the palette is not used up: two subjects, two colors");
+
+        tab.rename_subject("auth", "login");
+        assert_eq!(tab.subject_color("login"), Some(auth), "the color follows the name");
+        assert_eq!(tab.subject_color("auth"), None);
+        tab.rename_subject("login", "api");
+        assert_eq!(tab.subject_color("api"), Some(api), "merged: the kept subject keeps its color");
+        assert_eq!(tab.subject_colors.len(), 1);
+        tab.delete_subject("api");
+        assert!(tab.subject_colors.is_empty());
+
+        // A restored tab whose subjects have no color yet gets one each.
+        tab.subjects = vec!["x".into(), "y".into()];
+        tab.heal_subjects();
+        assert!(tab.subject_color("x").is_some() && tab.subject_color("y").is_some());
     }
 
     #[test]

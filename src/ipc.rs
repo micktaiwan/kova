@@ -225,6 +225,29 @@ pub enum IpcCommand {
     WithdrawAsks {
         session_id: String,
     },
+    /// Every subject of every tab, with the panes filed under it, in the order
+    /// Cmd+P draws them.
+    ListSubjects,
+    /// File a pane under a subject of its tab, created when the tab has none by
+    /// that name (Cmd+Right / Cmd+Shift+Right). `subject: None` takes it out of
+    /// its subject, as Cmd+Left does.
+    SetPaneSubject {
+        pane_id: u32,
+        subject: Option<String>,
+    },
+    /// Rename a subject of a tab; a name the tab already has merges the two
+    /// (Enter on the subject's header in Cmd+P).
+    RenameSubject {
+        tab_id: u32,
+        name: String,
+        new_name: String,
+    },
+    /// Delete a subject of a tab. Its panes stay open, out of any box
+    /// (Cmd+Backspace on the header, without the confirmation).
+    DeleteSubject {
+        tab_id: u32,
+        name: String,
+    },
 }
 
 /// How long the IPC connection thread should wait for the main thread's response.
@@ -642,6 +665,10 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "list-asks" => &[],
         "answer-ask" => &["id", "action", "text"],
         "withdraw-asks" => &["session_id"],
+        "list-subjects" => &[],
+        "set-pane-subject" => &["pane_id", "subject"],
+        "rename-subject" => &["tab_id", "name", "new_name"],
+        "delete-subject" => &["tab_id", "name"],
         _ => return None,
     })
 }
@@ -664,6 +691,30 @@ fn optional_u32(v: &serde_json::Value, key: &str) -> Result<Option<u32>, String>
             .map(Some)
             .ok_or_else(|| format!("\"{key}\" must be a non-negative integer up to {}", u32::MAX)),
     }
+}
+
+/// Longest subject name accepted, in chars: a box header in Cmd+P is one line.
+const MAX_SUBJECT_NAME_CHARS: usize = 200;
+
+/// A subject name: a string, trimmed as the Cmd+P prompt trims it, not empty,
+/// no control character (a newline would break the one-line header).
+fn subject_name(v: &serde_json::Value, key: &str) -> Result<String, String> {
+    let raw = match v.get(key) {
+        None => return Err(format!("missing \"{key}\" field")),
+        Some(serde_json::Value::String(s)) => s,
+        Some(_) => return Err(format!("\"{key}\" must be a string")),
+    };
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(format!("\"{key}\" must not be empty"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(format!("\"{key}\" must not contain control characters"));
+    }
+    if name.chars().count() > MAX_SUBJECT_NAME_CHARS {
+        return Err(format!("\"{key}\" is longer than {MAX_SUBJECT_NAME_CHARS} characters"));
+    }
+    Ok(name.to_string())
 }
 
 pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
@@ -1038,6 +1089,28 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             }
             Ok(IpcCommand::WithdrawAsks { session_id })
         }
+        "list-subjects" => Ok(IpcCommand::ListSubjects),
+        "set-pane-subject" => {
+            let pane_id = required_u32(&v, "pane_id")?;
+            // Required, so a forgotten field never reads as "take it out".
+            let subject = match v.get("subject") {
+                None => return Err("missing \"subject\" field (null takes the pane out of its subject)".to_string()),
+                Some(serde_json::Value::Null) => None,
+                Some(_) => Some(subject_name(&v, "subject")?),
+            };
+            Ok(IpcCommand::SetPaneSubject { pane_id, subject })
+        }
+        "rename-subject" => {
+            let tab_id = required_u32(&v, "tab_id")?;
+            let name = subject_name(&v, "name")?;
+            let new_name = subject_name(&v, "new_name")?;
+            Ok(IpcCommand::RenameSubject { tab_id, name, new_name })
+        }
+        "delete-subject" => {
+            let tab_id = required_u32(&v, "tab_id")?;
+            let name = subject_name(&v, "name")?;
+            Ok(IpcCommand::DeleteSubject { tab_id, name })
+        }
         other => Err(format!("unknown command: {}", other)),
     }
 }
@@ -1130,16 +1203,20 @@ pub mod topic {
     pub const PANE_OPEN: u32 = 1 << 3;
     /// A pane went away.
     pub const PANE_CLOSE: u32 = 1 << 4;
+    /// The subjects of Cmd+P changed: one created, renamed, deleted, moved, or
+    /// a pane filed into or out of one, whoever did it.
+    pub const SUBJECTS: u32 = 1 << 5;
 
-    pub const ALL: u32 = FOCUS | PANE_STATUS | PANE_WORKING | PANE_OPEN | PANE_CLOSE;
+    pub const ALL: u32 = FOCUS | PANE_STATUS | PANE_WORKING | PANE_OPEN | PANE_CLOSE | SUBJECTS;
 
     /// Wire names, in bit order — `names()` relies on that ordering.
-    pub const ALL_NAMES: [&str; 5] = [
+    pub const ALL_NAMES: [&str; 6] = [
         "focus",
         "pane-status",
         "pane-working",
         "pane-open",
         "pane-close",
+        "subjects",
     ];
 
     pub fn from_name(name: &str) -> Option<u32> {
@@ -1643,6 +1720,52 @@ mod tests {
     }
 
     #[test]
+    fn subject_commands_parse_and_check_their_names() {
+        assert!(matches!(parse_command(r#"{"cmd":"list-subjects"}"#), Ok(IpcCommand::ListSubjects)));
+        match parse_command(r#"{"cmd":"set-pane-subject","pane_id":4,"subject":"  auth  "}"#) {
+            Ok(IpcCommand::SetPaneSubject { pane_id: 4, subject }) => {
+                assert_eq!(subject.as_deref(), Some("auth"), "trimmed as the Cmd+P prompt trims");
+            }
+            _ => panic!("set-pane-subject with a name"),
+        }
+        assert!(matches!(
+            parse_command(r#"{"cmd":"set-pane-subject","pane_id":4,"subject":null}"#),
+            Ok(IpcCommand::SetPaneSubject { pane_id: 4, subject: None })
+        ));
+        let err = |line: &str| match parse_command(line) {
+            Err(e) => e,
+            Ok(_) => panic!("{line} must be refused"),
+        };
+        assert!(err(r#"{"cmd":"set-pane-subject","pane_id":4}"#).contains("missing \"subject\""),
+            "a forgotten field never reads as taking the pane out");
+        assert_eq!(err(r#"{"cmd":"set-pane-subject","pane_id":4,"subject":"  "}"#), "\"subject\" must not be empty");
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-subject","pane_id":4,"subject":"a\nb"}"#),
+            "\"subject\" must not contain control characters"
+        );
+        assert_eq!(err(r#"{"cmd":"set-pane-subject","pane_id":4,"subject":3}"#), "\"subject\" must be a string");
+        let long = format!(r#"{{"cmd":"set-pane-subject","pane_id":4,"subject":"{}"}}"#, "x".repeat(201));
+        assert!(err(&long).contains("longer than 200"));
+
+        match parse_command(r#"{"cmd":"rename-subject","tab_id":2,"name":"auth","new_name":"login"}"#) {
+            Ok(IpcCommand::RenameSubject { tab_id: 2, name, new_name }) => {
+                assert_eq!((name.as_str(), new_name.as_str()), ("auth", "login"));
+            }
+            _ => panic!("rename-subject"),
+        }
+        assert_eq!(err(r#"{"cmd":"rename-subject","tab_id":2,"name":"auth"}"#), "missing \"new_name\" field");
+        match parse_command(r#"{"cmd":"delete-subject","tab_id":2,"name":"auth"}"#) {
+            Ok(IpcCommand::DeleteSubject { tab_id: 2, name }) => assert_eq!(name, "auth"),
+            _ => panic!("delete-subject"),
+        }
+        assert_eq!(err(r#"{"cmd":"delete-subject","name":"auth"}"#), "missing \"tab_id\" field");
+        assert_eq!(
+            err(r#"{"cmd":"delete-subject","tab_id":2,"name":"auth","pane_id":1}"#),
+            "unknown field \"pane_id\" for command \"delete-subject\""
+        );
+    }
+
+    #[test]
     fn subscribe_without_events_takes_every_topic() {
         assert!(matches!(
             parse_command(r#"{"cmd":"subscribe"}"#),
@@ -1664,7 +1787,7 @@ mod tests {
         // that will never come — the failure has to be loud and immediate.
         assert_eq!(
             err(r#"{"cmd":"subscribe","events":["focous"]}"#),
-            "unknown event \"focous\" — known events: focus, pane-status, pane-working, pane-open, pane-close"
+            "unknown event \"focous\" — known events: focus, pane-status, pane-working, pane-open, pane-close, subjects"
         );
         assert_eq!(
             err(r#"{"cmd":"subscribe","events":[]}"#),

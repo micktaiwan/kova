@@ -70,6 +70,7 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 | Notify, the click focuses the pane | `{"cmd":"notify","pane_id":42,"title":"Claude Code","message":"done"}` |
 | Follow changes live | `{"cmd":"subscribe","events":["focus","pane-working"]}` |
 | Anchors | `set-anchor`, `clear-anchors` |
+| Subjects (the boxes of `Cmd+P`) | `{"cmd":"list-subjects"}`, `{"cmd":"set-pane-subject","pane_id":42,"subject":"auth"}` (`null` takes it out), `rename-subject`, `delete-subject` (both by `tab_id` + `name`) |
 | Reload the config | `{"cmd":"reload-config"}` |
 | Hook signals | `set-pane-status`, `mark-completed`, `mark-started`, `bell` |
 
@@ -80,7 +81,8 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 - The `command` field of `split` depends on the shell; `split` then `send-keys` is more reliable.
 - **`subscribe`** never gives the connection back: its answer is a snapshot (focus and every pane,
   the same objects as `list-panes`), then one JSON line per change (`focus`, `pane-status`,
-  `pane-working`, `pane-open`, `pane-close`, and a `ping` after 30 s of silence). Use it to follow
+  `pane-working`, `pane-open`, `pane-close`, `subjects` with the whole `list-subjects` list, and a
+  `ping` after 30 s of silence). Use it to follow
   the user instead of polling `list-panes`. `events` filters the topics; an unknown name is an
   error. `focus` also says when Kova itself goes to the background (`pane: null`,
   `reason: "app-inactive"`). Open a second connection for commands. A slow client is dropped and
@@ -161,6 +163,20 @@ again and find the pane by its conversation, `claude_session_id` or, while it sl
 The conversation name outranks the pane's custom title in `Cmd+P`, open-pane search, the IPC
 `title` and automatic tab titles; an explicitly renamed tab keeps its title. A `/rename` in the
 focused pane also emits a `focus` event with `reason: "session"`.
+
+## Subjects
+
+A subject is a named group of panes inside one tab, drawn in `Cmd+P` as a box under its name
+(`Cmd+→` files the selected pane, `Cmd+←` takes it out), and on screen as a colored band naming it
+over its panes, in a strip under the tab bar (only in a tab where a pane is filed: it costs a row). Each pane of `list-panes` carries
+`subject` (its name, or `null`). `list-subjects` answers one entry per subject: `tab_id`,
+`window`, `tab_index`, `name`, `color` (tab palette index, drawn at random at creation, then kept),
+`pane_ids`, in the order `Cmd+P` draws the boxes; an empty subject
+has `pane_ids: []`. A subject belongs to its tab: the same name in two tabs is two subjects, so
+`rename-subject` and `delete-subject` take the `tab_id` from `list-subjects`. `set-pane-subject`
+creates the subject in the pane's tab when the name is new (`created: true`). `delete-subject`
+asks nothing, unlike `Cmd+⌫` in `Cmd+P`: the panes stay open, out of any box. To follow changes,
+`subscribe` to `subjects`: each event carries the whole list again.
 
 ## Anchors and bookmarks, as the user sees them
 

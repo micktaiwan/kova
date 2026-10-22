@@ -765,6 +765,7 @@ impl KovaView {
                     geometry_scale: self.backing_scale(),
                     cell_h: std::cell::Cell::new(0.0),
                     subjects: Vec::new(),
+                    subject_colors: std::collections::HashMap::new(),
                 };
 
                 // Resize the source tab's remaining panes while it's still active

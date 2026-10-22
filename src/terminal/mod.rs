@@ -4354,4 +4354,99 @@ two");
         put_str(&mut t, "ÉCOLE");
         assert_eq!(t.search_lines("école").len(), 1);
     }
+
+    // --- Resize/reflow cost on a full default scrollback (manual bench) ---
+    // cargo test --release bench_resize_reflow -- --ignored --nocapture
+
+    #[test]
+    #[ignore]
+    fn bench_resize_reflow() {
+        use std::time::Instant;
+        let limit = crate::config::TerminalConfig::default().scrollback;
+        let build = || -> TerminalState {
+            let mut t = TerminalState::new(200, 50, limit, FG, BG);
+            let mut seed: u64 = 0x9E3779B97F4A7C15;
+            let mut rnd = move |n: u64| -> u64 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed % n
+            };
+            let words = ["cargo", "build", "warning:", "src/main.rs", "fn", "let", "error[E0308]",
+                "-->", "Compiling", "kova", "v2.0.1", "|", "=", "note:", "ok", "test", "passed"];
+            let wide = ["日本語", "✅", "🚀", "中文"];
+            let total = limit + 50 + 200;
+            for _ in 0..total {
+                if rnd(100) < 60 {
+                    let target = 40 + rnd(81) as usize;
+                    let mut len = 0usize;
+                    while len < target {
+                        if rnd(10) == 0 {
+                            t.set_sgr(&[(31 + rnd(6)) as u16]);
+                        }
+                        if rnd(25) == 0 {
+                            let w = wide[rnd(wide.len() as u64) as usize];
+                            put_str(&mut t, w);
+                            len += w.chars().count() * 2;
+                        } else {
+                            let w = words[rnd(words.len() as u64) as usize];
+                            put_str(&mut t, w);
+                            len += w.len();
+                        }
+                        t.set_sgr(&[0]);
+                        t.put_char(' ');
+                        len += 1;
+                    }
+                } else if rnd(2) == 0 {
+                    let n = rnd(15) as usize;
+                    put_str(&mut t, &"x".repeat(n));
+                }
+                t.newline();
+                t.carriage_return();
+            }
+            t
+        };
+
+        let t0 = Instant::now();
+        let base = build();
+        eprintln!("fill: scrollback_len={} (limit {limit}) in {:?}", base.scrollback_len(), t0.elapsed());
+        assert_eq!(base.scrollback_len(), limit);
+
+        // (a) one resize 200 -> 199 cols
+        let mut t = build();
+        let s = Instant::now();
+        t.resize(199, 50);
+        eprintln!("(a) 200->199 cols, 1 resize: {:?} (scrollback after {})", s.elapsed(), t.scrollback_len());
+
+        // (b) live drag: 30 resizes 200 -> 170, one column at a time
+        let mut t = build();
+        let s = Instant::now();
+        let mut steps = Vec::new();
+        for c in (170..200u16).rev() {
+            let st = Instant::now();
+            t.resize(c, 50);
+            steps.push(st.elapsed());
+        }
+        let total = s.elapsed();
+        let max = steps.iter().max().unwrap();
+        let min = steps.iter().min().unwrap();
+        eprintln!("(b) 30 resizes 200->170: total {:?}, mean {:?}/step, min {:?}, max {:?}",
+            total, total / 30, min, max);
+
+        // (c) rows-only resize (cols unchanged)
+        let mut t = build();
+        let s = Instant::now();
+        t.resize(200, 40);
+        eprintln!("(c) rows-only 50->40: {:?}", s.elapsed());
+        let s = Instant::now();
+        t.resize(200, 50);
+        eprintln!("(c) rows-only 40->50: {:?}", s.elapsed());
+
+        // (d) same as (a) in alt screen
+        let mut t = build();
+        t.enter_alt_screen();
+        let s = Instant::now();
+        t.resize(199, 50);
+        eprintln!("(d) alt screen 200->199 cols: {:?}", s.elapsed());
+    }
 }

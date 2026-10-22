@@ -66,6 +66,10 @@ pub trait EventSource {
     fn pane_json(&self, window: usize, pane: PaneId) -> Option<serde_json::Value>;
     /// Every pane's JSON, in `list-panes` order, for the snapshot.
     fn collect_panes(&self, out: &mut Vec<serde_json::Value>);
+    /// Every subject, in `list-subjects`' shape and order. Read on the pane
+    /// sweep, so it must not cost a syscall either. A host without subjects
+    /// keeps the default: none.
+    fn collect_subjects(&self, _out: &mut Vec<serde_json::Value>) {}
 }
 
 /// Where the events go.
@@ -119,6 +123,15 @@ impl EventSource for WindowsSource<'_> {
             }
         }
     }
+
+    fn collect_subjects(&self, out: &mut Vec<serde_json::Value>) {
+        let wins = self.0.borrow();
+        for (idx, win) in wins.iter().enumerate() {
+            if let Some(view) = crate::app::kova_view(win) {
+                view.ipc_collect_subjects(idx, out);
+            }
+        }
+    }
 }
 
 /// The last state published to subscribers.
@@ -127,6 +140,10 @@ pub struct EventState {
     /// or it has no key window.
     focus: Option<FocusKey>,
     panes: HashMap<PaneId, PaneFlags>,
+    /// The subjects last published, `None` while nobody wants the topic: a
+    /// list kept up to date for nobody would be diffed, once someone asks,
+    /// against a world that moved on unwatched.
+    subjects: Option<Vec<serde_json::Value>>,
     /// Ticks left before the next full pane sweep.
     countdown: u32,
     /// False until the first pass has filled the state. That first pass must not
@@ -145,6 +162,7 @@ impl EventState {
         Self {
             focus: None,
             panes: HashMap::new(),
+            subjects: None,
             countdown: 0,
             seeded: false,
         }
@@ -191,6 +209,7 @@ impl EventState {
         if force || self.countdown == 0 {
             self.countdown = pane_poll_interval(fps);
             self.poll_panes(source, sink, silent);
+            self.poll_subjects(source, sink, silent);
         } else {
             self.countdown -= 1;
         }
@@ -290,6 +309,24 @@ impl EventState {
 
         self.panes = current;
     }
+
+    /// The whole list goes out when anything in it changed: a client replaces
+    /// its copy instead of replaying edits, and a rename never reads as a
+    /// deletion followed by a creation.
+    fn poll_subjects(&mut self, source: &impl EventSource, sink: &mut impl EventSink, silent: bool) {
+        if !sink.wants(topic::SUBJECTS) {
+            self.subjects = None;
+            return;
+        }
+        let mut current = Vec::new();
+        source.collect_subjects(&mut current);
+        let Some(previous) = self.subjects.replace(current) else { return };
+        let current = self.subjects.as_ref().expect("just set");
+        if silent || previous == *current {
+            return;
+        }
+        sink.publish(topic::SUBJECTS, serde_json::json!({ "event": "subjects", "subjects": current }));
+    }
 }
 
 /// How many ticks between two full pane sweeps — about 250 ms, whatever the
@@ -361,6 +398,8 @@ pub fn snapshot(
 pub fn snapshot_with(source: &impl EventSource, app_active: bool, topics: u32) -> serde_json::Value {
     let mut panes = Vec::new();
     source.collect_panes(&mut panes);
+    let mut subjects = Vec::new();
+    source.collect_subjects(&mut subjects);
     let mut focus = serde_json::Value::Null;
     if app_active {
         if let Some(key) = source.focus() {
@@ -374,6 +413,7 @@ pub fn snapshot_with(source: &impl EventSource, app_active: bool, topics: u32) -
         "app_active": app_active,
         "focus": focus,
         "panes": panes,
+        "subjects": subjects,
     })
 }
 
@@ -394,6 +434,7 @@ mod tests {
     struct FakeSource {
         focus: Option<FocusKey>,
         panes: Vec<(PaneId, PaneFlags)>,
+        subjects: Vec<serde_json::Value>,
     }
 
     impl EventSource for FakeSource {
@@ -408,6 +449,9 @@ mod tests {
         }
         fn collect_panes(&self, out: &mut Vec<serde_json::Value>) {
             out.extend(self.panes.iter().map(|(id, f)| serde_json::json!({ "id": id, "window": f.window })));
+        }
+        fn collect_subjects(&self, out: &mut Vec<serde_json::Value>) {
+            out.extend(self.subjects.iter().cloned());
         }
     }
 
@@ -439,7 +483,7 @@ mod tests {
     fn the_diff_publishes_each_edge_once() {
         let mut state = EventState::new();
         let mut sink = Recorder { mask: topic::ALL, events: Vec::new() };
-        let mut world = FakeSource { focus: Some(key(0, 0, 1)), panes: vec![(1, flags(false, false))] };
+        let mut world = FakeSource { focus: Some(key(0, 0, 1)), panes: vec![(1, flags(false, false))], ..Default::default() };
         state.poll_with(&world, &mut sink, true, 4, false);
         assert!(sink.events.is_empty(), "the seeding pass announces nothing");
 
@@ -473,9 +517,40 @@ mod tests {
     }
 
     #[test]
+    fn a_subject_change_publishes_the_whole_list_once() {
+        let subject = |name: &str, panes: &[PaneId]| serde_json::json!({ "tab_id": 1, "name": name, "pane_ids": panes });
+        let mut state = EventState::new();
+        let mut sink = Recorder { mask: topic::SUBJECTS, events: Vec::new() };
+        let mut world = FakeSource { subjects: vec![subject("auth", &[1])], ..Default::default() };
+        state.poll_with(&world, &mut sink, true, 4, true);
+        assert!(sink.events.is_empty(), "the seeding pass announces nothing");
+
+        world.subjects = vec![subject("login", &[1]), subject("idle", &[])];
+        state.poll_with(&world, &mut sink, true, 4, true);
+        assert_eq!(
+            sink.events,
+            vec![serde_json::json!({ "event": "subjects", "subjects": world.subjects })]
+        );
+        state.poll_with(&world, &mut sink, true, 4, true);
+        assert_eq!(sink.events.len(), 1, "no change, nothing");
+
+        // Nobody wants the topic: its state goes, and a later subscriber is
+        // seeded again rather than told of what changed while unwatched.
+        let mut other = Recorder { mask: topic::FOCUS, events: Vec::new() };
+        state.poll_with(&world, &mut other, true, 4, true);
+        world.subjects.clear();
+        state.poll_with(&world, &mut sink, true, 4, true);
+        assert_eq!(sink.events.len(), 1);
+        world.subjects = vec![subject("auth", &[2])];
+        state.poll_with(&world, &mut sink, true, 4, true);
+        assert_eq!(sink.events.len(), 2);
+        assert_eq!(world.subjects, sink.events[1]["subjects"].as_array().unwrap().clone());
+    }
+
+    #[test]
     fn nobody_listening_drops_the_state() {
         let mut state = EventState::new();
-        let world = FakeSource { focus: Some(key(0, 0, 1)), panes: vec![(1, flags(false, false))] };
+        let world = FakeSource { focus: Some(key(0, 0, 1)), panes: vec![(1, flags(false, false))], ..Default::default() };
         let mut deaf = Recorder { mask: 0, events: Vec::new() };
         state.poll_with(&world, &mut deaf, true, 60, true);
         assert!(!state.seeded);
@@ -486,11 +561,12 @@ mod tests {
 
     #[test]
     fn the_snapshot_reads_the_source() {
-        let world = FakeSource { focus: Some(key(0, 0, 2)), panes: vec![(2, flags(false, false))] };
+        let world = FakeSource { focus: Some(key(0, 0, 2)), panes: vec![(2, flags(false, false))], ..Default::default() };
         let snap = snapshot_with(&world, true, topic::FOCUS | topic::PANE_CLOSE);
         assert_eq!(snap["events"], serde_json::json!(["focus", "pane-close"]));
         assert_eq!(snap["focus"]["id"], 2);
         assert_eq!(snap["panes"].as_array().unwrap().len(), 1);
+        assert_eq!(snap["subjects"], serde_json::json!([]));
         let away = snapshot_with(&world, false, topic::ALL);
         assert_eq!(away["app_active"], false);
         assert_eq!(away["focus"], serde_json::Value::Null);

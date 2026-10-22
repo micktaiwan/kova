@@ -798,6 +798,10 @@ mod tests {
             r#"{"cmd":"clear-anchors"}"#,
             r#"{"cmd":"reload-config"}"#,
             r#"{"cmd":"subscribe"}"#,
+            r#"{"cmd":"list-subjects"}"#,
+            r#"{"cmd":"set-pane-subject","pane_id":1,"subject":"x"}"#,
+            r#"{"cmd":"rename-subject","tab_id":1,"name":"x","new_name":"y"}"#,
+            r#"{"cmd":"delete-subject","tab_id":1,"name":"x"}"#,
         ] {
             let cmd = parse_command(request).unwrap();
             assert!(dispatch(&host, cmd).is_err(), "{request} belongs to the app");

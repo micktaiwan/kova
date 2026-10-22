@@ -5,7 +5,7 @@ mod geometry;
 mod ipc_handlers;
 pub(crate) mod overlays;
 use overlays::{FilterState, RenamePaneState, RenameTabState};
-pub use ipc_handlers::{IpcMergeTabResult, IpcSwapPaneResult};
+pub use ipc_handlers::{IpcMergeTabResult, IpcSwapPaneResult, SubjectError};
 mod recent_projects_overlay;
 use recent_projects_overlay::RecentProjectsState;
 mod resize;
@@ -66,6 +66,16 @@ pub struct KovaViewIvars {
     /// alone cannot say that, and it may change on a later event than the move
     /// (see `handle_resize`).
     last_screen_w: Cell<f32>,
+    /// A `resize_all_panes` is due at the start of the next frame
+    /// (`request_resize_all_panes`).
+    resize_pending: Cell<bool>,
+    /// The active tab drew a subject strip last frame. When that flips, the
+    /// panes gain or lose a row and must be resized.
+    subject_strip_shown: Cell<bool>,
+    /// (active tab, its scroll offset) when the last `resize_all_panes` left
+    /// off-screen panes at their old size; a different value means they may
+    /// be on screen now (`flush_pending_resize`).
+    offscreen_resize_stale: Cell<Option<(usize, f32)>>,
     last_focused: Cell<bool>,
     config: OnceCell<Config>,
     keybindings: OnceCell<Keybindings>,
@@ -797,7 +807,7 @@ define_class!(
                             ..drag
                         }));
                         drop(tabs);
-                        self.resize_all_panes();
+                        self.request_resize_all_panes();
                     } else if let Some(row_idx) = drag.row_sep_index {
                         // Row separator: adjust row weights within column
                         let delta_px = py - drag.origin_pixel;
@@ -809,7 +819,7 @@ define_class!(
                             ..drag
                         }));
                         drop(tabs);
-                        self.resize_all_panes();
+                        self.request_resize_all_panes();
                     }
                 }
                 return;
@@ -938,6 +948,9 @@ impl KovaView {
             metal_layer: OnceCell::new(),
             last_scale: Cell::new(0.0),
             last_screen_w: Cell::new(0.0),
+            resize_pending: Cell::new(false),
+            subject_strip_shown: Cell::new(false),
+            offscreen_resize_stale: Cell::new(None),
             last_focused: Cell::new(true),
             config: OnceCell::new(),
             drag_separator: Cell::new(None),

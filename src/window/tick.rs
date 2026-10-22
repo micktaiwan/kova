@@ -92,6 +92,7 @@ struct FramePanes {
     working_agents: usize,
     unread_panes: usize,
     sleeping_panes: usize,
+    subject_strip: crate::renderer::SubjectStrip,
 }
 
 impl KovaView {
@@ -166,6 +167,10 @@ impl KovaView {
             None => return true,
         };
 
+        // Resize asked by a live resize or a separator drag, once per frame.
+        // First, so the commands injected below start at the pane's real size.
+        self.flush_pending_resize();
+
         self.ask_about_duplicate_session();
 
         self.inject_pending_commands();
@@ -205,6 +210,7 @@ impl KovaView {
             working_agents,
             unread_panes,
             sleeping_panes,
+            subject_strip,
         } = match self.collect_frame_panes(&renderer, &layer, active_idx, split_min_w) {
             Some(f) => f,
             None => return false,
@@ -379,19 +385,35 @@ impl KovaView {
 
         // Build tab/pane switcher render data (one entry per column)
         let ps_guard = ivars.pane_switcher.borrow();
+        // Each box is drawn in its subject's color: by tab and name for a
+        // header, by pane for a member. Read only while Cmd+P is open.
+        let mut header_colors: std::collections::HashMap<(crate::pane::TabId, String), usize> = std::collections::HashMap::new();
+        let mut member_colors: std::collections::HashMap<PaneId, usize> = std::collections::HashMap::new();
+        if ps_guard.is_some() {
+            for t in ivars.tabs.borrow().iter() {
+                for (name, color) in &t.subject_colors {
+                    header_colors.insert((t.id, name.clone()), *color);
+                }
+                t.for_each_pane(&mut |p| {
+                    if let Some(color) = p.subject.as_deref().and_then(|n| t.subject_color(n)) {
+                        member_colors.insert(p.id, color);
+                    }
+                });
+            }
+        }
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false, subject_color: None },
                 // A subject header opens its box; an empty subject's closes it too.
-                SwitcherRow::SubjectHeader { name, empty, .. } => crate::renderer::PaneSwitcherRowRender { text: name.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: true, in_subject: false, box_top: true, box_bottom: *empty },
-                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, subject, last_in_subject, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref(), bookmarked: *bookmarked, anchored: *anchored, raf_todo: raf_todo.as_deref(), raf_idea: raf_idea.as_deref(), subject_header: false, in_subject: subject.is_some(), box_top: false, box_bottom: *last_in_subject },
+                SwitcherRow::SubjectHeader { name, empty, tab } => crate::renderer::PaneSwitcherRowRender { text: name.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: true, in_subject: false, box_top: true, box_bottom: *empty, subject_color: header_colors.get(&(*tab, name.clone())).copied() },
+                SwitcherRow::Pane { pane_id, title, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, subject, last_in_subject, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref(), bookmarked: *bookmarked, anchored: *anchored, raf_todo: raf_todo.as_deref(), raf_idea: raf_idea.as_deref(), subject_header: false, in_subject: subject.is_some(), box_top: false, box_bottom: *last_in_subject, subject_color: member_colors.get(pane_id).copied() },
                 // A bookmark row borrows the pane row's shape: its title on the
                 // left, the project and agent dim on the right.
-                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false },
+                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false, subject_color: None },
                 // An anchor row is the same shape, painted like a saved
                 // conversation: it is one, and its section header is what says
                 // it is today's.
-                SwitcherRow::Anchor { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: true, anchored: true, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false },
+                SwitcherRow::Anchor { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: true, anchored: true, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false, subject_color: None },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -501,6 +523,7 @@ impl KovaView {
             }
         }
 
+        r.subject_strip = subject_strip;
         r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_agents, unread_panes, sleeping_panes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
@@ -785,12 +808,45 @@ impl KovaView {
                 let screen_width = drawable_size.width as f32;
                 let virtual_width = tab.virtual_width(screen_width, split_min_w);
                 let global_bar_h = cell_h;
+                // Same rule as `subject_strip_height`, which the input and
+                // resize paths read: a row only where a pane is filed.
+                let strip_h = if tab.has_filed_panes() { cell_h } else { 0.0 };
                 let panes_vp = PaneViewport {
                     x: -tab.scroll_offset_x,
-                    y: tab_bar_h,
+                    y: tab_bar_h + strip_h,
                     width: virtual_width,
-                    height: drawable_size.height as f32 - tab_bar_h - global_bar_h,
+                    height: drawable_size.height as f32 - tab_bar_h - strip_h - global_bar_h,
                 };
+                let subject_strip = if strip_h > 0.0 {
+                    // One entry per column, left to right: its first filed
+                    // pane's subject, and whether it holds the focus.
+                    let mut columns: Vec<(f32, f32, Option<(String, Option<usize>)>, bool)> = Vec::new();
+                    tab.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
+                        let subject = pane.subject.as_ref().map(|n| (n.clone(), tab.subject_color(n)));
+                        let focused = pane.id == focused_id;
+                        match columns.last_mut() {
+                            Some(col) if col.0 == vp.x => {
+                                if col.2.is_none() {
+                                    col.2 = subject;
+                                }
+                                col.3 |= focused;
+                            }
+                            _ => columns.push((vp.x, vp.width, subject, focused)),
+                        }
+                    });
+                    crate::renderer::SubjectStrip {
+                        y: tab_bar_h,
+                        height: strip_h,
+                        segments: crate::renderer::subject_strip_segments(&columns),
+                    }
+                } else {
+                    crate::renderer::SubjectStrip::default()
+                };
+                if ivars.subject_strip_shown.replace(strip_h > 0.0) != (strip_h > 0.0) {
+                    // The panes gain or lose the strip's row: their terminals
+                    // follow at the start of the next frame.
+                    self.request_resize_all_panes();
+                }
                 tab.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
                     // First frame this pane is submitted to the renderer = it becomes
                     // visible (loading overlay or content). "time to rectangle".
@@ -962,6 +1018,7 @@ impl KovaView {
             working_agents,
             unread_panes,
             sleeping_panes,
+            subject_strip,
         })
     }
 

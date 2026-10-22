@@ -139,7 +139,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "claude_session_id": "0b6f…",
   "claude_session_name": "subscribe on the Kova side",
   "peer_name": "subscribe on the Kova side",
-  "dormant_session_id": null
+  "dormant_session_id": null,
+  "subject": "auth"
 }
 ```
 
@@ -164,6 +165,8 @@ The pane switcher, open-pane search results, IPC `title`, and automatic tab titl
 `working` is `true` when the app in the pane is actively generating or running a tool, detected from its OSC 0/2 title: Claude Code prepends an **animated Braille spinner glyph** (U+2800–U+28FF, e.g. `⠂`/`⠐`) followed by a space *only while it works*. At the prompt it instead shows an asterisk-like idle marker (`✳ Claude Code`) or a plain title, so the asterisk is explicitly NOT treated as busy. Counting panes with `working: true` therefore gives the number of Claude Code sessions actually busy — as opposed to those merely open and waiting for input (which stay `is_idle: false` too, since the `claude` process is always a child). It reads the live OSC 0/2 title even when a sticky custom title (OSC 1 / manual rename) shadows the display. Kova also shows this count in the global status bar as `✳N` (hidden when zero).
 
 `awaiting` is `true` when the app in the pane has declared, over `set-pane-status`, that it is waiting for the user — and nothing Kova observed since contradicts it. `awaiting_since` is the epoch second at which the wait started (`null` when not waiting), so a client can show how long a session has been unanswered. Unlike `working`, this is *pushed*, not guessed: `working` is inferred from the terminal title, while `awaiting` is a claim the running app makes about itself. See `set-pane-status` for how it is set and, more importantly, for the ways Kova retracts it on its own.
+
+`subject` is the name of the subject the pane is filed under in `Cmd+P` (the box it is drawn in), or `null`. Kova.app only: a library host has no subjects and its panes carry no such field. See `list-subjects`.
 
 `awaiting_seen` is `true` when a waiting pane has been looked at on this Mac since it started waiting: Kova stamps it on the focused pane of the key window, on every frame. It is the difference between the two things `awaiting` alone cannot tell apart, and the reason `Cmd+J` does not hand you the same pane twice. The marker stays up either way, because reading a question is not answering it; only the jump set shrinks. A remote client that walks waiting panes should obey the same halt, otherwise it offers panes already read here. It is `false` on a pane that is not waiting, where the bit means nothing.
 
@@ -580,6 +583,64 @@ Response: `{ "ok": true }`.
 
 ---
 
+### `list-subjects` — the subjects of every tab
+
+```json
+{ "cmd": "list-subjects" }
+```
+
+A subject is a named group of panes inside one tab, drawn in `Cmd+P` as a box under its name. It belongs to its tab: the same name in two tabs is two subjects. Response: one entry per subject, tab by tab, each tab's in the order `Cmd+P` draws the boxes (empty subjects first, then each where its first member sits):
+
+```json
+{ "ok": true, "data": [
+  { "tab_id": 3, "window": 0, "tab_index": 0, "name": "idle", "color": 2, "pane_ids": [] },
+  { "tab_id": 3, "window": 0, "tab_index": 0, "name": "auth", "color": 4, "pane_ids": [42, 57] }
+] }
+```
+
+`color` is the subject's color, an index into the tab palette (the same indices as `set-tab-color`): drawn at random when the subject is created, among the colors its tab uses least, then kept across relaunches. It frames the subject's box in `Cmd+P` and paints its band in the strip Kova draws under the tab bar. `pane_ids` follows the tab's order. To follow changes instead of polling, `subscribe` to `subjects`: the event carries this same list whenever anything in it changes. A pane id dies with its pane (see `list-panes`); a client that must remember which conversation sits in which subject keys on the pane's `agent_session_id`. Kova.app only: a library host answers `command not supported by this host`.
+
+---
+
+### `set-pane-subject` — file a pane under a subject, or take it out
+
+```json
+{ "cmd": "set-pane-subject", "pane_id": 42, "subject": "auth" }
+{ "cmd": "set-pane-subject", "pane_id": 42, "subject": null }
+```
+
+With a name, files the pane under that subject of its own tab, as `Cmd+→` does; a name the tab does not have yet creates the subject. A pane already in another subject moves to this one. Nothing moves on screen. With `null`, takes the pane out of its subject, as `Cmd+←` does: a pane from the middle of the box moves past its last member, so it lands right under the box, and the subject stays even left empty. Taking out a pane that is in no subject does nothing and is not an error.
+
+`subject` is required (a forgotten field never reads as "take it out"). The name is trimmed; it must not be empty, hold a control character, or exceed 200 characters. An open `Cmd+P` is redrawn with the new boxes.
+
+Response: `{ "ok": true, "data": { "tab_id": 3, "subject": "auth", "created": false } }`. Error: `pane <id> not found`.
+
+---
+
+### `rename-subject` — rename a subject of a tab
+
+```json
+{ "cmd": "rename-subject", "tab_id": 3, "name": "auth", "new_name": "login" }
+```
+
+Renames the subject in place, its panes following, as Enter on its header in `Cmd+P` does. A `new_name` the tab already has merges the two: the renamed subject's panes join the other one, which keeps its place. Names are checked as in `set-pane-subject`.
+
+Response: `{ "ok": true, "data": { "merged": false } }`. Errors: `tab <id> not found`, `tab <id> has no subject "<name>"`.
+
+---
+
+### `delete-subject` — delete a subject of a tab
+
+```json
+{ "cmd": "delete-subject", "tab_id": 3, "name": "auth" }
+```
+
+Deletes the subject. Its panes stay open where they are, out of any box. Unlike `Cmd+⌫` on the header in `Cmd+P`, nothing is confirmed: the client asked.
+
+Response: `{ "ok": true, "data": { "released": 2 } }` — how many panes the subject held. Errors as in `rename-subject`.
+
+---
+
 ### `dispatch-action` — trigger any keyboard action by name
 
 ```json
@@ -688,6 +749,8 @@ Response:
 ] } }
 ```
 
+`cols` and `rows` are the pane's terminal size. A pane scrolled entirely off-screen (a tab wider than the window) keeps the size it had until it is on screen again: a window resize does not reach it, so it does not redraw for nothing.
+
 Per-pane errors don't fail the whole request — missing IDs come back as `{ "id": ..., "error": "not found" }` entries inside the array.
 
 ---
@@ -748,7 +811,7 @@ Response:
 ### `subscribe` — stream state changes as they happen
 
 ```json
-{ "cmd": "subscribe", "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close"] }
+{ "cmd": "subscribe", "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close", "subjects"] }
 ```
 
 Turns this connection into an event stream. `events` is optional — omit it to get
@@ -761,10 +824,11 @@ separate `list-panes` to bootstrap, and has no gap between "what is true now" an
 
 ```json
 { "ok": true, "data": {
-  "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close"],
+  "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close", "subjects"],
   "app_active": true,
   "focus": { ...pane object, or null... },
-  "panes": [ ...same objects as `list-panes`... ]
+  "panes": [ ...same objects as `list-panes`... ],
+  "subjects": [ ...same entries as `list-subjects`... ]
 } }
 ```
 
@@ -777,6 +841,7 @@ Every line after that is one event, told apart from a response by its `event` ke
 | `pane-working` | `pane_id`, `working` | a pane started or stopped working |
 | `pane-open` | `pane` | a pane appeared |
 | `pane-close` | `pane_id`, `window`, `tab` | a pane went away |
+| `subjects` | `subjects` (the whole `list-subjects` answer) | a subject was created, renamed, deleted or moved, or a pane was filed into or out of one — from Cmd+P, a split inheriting its subject, a closed pane or tab, or IPC |
 | `ping` | — | 30 s of silence (see below) |
 
 **`focus` folds "is Kova even frontmost" into the same stream.** Leaving Kova for
@@ -812,7 +877,7 @@ Notes that matter when writing a client:
 - **The connection is one-way once subscribed.** Kova stops reading it. Open a
   second connection for commands.
 - **`focus` is compared every frame; the pane sweep runs at ~4 Hz.** So
-  `pane-status` / `pane-working` / `pane-open` / `pane-close` can lag a change by
+  `pane-status` / `pane-working` / `pane-open` / `pane-close` / `subjects` can lag a change by
   up to ~250 ms, while `focus` is reported on the next frame.
 - **The socket name carries Kova's pid**, so a Kova restart moves it. A long-lived
   subscriber needs to re-glob `/tmp/kova-*.sock` and re-subscribe.

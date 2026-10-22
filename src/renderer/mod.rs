@@ -135,6 +135,64 @@ const SUBJECT_FRAME_PX: f32 = 2.0;
 /// A subject's name, on the tinted title bar of its box.
 const SUBJECT_TITLE_FG: [f32; 4] = [0.95, 0.95, 1.0, 1.0];
 
+/// One stretch of the subject strip: a subject's name over the columns its
+/// panes occupy side by side, in its color.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubjectSegment {
+    pub x: f32,
+    pub width: f32,
+    pub name: String,
+    /// Index into `TAB_COLORS`; `None` falls back to the Cmd+P frame blue.
+    pub color: Option<usize>,
+    /// The focused pane is under it: drawn in full color, the others dimmed
+    /// as inactive tabs are.
+    pub focused: bool,
+}
+
+/// The subject strip of the active tab: where it sits and what it shows.
+#[derive(Clone, Debug, Default)]
+pub struct SubjectStrip {
+    pub y: f32,
+    pub height: f32,
+    pub segments: Vec<SubjectSegment>,
+}
+
+/// The strip's segments from the tab's columns, left to right: for each,
+/// `(x, width, subject, focused)` — the subject being the first one filed
+/// among the column's panes, top first. Neighboring columns of the same
+/// subject make one segment; a column in no subject breaks the run, so the
+/// same name shows twice when a subject's panes are apart.
+pub fn subject_strip_segments(columns: &[(f32, f32, Option<(String, Option<usize>)>, bool)]) -> Vec<SubjectSegment> {
+    let mut out: Vec<SubjectSegment> = Vec::new();
+    let mut previous_filed = false;
+    for (x, width, subject, focused) in columns {
+        let Some((name, color)) = subject else {
+            previous_filed = false;
+            continue;
+        };
+        if *width <= 0.0 {
+            // A fully minimized column takes no room: it neither shows nor
+            // breaks the run it sits in.
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if previous_filed && last.name == *name => {
+                last.width = x + width - last.x;
+                last.focused |= *focused;
+            }
+            _ => out.push(SubjectSegment {
+                x: *x,
+                width: *width,
+                name: name.clone(),
+                color: *color,
+                focused: *focused,
+            }),
+        }
+        previous_filed = true;
+    }
+    out
+}
+
 /// Color of the status-bar unread counter. Same amber as the per-pane bell dot:
 /// the counter and the dots it sums must read as one signal.
 const UNREAD_FG: [f32; 4] = [0.9, 0.6, 0.2, 1.0];
@@ -282,6 +340,9 @@ pub struct PaneSwitcherRowRender<'a> {
     /// The box's frame closes under this row (its last member, or the header
     /// of an empty subject).
     pub box_bottom: bool,
+    /// The subject's color, an index into `TAB_COLORS`: the box's frame and
+    /// title bar, as the subject strip draws it. `None` = the default blue.
+    pub subject_color: Option<usize>,
 }
 
 /// One column of the pane-switcher overlay: a vertical run of rows holding
@@ -522,6 +583,15 @@ pub struct PaneViewport {
     pub height: f32,
 }
 
+impl PaneViewport {
+    /// Entirely outside the screen's horizontal span `[0, screen_w)` (a tab
+    /// wider than the screen, scrolled). Such a pane is neither drawn nor
+    /// resized until it comes back.
+    pub fn off_screen(&self, screen_w: f32) -> bool {
+        self.x + self.width <= 0.0 || self.x >= screen_w
+    }
+}
+
 const INITIAL_VERTEX_BYTES: usize = 8 * 1024 * 1024; // 8MB
 
 /// Kova's window renderer: one per window, the host of that window's panes.
@@ -576,6 +646,8 @@ pub struct Renderer {
     /// Banner to paint across the focused pane's status bar (text, background):
     /// which attention tier the last Cmd+J landed in. `None` most of the time.
     pub pane_banner: Option<(String, [f32; 3])>,
+    /// The active tab's subject strip, set by the window every frame.
+    pub subject_strip: SubjectStrip,
     /// Boundary flash: (edge_x, top_y, bottom_y, alpha, is_right_edge). Set by window when navigation hits tab edge.
     pub boundary_flash: Option<(f32, f32, f32, f32, bool)>,
     /// Pane flash for search-palette jumps: (x, y, width, height, alpha).
@@ -699,6 +771,7 @@ impl Renderer {
             hovered_url_text: None,
             resize_feedback_text: None,
             pane_banner: None,
+            subject_strip: SubjectStrip::default(),
             boundary_flash: None,
             pane_flash: None,
             pane_flash_label: None,
@@ -810,7 +883,7 @@ impl Renderer {
                 // Skip panes entirely off-screen (hidden by horizontal scroll).
                 // Their dirty flag was consumed this frame without a rebuild:
                 // drop the cache entry so they are rebuilt when they come back.
-                if vp.x + vp.width <= 0.0 || vp.x >= viewport_w {
+                if vp.off_screen(viewport_w) {
                     self.pane_renderers.remove(&pane.pane_id);
                     continue;
                 }
@@ -1074,6 +1147,7 @@ impl Renderer {
         if tab_titles.len() > 0 {
             self.build_tab_bar_vertices(&mut overlay_vertices, viewport_w, tab_titles, tab_bar_left_inset);
         }
+        self.build_subject_strip_vertices(&mut overlay_vertices, viewport_w);
 
         // Update I/O char counters (global totals, persist across pane closures)
         if rss_changed {
@@ -1553,6 +1627,40 @@ impl Renderer {
                 self.minimized_counter_zone = Some((left_edge, bar_y, min_w, cell_h));
             }
         }
+    }
+
+    /// The subject strip under the tab bar: each segment a band of its
+    /// subject's color with the name on it, full color over the focused pane
+    /// and dimmed elsewhere, like the tabs. The name stays on screen when the
+    /// segment starts left of it (horizontal scroll).
+    fn build_subject_strip_vertices(&mut self, vertices: &mut Vec<Vertex>, viewport_w: f32) {
+        if self.subject_strip.height <= 0.0 {
+            return;
+        }
+        let cell_w = self.ctx.atlas.cell_width;
+        let cell_h = self.ctx.atlas.cell_height;
+        let strip = std::mem::take(&mut self.subject_strip);
+        push_bg_quad(vertices, 0.0, strip.y, viewport_w, strip.height, self.tab_bar_bg);
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        for seg in &strip.segments {
+            let x0 = seg.x.max(0.0);
+            let x1 = (seg.x + seg.width).min(viewport_w);
+            if x1 <= x0 {
+                continue;
+            }
+            let base = seg.color.map_or(SUBJECT_FRAME, |i| TAB_COLORS[i % TAB_COLORS.len()]);
+            let bg = if seg.focused { base } else { dim_inactive_tab(base) };
+            // One pixel apart: two subjects sharing a color stay two bands.
+            push_bg_quad(vertices, x0, strip.y, (x1 - x0 - 1.0).max(0.0), strip.height, bg);
+            let fg = if seg.focused {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [DIM_BRIGHTNESS, DIM_BRIGHTNESS, DIM_BRIGHTNESS, 1.0]
+            };
+            let text_y = strip.y + (strip.height - cell_h) / 2.0;
+            self.ctx.render_status_text(vertices, &seg.name, x0 + cell_w, text_y, x1 - cell_w, fg, no_bg);
+        }
+        self.subject_strip = strip;
     }
 
     fn build_tab_bar_vertices(
@@ -2197,14 +2305,16 @@ impl Renderer {
                     }
                 }
 
+                // The subject's own color, the one its strip wears above the panes.
+                let frame = row.subject_color.map_or(SUBJECT_FRAME, |i| TAB_COLORS[i % TAB_COLORS.len()]);
                 if row.subject_header || row.in_subject {
-                    push_bg_quad_alpha(vertices, x0, y0, SUBJECT_FRAME_PX, y1 - y0, SUBJECT_FRAME, 0.9);
-                    push_bg_quad_alpha(vertices, x1 - SUBJECT_FRAME_PX, y0, SUBJECT_FRAME_PX, y1 - y0, SUBJECT_FRAME, 0.9);
+                    push_bg_quad_alpha(vertices, x0, y0, SUBJECT_FRAME_PX, y1 - y0, frame, 0.9);
+                    push_bg_quad_alpha(vertices, x1 - SUBJECT_FRAME_PX, y0, SUBJECT_FRAME_PX, y1 - y0, frame, 0.9);
                     if row.box_top {
-                        push_bg_quad_alpha(vertices, x0, y0, x1 - x0, SUBJECT_FRAME_PX, SUBJECT_FRAME, 0.9);
+                        push_bg_quad_alpha(vertices, x0, y0, x1 - x0, SUBJECT_FRAME_PX, frame, 0.9);
                     }
                     if row.box_bottom {
-                        push_bg_quad_alpha(vertices, x0, y1 - SUBJECT_FRAME_PX, x1 - x0, SUBJECT_FRAME_PX, SUBJECT_FRAME, 0.9);
+                        push_bg_quad_alpha(vertices, x0, y1 - SUBJECT_FRAME_PX, x1 - x0, SUBJECT_FRAME_PX, frame, 0.9);
                     }
                 }
 
@@ -2217,7 +2327,7 @@ impl Renderer {
                     // No fill: a filled bar read like a bookmarked row's band.
                     // A rule under the name separates it from its panes.
                     if !row.box_bottom {
-                        push_bg_quad_alpha(vertices, x0 + gap, bar_bottom - 1.0, x1 - x0 - 2.0 * gap, 1.0, SUBJECT_FRAME, 0.6);
+                        push_bg_quad_alpha(vertices, x0 + gap, bar_bottom - 1.0, x1 - x0 - 2.0 * gap, 1.0, frame, 0.6);
                     }
                     self.ctx.render_text(vertices, row.text, left_margin + scaled_cell_w, text_y, right_margin, SUBJECT_TITLE_FG, no_bg, body_scale);
                 } else if row.is_header {
@@ -3037,6 +3147,16 @@ fn format_key_combo(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn viewport_off_screen_only_when_no_column_is_visible() {
+        let vp = |x: f32, width: f32| super::PaneViewport { x, y: 0.0, width, height: 100.0 };
+        assert!(vp(-500.0, 500.0).off_screen(1000.0), "ends exactly at the left edge");
+        assert!(!vp(-499.0, 500.0).off_screen(1000.0), "one pixel still visible on the left");
+        assert!(vp(1000.0, 500.0).off_screen(1000.0), "starts exactly at the right edge");
+        assert!(!vp(999.0, 500.0).off_screen(1000.0), "one pixel still visible on the right");
+        assert!(!vp(-100.0, 2000.0).off_screen(1000.0), "wider than the screen");
+    }
+
 
     fn draw_key() -> PaneDrawKey {
         PaneDrawKey {
@@ -3431,6 +3551,32 @@ mod tests {
         assert_eq!(PaneAttention::None.bar_bg(default), default);
         assert_ne!(PaneAttention::Bell.bar_bg(default), default);
         assert_ne!(PaneAttention::Completion.bar_bg(default), default);
+    }
+
+    #[test]
+    fn neighboring_columns_of_a_subject_make_one_segment() {
+        let col = |x: f32, name: Option<&str>, focused: bool| (x, 10.0, name.map(|n| (n.to_string(), Some(1))), focused);
+        let segs = subject_strip_segments(&[
+            col(0.0, Some("auth"), false),
+            col(10.0, Some("auth"), true),
+            col(20.0, Some("api"), false),
+            col(30.0, None, false),
+            col(40.0, Some("auth"), false),
+        ]);
+        let spans: Vec<(f32, f32, &str, bool)> = segs.iter().map(|s| (s.x, s.width, s.name.as_str(), s.focused)).collect();
+        assert_eq!(
+            spans,
+            [(0.0, 20.0, "auth", true), (20.0, 10.0, "api", false), (40.0, 10.0, "auth", false)],
+            "a column in no subject breaks the run: the name shows twice"
+        );
+        // A minimized column (no width) neither shows nor breaks the run.
+        let segs = subject_strip_segments(&[
+            col(0.0, Some("a"), false),
+            (10.0, 0.0, Some(("a".to_string(), Some(1))), false),
+            col(10.0, Some("a"), false),
+        ]);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].width, 20.0);
     }
 
     #[test]

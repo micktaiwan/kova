@@ -74,7 +74,35 @@ impl KovaView {
         }));
     }
 
-    /// Resize all panes in the active tab to match their current viewports.
+    /// Ask for `resize_all_panes` at the start of the next frame. For event
+    /// streams (window live resize, separator drag) that fire several times a
+    /// frame: each event used to resize every pane — a terminal resize under
+    /// its write lock plus a SIGWINCH that makes a TUI redraw its whole
+    /// screen — while only the last size of the frame is ever drawn.
+    pub(super) fn request_resize_all_panes(&self) {
+        self.ivars().resize_pending.set(true);
+    }
+
+    /// Start of a frame: run the resize asked by `request_resize_all_panes`,
+    /// and catch up on panes `resize_all_panes` left off-screen once the
+    /// active tab scrolls or changes.
+    pub(super) fn flush_pending_resize(&self) {
+        let ivars = self.ivars();
+        let view = {
+            let tabs = ivars.tabs.borrow();
+            let idx = ivars.active_tab.get();
+            tabs.get(idx).map(|t| (idx, t.scroll_offset_x))
+        };
+        let catch_up = offscreen_catch_up_due(ivars.offscreen_resize_stale.get(), view);
+        if ivars.resize_pending.replace(false) || catch_up {
+            self.resize_all_panes();
+        }
+    }
+
+    /// Resize the panes of the active tab to match their current viewports.
+    /// A pane entirely off-screen (horizontal scroll) keeps its size until it
+    /// shows up again (`flush_pending_resize`): a window height change would
+    /// otherwise resize, and SIGWINCH, every pane of a tab holding dozens.
     pub(super) fn resize_all_panes(&self) {
         let renderer = match self.ivars().renderer.get() {
             Some(r) => r,
@@ -85,13 +113,19 @@ impl KovaView {
         let status_bar = renderer_r.status_bar_enabled();
         drop(renderer_r);
         let h_pad = self.h_padding();
+        let started = std::time::Instant::now();
+        // A direct call also covers what a pending request asked for.
+        self.ivars().resize_pending.set(false);
+        self.ivars().offscreen_resize_stale.set(None);
 
         // Drop expired resize histories (also clears entries of closed panes)
         self.ivars().resize_repair.borrow_mut().prune_history(std::time::Instant::now());
 
+        let screen_w = self.drawable_viewport().width;
         let panes_vp = self.panes_viewport();
         let tabs = self.ivars().tabs.borrow();
         let idx = self.ivars().active_tab.get();
+        let (mut resized, mut deferred) = (0usize, 0usize);
         if let Some(tab) = tabs.get(idx) {
             tab.cell_h.set(cell_h);
             tab.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
@@ -102,8 +136,22 @@ impl KovaView {
                 let cols = ((vp.width - 2.0 * h_pad) / cell_w).floor().max(1.0) as u16;
                 let usable_h = if status_bar { vp.height - cell_h } else { vp.height };
                 let rows = (usable_h / cell_h).floor().max(1.0) as u16;
+                // Compare under the read lock: most panes of a pass keep their
+                // size, and the write lock stalls the pane's PTY reader far
+                // longer (a resize reflows the scrollback).
+                {
+                    let term = pane.terminal.read();
+                    if cols == term.cols && rows == term.rows {
+                        return;
+                    }
+                }
+                if vp.off_screen(screen_w) {
+                    deferred += 1;
+                    return;
+                }
                 let mut term = pane.terminal.write();
                 if cols != term.cols || rows != term.rows {
+                    resized += 1;
                     let old = (term.cols, term.rows);
                     term.resize(cols, rows);
                     drop(term);
@@ -127,6 +175,16 @@ impl KovaView {
                     );
                 }
             });
+            if deferred > 0 {
+                self.ivars().offscreen_resize_stale.set(Some((idx, tab.scroll_offset_x)));
+            }
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(8) {
+            log::info!(
+                "RESIZE: {resized} pane(s) resized, {deferred} off-screen deferred, in {:.1}ms",
+                elapsed.as_secs_f64() * 1000.0
+            );
         }
     }
 
@@ -218,6 +276,28 @@ impl KovaView {
             }
         }
 
-        self.resize_all_panes();
+        // One per frame: AppKit calls `setFrameSize:` for every step of a live resize.
+        self.request_resize_all_panes();
+    }
+}
+
+/// Whether panes left off-screen at their old size by the last
+/// `resize_all_panes` (`stale`: the active tab and its scroll offset then) may
+/// be on screen in `view` (the same pair now): any other tab or offset.
+fn offscreen_catch_up_due(stale: Option<(usize, f32)>, view: Option<(usize, f32)>) -> bool {
+    stale.is_some_and(|s| view != Some(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::offscreen_catch_up_due;
+
+    #[test]
+    fn offscreen_panes_catch_up_once_the_view_moves() {
+        assert!(!offscreen_catch_up_due(None, Some((0, 120.0))), "nothing was deferred");
+        assert!(!offscreen_catch_up_due(Some((0, 120.0)), Some((0, 120.0))), "same tab, same scroll");
+        assert!(offscreen_catch_up_due(Some((0, 120.0)), Some((0, 80.0))), "scrolled");
+        assert!(offscreen_catch_up_due(Some((0, 120.0)), Some((1, 120.0))), "other tab");
+        assert!(offscreen_catch_up_due(Some((0, 120.0)), None), "the tab is gone");
     }
 }

@@ -221,6 +221,61 @@ pub(super) fn outdent_steps(panes: &[Option<String>], p: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// File the pane under `name` in its tab: Cmd+Right's effect, and the
+/// `set-pane-subject` command's. A name the tab lacks is added to its list.
+/// Nothing moves on screen. Returns whether the subject was created, `None`
+/// when the tab holds no such pane.
+pub(super) fn file_under_subject(tab: &mut Tab, pane_id: PaneId, name: &str) -> Option<bool> {
+    tab.pane(pane_id)?;
+    let created = tab.add_subject(name);
+    tab.pane_mut(pane_id)?.subject = Some(name.to_string());
+    Some(created)
+}
+
+/// Take the pane out of its subject: Cmd+Left's effect, and `set-pane-subject`
+/// with a null subject's. A pane from the middle of the box moves past its
+/// last member (`outdent_steps`); the subject stays, even left empty. Returns
+/// whether the layout moved, `None` when the tab holds no such pane or the
+/// pane is in no subject.
+pub(super) fn take_out_of_subject(tab: &mut Tab, pane_id: PaneId) -> Option<bool> {
+    let order = tab.pane_subjects();
+    let p = order.iter().position(|(id, _)| *id == pane_id)?;
+    order[p].1.as_ref()?;
+    let subjects: Vec<Option<String>> = order.into_iter().map(|(_, s)| s).collect();
+    let steps = outdent_steps(&subjects, p);
+    tab.pane_mut(pane_id)?.subject = None;
+    let mut moved = false;
+    for _ in 0..steps {
+        if !tab.move_pane_in_order(pane_id, true) {
+            break;
+        }
+        moved = true;
+    }
+    Some(moved)
+}
+
+/// Every subject of a tab with the panes filed under it, in the order Cmd+P
+/// draws the boxes (`subject_outline`): empty ones first, then each where its
+/// first member sits, members in the tab's order. `list-subjects` answers
+/// with it, so a client sees the boxes the user sees.
+pub(super) fn subject_listing(subjects: &[String], panes: &[(PaneId, Option<String>)]) -> Vec<(String, Vec<PaneId>)> {
+    let names: Vec<Option<String>> = panes.iter().map(|(_, s)| s.clone()).collect();
+    let mut out: Vec<(String, Vec<PaneId>)> = Vec::new();
+    for item in subject_outline(subjects, &names) {
+        match item {
+            OutlineItem::Subject { name, .. } => out.push((name, Vec::new())),
+            // The outline puts every member right under its header.
+            OutlineItem::Pane { index, subject: Some(_), .. } => {
+                if let Some((_, members)) = out.last_mut() {
+                    members.push(panes[index].0);
+                }
+            }
+            OutlineItem::Pane { subject: None, .. } => {}
+        }
+    }
+    out
+}
+
 /// What Cmd+Up/Down does to the pane at `p` in a tab with subjects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SubjectMove {
@@ -1615,12 +1670,7 @@ impl KovaView {
             let mut tabs = self.ivars().tabs.borrow_mut();
             // Found again: the alert may have let the pane move or close.
             let Some(tab) = tabs.iter_mut().find(|t| t.pane(pane_id).is_some()) else { return };
-            if !tab.subjects.contains(&name) {
-                tab.subjects.push(name.clone());
-            }
-            if let Some(pane) = tab.pane_mut(pane_id) {
-                pane.subject = Some(name);
-            }
+            file_under_subject(tab, pane_id, &name);
         }
         if self.ivars().pane_switcher.borrow().is_none() {
             return;
@@ -1636,23 +1686,7 @@ impl KovaView {
         let moved = {
             let mut tabs = self.ivars().tabs.borrow_mut();
             let Some(tab) = tabs.iter_mut().find(|t| t.pane(pane_id).is_some()) else { return };
-            let order = tab.pane_subjects();
-            let p = order.iter().position(|(id, _)| *id == pane_id).unwrap_or(0);
-            if order[p].1.is_none() {
-                return;
-            }
-            let subjects: Vec<Option<String>> = order.into_iter().map(|(_, s)| s).collect();
-            let steps = outdent_steps(&subjects, p);
-            if let Some(pane) = tab.pane_mut(pane_id) {
-                pane.subject = None;
-            }
-            let mut moved = false;
-            for _ in 0..steps {
-                if !tab.move_pane_in_order(pane_id, true) {
-                    break;
-                }
-                moved = true;
-            }
+            let Some(moved) = take_out_of_subject(tab, pane_id) else { return };
             moved
         };
         if moved {
@@ -2476,6 +2510,49 @@ mod tests {
         assert_eq!(outdent_steps(&panes, 2), 1);
         assert_eq!(outdent_steps(&panes, 3), 0, "the last member is already right above the outside");
         assert_eq!(outdent_steps(&panes, 0), 0, "not in a subject");
+    }
+
+    #[test]
+    fn subject_listing_follows_the_boxes_cmd_p_draws() {
+        let panes: Vec<(PaneId, Option<String>)> = vec![
+            (10, Some("a".into())),
+            (11, None),
+            (12, Some("b".into())),
+            (13, Some("a".into())),
+        ];
+        let listing = subject_listing(&names(&["b", "a", "idle"]), &panes);
+        assert_eq!(
+            listing,
+            vec![
+                ("idle".to_string(), vec![]),
+                ("a".to_string(), vec![10, 13]),
+                ("b".to_string(), vec![12]),
+            ],
+            "empty subjects first, then each box at its first member"
+        );
+        assert!(subject_listing(&[], &[(1, None)]).is_empty());
+    }
+
+    #[test]
+    fn filing_and_unfiling_a_pane_as_cmd_right_and_left_do() {
+        let (a, _fa) = Pane::capture(10, 2);
+        let (b, _fb) = Pane::capture(10, 2);
+        let (c, _fc) = Pane::capture(10, 2);
+        let (ia, ib, ic) = (a.id, b.id, c.id);
+        let mut tab = Tab::with_columns(vec![vec![a], vec![b], vec![c]]);
+
+        assert_eq!(file_under_subject(&mut tab, ia, "auth"), Some(true), "a new name is created");
+        assert_eq!(file_under_subject(&mut tab, ic, "auth"), Some(false), "an existing one is joined");
+        assert_eq!(tab.subjects, ["auth"]);
+        assert_eq!(file_under_subject(&mut tab, 9999, "auth"), None);
+
+        assert_eq!(take_out_of_subject(&mut tab, ib), None, "not in a subject");
+        // The first member leaves past the last one: it lands under the box.
+        assert_eq!(take_out_of_subject(&mut tab, ia), Some(true));
+        let order: Vec<_> = tab.pane_subjects();
+        assert_eq!(order, vec![(ib, None), (ic, Some("auth".to_string())), (ia, None)]);
+        assert_eq!(take_out_of_subject(&mut tab, ic), Some(false), "the last member stays put");
+        assert_eq!(tab.subjects, ["auth"], "the subject stays, empty");
     }
 
     #[test]

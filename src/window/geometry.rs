@@ -27,9 +27,9 @@ impl KovaView {
         if let Some(tab) = tabs.get(idx) {
             let screen_w = self.drawable_viewport().width;
             let vw = tab.virtual_width(screen_w, self.min_split_width_px());
-            self.panes_viewport_inner(tab.scroll_offset_x, vw)
+            self.panes_viewport_inner(tab.scroll_offset_x, vw, self.subject_strip_height(tab))
         } else {
-            self.panes_viewport_inner(0.0, self.drawable_viewport().width)
+            self.panes_viewport_inner(0.0, self.drawable_viewport().width, 0.0)
         }
     }
 
@@ -37,7 +37,7 @@ impl KovaView {
     pub(super) fn panes_viewport_for_tab(&self, tab: &crate::pane::Tab) -> PaneViewport {
         let screen_w = self.drawable_viewport().width;
         let vw = tab.virtual_width(screen_w, self.min_split_width_px());
-        self.panes_viewport_inner(tab.scroll_offset_x, vw)
+        self.panes_viewport_inner(tab.scroll_offset_x, vw, self.subject_strip_height(tab))
     }
 
     /// Scroll the tab so that the given pane is visible on screen.
@@ -48,16 +48,26 @@ impl KovaView {
         }
     }
 
-    pub(super) fn panes_viewport_inner(&self, scroll_offset_x: f32, virtual_width: f32) -> PaneViewport {
+    pub(super) fn panes_viewport_inner(&self, scroll_offset_x: f32, virtual_width: f32, strip_h: f32) -> PaneViewport {
         let full = self.drawable_viewport();
         let tab_bar_h = self.tab_bar_height();
         let global_bar_h = self.global_bar_height();
         PaneViewport {
             x: -scroll_offset_x,
-            y: full.y + tab_bar_h,
+            y: full.y + tab_bar_h + strip_h,
             width: virtual_width,
-            height: full.height - tab_bar_h - global_bar_h,
+            height: full.height - tab_bar_h - strip_h - global_bar_h,
         }
+    }
+
+    /// Height of the subject strip under the tab bar: one cell row in a tab
+    /// where a pane is filed under a subject, nothing otherwise — a tab
+    /// without subjects keeps every row.
+    pub(super) fn subject_strip_height(&self, tab: &Tab) -> f32 {
+        if !tab.has_filed_panes() {
+            return 0.0;
+        }
+        self.cell_size().map_or(0.0, |(_, cell_h)| cell_h)
     }
 
     /// Global status bar height in pixels (1x cell height).

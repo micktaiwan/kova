@@ -66,6 +66,10 @@ pub struct SavedTab {
     /// The tab's subjects in creation order, empty ones included (`Tab::subjects`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subjects: Vec<String>,
+    /// Each subject's color, an index into the tab palette (`Tab::subject_colors`).
+    /// Absent in sessions written before: colors are then drawn on restore.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub subject_colors: std::collections::BTreeMap<String, usize>,
 }
 
 /// Flat column format (v4): a column is a list of panes with row weights.
@@ -234,6 +238,7 @@ pub fn snapshot_tab(tab: &Tab) -> SavedTab {
         scroll_offset_x: if tab.scroll_offset_x != 0.0 { Some(tab.scroll_offset_x) } else { None },
         geometry_scale: if tab.geometry_scale > 0.0 { Some(tab.geometry_scale) } else { None },
         subjects: tab.subjects.clone(),
+        subject_colors: tab.subject_colors.iter().map(|(k, v)| (k.clone(), *v)).collect(),
     }
 }
 
@@ -872,6 +877,7 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         geometry_scale: saved.geometry_scale.unwrap_or(0.0),
         cell_h: std::cell::Cell::new(0.0),
         subjects: saved.subjects.clone(),
+        subject_colors: saved.subject_colors.iter().map(|(k, v)| (k.clone(), *v)).collect(),
     };
     tab.heal_subjects();
     tab.rebuild_minimized_stack();
@@ -1024,10 +1030,16 @@ mod tests {
         let back: SavedTab = serde_json::from_str(&serde_json::to_string(&tab).unwrap()).unwrap();
         assert_eq!(back.subjects, ["auth", "empty one"], "empty subjects are kept too");
         assert_eq!(back.flat_columns.unwrap()[0].panes[0].subject.as_deref(), Some("auth"));
+        assert!(back.subject_colors.is_empty(), "a session from before colors has none");
+
+        tab.subject_colors = [("auth".to_string(), 4), ("empty one".to_string(), 1)].into_iter().collect();
+        let back: SavedTab = serde_json::from_str(&serde_json::to_string(&tab).unwrap()).unwrap();
+        assert_eq!(back.subject_colors, tab.subject_colors, "colors survive a save");
 
         // Nothing filed: the file does not grow.
         let json = serde_json::to_value(&old).unwrap();
         assert!(json.get("subjects").is_none());
+        assert!(json.get("subject_colors").is_none());
         assert!(serde_json::to_value(pane("/a")).unwrap().get("subject").is_none());
     }
 
