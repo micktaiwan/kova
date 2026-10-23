@@ -375,6 +375,16 @@ pub struct PaneSwitcherRenderData<'a> {
 /// Vertical geometry of a list overlay (title + subtitle + scrolling rows),
 /// shared between the renderer and mouse hit-testing so a click maps to the
 /// exact row that was drawn. Computed purely from cell size + viewport height.
+/// First row the search palette shows: its scroll, moved down just enough to
+/// keep the selected row in view.
+pub fn search_palette_scroll(selected: usize, scroll: usize, max_visible: usize) -> usize {
+    if selected >= scroll + max_visible {
+        selected + 1 - max_visible
+    } else {
+        scroll
+    }
+}
+
 pub struct OverlayListGeometry {
     pub content_top: f32,
     pub row_height: f32,
@@ -2641,6 +2651,24 @@ impl Renderer {
         }
     }
 
+    /// Vertical geometry of the search palette's result list, shared by the
+    /// renderer and the mouse hit-testing so a click lands on the row drawn.
+    pub fn search_palette_list_geometry(&self, viewport_h: f32) -> OverlayListGeometry {
+        let cell_h = self.ctx.atlas.cell_height;
+        let scaled_cell_h = cell_h * 1.3;
+        let row_height = scaled_cell_h * 1.6;
+        // Title, subtitle, input box, status line: see the build function.
+        let content_top = cell_h * 3.0
+            + cell_h * 1.8 * 1.5
+            + scaled_cell_h * 2.0
+            + row_height
+            + scaled_cell_h * 0.75
+            + scaled_cell_h * 1.5;
+        let content_bottom = viewport_h - cell_h * 2.0;
+        let max_visible = ((content_bottom - content_top) / row_height).max(0.0) as usize;
+        OverlayListGeometry { content_top, row_height, max_visible }
+    }
+
     fn build_search_palette_overlay_vertices(
         &mut self,
         vertices: &mut Vec<Vertex>,
@@ -2723,19 +2751,16 @@ impl Renderer {
             return;
         }
 
-        let content_top = y;
+        let geom = self.search_palette_list_geometry(viewport_h);
+        debug_assert!((geom.content_top - y).abs() < 0.01, "geometry out of sync with the layout");
+        let content_top = geom.content_top;
         let content_bottom = viewport_h - cell_h * 2.0;
-        let max_visible = ((content_bottom - content_top) / row_height) as usize;
+        let max_visible = geom.max_visible;
         if max_visible == 0 {
             return;
         }
 
-        // Compute scroll to keep selected visible.
-        let scroll = if data.selected >= data.scroll + max_visible {
-            data.selected - max_visible + 1
-        } else {
-            data.scroll
-        };
+        let scroll = search_palette_scroll(data.selected, data.scroll, max_visible);
 
         let header_fg = [1.0, 0.85, 0.3, 1.0];
         let hit_indent = scaled_cell_w * 2.0;

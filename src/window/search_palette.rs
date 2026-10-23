@@ -71,6 +71,8 @@ pub(super) struct SearchPaletteState {
     pub(super) selected: usize,
     /// Scroll offset (index of first visible row in the list).
     pub(super) scroll: usize,
+    /// Trackpad scroll remainder, carried until it adds up to a whole row.
+    pub(super) scroll_acc: f64,
     /// Set when the query changed and a live search is owed once debounced.
     pub(super) needs_search: bool,
     /// Timestamp of the last edit, for debouncing the live search.
@@ -127,6 +129,41 @@ fn drop_recall_rows(state: &mut SearchPaletteState) {
         state.selected = 0;
         state.scroll = 0;
     }
+}
+
+/// Scroll the result list by `lines` rows (positive goes down), within the
+/// list, and pull the selection along when it leaves the view: Enter opens a
+/// row the user can see, and the renderer does not snap the view back to it.
+fn scroll_rows(state: &mut SearchPaletteState, lines: i64, max_visible: usize) {
+    let max_visible = max_visible.max(1);
+    let max_scroll = state.rows.len().saturating_sub(max_visible);
+    let from = crate::renderer::search_palette_scroll(state.selected, state.scroll, max_visible);
+    state.scroll = (from as i64 + lines).clamp(0, max_scroll as i64) as usize;
+    let end = (state.scroll + max_visible).min(state.rows.len());
+    let in_view = &state.rows[state.scroll..end];
+    if state.selected < state.scroll {
+        if let Some(off) = in_view.iter().position(SearchRow::is_hit) {
+            state.selected = state.scroll + off;
+        }
+    } else if state.selected >= end {
+        if let Some(off) = in_view.iter().rposition(SearchRow::is_hit) {
+            state.selected = state.scroll + off;
+        }
+    }
+}
+
+/// The hit row drawn at height `py`, if any: headers and the space around the
+/// list are not clickable.
+fn hit_row_at(state: &SearchPaletteState, py: f32, geom: &crate::renderer::OverlayListGeometry) -> Option<usize> {
+    if py < geom.content_top || geom.row_height <= 0.0 {
+        return None;
+    }
+    let visible = ((py - geom.content_top) / geom.row_height) as usize;
+    if visible >= geom.max_visible {
+        return None;
+    }
+    let idx = crate::renderer::search_palette_scroll(state.selected, state.scroll, geom.max_visible) + visible;
+    state.rows.get(idx).filter(|r| r.is_hit()).map(|_| idx)
 }
 
 /// Whether a key event's character is something to type into a text input.
@@ -294,6 +331,28 @@ fn match_pane(p: &SearchPaneSnapshot, terms: &[String], session_text: Option<&St
     PaneMatch { fit: worst, snippet }
 }
 
+/// How a pane or tab name answers the query: its weakest term's fit, so `Word`
+/// means the name alone carries every term as a whole word.
+fn title_fit(title: &str, terms: &[String]) -> crate::claude_history::Fit {
+    use crate::claude_history::{fit, Fit};
+    let lower = lowercase_same_len(title);
+    terms.iter().map(|t| fit(&lower, t)).min().unwrap_or(Fit::Absent)
+}
+
+/// Order name hits by how close the name is to the query: a name made of
+/// exactly the typed words first, then the names with the fewest words. Stable,
+/// so equal names keep their window → tab order.
+fn rank_by_name(named: &mut [(String, SearchHit)], terms: &[String]) {
+    let mut typed: Vec<&String> = terms.iter().collect();
+    typed.sort();
+    named.sort_by_cached_key(|(name, _)| {
+        let mut words = crate::claude_history::split_terms(name);
+        words.sort();
+        let exact = words.iter().eq(typed.iter().copied());
+        (!exact, words.len())
+    });
+}
+
 /// Match one bookmark against `terms`: its saved label, its directory and —
 /// for a Claude conversation — the indexed prompts. Same rule as a pane: the
 /// best source per term, the weakest term for the bookmark.
@@ -375,10 +434,11 @@ fn bookmark_hits(
 /// — the term may be a prefix still being typed — but moved to a last section
 /// of its own, so it never sits among the real hits.
 ///
-/// Produces up to four sections:
-///   1. Panes whose title, screen or conversation matches, grouped under a
+/// Produces up to five sections:
+///   0. "Names": panes and tabs whose own name carries every term, the name
+///      closest to the query first (see `rank_by_name`).
+///   1. Other panes whose screen or conversation matches, grouped under a
 ///      per-tab header (one entry per pane).
-///   2. A "Tabs" section listing tabs whose title matches.
 ///   3. A "Bookmarks" section: saved conversations (Cmd+B) whose label,
 ///      directory or prompts match, minus those whose pane is listed in 1.
 ///   4. A "Claude sessions (closed)" section: past conversations that match,
@@ -396,7 +456,7 @@ fn run_search_worker(
     live_sessions: &[String],
     bookmarks: &[crate::bookmarks::Bookmark],
 ) -> Vec<SearchRow> {
-    use crate::claude_history::{fit, Fit};
+    use crate::claude_history::Fit;
     let terms = crate::claude_history::split_terms(query);
     let mut rows: Vec<SearchRow> = Vec::new();
     if terms.is_empty() {
@@ -414,9 +474,39 @@ fn run_search_worker(
     let mut inside: Vec<SearchHit> = Vec::new();
     let mut listed_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Section 1: matching panes, grouped by tab.
+    // Section 0: panes and tabs whose own name carries every term. A pane
+    // named "PR" is what "PR" means; listing it in window order among every
+    // pane whose screen says "PR" buries it.
+    let mut named: Vec<(String, SearchHit)> = Vec::new();
+    for p in panes {
+        if title_fit(&p.pane_title, &terms) == Fit::Word {
+            listed_sessions.extend(p.agent_session.clone());
+            named.push((p.pane_title.clone(), SearchHit {
+                target: SearchTarget::Open { tab_id: p.tab_id, pane_id: Some(p.pane_id) },
+                label: format!("{} · {}", p.tab_title, p.pane_title),
+            }));
+        }
+    }
+    for tab in tabs {
+        if title_fit(&tab.title, &terms) == Fit::Word {
+            named.push((tab.title.clone(), SearchHit {
+                target: SearchTarget::Open { tab_id: tab.tab_id, pane_id: None },
+                label: format!("Tab · {}", tab.title),
+            }));
+        }
+    }
+    if !named.is_empty() {
+        rank_by_name(&mut named, &terms);
+        rows.push(SearchRow::Header("Names".to_string()));
+        rows.extend(named.into_iter().map(|(_, hit)| SearchRow::Hit(hit)));
+    }
+
+    // Section 1: panes matching by their screen or conversation, grouped by tab.
     let mut current_tab: Option<TabId> = None;
     for p in panes {
+        if title_fit(&p.pane_title, &terms) == Fit::Word {
+            continue;
+        }
         let m = match_pane(p, &terms, p.session_id.as_ref().and_then(|id| said.get(id)));
         let label = match m.snippet {
             Some(s) => format!("{}  ·  {}", p.pane_title, s),
@@ -441,25 +531,14 @@ fn run_search_worker(
         rows.push(SearchRow::Hit(SearchHit { target, label }));
     }
 
-    // Section 2: tabs whose title matches.
-    let mut tab_section_open = false;
+    // Tabs whose title matches only inside a longer word (a whole-word match
+    // is listed under "Names").
     for tab in tabs {
-        let title = lowercase_same_len(&tab.title);
-        let worst = terms.iter().map(|t| fit(&title, t)).min().unwrap_or(Fit::Absent);
-        let hit = SearchHit {
-            target: SearchTarget::Open { tab_id: tab.tab_id, pane_id: None },
-            label: tab.title.clone(),
-        };
-        match worst {
-            Fit::Absent => {}
-            Fit::Inside => inside.push(SearchHit { label: format!("Tab · {}", hit.label), ..hit }),
-            Fit::Word => {
-                if !tab_section_open {
-                    rows.push(SearchRow::Header("Tabs".to_string()));
-                    tab_section_open = true;
-                }
-                rows.push(SearchRow::Hit(hit));
-            }
+        if title_fit(&tab.title, &terms) == Fit::Inside {
+            inside.push(SearchHit {
+                target: SearchTarget::Open { tab_id: tab.tab_id, pane_id: None },
+                label: format!("Tab · {}", tab.title),
+            });
         }
     }
 
@@ -796,6 +875,7 @@ impl KovaView {
             rows,
             selected,
             scroll: 0,
+            scroll_acc: 0.0,
             needs_search: false,
             last_edit: None,
         });
@@ -998,6 +1078,112 @@ impl KovaView {
         self.mark_dirty();
     }
 
+    /// Open the selected hit (Enter, or a click on a row). Live search keeps
+    /// the rows fresh, so the only fallback is to force a scan if one is owed
+    /// but the debounce hasn't fired yet.
+    fn open_selected_search_hit(&self) {
+        let action = {
+            let guard = self.ivars().search_palette.borrow();
+            let state = match guard.as_ref() {
+                Some(s) => s,
+                None => return,
+            };
+            // Rows that answer an older query (a paste or a keystroke
+            // still inside the debounce) must not be opened: search the
+            // query on screen instead, and let the next Enter open.
+            let stale = state.needs_search
+                || state.searching
+                || state.query != state.submitted_query;
+            match state.rows.get(state.selected) {
+                Some(SearchRow::Hit(hit))
+                    if !stale || matches!(hit.target, SearchTarget::Recall { .. }) =>
+                {
+                    Some(hit.clone())
+                }
+                _ => None,
+            }
+        };
+        match action {
+            // A recalled query stays in the palette: it retypes the
+            // query and searches again, it does not open anything.
+            Some(SearchHit { target: SearchTarget::Recall { query }, .. }) => {
+                if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
+                    state.cursor = query.chars().count();
+                    state.query = query;
+                    state.needs_search = true;
+                    // No debounce for a query the user did not type:
+                    // it is complete, so run it on the next tick.
+                    state.last_edit = None;
+                }
+                self.mark_dirty();
+            }
+            Some(hit) => {
+                self.close_search_palette();
+                match &hit.target {
+                    SearchTarget::Open { .. } => jump_to_search_hit(&hit),
+                    SearchTarget::Archived { session_id, cwd } => {
+                        self.open_archived_claude_session(session_id, cwd)
+                    }
+                    SearchTarget::Bookmark(bm) => self.open_saved_conversation(bm),
+                    SearchTarget::Recall { .. } => unreachable!("handled above"),
+                }
+            }
+            None => self.submit_search_palette(),
+        }
+    }
+
+    fn search_palette_geometry(&self) -> Option<crate::renderer::OverlayListGeometry> {
+        let renderer = self.ivars().renderer.get()?;
+        let vh = self.drawable_viewport().height;
+        let geom = renderer.read().search_palette_list_geometry(vh);
+        Some(geom)
+    }
+
+    /// A click on a result row opens it, as Enter would; anywhere else in the
+    /// palette it does nothing.
+    pub(super) fn handle_search_palette_click(&self, py: f32) {
+        let Some(geom) = self.search_palette_geometry() else { return };
+        let row = {
+            let guard = self.ivars().search_palette.borrow();
+            match guard.as_ref() {
+                Some(state) => hit_row_at(state, py, &geom),
+                None => return,
+            }
+        };
+        let Some(row) = row else { return };
+        if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
+            state.selected = row;
+        }
+        self.mark_dirty();
+        self.open_selected_search_hit();
+    }
+
+    /// The wheel or trackpad scrolls the result list, the selection following
+    /// along so it stays on screen.
+    pub(super) fn handle_search_palette_scroll(&self, event: &NSEvent, is_trackpad: bool) {
+        let Some(geom) = self.search_palette_geometry() else { return };
+        let mut guard = self.ivars().search_palette.borrow_mut();
+        let Some(state) = guard.as_mut() else { return };
+        // Same feel as the Cmd+P list: natural scrolling, a trackpad's fine
+        // deltas added up until they make a whole row.
+        let dy = event.scrollingDeltaY();
+        let lines = if is_trackpad {
+            let acc = state.scroll_acc - dy / 8.0;
+            let discrete = acc.trunc();
+            state.scroll_acc = acc - discrete;
+            discrete as i64
+        } else {
+            state.scroll_acc = 0.0;
+            -dy as i64
+        };
+        if lines == 0 {
+            return;
+        }
+        scroll_rows(state, lines, geom.max_visible);
+        drop(guard);
+        self.mark_dirty();
+    }
+
     /// Handle key events while the search palette overlay is active.
     pub(super) fn handle_search_palette_key(&self, event: &NSEvent) {
         let key_code = event.keyCode();
@@ -1071,59 +1257,7 @@ impl KovaView {
                 // a search abandoned is still a search one may want back.
                 self.close_search_palette();
             }
-            '\r' => {
-                // Enter: open the selected hit. Live search keeps the rows fresh,
-                // so the only fallback is to force a scan if one is owed but the
-                // debounce hasn't fired yet.
-                let action = {
-                    let guard = self.ivars().search_palette.borrow();
-                    let state = match guard.as_ref() {
-                        Some(s) => s,
-                        None => return,
-                    };
-                    // Rows that answer an older query (a paste or a keystroke
-                    // still inside the debounce) must not be opened: search the
-                    // query on screen instead, and let the next Enter open.
-                    let stale = state.needs_search
-                        || state.searching
-                        || state.query != state.submitted_query;
-                    match state.rows.get(state.selected) {
-                        Some(SearchRow::Hit(hit))
-                            if !stale || matches!(hit.target, SearchTarget::Recall { .. }) =>
-                        {
-                            Some(hit.clone())
-                        }
-                        _ => None,
-                    }
-                };
-                match action {
-                    // A recalled query stays in the palette: it retypes the
-                    // query and searches again, it does not open anything.
-                    Some(SearchHit { target: SearchTarget::Recall { query }, .. }) => {
-                        if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
-                            state.cursor = query.chars().count();
-                            state.query = query;
-                            state.needs_search = true;
-                            // No debounce for a query the user did not type:
-                            // it is complete, so run it on the next tick.
-                            state.last_edit = None;
-                        }
-                        self.mark_dirty();
-                    }
-                    Some(hit) => {
-                        self.close_search_palette();
-                        match &hit.target {
-                            SearchTarget::Open { .. } => jump_to_search_hit(&hit),
-                            SearchTarget::Archived { session_id, cwd } => {
-                                self.open_archived_claude_session(session_id, cwd)
-                            }
-                            SearchTarget::Bookmark(bm) => self.open_saved_conversation(bm),
-                            SearchTarget::Recall { .. } => unreachable!("handled above"),
-                        }
-                    }
-                    None => self.submit_search_palette(),
-                }
-            }
+            '\r' => self.open_selected_search_hit(),
             '\u{7F}' | '\u{08}' => {
                 // Backspace — remove char before cursor; queue a live search.
                 let mut guard = self.ivars().search_palette.borrow_mut();
@@ -1207,6 +1341,7 @@ mod tests {
             selected: rows.iter().position(SearchRow::is_hit).unwrap_or(0),
             rows,
             scroll: 0,
+            scroll_acc: 0.0,
             needs_search: false,
             last_edit: None,
         }
@@ -1313,6 +1448,89 @@ mod tests {
         fn target_is_shell_bookmark(&self) -> bool {
             matches!(&self.target, SearchTarget::Bookmark(b) if b.session_id.is_none())
         }
+    }
+
+    /// A header, then `n` hits, then a header and `n` more hits.
+    fn two_sections(n: usize) -> Vec<SearchRow> {
+        let hit = |i: usize| {
+            SearchRow::Hit(SearchHit {
+                target: SearchTarget::Recall { query: String::new() },
+                label: i.to_string(),
+            })
+        };
+        let mut rows = vec![SearchRow::Header("A".into())];
+        rows.extend((0..n).map(hit));
+        rows.push(SearchRow::Header("B".into()));
+        rows.extend((n..2 * n).map(hit));
+        rows
+    }
+
+    #[test]
+    fn the_wheel_scrolls_within_the_list_and_drags_the_selection_along() {
+        let mut state = palette_state("q", "q", two_sections(10)); // 22 rows
+        assert_eq!(state.selected, 1);
+        scroll_rows(&mut state, 5, 4);
+        assert_eq!(state.scroll, 5);
+        assert_eq!(state.selected, 5, "the first hit in view");
+        scroll_rows(&mut state, 100, 4);
+        assert_eq!(state.scroll, 18, "stops on the last screenful");
+        assert_eq!(state.selected, 18);
+        // Back up past the selection: it moves to the last hit in view.
+        scroll_rows(&mut state, -10, 4);
+        assert_eq!(state.scroll, 8);
+        assert_eq!(state.selected, 10);
+        scroll_rows(&mut state, -100, 4);
+        assert_eq!((state.scroll, state.selected), (0, 3));
+    }
+
+    #[test]
+    fn the_wheel_keeps_a_selection_already_in_view() {
+        let mut state = palette_state("q", "q", two_sections(10));
+        state.selected = 3;
+        scroll_rows(&mut state, 2, 4);
+        assert_eq!((state.scroll, state.selected), (2, 3));
+        // Starts from the view on screen, which the selection had pushed down.
+        state.selected = 9;
+        state.scroll = 0;
+        scroll_rows(&mut state, 1, 4);
+        assert_eq!((state.scroll, state.selected), (7, 9));
+    }
+
+    #[test]
+    fn a_click_lands_on_the_hit_drawn_under_it() {
+        let geom = crate::renderer::OverlayListGeometry { content_top: 100.0, row_height: 20.0, max_visible: 5 };
+        let mut state = palette_state("q", "q", two_sections(3)); // A 0 1 2 B 3 4 5
+        assert_eq!(hit_row_at(&state, 125.0, &geom), Some(1));
+        assert_eq!(hit_row_at(&state, 105.0, &geom), None, "a header");
+        assert_eq!(hit_row_at(&state, 90.0, &geom), None, "above the list");
+        assert_eq!(hit_row_at(&state, 205.0, &geom), None, "below the last visible row");
+        // Selection at row 6 pushes the view down by 2, as the renderer does.
+        state.selected = 6;
+        assert_eq!(hit_row_at(&state, 105.0, &geom), Some(2));
+    }
+
+    #[test]
+    fn a_name_matching_the_query_ranks_first() {
+        let terms = crate::claude_history::split_terms("PR");
+        let hit = |name: &str| {
+            (name.to_string(), SearchHit {
+                target: SearchTarget::Recall { query: String::new() },
+                label: name.to_string(),
+            })
+        };
+        let mut named = vec![hit("review PR acme"), hit("PR merge"), hit("PR")];
+        rank_by_name(&mut named, &terms);
+        let order: Vec<&str> = named.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(order, ["PR", "PR merge", "review PR acme"]);
+    }
+
+    #[test]
+    fn a_name_holds_the_query_only_as_whole_words() {
+        use crate::claude_history::{split_terms, Fit};
+        assert_eq!(title_fit("PR", &split_terms("pr")), Fit::Word);
+        assert_eq!(title_fit("fix PR review", &split_terms("review pr")), Fit::Word);
+        assert_eq!(title_fit("prompts", &split_terms("pr")), Fit::Inside);
+        assert_eq!(title_fit("PR", &split_terms("pr kova")), Fit::Absent);
     }
 
     #[test]

@@ -990,7 +990,10 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
             flag if flag.starts_with("--") => return Err(format!("kova ask: unknown flag {}\n\n{}", flag, USAGE)),
             _ => {
                 if message.is_some() {
-                    return Err(format!("kova ask: one message only (quote it)\n\n{}", USAGE));
+                    return Err(format!(
+                        "kova ask: unexpected extra argument '{}': the message is one quoted string, and so is an --actions list whose labels contain spaces (--actions \"Yes please,No\")\n\n{}",
+                        a, USAGE
+                    ));
                 }
                 message = Some(a.clone());
             }
@@ -1504,6 +1507,9 @@ mod tests {
         assert_eq!(c.timeout, Some(30));
         assert!(parse_cli(&args(&[])).is_err());
         assert!(parse_cli(&args(&["a", "b"])).is_err());
+        // An unquoted --actions list with spaces splits into stray arguments: the error names one and says to quote.
+        let e = parse_cli(&args(&["a", "--actions", "Yes", "please,No"])).err().expect("stray argument must be refused");
+        assert!(e.contains("'please,No'") && e.contains("--actions \"Yes please,No\""), "{}", e);
         assert!(parse_cli(&args(&["a", "--timeout", "0"])).is_err());
         assert!(parse_cli(&args(&["a", "--bogus"])).is_err());
         assert!(parse_cli(&args(&["a", "--from"])).is_err());

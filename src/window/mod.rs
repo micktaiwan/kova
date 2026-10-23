@@ -619,6 +619,11 @@ define_class!(
             let ivars = self.ivars();
             let is_trackpad = event.hasPreciseScrollingDeltas();
 
+            if ivars.search_palette.borrow().is_some() {
+                self.handle_search_palette_scroll(event, is_trackpad);
+                return;
+            }
+
             // Pane switcher overlay handles its own scroll (scroll the column under the cursor).
             if ivars.pane_switcher.borrow().is_some() {
                 self.handle_pane_switcher_scroll(event, is_trackpad);
@@ -663,6 +668,13 @@ define_class!(
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             let (px, py) = self.event_to_pixel(event);
+
+            // The search palette covers the window: a click there never
+            // reaches the tab bar or the panes behind it.
+            if self.ivars().search_palette.borrow().is_some() {
+                self.handle_search_palette_click(py);
+                return;
+            }
 
             // Check filter click
             if self.ivars().filter.borrow().is_some() {
