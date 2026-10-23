@@ -248,6 +248,13 @@ pub enum IpcCommand {
         tab_id: u32,
         name: String,
     },
+    /// Give a subject of a tab a color of the tab palette (the strip's
+    /// right-click menu, Cmd+P's `c`).
+    SetSubjectColor {
+        tab_id: u32,
+        name: String,
+        color: usize,
+    },
 }
 
 /// How long the IPC connection thread should wait for the main thread's response.
@@ -669,6 +676,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "set-pane-subject" => &["pane_id", "subject"],
         "rename-subject" => &["tab_id", "name", "new_name"],
         "delete-subject" => &["tab_id", "name"],
+        "set-subject-color" => &["tab_id", "name", "color"],
         _ => return None,
     })
 }
@@ -1110,6 +1118,18 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             let tab_id = required_u32(&v, "tab_id")?;
             let name = subject_name(&v, "name")?;
             Ok(IpcCommand::DeleteSubject { tab_id, name })
+        }
+        "set-subject-color" => {
+            let tab_id = required_u32(&v, "tab_id")?;
+            let name = subject_name(&v, "name")?;
+            // Required and never null: a subject always has a color.
+            let color = v
+                .get("color")
+                .ok_or_else(|| "missing \"color\" field".to_string())?
+                .as_u64()
+                .filter(|&c| (c as usize) < TAB_COLOR_COUNT)
+                .ok_or_else(|| format!("\"color\" must be 0..{}", TAB_COLOR_COUNT - 1))? as usize;
+            Ok(IpcCommand::SetSubjectColor { tab_id, name, color })
         }
         other => Err(format!("unknown command: {}", other)),
     }
@@ -1759,6 +1779,13 @@ mod tests {
             _ => panic!("delete-subject"),
         }
         assert_eq!(err(r#"{"cmd":"delete-subject","name":"auth"}"#), "missing \"tab_id\" field");
+        match parse_command(r#"{"cmd":"set-subject-color","tab_id":2,"name":"auth","color":5}"#) {
+            Ok(IpcCommand::SetSubjectColor { tab_id: 2, name, color: 5 }) => assert_eq!(name, "auth"),
+            _ => panic!("set-subject-color"),
+        }
+        assert_eq!(err(r#"{"cmd":"set-subject-color","tab_id":2,"name":"auth","color":6}"#), "\"color\" must be 0..5");
+        assert_eq!(err(r#"{"cmd":"set-subject-color","tab_id":2,"name":"auth","color":null}"#), "\"color\" must be 0..5");
+        assert_eq!(err(r#"{"cmd":"set-subject-color","tab_id":2,"name":"auth"}"#), "missing \"color\" field");
         assert_eq!(
             err(r#"{"cmd":"delete-subject","tab_id":2,"name":"auth","pane_id":1}"#),
             "unknown field \"pane_id\" for command \"delete-subject\""

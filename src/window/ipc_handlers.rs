@@ -472,6 +472,20 @@ impl KovaView {
         Ok(released)
     }
 
+    /// IPC: give a subject of tab `tab_id` a palette color.
+    pub fn ipc_set_subject_color(&self, tab_id: TabId, name: &str, color: usize) -> Result<(), SubjectError> {
+        {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let tab = tabs.iter_mut().find(|t| t.id == tab_id).ok_or(SubjectError::NoTab)?;
+            if !tab.set_subject_color(name, color) {
+                return Err(SubjectError::NoSubject);
+            }
+        }
+        log::info!("IPC: subject {} in tab {} colored {}", name, tab_id, color);
+        self.after_subject_change(false);
+        Ok(())
+    }
+
     /// What follows a subject change made from outside: the layout catches up
     /// when a pane moved, and an open Cmd+P is rebuilt, since its rows are a
     /// snapshot that would keep showing the old boxes.

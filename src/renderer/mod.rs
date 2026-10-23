@@ -2230,6 +2230,7 @@ impl Renderer {
                 ("\u{2318}\u{2190}\u{2192}", "Subject"),
                 ("\u{2318}\u{21e7}\u{2192}", "New subject"),
                 ("\u{23ce}/\u{2318}\u{232b}", "Rename/delete subject"),
+                ("c", "Subject color"),
                 ("b", "Bookmarks"),
                 ("m", "Memory"),
                 ("\u{2318}B", "Bookmark"),

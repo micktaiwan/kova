@@ -598,7 +598,7 @@ A subject is a named group of panes inside one tab, drawn in `Cmd+P` as a box un
 ] }
 ```
 
-`color` is the subject's color, an index into the tab palette (the same indices as `set-tab-color`): drawn at random when the subject is created, among the colors its tab uses least, then kept across relaunches. It frames the subject's box in `Cmd+P` and paints its band in the strip Kova draws under the tab bar. `pane_ids` follows the tab's order. To follow changes instead of polling, `subscribe` to `subjects`: the event carries this same list whenever anything in it changes. A pane id dies with its pane (see `list-panes`); a client that must remember which conversation sits in which subject keys on the pane's `agent_session_id`. Kova.app only: a library host answers `command not supported by this host`.
+`color` is the subject's color, an index into the tab palette (the same indices as `set-tab-color`): drawn at random when the subject is created, among the colors its tab uses least (ties broken at random), then kept across relaunches. The user can change it (right-click on the band, `c` on the header in `Cmd+P`), and so can `set-subject-color`. It frames the subject's box in `Cmd+P` and paints its band in the strip Kova draws under the tab bar. `pane_ids` follows the tab's order. To follow changes instead of polling, `subscribe` to `subjects`: the event carries this same list whenever anything in it changes. A pane id dies with its pane (see `list-panes`); a client that must remember which conversation sits in which subject keys on the pane's `agent_session_id`. Kova.app only: a library host answers `command not supported by this host`.
 
 ---
 
@@ -638,6 +638,18 @@ Response: `{ "ok": true, "data": { "merged": false } }`. Errors: `tab <id> not f
 Deletes the subject. Its panes stay open where they are, out of any box. Unlike `Cmd+⌫` on the header in `Cmd+P`, nothing is confirmed: the client asked.
 
 Response: `{ "ok": true, "data": { "released": 2 } }` — how many panes the subject held. Errors as in `rename-subject`.
+
+---
+
+### `set-subject-color` — choose a subject's color
+
+```json
+{ "cmd": "set-subject-color", "tab_id": 3, "name": "auth", "color": 4 }
+```
+
+Gives the subject a color of the tab palette, `0` to `5` (the same indices as `set-tab-color`). It is saved with the session and repaints the subject's box in `Cmd+P` and its band in the strip together. Required and never `null`: a subject always has a color.
+
+Response: `{ "ok": true, "data": { "color": 4 } }`. Errors as in `rename-subject`, plus `"color" must be 0..5`.
 
 ---
 
@@ -841,7 +853,7 @@ Every line after that is one event, told apart from a response by its `event` ke
 | `pane-working` | `pane_id`, `working` | a pane started or stopped working |
 | `pane-open` | `pane` | a pane appeared |
 | `pane-close` | `pane_id`, `window`, `tab` | a pane went away |
-| `subjects` | `subjects` (the whole `list-subjects` answer) | a subject was created, renamed, deleted or moved, or a pane was filed into or out of one — from Cmd+P, a split inheriting its subject, a closed pane or tab, or IPC |
+| `subjects` | `subjects` (the whole `list-subjects` answer) | a subject was created, renamed, recolored, deleted or moved, or a pane was filed into or out of one — from Cmd+P, a split inheriting its subject, a closed pane or tab, or IPC |
 | `ping` | — | 30 s of silence (see below) |
 
 **`focus` folds "is Kova even frontmost" into the same stream.** Leaving Kova for

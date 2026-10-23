@@ -87,6 +87,8 @@ pub struct KovaViewIvars {
     tab_bar_left_inset: Cell<f32>,
     /// Tab index targeted by right-click color menu.
     color_menu_tab: Cell<usize>,
+    /// Subject (its tab, its name) targeted by the strip's right-click color menu.
+    color_menu_subject: RefCell<Option<(TabId, String)>>,
     drag_tab: Cell<Option<DragTabState>>,
     /// URL currently hovered (pane_id, per-row segments [(row, col_start, col_end)], url) — set by mouseMoved when Cmd held
     hovered_url: RefCell<Option<(PaneId, Vec<(usize, u16, u16)>, String)>>,
@@ -865,6 +867,22 @@ define_class!(
             }
         }
 
+        /// A pick in the subject strip's color menu: a palette color by its
+        /// tag, or -1 for "Draw another color".
+        #[unsafe(method(subjectColorSelected:))]
+        fn subject_color_selected(&self, sender: &objc2_app_kit::NSMenuItem) {
+            let tag = sender.tag();
+            let Some((tab_id, name)) = self.ivars().color_menu_subject.borrow_mut().take() else { return };
+            if let Some(tab) = self.ivars().tabs.borrow_mut().iter_mut().find(|t| t.id == tab_id) {
+                if tag >= 0 {
+                    tab.set_subject_color(&name, tag as usize);
+                } else {
+                    tab.redraw_subject_color(&name);
+                }
+            }
+            self.mark_dirty();
+        }
+
         #[unsafe(method(tabColorSelected:))]
         fn tab_color_selected(&self, sender: &objc2_app_kit::NSMenuItem) {
             const PALETTE_SIZE: isize = 6;
@@ -886,11 +904,22 @@ define_class!(
         fn right_mouse_down(&self, event: &NSEvent) {
             let (px, py) = self.event_to_pixel(event);
             let tab_bar_h = self.tab_bar_height();
+            log::debug!(
+                "rightMouseDown at ({:.0}, {:.0}), tab bar {:.0}px, subject under it: {:?}",
+                px,
+                py,
+                tab_bar_h,
+                self.subject_at_strip(px, py).map(|(_, name, _)| name)
+            );
             if py <= tab_bar_h {
                 if let Some(tab_idx) = self.tab_index_at_x(px) {
                     self.show_tab_color_menu(event, tab_idx);
                     return;
                 }
+            }
+            if let Some((tab_id, name, color)) = self.subject_at_strip(px, py) {
+                self.show_subject_color_menu(event, tab_id, name, color);
+                return;
             }
             // Default behavior for right-click outside tab bar
             unsafe { msg_send![super(self), rightMouseDown: event] }
@@ -959,6 +988,7 @@ impl KovaView {
             rename_pane: RefCell::new(None),
             tab_bar_left_inset: Cell::new(0.0),
             color_menu_tab: Cell::new(0),
+            color_menu_subject: RefCell::new(None),
             drag_tab: Cell::new(None),
             hovered_url: RefCell::new(None),
             cmd_held: Cell::new(false),

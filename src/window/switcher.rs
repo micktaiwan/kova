@@ -1230,6 +1230,22 @@ impl KovaView {
         // bookmark half.
         // `m` does the same with the memory list.
         let unmodified = event.charactersIgnoringModifiers().map(|s| s.to_string());
+
+        // `c` on a subject's header: the subject's next color, box and strip
+        // band at once. Read from the typed letter (AZERTY), and never with
+        // Cmd held: Cmd+C reaches this handler too.
+        if unmodified.as_deref().is_some_and(|c| c.eq_ignore_ascii_case("c"))
+            && !event.modifierFlags().contains(NSEventModifierFlags::Command)
+        {
+            if let Some((tab, name)) = self.pane_switcher_selected_subject() {
+                if let Some(t) = self.ivars().tabs.borrow_mut().iter_mut().find(|t| t.id == tab) {
+                    t.cycle_subject_color(&name);
+                }
+                self.mark_dirty();
+                return;
+            }
+        }
+
         let wanted = view_for_key(unmodified.as_deref());
         if let Some(wanted) = wanted.filter(|_| !event.modifierFlags().contains(NSEventModifierFlags::Command)) {
             let (filtered, view) = self.pane_switcher_modes();

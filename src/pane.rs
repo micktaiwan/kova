@@ -402,13 +402,20 @@ pub fn heal_subject_list(subjects: &mut Vec<String>, named: impl IntoIterator<It
 /// the palette is used up. `taken` holds those subjects' colors; `seed` is
 /// the randomness, passed in so the choice can be tested.
 pub fn pick_subject_color(taken: impl IntoIterator<Item = usize>, seed: u64) -> usize {
+    pick_subject_color_except(taken, None, seed)
+}
+
+/// `pick_subject_color`, never returning `except`: "Draw another color" must
+/// change the color, even when the one it has is among the least used.
+pub fn pick_subject_color_except(taken: impl IntoIterator<Item = usize>, except: Option<usize>, seed: u64) -> usize {
     let n = crate::tab_colors::TAB_COLORS.len();
     let mut uses = vec![0usize; n];
     for c in taken {
         uses[c % n] += 1;
     }
-    let least = uses.iter().copied().min().unwrap_or(0);
-    let candidates: Vec<usize> = (0..n).filter(|&i| uses[i] == least).collect();
+    let allowed = |i: usize| Some(i) != except.map(|e| e % n);
+    let least = (0..n).filter(|&i| allowed(i)).map(|i| uses[i]).min().unwrap_or(0);
+    let candidates: Vec<usize> = (0..n).filter(|&i| allowed(i) && uses[i] == least).collect();
     candidates[(seed % candidates.len() as u64) as usize]
 }
 
@@ -1588,6 +1595,61 @@ impl Tab {
         self.columns.iter().any(|c| c.panes.iter().any(|p| p.subject.is_some()))
     }
 
+    /// Give a subject a color chosen by hand (an index into `TAB_COLORS`).
+    /// False when the tab has no such subject.
+    pub fn set_subject_color(&mut self, name: &str, color: usize) -> bool {
+        if !self.subjects.iter().any(|s| s == name) {
+            return false;
+        }
+        self.subject_colors.insert(name.to_string(), color % crate::tab_colors::TAB_COLORS.len());
+        true
+    }
+
+    /// Move a subject to the next color of the palette (Cmd+P's `c` on its
+    /// header). Returns the new color.
+    pub fn cycle_subject_color(&mut self, name: &str) -> Option<usize> {
+        let next = (self.subject_color(name)? + 1) % crate::tab_colors::TAB_COLORS.len();
+        self.set_subject_color(name, next);
+        Some(next)
+    }
+
+    /// Draw a new random color for a subject, never the one it has, among the
+    /// colors the tab's other subjects use least (the strip menu's "Draw
+    /// another color"). Returns the new color.
+    pub fn redraw_subject_color(&mut self, name: &str) -> Option<usize> {
+        let current = self.subject_color(name)?;
+        let others: Vec<usize> = self.subject_colors.iter().filter(|(n, _)| n.as_str() != name).map(|(_, c)| *c).collect();
+        let color = pick_subject_color_except(others, Some(current), random_seed());
+        self.set_subject_color(name, color);
+        Some(color)
+    }
+
+    /// One entry per column for the subject strip, left to right: its x and
+    /// width in `vp`, the subject of its first filed pane (top first) with
+    /// that subject's color, and whether it holds `focused`. What the strip
+    /// draws (`subject_strip_segments`) and what a right-click on it hits.
+    pub fn subject_strip_columns(
+        &self,
+        vp: PaneViewport,
+        focused: PaneId,
+    ) -> Vec<(f32, f32, Option<(String, Option<usize>)>, bool)> {
+        let mut columns: Vec<(f32, f32, Option<(String, Option<usize>)>, bool)> = Vec::new();
+        self.for_each_pane_with_viewport(vp, &mut |pane, pvp| {
+            let subject = pane.subject.as_ref().map(|n| (n.clone(), self.subject_color(n)));
+            let is_focused = pane.id == focused;
+            match columns.last_mut() {
+                Some(col) if col.0 == pvp.x => {
+                    if col.2.is_none() {
+                        col.2 = subject;
+                    }
+                    col.3 |= is_focused;
+                }
+                _ => columns.push((pvp.x, pvp.width, subject, is_focused)),
+            }
+        });
+        columns
+    }
+
     /// The color of a subject of this tab, an index into `TAB_COLORS`.
     pub fn subject_color(&self, name: &str) -> Option<usize> {
         self.subject_colors.get(name).copied()
@@ -2521,6 +2583,29 @@ mod tests {
         // Nothing taken: any color, chosen by the seed.
         let picks: std::collections::HashSet<usize> = (0..50).map(|seed| super::pick_subject_color([], seed)).collect();
         assert_eq!(picks.len(), n, "every color can come out");
+    }
+
+    #[test]
+    fn a_subject_color_set_cycled_or_redrawn_by_hand() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let mut tab = super::Tab::with_columns(vec![vec![a]]);
+        tab.add_subject("auth");
+        assert!(tab.set_subject_color("auth", 3));
+        assert_eq!(tab.subject_color("auth"), Some(3));
+        assert!(!tab.set_subject_color("nope", 3), "no such subject");
+        let n = crate::tab_colors::TAB_COLORS.len();
+        tab.set_subject_color("auth", n - 1);
+        assert_eq!(tab.cycle_subject_color("auth"), Some(0), "the last color wraps to the first");
+        assert_eq!(tab.cycle_subject_color("nope"), None);
+        for _ in 0..30 {
+            let before = tab.subject_color("auth").unwrap();
+            let after = tab.redraw_subject_color("auth").unwrap();
+            assert_ne!(before, after, "drawing another color always changes it");
+        }
+        // The excluded color never comes out, even when it is the least used.
+        for seed in 0..50 {
+            assert_ne!(super::pick_subject_color_except([0, 1, 3, 4, 5], Some(2), seed), 2);
+        }
     }
 
     #[test]

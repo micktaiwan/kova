@@ -60,6 +60,24 @@ impl KovaView {
         }
     }
 
+    /// The subject whose band in the strip is at this pixel: its tab, its
+    /// name and its color. `None` off the strip, or over a column in no
+    /// subject.
+    pub(super) fn subject_at_strip(&self, px: f32, py: f32) -> Option<(TabId, String, Option<usize>)> {
+        let top = self.tab_bar_height();
+        let tabs = self.ivars().tabs.borrow();
+        let tab = tabs.get(self.ivars().active_tab.get())?;
+        let strip_h = self.subject_strip_height(tab);
+        if py <= top || py > top + strip_h {
+            return None;
+        }
+        let vp = self.panes_viewport_for_tab(tab);
+        crate::renderer::subject_strip_segments(&tab.subject_strip_columns(vp, tab.focused_pane))
+            .into_iter()
+            .find(|seg| px >= seg.x && px < seg.x + seg.width)
+            .map(|seg| (tab.id, seg.name, seg.color))
+    }
+
     /// Height of the subject strip under the tab bar: one cell row in a tab
     /// where a pane is filed under a subject, nothing otherwise — a tab
     /// without subjects keeps every row.

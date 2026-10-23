@@ -818,22 +818,7 @@ impl KovaView {
                     height: drawable_size.height as f32 - tab_bar_h - strip_h - global_bar_h,
                 };
                 let subject_strip = if strip_h > 0.0 {
-                    // One entry per column, left to right: its first filed
-                    // pane's subject, and whether it holds the focus.
-                    let mut columns: Vec<(f32, f32, Option<(String, Option<usize>)>, bool)> = Vec::new();
-                    tab.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
-                        let subject = pane.subject.as_ref().map(|n| (n.clone(), tab.subject_color(n)));
-                        let focused = pane.id == focused_id;
-                        match columns.last_mut() {
-                            Some(col) if col.0 == vp.x => {
-                                if col.2.is_none() {
-                                    col.2 = subject;
-                                }
-                                col.3 |= focused;
-                            }
-                            _ => columns.push((vp.x, vp.width, subject, focused)),
-                        }
-                    });
+                    let columns = tab.subject_strip_columns(panes_vp, focused_id);
                     crate::renderer::SubjectStrip {
                         y: tab_bar_h,
                         height: strip_h,

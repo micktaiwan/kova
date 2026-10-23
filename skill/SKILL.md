@@ -70,7 +70,7 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 | Notify, the click focuses the pane | `{"cmd":"notify","pane_id":42,"title":"Claude Code","message":"done"}` |
 | Follow changes live | `{"cmd":"subscribe","events":["focus","pane-working"]}` |
 | Anchors | `set-anchor`, `clear-anchors` |
-| Subjects (the boxes of `Cmd+P`) | `{"cmd":"list-subjects"}`, `{"cmd":"set-pane-subject","pane_id":42,"subject":"auth"}` (`null` takes it out), `rename-subject`, `delete-subject` (both by `tab_id` + `name`) |
+| Subjects (the boxes of `Cmd+P`) | `{"cmd":"list-subjects"}`, `{"cmd":"set-pane-subject","pane_id":42,"subject":"auth"}` (`null` takes it out), `rename-subject`, `delete-subject`, `set-subject-color` (`"color"` 0..5) (all by `tab_id` + `name`) |
 | Reload the config | `{"cmd":"reload-config"}` |
 | Hook signals | `set-pane-status`, `mark-completed`, `mark-started`, `bell` |
 
@@ -171,7 +171,8 @@ A subject is a named group of panes inside one tab, drawn in `Cmd+P` as a box un
 over its panes, in a strip under the tab bar (only in a tab where a pane is filed: it costs a row). Each pane of `list-panes` carries
 `subject` (its name, or `null`). `list-subjects` answers one entry per subject: `tab_id`,
 `window`, `tab_index`, `name`, `color` (tab palette index, drawn at random at creation, then kept),
-`pane_ids`, in the order `Cmd+P` draws the boxes; an empty subject
+`pane_ids`, in the order `Cmd+P` draws the boxes (the user changes a color by right-clicking the band
+or pressing `c` on the header in `Cmd+P`); an empty subject
 has `pane_ids: []`. A subject belongs to its tab: the same name in two tabs is two subjects, so
 `rename-subject` and `delete-subject` take the `tab_id` from `list-subjects`. `set-pane-subject`
 creates the subject in the pane's tab when the name is new (`created: true`). `delete-subject`

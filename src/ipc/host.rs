@@ -802,6 +802,7 @@ mod tests {
             r#"{"cmd":"set-pane-subject","pane_id":1,"subject":"x"}"#,
             r#"{"cmd":"rename-subject","tab_id":1,"name":"x","new_name":"y"}"#,
             r#"{"cmd":"delete-subject","tab_id":1,"name":"x"}"#,
+            r#"{"cmd":"set-subject-color","tab_id":1,"name":"x","color":0}"#,
         ] {
             let cmd = parse_command(request).unwrap();
             assert!(dispatch(&host, cmd).is_err(), "{request} belongs to the app");

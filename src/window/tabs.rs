@@ -120,6 +120,47 @@ impl KovaView {
         };
     }
 
+    /// Show the color menu of a subject, from a right-click on its band in
+    /// the strip: the palette, its current color checked, and "Draw another
+    /// color". No "none": a subject always has a color.
+    pub(super) fn show_subject_color_menu(&self, event: &NSEvent, tab_id: TabId, name: String, current: Option<usize>) {
+        use objc2_app_kit::{NSControlStateValueOn, NSMenu, NSMenuItem};
+
+        *self.ivars().color_menu_subject.borrow_mut() = Some((tab_id, name));
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let pastilles = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣"];
+        let menu = NSMenu::new(mtm);
+        let action = objc2::sel!(subjectColorSelected:);
+        let empty_ke = NSString::from_str("");
+        let add = |title: &str, tag: isize| {
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(title),
+                    Some(action),
+                    &empty_ke,
+                )
+            };
+            item.setTag(tag);
+            unsafe { item.setTarget(Some(&*self)) };
+            menu.addItem(&item);
+            item
+        };
+        for (i, emoji) in pastilles.iter().enumerate() {
+            let item = add(emoji, i as isize);
+            if current == Some(i) {
+                item.setState(NSControlStateValueOn);
+            }
+        }
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        add("Draw another color", -1);
+
+        let location = event.locationInWindow();
+        let _ok: bool = unsafe {
+            objc2::msg_send![&menu, popUpMenuPositioningItem: std::ptr::null::<NSMenuItem>(), atLocation: location, inView: self]
+        };
+    }
+
     /// Switch to relative tab (delta = -1 for prev, +1 for next).
     pub(super) fn do_switch_tab_relative(&self, delta: i32) {
         let tabs = self.ivars().tabs.borrow();

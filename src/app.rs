@@ -769,6 +769,9 @@ fn handle_ipc_command_sync(
             handle_ipc_rename_subject(windows, tab_id, &name, &new_name)
         }
         IpcCommand::DeleteSubject { tab_id, name } => handle_ipc_delete_subject(windows, tab_id, &name),
+        IpcCommand::SetSubjectColor { tab_id, name, color } => {
+            handle_ipc_set_subject_color(windows, tab_id, &name, color)
+        }
         IpcCommand::ReloadConfig => {
             handle_ipc_reload_config(windows)
         }
@@ -1233,6 +1236,26 @@ fn handle_ipc_delete_subject(
         match view.ipc_delete_subject(tab_id, name) {
             Ok(released) => {
                 return crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "released": released })) };
+            }
+            Err(crate::window::SubjectError::NoTab) => continue,
+            Err(e) => return subject_error(e, tab_id, name),
+        }
+    }
+    subject_error(crate::window::SubjectError::NoTab, tab_id, name)
+}
+
+/// IPC: give a subject of a tab a palette color.
+fn handle_ipc_set_subject_color(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    tab_id: u32,
+    name: &str,
+    color: usize,
+) -> crate::ipc::IpcResponse {
+    for win in windows.borrow().iter() {
+        let Some(view) = kova_view(win) else { continue };
+        match view.ipc_set_subject_color(tab_id, name, color) {
+            Ok(()) => {
+                return crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "color": color })) };
             }
             Err(crate::window::SubjectError::NoTab) => continue,
             Err(e) => return subject_error(e, tab_id, name),
