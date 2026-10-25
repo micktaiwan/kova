@@ -2928,6 +2928,18 @@ impl Renderer {
     }
 }
 
+/// The colour of an OSC 7501 badge, by the hue key `program_status::badge`
+/// returns: working, waiting for the user, finished, failed. Picked to stay
+/// legible on the status bar over the default dark background.
+pub(super) fn program_status_color(hue: u8) -> [f32; 3] {
+    match hue {
+        1 => [1.00, 0.72, 0.28],
+        2 => [0.45, 0.85, 0.55],
+        3 => [1.00, 0.42, 0.42],
+        _ => [0.45, 0.72, 1.00],
+    }
+}
+
 /// Fade a colour toward `bg`. `t` is the dim amount: 0.0 leaves the colour
 /// alone, 1.0 makes it the background. Used by `text` dim mode, which fades
 /// glyphs instead of laying a veil over the pane.

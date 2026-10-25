@@ -3,7 +3,14 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use vte::{Params, Perform};
 
+use super::program_status::{self, ProgramStatus};
 use super::{CursorShape, TerminalState};
+
+/// The Kitty keyboard protocol flags this terminal implements: bit 1,
+/// disambiguate escape codes. Bits 2 (report event types) and 4 (report
+/// alternate keys) are not implemented, so they are never advertised back to a
+/// program — the flags a program pushes are echoed minus those bits.
+pub const KITTY_IMPLEMENTED_FLAGS: u8 = 1;
 
 /// Walk up from `path` to find `.git` and extract the branch name.
 /// Supports both regular repos (`.git/HEAD`) and worktrees (`.git` file pointing to gitdir).
@@ -135,6 +142,10 @@ enum TermOp {
     ShiftCharset(bool),
     ReportPrivateMode(u16),
     KittyKeyboardQuery,
+    /// OSC 7501 — a program reports what it is doing. `None` clears the record.
+    SetProgramStatus(Option<ProgramStatus>),
+    /// OSC 7501 ; ? — feature detection: the terminal answers `QUERY_REPLY`.
+    ProgramStatusQuery,
 }
 
 pub struct VteHandler {
@@ -420,6 +431,19 @@ impl VteHandler {
                         term.last_command_slot_open = true;
                         term.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
                         term.command_running.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // A new command from the shell means whatever program held
+                        // this pane has exited: `working` and `blocked` end there
+                        // (OSC 7501 lifetime). `done` and `error` survive the
+                        // prompt on purpose — they are the result the eye has not
+                        // looked at yet.
+                        if term.program_status.as_ref().is_some_and(|s| {
+                            matches!(
+                                s.state,
+                                Some(program_status::ProgramState::Working | program_status::ProgramState::Blocked)
+                            )
+                        }) {
+                            term.program_status = None;
+                        }
                     }
                     TermOp::SetCommandCompleted => {
                         log::debug!("OSC 133;D command completed (terminal {})", term.terminal_id);
@@ -482,8 +506,20 @@ impl VteHandler {
                         pty_responses.push(format!("\x1b[?{};{}$y", mode, value).into_bytes());
                     }
                     TermOp::KittyKeyboardQuery => {
-                        let flags = term.kitty_flags();
+                        // Only the bits this terminal actually implements:
+                        // bit 1, disambiguate. A program that pushed 7 (Pi
+                        // does) would otherwise believe it will receive key
+                        // event types and alternate keys, and neither is sent.
+                        let flags = term.kitty_flags() & KITTY_IMPLEMENTED_FLAGS;
                         pty_responses.push(format!("\x1b[?{}u", flags).into_bytes());
+                    }
+                    TermOp::SetProgramStatus(status) => {
+                        // What the program in this pane says it is doing (OSC
+                        // 7501). `None` clears the record.
+                        term.program_status = status;
+                    }
+                    TermOp::ProgramStatusQuery => {
+                        pty_responses.push(program_status::QUERY_REPLY.to_vec());
                     }
                 }
             }
@@ -500,7 +536,7 @@ impl VteHandler {
 }
 
 /// Decode standard base64 (padding optional, whitespace skipped). None on any other byte.
-fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
     let mut acc: u32 = 0;
     let mut bits = 0u32;
@@ -665,6 +701,36 @@ impl Perform for VteHandler {
                             log::trace!("OSC 8 hyperlink: {}", uri);
                             self.ops.push(TermOp::SetHyperlink(Some(uri)));
                         }
+                    }
+                }
+                b"7501" => {
+                    if params[1].len() > MAX_OSC_PAYLOAD { return; }
+                    if params[1] == &b"?"[..] {
+                        self.ops.push(TermOp::ProgramStatusQuery);
+                        return;
+                    }
+                    match program_status::parse_report(params[1]) {
+                        Some(program_status::ProgramReport::Clear) => {
+                            self.ops.push(TermOp::SetProgramStatus(None))
+                        }
+                        Some(program_status::ProgramReport::Record(status)) => {
+                            // Info, not debug: this is the state the pane will
+                            // show, and the log is the only way to read it back
+                            // without looking at the bar.
+                            log::info!(
+                                "OSC 7501 program status (terminal {}): state={:?} kind={:?} progress={:?} app={:?} msg={:?}",
+                                self.terminal.read().terminal_id,
+                                status.state,
+                                status.kind,
+                                status.progress,
+                                status.app,
+                                status.msg.as_deref().map(|m| m.chars().take(120).collect::<String>()),
+                            );
+                            self.ops.push(TermOp::SetProgramStatus(Some(status)))
+                        }
+                        // Ignored whole: no state, unknown state, a child record,
+                        // undecodable text. The previous record stays.
+                        None => log::debug!("OSC 7501 report ignored"),
                     }
                 }
                 b"7777" => {
@@ -1522,5 +1588,81 @@ mod tests {
         assert_eq!(percent_decode("/a%2"), "/a%2");
         assert_eq!(percent_decode("/a%zz/b"), "/a%zz/b");
         assert_eq!(percent_decode("/100%25"), "/100%");
+    }
+
+    // --- OSC 7501 (Program Status Protocol) and the kitty flags reply ---
+
+    /// Feed raw bytes and return what the terminal wrote back to the program.
+    /// `name` makes the temp file unique: tests run in parallel.
+    fn drive_capturing(name: &str, bytes: &[u8]) -> Vec<u8> {
+        let term = Arc::new(RwLock::new(TerminalState::new(
+            20, 5, 100, DEFAULT_FG, DEFAULT_BG,
+        )));
+        let path = std::env::temp_dir().join(format!("kova-reply-{}-{}.out", std::process::id(), name));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let writer: Arc<OwnedFd> = Arc::new(file.into());
+        let mut parser = vte::Parser::new();
+        let mut handler = VteHandler::new(term, writer);
+        parser.advance(&mut handler, bytes);
+        handler.apply_ops();
+        let out = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        out
+    }
+
+    #[test]
+    fn osc7501_query_is_answered_with_the_states_we_accept() {
+        let reply = drive_capturing("7501-query", b"\x1b]7501;?\x1b\\");
+        assert_eq!(reply, program_status::QUERY_REPLY.to_vec());
+    }
+
+    #[test]
+    fn osc7501_report_lands_on_the_terminal_and_clear_removes_it() {
+        // `state=working:app=pi:msg=dGVzdA==` ('test'), ST-terminated like Pi sends it.
+        let term = drive(20, 5, &[b"\x1b]7501;state=working:app=pi:msg=dGVzdA==\x1b\\"]);
+        {
+            let t = term.read();
+            let status = t.program_status.as_ref().expect("a record");
+            assert_eq!(status.state, Some(program_status::ProgramState::Working));
+            assert_eq!(status.app.as_deref(), Some("pi"));
+            assert_eq!(status.msg.as_deref(), Some("test"));
+        }
+        feed(&term, b"\x1b]7501;state=clear\x07");
+        assert_eq!(term.read().program_status, None, "clear removes the record");
+    }
+
+    #[test]
+    fn osc7501_garbage_leaves_the_previous_record_alone() {
+        let term = drive(20, 5, &[b"\x1b]7501;state=blocked:kind=permission\x1b\\"]);
+        assert!(term.read().program_status.is_some());
+        // Unknown state, then a child record: both ignored whole.
+        feed(&term, b"\x1b]7501;state=deploying\x07");
+        feed(&term, b"\x1b]7501;state=idle:id=child\x07");
+        let t = term.read();
+        let status = t.program_status.as_ref().expect("the first record survives");
+        assert_eq!(status.state, Some(program_status::ProgramState::Blocked));
+        assert_eq!(status.kind, Some(program_status::BlockedKind::Permission));
+    }
+
+    #[test]
+    fn osc7501_is_not_printed_to_the_grid() {
+        let term = drive(20, 5, &[b"\x1b]7501;state=working\x07X"]);
+        assert_eq!(term.read().visible_lines()[0][0].c, 'X');
+    }
+
+    #[test]
+    fn kitty_flags_are_reported_without_the_bits_we_do_not_implement() {
+        // Pi pushes 7 (disambiguate + event types + alternate keys) and asks
+        // what came out: we only implement bit 1, and say so.
+        let reply = drive_capturing("kitty-flags", b"\x1b[>7u\x1b[?u");
+        assert_eq!(reply, b"\x1b[?1u".to_vec(), "got {:?}", String::from_utf8_lossy(&reply));
+        // Popping the stack brings the reply back to the default: nothing on.
+        let reply = drive_capturing("kitty-pop", b"\x1b[>7u\x1b[<u\x1b[?u");
+        assert_eq!(reply, b"\x1b[?0u".to_vec());
     }
 }

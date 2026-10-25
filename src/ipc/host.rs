@@ -444,6 +444,9 @@ pub fn surface_json(
         "agent_session_name": pane.agent_session_name(),
         "claude_session_id": pane.claude_session_id(),
         "claude_session_name": pane.claude_session_name(),
+        // The CLAUDE_CONFIG_DIR the session runs under when it is not
+        // ~/.claude: its transcript is under <dir>/projects, not ~/.claude/projects.
+        "claude_config_dir": pane.claude_config_dir(),
         // A conversation a launch restore left asleep here: its resume line
         // waits until the pane is on screen or `wake-pane`. No agent runs, so
         // the session ids above are null and it has no `peer_name`.

@@ -337,6 +337,11 @@ impl Pty {
                 .stdout(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
                 .stderr(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
                 .env("TERM", "xterm-256color")
+                // Kova renders 24-bit SGR (38;2;r;g;b), but every program that
+                // sniffs its colours from the environment — Pi, chalk, most
+                // TUIs — only believes COLORTERM. Without this line they all
+                // quantize their theme to the 256-colour palette.
+                .env("COLORTERM", "truecolor")
                 .env("TERM_PROGRAM", "Kova")
                 .env("KOVA_SHELL_INTEGRATION", "1")
                 .env("KOVA_SOCKET", &env.socket)

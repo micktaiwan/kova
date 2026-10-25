@@ -1,5 +1,6 @@
 pub mod parser;
 pub mod paste_block;
+pub mod program_status;
 pub mod pty;
 
 use std::borrow::Cow;
@@ -287,6 +288,10 @@ pub struct TerminalState {
     pub osc133_primed: bool,
     // Last command executed (set via OSC 7777 from shell integration)
     pub last_command: Option<String>,
+    // What the program in this pane says it is doing (OSC 7501). `None` at a
+    // bare shell prompt, or after the program clears its record. Never scraped
+    // from the screen: the program that knows its state reports it.
+    pub program_status: Option<program_status::ProgramStatus>,
     // True between the shell announcing a command (OSC 133;C) and the one OSC
     // 7777 it sends right after to name that command. Any program can print an
     // OSC 7777 — it is just bytes on the tty — and `last_command` is replayed at
@@ -401,6 +406,7 @@ impl TerminalState {
             osc133_primed: false,
             last_command: None,
             last_command_slot_open: false,
+            program_status: None,
             last_printed: None,
             g0_dec_graphics: false,
             g1_dec_graphics: false,

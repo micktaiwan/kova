@@ -18,8 +18,8 @@
 use super::context::RenderContext;
 use super::vertex::Vertex;
 use super::{
-    bg_runs, fade_toward, format_count, format_last_activity, push_bg_quad, PaneAttention,
-    PaneRenderData, PaneViewport, TooltipZone, ITALIC_SHEAR,
+    bg_runs, fade_toward, format_count, format_last_activity, program_status_color, push_bg_quad,
+    PaneAttention, PaneRenderData, PaneViewport, TooltipZone, ITALIC_SHEAR,
 };
 use crate::config::{Config, DimMode};
 use crate::pane::PaneId;
@@ -709,6 +709,37 @@ impl PaneBuild<'_> {
             self.push_tooltip_zone(proc_x, bar_y, proc_w, cell_h, "Foreground process running in this pane");
         }
 
+        // Program status (OSC 7501): the state the program itself reports — an
+        // agent that is working, the approval it is waiting for, the run that
+        // finished. Sits after the process name because it is the same kind of
+        // news (what this pane is doing), only richer. `idle` prints nothing:
+        // the quiet bar already says it.
+        if let Some((label, hue)) = term
+            .program_status
+            .as_ref()
+            .and_then(crate::terminal::program_status::badge)
+        {
+            let status_fg = fade_toward(program_status_color(hue), bar_bg, text_fade);
+            let status_x = left_end + cell_w * 2.0;
+            let status_w = label.chars().count() as f32 * cell_w;
+            left_end = self.ctx.render_status_text(
+                vertices,
+                &label,
+                status_x,
+                bar_y,
+                vp.x + vp.width * 0.85,
+                [status_fg[0], status_fg[1], status_fg[2], 1.0],
+                no_bg,
+            );
+            self.push_tooltip_zone(
+                status_x,
+                bar_y,
+                status_w,
+                cell_h,
+                "Program status reported by the running program (OSC 7501)",
+            );
+        }
+
         // Right side: title (custom or hovered URL or OSC) + scroll indicator
         let right_edge = vp.x + vp.width - cell_w; // 1 cell padding from right
 
@@ -950,6 +981,37 @@ mod tests {
         // Dirty: rebuilt, and the new cell shows.
         prepare(&mut r, &mut ctx, &style, &p, true);
         assert_ne!(bits(r.vertices()), first);
+    }
+
+    #[test]
+    fn the_program_status_badge_is_drawn_only_when_the_program_reports_one() {
+        use crate::terminal::program_status::{BlockedKind, ProgramState, ProgramStatus};
+        let config = Config::default();
+        let mut ctx = context(&config);
+        let style = PaneStyle::from_config(&config);
+        let p = pane(terminal(), vp_at(100.0, 30.0));
+
+        // Nothing reported (a bare shell prompt, or a program that says nothing):
+        // the bar stays quiet.
+        let mut quiet = PaneRenderer::default();
+        let zones = prepare(&mut quiet, &mut ctx, &style, &p, true);
+        assert!(!zones.iter().any(|z| z.text.contains("OSC 7501")), "no badge by default");
+        let quiet_bits = bits(quiet.vertices());
+
+        // A program reports it is waiting for an approval (OSC 7501): the badge
+        // is painted, and it is clickable/hoverable like the rest of the bar.
+        p.terminal.write().program_status = Some(ProgramStatus {
+            state: Some(ProgramState::Blocked),
+            kind: Some(BlockedKind::Permission),
+            ..ProgramStatus::default()
+        });
+        let mut waiting = PaneRenderer::default();
+        let zones = prepare(&mut waiting, &mut ctx, &style, &p, true);
+        assert!(
+            zones.iter().any(|z| z.text.contains("OSC 7501")),
+            "the badge registers its tooltip zone"
+        );
+        assert_ne!(bits(waiting.vertices()), quiet_bits, "and its glyphs are drawn");
     }
 
     #[test]

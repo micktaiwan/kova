@@ -39,6 +39,9 @@ pub struct AgentSession {
     /// `SendMessage` (see `claude_session::Session::peer_name`). Codex has no
     /// such thing, so it is always `None` there.
     pub peer_name: Option<String>,
+    /// Claude only: the session's `CLAUDE_CONFIG_DIR` when it is not the
+    /// default one (`claude_session::Session::config_dir`).
+    pub config_dir: Option<String>,
 }
 
 /// The agent session running under `shell_pid`, if any.
@@ -48,10 +51,10 @@ pub struct AgentSession {
 /// scan only happens for panes that are not Claude.
 pub fn for_shell(shell_pid: u32) -> Option<AgentSession> {
     if let Some(s) = crate::claude_session::session_for_shell(shell_pid) {
-        return Some(AgentSession { agent: Agent::Claude, id: s.id, name: s.name, peer_name: s.peer_name });
+        return Some(AgentSession { agent: Agent::Claude, id: s.id, name: s.name, peer_name: s.peer_name, config_dir: s.config_dir });
     }
     let s = crate::codex_session::for_shell(shell_pid)?;
-    Some(AgentSession { agent: Agent::Codex, id: s.id, name: s.name, peer_name: None })
+    Some(AgentSession { agent: Agent::Codex, id: s.id, name: s.name, peer_name: None, config_dir: None })
 }
 
 /// The command line that reopens this conversation, or `None` when the id is
@@ -59,9 +62,10 @@ pub fn for_shell(shell_pid: u32) -> Option<AgentSession> {
 ///
 /// `last_command` is the line the pane last ran: on the Claude side it carries
 /// the flags the session was started with, which the resume line reuses.
-pub fn resume_command(agent: Agent, session_id: &str, last_command: Option<&str>) -> Option<String> {
+/// `config_dir` is Claude's non-default `CLAUDE_CONFIG_DIR`, ignored for Codex.
+pub fn resume_command(agent: Agent, session_id: &str, last_command: Option<&str>, config_dir: Option<&str>) -> Option<String> {
     match agent {
-        Agent::Claude => crate::claude_session::resume_command(last_command, session_id),
+        Agent::Claude => crate::claude_session::resume_command(last_command, session_id, config_dir),
         Agent::Codex => crate::codex_session::resume_command(session_id),
     }
 }
@@ -74,18 +78,18 @@ mod tests {
     fn each_agent_resumes_with_its_own_command() {
         let id = "01a07651-015e-78a3-97f2-2eaf0f0cd663";
         assert_eq!(
-            resume_command(Agent::Codex, id, None).as_deref(),
+            resume_command(Agent::Codex, id, None, None).as_deref(),
             Some("codex resume 01a07651-015e-78a3-97f2-2eaf0f0cd663")
         );
-        let claude = resume_command(Agent::Claude, id, None).expect("a claude line");
+        let claude = resume_command(Agent::Claude, id, None, None).expect("a claude line");
         assert!(claude.starts_with("claude "), "got {}", claude);
         assert!(claude.contains(id));
     }
 
     #[test]
     fn an_unsafe_id_is_refused_for_both() {
-        assert!(resume_command(Agent::Claude, "id\nrm -rf ~", None).is_none());
-        assert!(resume_command(Agent::Codex, "id\nrm -rf ~", None).is_none());
+        assert!(resume_command(Agent::Claude, "id\nrm -rf ~", None, None).is_none());
+        assert!(resume_command(Agent::Codex, "id\nrm -rf ~", None, None).is_none());
     }
 
     #[test]

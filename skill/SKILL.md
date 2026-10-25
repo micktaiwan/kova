@@ -10,8 +10,8 @@ accepts one JSON command per line. This skill lives in the kova repo (`skill/`).
 
 **If a `LOCAL.md` sits next to this file, read it first.** It carries what is specific to the
 machine and its user: names, habits, working rules. It is excluded from git.
-
 ## Where to look — three levels
+
 
 1. **This file**: the commands you need most. Enough to open a pane, run something in it and read
    what it printed.
@@ -210,8 +210,9 @@ The recipe:
 ```bash
 # 1. pane → session
 printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET" |
-  jq -r '.data[] | select(.id==42) | "\(.claude_session_id) \(.cwd)"'
-# 2. transcript: ~/.claude/projects/<dir>/<session_id>.jsonl, where <dir> is the directory the
+  jq -r '.data[] | select(.id==42) | "\(.claude_session_id) \(.cwd) \(.claude_config_dir)"'
+# 2. transcript: ~/.claude/projects/<dir>/<session_id>.jsonl (<claude_config_dir>/projects/… when
+#    that field is not null: a session started with its own CLAUDE_CONFIG_DIR), where <dir> is the directory the
 #    conversation started in with every non-alphanumeric character turned into "-"
 #    (/Users/me/projects/app → -Users-me-projects-app). Usually the pane's cwd; if the file is
 #    missing, look for <session_id>.jsonl under ~/.claude/projects/.

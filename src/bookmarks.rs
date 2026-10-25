@@ -45,7 +45,7 @@ impl Bookmark {
     pub fn resume_command(&self) -> Option<String> {
         let agent = self.agent?;
         let id = self.session_id.as_deref()?;
-        crate::agent_session::resume_command(agent, id, None)
+        crate::agent_session::resume_command(agent, id, None, None)
     }
 }
 

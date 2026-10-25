@@ -71,7 +71,7 @@ different command fails loudly instead of making the command do something else.
 
 - `direction` defaults to `horizontal`.
 - `cwd` falls back to the focused pane's CWD.
-- If `command` is provided, the new shell runs it on launch.
+- If `command` is provided, the new shell **types it at its prompt without pressing Enter**, once the shell is ready: the line waits for review (this is what `ask` relies on to leave a `--resume` line on screen). Send `{"cmd":"send-keys","pane_id":N,"text":"\n"}` to run it. An Enter sent before the line appears would reach the shell first.
 
 Response: `{ "data": { "pane_id": <new-id> } }`
 
@@ -82,6 +82,8 @@ Response: `{ "data": { "pane_id": <new-id> } }`
 ```json
 { "cmd": "new-tab", "cwd": "<optional>", "command": "<optional>" }
 ```
+
+`command` is typed at the new shell's prompt without Enter, exactly like `split` above.
 
 Response: `{ "data": { "tab_id": <int>, "pane_id": <int> } }`
 
@@ -137,6 +139,7 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "agent_session_id": "0b6f…",
   "agent_session_name": "subscribe on the Kova side",
   "claude_session_id": "0b6f…",
+  "claude_config_dir": null,
   "claude_session_name": "subscribe on the Kova side",
   "peer_name": "subscribe on the Kova side",
   "dormant_session_id": null,
@@ -149,6 +152,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 `child_processes[].name` is the program's name as it was invoked (argv[0], what `ps` shows), not the kernel's `p_comm`. The difference matters for anything installed under a versioned filename: Claude Code's binary is `~/.local/share/claude/versions/2.1.226`, so `p_comm` there is `2.1.226` and the name would say nothing about which program is running. `version` carries that number when the executable's own filename is one, and is `null` otherwise — so a Claude Code pane reads `{"name": "claude", "version": "2.1.226"}`.
 
 `claude_session_id` is the id of the Claude Code conversation running in the pane — the argument `claude --resume` takes — and `claude_session_name` is the name its `/rename` set (`null` until the user sets one). Both are `null` in a pane with no Claude session. They are read from `~/.claude/sessions/<pid>.json`, on the same throttled probe as the rest, and they matter because **the id is the only identifier here that outlives the pane**: a client tying a pane to a subject must key on it rather than on `id` or `cwd`. A pane id dies with its tab and does not survive a Kova relaunch either (every restored pane is numbered afresh, so an id noted before the relaunch may name another pane), and a directory is shared by every unrelated conversation started in the same repository. The name also appears inside `title`, but only as one candidate among five (see `display_title`), where it cannot be told apart from an OSC title or a directory name.
+
+`claude_config_dir` is the `CLAUDE_CONFIG_DIR` the pane's Claude session runs under when it is not the default `~/.claude` (a launcher that points Claude Code at another account or at a proxy), `null` otherwise. Kova scans the `sessions/` of every `~/.claude-*` directory as well as `~/.claude/sessions/`; such a session's transcript lives under `<claude_config_dir>/projects/`, and a relaunch reopens it through the command that started it (`<that command> --resume <id>`, so a launcher must pass `--resume` on to Claude Code) or, when that command was `claude` itself, with `CLAUDE_CONFIG_DIR=<dir>` in front.
 
 `peer_name` is the name other Claude Code sessions use to reach this one with `SendMessage` / `ListAgents` (e.g. `"myproject-f1"`). It is the session file's `name` field as Claude Code wrote it, **including a name it derived on its own** (`nameSource: "derived"`), which `claude_session_name` deliberately drops so that it never shadows the pane title. After a `/rename` the two fields carry the same value. It is `null` in a pane with no Claude session, for Codex, and while Claude Code has not yet written a name. It comes from the same cached scan of `~/.claude/sessions/` as `claude_session_id`, with no extra filesystem pass.
 

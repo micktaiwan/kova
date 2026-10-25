@@ -765,7 +765,7 @@ impl KovaView {
         crate::claude_session::end_orphan(session_id);
         // Same guard as the restore path: an id that cannot make a safe command
         // line never reaches a PTY.
-        let command = match crate::claude_session::resume_command(None, session_id) {
+        let command = match crate::claude_session::resume_command(None, session_id, None) {
             Some(c) => c,
             None => {
                 log::warn!("Refusing to resume an unsafe session id: {:?}", session_id);

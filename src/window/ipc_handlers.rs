@@ -1050,7 +1050,7 @@ mod tests {
         keys.sort();
         assert_eq!(keys, [
             "agent", "agent_session_id", "agent_session_name", "awaiting", "awaiting_seen",
-            "awaiting_since", "child_processes", "claude_session_id", "claude_session_name",
+            "awaiting_since", "child_processes", "claude_config_dir", "claude_session_id", "claude_session_name",
             "cwd", "dormant_session_id", "focused", "id", "is_idle", "minimized", "peer_name", "pid", "subject", "tab",
             "title", "window", "working",
         ]);

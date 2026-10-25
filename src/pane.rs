@@ -2457,7 +2457,7 @@ mod tests {
     fn claude_session() -> crate::agent_session::AgentSession {
         crate::agent_session::AgentSession {
             agent: crate::agent_session::Agent::Claude, id: "claude-id".into(), name: None,
-            peer_name: None,
+            peer_name: None, config_dir: None,
         }
     }
 
@@ -2474,12 +2474,12 @@ mod tests {
         assert_eq!(pane.last_claude_session_id().as_deref(), Some("claude-id"));
         // A Codex conversation is not a Claude one: the Claude id stays.
         pane.set_agent_session(Some(AgentSession {
-            agent: Agent::Codex, id: "codex-id".into(), name: None, peer_name: None,
+            agent: Agent::Codex, id: "codex-id".into(), name: None, peer_name: None, config_dir: None,
         }));
         assert_eq!(pane.last_claude_session_id().as_deref(), Some("claude-id"));
         // The next Claude conversation replaces it.
         pane.set_agent_session(Some(AgentSession {
-            agent: Agent::Claude, id: "next-id".into(), name: None, peer_name: None,
+            agent: Agent::Claude, id: "next-id".into(), name: None, peer_name: None, config_dir: None,
         }));
         assert_eq!(pane.last_claude_session_id().as_deref(), Some("next-id"));
         // A dead shell keeps it too.
@@ -2694,6 +2694,7 @@ mod tests {
         pane.agent_session.replace(Some(AgentSession {
             agent: Agent::Codex, id: "codex-id".into(), name: Some("premier nom".into()),
             peer_name: Some("leak".into()),
+            config_dir: None,
         }));
         assert_eq!(pane.display_title("shell"), "premier nom");
         assert_eq!(pane.agent_session_name().as_deref(), Some("premier nom"));
@@ -2712,6 +2713,7 @@ mod tests {
         pane.agent_session.replace(Some(AgentSession {
             agent: Agent::Claude, id: "claude-id".into(), name: Some("Claude nommé".into()),
             peer_name: Some("Claude nommé".into()),
+            config_dir: None,
         }));
         assert_eq!(pane.display_title("shell"), "Claude nommé");
         assert_eq!(pane.agent_session_name(), pane.claude_session_name());
@@ -2724,6 +2726,7 @@ mod tests {
         pane.agent_session.replace(Some(AgentSession {
             agent: Agent::Claude, id: "claude-id".into(), name: None,
             peer_name: Some("myproject-f1".into()),
+            config_dir: None,
         }));
         assert_eq!(pane.claude_session_name(), None);
         assert_eq!(pane.claude_peer_name().as_deref(), Some("myproject-f1"));

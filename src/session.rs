@@ -120,6 +120,11 @@ pub struct SavedPane {
 pub struct SavedAgentSession {
     pub agent: crate::agent_session::Agent,
     pub id: String,
+    /// Claude's `CLAUDE_CONFIG_DIR` when the session did not run under the
+    /// default one, so the resume line reopens it there (see
+    /// `claude_session::resume_command`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
 }
 
 /// Legacy column format (v3) — kept for backward compat reading.
@@ -201,10 +206,10 @@ fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
 /// but that is the conversation to bring back next time too.
 fn session_to_save(
     live: Option<crate::agent_session::AgentSession>,
-    dormant: Option<(crate::agent_session::Agent, String)>,
+    dormant: Option<SavedAgentSession>,
 ) -> Option<SavedAgentSession> {
-    live.map(|s| SavedAgentSession { agent: s.agent, id: s.id })
-        .or_else(|| dormant.map(|(agent, id)| SavedAgentSession { agent, id }))
+    live.map(|s| SavedAgentSession { agent: s.agent, id: s.id, config_dir: s.config_dir })
+        .or(dormant)
 }
 
 /// Find the flat leaf index of a pane by id across all columns.
@@ -570,7 +575,7 @@ fn restore_command(sp: &SavedPane) -> Option<String> {
 /// The resume line of the agent the pane was running at snapshot time, if any.
 fn agent_resume_line(sp: &SavedPane) -> Option<String> {
     let session = saved_agent_session(sp)?;
-    crate::agent_session::resume_command(session.agent, &session.id, sp.last_command.as_deref())
+    crate::agent_session::resume_command(session.agent, &session.id, sp.last_command.as_deref(), session.config_dir.as_deref())
 }
 
 /// The agent conversation the pane was running at snapshot time, if any.
@@ -580,6 +585,7 @@ fn saved_agent_session(sp: &SavedPane) -> Option<SavedAgentSession> {
         sp.claude_session.as_ref().map(|id| SavedAgentSession {
             agent: crate::agent_session::Agent::Claude,
             id: id.clone(),
+            config_dir: None,
         })
     })
 }
@@ -627,7 +633,7 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
         }
         if at_launch && runs_on_launch(sp) {
             if let Some(session) = saved_agent_session(sp) {
-                pane.sleep_until_shown(session.agent, session.id);
+                pane.sleep_until_shown(session);
             }
         }
         pane.custom_title = sp.custom_title.clone();
@@ -1046,11 +1052,11 @@ mod tests {
     #[test]
     fn a_pane_still_asleep_is_saved_with_its_conversation() {
         use crate::agent_session::{Agent, AgentSession};
-        let asleep = Some((Agent::Codex, "sleeping".to_string()));
+        let asleep = Some(SavedAgentSession { agent: Agent::Codex, id: "sleeping".into(), config_dir: None });
         let saved = session_to_save(None, asleep.clone()).expect("not forgotten");
         assert_eq!((saved.agent, saved.id.as_str()), (Agent::Codex, "sleeping"));
 
-        let live = AgentSession { agent: Agent::Claude, id: "live".into(), name: None, peer_name: None };
+        let live = AgentSession { agent: Agent::Claude, id: "live".into(), name: None, peer_name: None, config_dir: None };
         assert_eq!(session_to_save(Some(live), asleep).unwrap().id, "live", "a running agent wins");
         assert!(session_to_save(None, None).is_none());
     }
@@ -1113,6 +1119,7 @@ mod tests {
         sp.agent_session = Some(SavedAgentSession {
             agent: crate::agent_session::Agent::Codex,
             id: "01a07651-015e-78a3-97f2-2eaf0f0cd663".into(),
+            config_dir: None,
         });
         assert_eq!(
             restore_command(&sp).as_deref(),
@@ -1129,8 +1136,30 @@ mod tests {
         sp.agent_session = Some(SavedAgentSession {
             agent: crate::agent_session::Agent::Codex,
             id: "codex-id".into(),
+            config_dir: None,
         });
         assert_eq!(restore_command(&sp).as_deref(), Some("codex resume codex-id"));
+    }
+
+    #[test]
+    fn a_claude_session_from_another_config_dir_resumes_through_its_launcher() {
+        let mut sp = pane("/a");
+        sp.last_command = Some("proxy-cc".into());
+        sp.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Claude,
+            id: "abc".into(),
+            config_dir: Some("/Users/x/.claude-proxy".into()),
+        });
+        assert_eq!(restore_command(&sp).as_deref(), Some("proxy-cc --resume abc"));
+        assert!(runs_on_launch(&sp));
+
+        // The config dir survives a round trip through the session file, and a
+        // file without it (every older one) still reads.
+        let json = serde_json::to_string(sp.agent_session.as_ref().unwrap()).unwrap();
+        let back: SavedAgentSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.config_dir.as_deref(), Some("/Users/x/.claude-proxy"));
+        let old: SavedAgentSession = serde_json::from_str(r#"{"agent":"claude","id":"abc"}"#).unwrap();
+        assert_eq!(old.config_dir, None);
     }
 
     #[test]
@@ -1151,6 +1180,7 @@ mod tests {
         codex.agent_session = Some(SavedAgentSession {
             agent: crate::agent_session::Agent::Codex,
             id: "codex-id".into(),
+            config_dir: None,
         });
         assert!(runs_on_launch(&codex));
 
