@@ -11,9 +11,9 @@ pub mod session;
 
 mod agent_session;
 mod anchors;
+mod appkit_input;
 mod ask;
 mod ask_card;
-mod appkit_input;
 mod bookmarks;
 mod claude_history;
 mod claude_session;
@@ -23,9 +23,11 @@ mod events;
 mod input;
 mod ipc;
 mod keybindings;
+mod launchers;
 mod notification;
 mod pane;
 mod pane_history;
+mod pi_session;
 mod raf;
 mod recent_projects;
 mod renderer;
@@ -55,6 +57,10 @@ pub(crate) fn get_rss_mb() -> f64 {
             &mut info as *mut _ as *mut i32,
             &mut count,
         );
-        if kr == 0 { info.resident_size as f64 / (1024.0 * 1024.0) } else { -1.0 }
+        if kr == 0 {
+            info.resident_size as f64 / (1024.0 * 1024.0)
+        } else {
+            -1.0
+        }
     }
 }

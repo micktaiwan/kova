@@ -54,6 +54,8 @@ struct Scan {
 pub struct Session {
     /// Conversation id, the argument `claude --resume` expects.
     pub id: String,
+    /// The Claude Code process itself, which may sit below a launcher script.
+    pub pid: u32,
     /// Session name as set by Claude Code's `/rename`, absent until the user
     /// sets one. Claude Code never puts it in the terminal title, so reading
     /// the file is the only way to show it. A name Claude Code derived on its
@@ -171,7 +173,17 @@ fn parse_session_file(data: &str) -> Option<(u32, u64, Session)> {
         .filter(|n| !n.is_empty())
         .map(str::to_string);
     let name = peer_name.clone().filter(|_| !derived);
-    Some((pid, started_at, Session { id, name, peer_name, config_dir: None }))
+    Some((
+        pid,
+        started_at,
+        Session {
+            id,
+            pid,
+            name,
+            peer_name,
+            config_dir: None,
+        },
+    ))
 }
 
 /// Read `~/.claude/sessions/` once into a `Scan`: a map of "ancestor PID →
@@ -360,6 +372,72 @@ pub fn resume_command(last_command: Option<&str>, session_id: &str, config_dir: 
     Some(format!("{}{} --resume {}", env, base.join(" "), session_id))
 }
 
+/// The config dir a closed conversation last ran under, `None` for the default
+/// `~/.claude`: each dir keeps the prompts typed in it in its own `history.jsonl`,
+/// with the conversation id on every line. A conversation resumed from another
+/// dir since shows up in both, so the dir with the latest line wins.
+///
+/// Reads every history file, the default one included (tens of MB), so it is
+/// for a pick the user just made, never for a frame.
+pub fn config_dir_of(session_id: &str) -> Option<String> {
+    let needle = format!("\"sessionId\":\"{}\"", session_id);
+    let mut best: Option<(u64, Option<String>)> = None;
+    for (sessions, config_dir) in sessions_dirs() {
+        let Some(dir) = sessions.parent() else {
+            continue;
+        };
+        let Some(latest) = latest_prompt_at(&dir.join("history.jsonl"), &needle) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(at, _)| latest > *at) {
+            best = Some((latest, config_dir));
+        }
+    }
+    best.and_then(|(_, config_dir)| config_dir)
+}
+
+/// Timestamp of the last line of a `history.jsonl` that contains `needle`.
+/// Lines are tested as text first, so only the matching ones are parsed.
+fn latest_prompt_at(path: &std::path::Path, needle: &str) -> Option<u64> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    std::io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| line.contains(needle))
+        .filter_map(|line| {
+            serde_json::from_str::<serde_json::Value>(&line)
+                .ok()?
+                .get("timestamp")?
+                .as_u64()
+        })
+        .max()
+}
+
+/// The launcher a session with its own config dir was started from, stripped of
+/// its session flags (`deepseek-cc --resume abc` → `deepseek-cc`): what a saved
+/// conversation keeps to be reopened the same way. `None` for a session in the
+/// default dir, a plain `claude` line, or anything not plain text.
+pub fn launcher(last_command: Option<&str>, config_dir: Option<&str>) -> Option<String> {
+    config_dir?;
+    let cmd = last_command?.trim();
+    if !is_launcher_invocation(cmd) {
+        return None;
+    }
+    let line = strip_session_flags(cmd).join(" ");
+    (!line.is_empty() && is_plain_launcher(&line)).then_some(line)
+}
+
+/// True if `line` is safe to type as a launcher: words of plain characters.
+/// It is read back from a file, so anything else (a control character, `$`,
+/// a quote) is refused rather than escaped.
+pub fn is_plain_launcher(line: &str) -> bool {
+    !line.is_empty()
+        && line
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b" -_./,=:@+".contains(&b))
+}
+
 /// True if `cmd` is a plain command (no pipeline, no env prefix) whose program
 /// is not `claude` itself: the launcher a session with its own config dir was
 /// started from.
@@ -411,6 +489,45 @@ fn strip_session_flags(cmd: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_latest_prompt_of_a_conversation_is_found_by_its_id() {
+        let path = std::env::temp_dir().join(format!("kova-history-{}.jsonl", std::process::id()));
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"display":"a","timestamp":10,"sessionId":"abc"}"#,
+                "\n",
+                r#"{"display":"b","timestamp":30,"sessionId":"other"}"#,
+                "\n",
+                r#"{"display":"c","timestamp":20,"sessionId":"abc"}"#,
+                "\n",
+                "not json at all\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(latest_prompt_at(&path, r#""sessionId":"abc""#), Some(20));
+        assert_eq!(latest_prompt_at(&path, r#""sessionId":"missing""#), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_launcher_is_kept_without_its_session_flags() {
+        let dir = Some("/Users/x/.claude-deepseek");
+        assert_eq!(
+            launcher(Some("deepseek-cc --resume abc"), dir).as_deref(),
+            Some("deepseek-cc")
+        );
+        assert_eq!(
+            launcher(Some("deepseek-cc --mcp a,b"), dir).as_deref(),
+            Some("deepseek-cc --mcp a,b")
+        );
+        // Default config dir, or a plain claude line: nothing to keep.
+        assert_eq!(launcher(Some("deepseek-cc"), None), None);
+        assert_eq!(launcher(Some("claude --model x"), dir), None);
+        assert_eq!(launcher(Some("deepseek-cc $(whoami)"), dir), None);
+        assert_eq!(launcher(None, dir), None);
+    }
 
     /// Manual check against the live machine — the detection depends on Claude
     /// Code's on-disk layout, which no unit test can stand in for. Run it with

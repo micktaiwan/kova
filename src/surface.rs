@@ -187,6 +187,20 @@ fn normalize_process_name(raw: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// What to call a `claude` that runs from another config dir: the dir's
+/// suffix, so `~/.claude-deepseek` reads `deepseek` — a launcher that points
+/// Claude Code at another model or account names its config dir after it.
+/// `None` keeps the process name (another program, or the default dir).
+fn claude_flavor_name(process: &str, config_dir: Option<&str>) -> Option<String> {
+    if process != "claude" {
+        return None;
+    }
+    let base = config_dir?.trim_end_matches('/').rsplit('/').next()?;
+    base.strip_prefix(".claude-")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Conversation name → custom pane title → non-empty OSC title → foreground
 /// process → cwd basename → fallback. Blank names/titles count as absent.
 fn derive_display_title(
@@ -427,10 +441,16 @@ impl Surface {
     /// An unresolvable name caches as `None` (nothing to display) without
     /// changing the returned yes/no.
     fn refresh_fg_process(&self) -> bool {
-        let probe = self.pty.foreground_process();
+        let (agent_pid, config_dir) = match self.agent_session.borrow().as_ref() {
+            Some(s) => (s.pid, s.config_dir.clone()),
+            None => (None, None),
+        };
+        let probe = self.pty.foreground_process_preferring(agent_pid);
         let running = probe.is_some();
         self.fg_process.replace(probe.and_then(|info| {
-            normalize_process_name(&info.name).map(|name| ProcessInfo { name, ..info })
+            let name = normalize_process_name(&info.name)?;
+            let name = claude_flavor_name(&name, config_dir.as_deref()).unwrap_or(name);
+            Some(ProcessInfo { name, ..info })
         }));
         running
     }
@@ -498,6 +518,13 @@ impl Surface {
         }
         if let Some(s) = found.as_ref().filter(|s| s.agent == crate::agent_session::Agent::Claude) {
             self.last_claude_session.replace(Some(s.id.clone()));
+            if let Some(dir) = s.config_dir.as_deref() {
+                if let Some(launcher) =
+                    crate::claude_session::launcher(self.last_command().as_deref(), Some(dir))
+                {
+                    crate::launchers::remember(dir, &launcher);
+                }
+            }
         }
         *self.agent_session.borrow_mut() = found;
     }
@@ -806,7 +833,10 @@ fn injected_line(command: &str, run: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_display_title, injected_line, is_working_marker, normalize_process_name, strip_activity_prefix, AwaitingFlag};
+    use super::{
+        AwaitingFlag, claude_flavor_name, derive_display_title, injected_line, is_working_marker,
+        normalize_process_name, strip_activity_prefix,
+    };
 
     #[test]
     fn a_read_waiting_pane_re_enters_the_jump_cycle_only_on_a_new_question() {
@@ -974,6 +1004,36 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_from_another_config_dir_is_named_after_it() {
+        assert_eq!(
+            claude_flavor_name("claude", Some("/Users/x/.claude-deepseek")).as_deref(),
+            Some("deepseek")
+        );
+        assert_eq!(
+            claude_flavor_name("claude", Some("/Users/x/.claude-deepseek/")).as_deref(),
+            Some("deepseek")
+        );
+    }
+
+    #[test]
+    fn the_process_name_stays_otherwise() {
+        assert_eq!(claude_flavor_name("claude", None), None);
+        assert_eq!(
+            claude_flavor_name("claude", Some("/Users/x/.claude-")),
+            None
+        );
+        assert_eq!(
+            claude_flavor_name("claude", Some("/Users/x/.config/claude")),
+            None
+        );
+        // Something else in the foreground (claude suspended): not renamed.
+        assert_eq!(
+            claude_flavor_name("vim", Some("/Users/x/.claude-deepseek")),
+            None
+        );
+    }
+
+    #[test]
     fn foreground_process_used_when_nothing_named_the_pane() {
         let t = derive_display_title(None, None, None, Some("nvim"), Some("/home/x/proj"), "shell");
         assert_eq!(t, "nvim");
@@ -1069,9 +1129,23 @@ mod tests {
             "claude not registered yet: a quit now still saves the conversation"
         );
         surface.set_agent_session(None);
-        assert!(surface.unregistered_session().is_some(), "an empty probe forgets nothing");
-        surface.set_agent_session(Some(AgentSession { agent: Agent::Claude, id: "abc".into(), name: None, peer_name: None, config_dir: None }));
-        assert_eq!(surface.unregistered_session(), None, "the live session takes over");
+        assert!(
+            surface.unregistered_session().is_some(),
+            "an empty probe forgets nothing"
+        );
+        surface.set_agent_session(Some(AgentSession {
+            pid: None,
+            agent: Agent::Claude,
+            id: "abc".into(),
+            name: None,
+            peer_name: None,
+            config_dir: None,
+        }));
+        assert_eq!(
+            surface.unregistered_session(),
+            None,
+            "the live session takes over"
+        );
     }
 
     #[test]

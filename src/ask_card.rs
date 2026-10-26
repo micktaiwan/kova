@@ -124,7 +124,8 @@ define_class!(
             }
         }
 
-        /// Enter in the field sends with the first button; Shift+Enter (or
+        /// Enter in the field sends with "Other" when text was typed and the
+        /// card has it, else with the first button; Shift+Enter (or
         /// Option+Enter) adds a line.
         #[unsafe(method(control:textView:doCommandBySelector:))]
         fn control_text_view_do_command(
@@ -163,7 +164,19 @@ fn enter_in_field(mtm: MainThreadMarker, text_view: &NSTextView, selector: Sel) 
         return false;
     }
     let Some(card) = card() else { return false };
-    let Some(primary) = card.current.borrow().as_ref().map(|c| c.buttons[0].clone()) else {
+    // Typed text sent with Enter is the free answer: it goes out as "Other" when the card has
+    // that button, never under the first proposed choice.
+    let typed = !card.field.stringValue().to_string().trim().is_empty();
+    let Some(primary) = card.current.borrow().as_ref().map(|c| {
+        match c
+            .buttons
+            .iter()
+            .find(|b| typed && b.as_str() == crate::ask::OTHER)
+        {
+            Some(other) => other.clone(),
+            None => c.buttons[0].clone(),
+        }
+    }) else {
         return false;
     };
     let flags = NSApplication::sharedApplication(mtm)

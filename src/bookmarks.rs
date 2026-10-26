@@ -31,6 +31,17 @@ pub struct Bookmark {
     /// the name the user recognises the row by, and the live title of a
     /// reopened conversation may say something else entirely.
     pub label: String,
+    /// Claude only: the session's non-default `CLAUDE_CONFIG_DIR`
+    /// (`claude_session::Session::config_dir`). Without it a conversation
+    /// started by a launcher would come back under the default account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
+    /// Claude only: the launcher that started the session from `config_dir`,
+    /// without its session flags (`deepseek-cc`), which reopens it with
+    /// `--resume <id>`. The launcher may do more than set the variable (start
+    /// a proxy), so the variable alone does not bring the conversation back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher: Option<String>,
 }
 
 impl Bookmark {
@@ -45,7 +56,23 @@ impl Bookmark {
     pub fn resume_command(&self) -> Option<String> {
         let agent = self.agent?;
         let id = self.session_id.as_deref()?;
-        crate::agent_session::resume_command(agent, id, None, None)
+        // The file is ours, but anything can write it: a launcher that is not
+        // plain text is dropped, never typed into a shell.
+        let launcher = self
+            .launcher
+            .clone()
+            .filter(|l| crate::claude_session::is_plain_launcher(l))
+            .or_else(|| {
+                self.config_dir
+                    .as_deref()
+                    .and_then(crate::launchers::for_config_dir)
+            });
+        crate::agent_session::resume_command(
+            agent,
+            id,
+            launcher.as_deref(),
+            self.config_dir.as_deref(),
+        )
     }
 }
 
@@ -110,11 +137,59 @@ mod tests {
 
     fn claude(id: &str, cwd: &str) -> Bookmark {
         Bookmark {
+            config_dir: None,
+            launcher: None,
             agent: Some(Agent::Claude),
             session_id: Some(id.to_string()),
             cwd: cwd.to_string(),
             label: format!("pane in {}", cwd),
         }
+    }
+
+    #[test]
+    fn a_conversation_from_a_launcher_reopens_through_it() {
+        let mut bm = claude("abc", "/a");
+        bm.config_dir = Some("/Users/x/.claude-deepseek".into());
+        bm.launcher = Some("deepseek-cc --mcp a,b".into());
+        assert_eq!(
+            bm.resume_command().as_deref(),
+            Some("deepseek-cc --mcp a,b --resume abc")
+        );
+        // No launcher known: the config dir alone still points at the right account.
+        bm.launcher = None;
+        assert_eq!(
+            bm.resume_command().as_deref(),
+            Some("CLAUDE_CONFIG_DIR=/Users/x/.claude-deepseek claude --resume abc")
+        );
+    }
+
+    #[test]
+    fn a_launcher_that_is_not_plain_text_is_never_typed() {
+        let mut bm = claude("abc", "/a");
+        bm.config_dir = Some("/Users/x/.claude-deepseek".into());
+        bm.launcher = Some("deepseek-cc\nrm -rf ~".into());
+        assert_eq!(
+            bm.resume_command().as_deref(),
+            Some("CLAUDE_CONFIG_DIR=/Users/x/.claude-deepseek claude --resume abc")
+        );
+    }
+
+    #[test]
+    fn an_old_bookmark_file_still_reads() {
+        let old: Bookmarks = serde_json::from_str(
+            r#"{"items":[{"agent":"claude","session_id":"abc","cwd":"/a","label":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old.items[0].resume_command().as_deref(),
+            Some("claude --resume abc")
+        );
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(
+            !json.contains("config_dir") && !json.contains("launcher"),
+            "{}",
+            json
+        );
     }
 
     #[test]
@@ -146,6 +221,8 @@ mod tests {
     #[test]
     fn a_shell_bookmark_is_keyed_on_its_directory() {
         let shell = Bookmark {
+            config_dir: None,
+            launcher: None,
             agent: None,
             session_id: None,
             cwd: "/a".into(),
@@ -162,13 +239,22 @@ mod tests {
 
     #[test]
     fn a_shell_bookmark_reopens_without_a_command() {
-        let shell = Bookmark { agent: None, session_id: None, cwd: "/a".into(), label: "a".into() };
+        let shell = Bookmark {
+            config_dir: None,
+            launcher: None,
+            agent: None,
+            session_id: None,
+            cwd: "/a".into(),
+            label: "a".into(),
+        };
         assert_eq!(shell.resume_command(), None);
         assert_eq!(
             claude("abc", "/a").resume_command().as_deref(),
             Some("claude --resume abc")
         );
         let codex = Bookmark {
+            config_dir: None,
+            launcher: None,
             agent: Some(Agent::Codex),
             session_id: Some("01a07651-015e-78a3-97f2-2eaf0f0cd663".into()),
             cwd: "/a".into(),

@@ -4,22 +4,26 @@ mod duplicates;
 mod geometry;
 mod ipc_handlers;
 pub(crate) mod overlays;
-use overlays::{FilterState, RenamePaneState, RenameTabState};
 pub use ipc_handlers::{IpcMergeTabResult, IpcSwapPaneResult, SubjectError};
+use overlays::{FilterState, RenamePaneState, RenameTabState};
 mod recent_projects_overlay;
 use recent_projects_overlay::RecentProjectsState;
 mod resize;
 mod search_palette;
-use search_palette::{is_shortcut, is_typed_char, typed_text, SearchPaletteState, SearchRow};
+use search_palette::{SearchPaletteState, SearchRow, is_shortcut, is_typed_char, typed_text};
 mod switcher;
 mod tabs;
 mod tick;
-use tabs::{MergeTabState, SendToWindowState};
 use switcher::{PaneSwitcherState, SwitcherRow};
+use tabs::{MergeTabState, SendToWindowState};
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2_app_kit::{
+    NSAlert, NSAlertStyle, NSApplication, NSBackingStoreType, NSCursor, NSEvent,
+    NSEventModifierFlags, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions,
+    NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
+};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSObjectProtocol, NSString};
 use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -27,15 +31,15 @@ use objc2_quartz_core::CAMetalLayer;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::Arc;
 
-use crate::appkit_input::{self, copy_to_pasteboard, AppKitInput, PaneOrigin, ScrollAxisLock};
+use crate::appkit_input::{self, AppKitInput, PaneOrigin, ScrollAxisLock, copy_to_pasteboard};
 use crate::config::{Config, TerminalConfig};
 use crate::input::{self, MouseAction, MouseResult};
-use crate::keybindings::{Action, Keybindings, KeyCombo};
-use crate::pane::{alloc_tab_id, NavDirection, Pane, PaneId, SplitDirection, Tab, TabId};
+use crate::keybindings::{Action, KeyCombo, Keybindings};
+use crate::pane::{NavDirection, Pane, PaneId, SplitDirection, Tab, TabId, alloc_tab_id};
 use crate::renderer::{PaneViewport, Renderer};
 use crate::resize_repair::ResizeRepair;
-use crate::terminal::pty::ProcessInfo;
 use crate::terminal::FilterMatch;
+use crate::terminal::pty::ProcessInfo;
 
 #[derive(Clone, Copy)]
 struct SeparatorDrag {
@@ -188,7 +192,11 @@ struct ResizeFeedback {
 }
 
 #[derive(Clone, Copy)]
-enum ResizeMode { Ratio, Virtual, Edge }
+enum ResizeMode {
+    Ratio,
+    Virtual,
+    Edge,
+}
 
 #[derive(Clone, Copy)]
 struct BoundaryHit {
@@ -203,14 +211,8 @@ struct BoundaryFlash {
     remaining_frames: u32,
 }
 
-
-
-
-
-
 /// Debounce window before a keystroke kicks off a live search.
 const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(140);
-
 
 #[derive(Clone)]
 struct PaneFlash {
@@ -248,17 +250,16 @@ fn flash_label_parts(cwd: &str, home: &str) -> (String, String) {
     }
     match trimmed.rsplit_once('/') {
         Some((parent, name)) => {
-            let parent = if parent.is_empty() { "/".to_string() } else { parent.to_string() };
+            let parent = if parent.is_empty() {
+                "/".to_string()
+            } else {
+                parent.to_string()
+            };
             (name.to_string(), parent)
         }
         None => (trimmed.to_string(), String::new()),
     }
 }
-
-
-
-
-
 
 struct SendToWindowEntry {
     label: String,
@@ -271,27 +272,6 @@ struct MergeTabEntry {
     /// Tab index in the current window's tab list.
     tab_index: usize,
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 define_class!(
     #[unsafe(super(objc2_app_kit::NSView))]
@@ -1082,8 +1062,14 @@ impl KovaView {
 
                         pane_details.push(format!(
                             "  w{}t{} pane{}: {}x{}, sb={} lines ({:.1} KB), grid={:.1} KB",
-                            wi, ti, pane.id, cols, rows, sb_len,
-                            sb_b as f64 / 1024.0, grid_b as f64 / 1024.0,
+                            wi,
+                            ti,
+                            pane.id,
+                            cols,
+                            rows,
+                            sb_len,
+                            sb_b as f64 / 1024.0,
+                            grid_b as f64 / 1024.0,
                         ));
                     });
                 }
@@ -1095,8 +1081,11 @@ impl KovaView {
                     total_renderer_bytes += atlas_buf + vbuf;
                     renderer_details.push(format!(
                         "  w{}: atlas={}x{} ({:.1} KB, {} glyphs), vbufs={:.1} MB",
-                        wi, atlas_dims.0, atlas_dims.1,
-                        atlas_buf as f64 / 1024.0, glyph_count,
+                        wi,
+                        atlas_dims.0,
+                        atlas_dims.1,
+                        atlas_buf as f64 / 1024.0,
+                        glyph_count,
                         vbuf as f64 / (1024.0 * 1024.0),
                     ));
                 }
@@ -1124,8 +1113,12 @@ impl KovaView {
         for rd in &renderer_details {
             report.push(format!("~{}", rd));
         }
-        let accounted = total_terminal as f64 / (1024.0 * 1024.0) + total_renderer_bytes as f64 / (1024.0 * 1024.0);
-        report.push(format!("~Unaccounted: {:.1} MB (system/Metal drawables/AppKit)", rss_mb - accounted));
+        let accounted = total_terminal as f64 / (1024.0 * 1024.0)
+            + total_renderer_bytes as f64 / (1024.0 * 1024.0);
+        report.push(format!(
+            "~Unaccounted: {:.1} MB (system/Metal drawables/AppKit)",
+            rss_mb - accounted
+        ));
         report.push(String::from("~(~ = estimated, may differ from RSS)"));
         report.push(String::new());
         for detail in &pane_details {
@@ -1177,11 +1170,15 @@ impl KovaView {
             term.soft_reset();
             term.reset_rows_touched();
         }
-        pane.pty.resize(cols, crate::resize_repair::nudged_rows(rows));
+        pane.pty
+            .resize(cols, crate::resize_repair::nudged_rows(rows));
         // ~50ms @60fps before restoring the real winsize, so the foreground
         // program sees two distinct SIGWINCHs with two distinct sizes. One
         // slot per pane: a second Cmd+R re-arms its own pane's restore only.
-        self.ivars().resize_repair.borrow_mut().schedule_restore(pane_id);
+        self.ivars()
+            .resize_repair
+            .borrow_mut()
+            .schedule_restore(pane_id);
         self.set_pane_flash(pane_id, 20, None);
     }
 
@@ -1195,7 +1192,6 @@ impl KovaView {
         // never while an event handler holds this ref.
         Some(unsafe { &*(pane as *const Pane) })
     }
-
 
     /// Update mouse cursor when hovering over a separator (±3px tolerance).
     fn update_separator_cursor(&self, event: &NSEvent) {
@@ -1220,13 +1216,15 @@ impl KovaView {
 
         for sep in &seps {
             if sep.is_column_sep {
-                if (px - sep.pos).abs() < tolerance && py >= sep.cross_start && py <= sep.cross_end {
+                if (px - sep.pos).abs() < tolerance && py >= sep.cross_start && py <= sep.cross_end
+                {
                     #[allow(deprecated)]
                     NSCursor::resizeLeftRightCursor().set();
                     return;
                 }
             } else {
-                if (py - sep.pos).abs() < tolerance && px >= sep.cross_start && px <= sep.cross_end {
+                if (py - sep.pos).abs() < tolerance && px >= sep.cross_start && px <= sep.cross_end
+                {
                     #[allow(deprecated)]
                     NSCursor::resizeUpDownCursor().set();
                     return;
@@ -1244,8 +1242,15 @@ impl KovaView {
         self.ivars().cmd_held.set(cmd);
         let (px, py) = self.event_to_pixel(event);
         self.update_hovered_url_at(cmd, px, py);
-        let stamp = if self.ivars().hovered_url.borrow().is_some() { self.url_hover_stamp_at(px, py) } else { None };
-        self.ivars().url_hover_tracker.borrow_mut().seen((px, py), stamp);
+        let stamp = if self.ivars().hovered_url.borrow().is_some() {
+            self.url_hover_stamp_at(px, py)
+        } else {
+            None
+        };
+        self.ivars()
+            .url_hover_tracker
+            .borrow_mut()
+            .seen((px, py), stamp);
     }
 
     /// What the cells under `(px, py)` depend on (`input::HoverStamp`): the
@@ -1255,7 +1260,10 @@ impl KovaView {
         let tab = tabs.get(self.ivars().active_tab.get())?;
         let (pane, vp) = tab.hit_test(px, py, self.panes_viewport_for_tab(tab))?;
         let term = pane.terminal.read();
-        Some(crate::input::HoverStamp::of(&term, [vp.x, vp.y, vp.width, vp.height]))
+        Some(crate::input::HoverStamp::of(
+            &term,
+            [vp.x, vp.y, vp.width, vp.height],
+        ))
     }
 
     /// Once per tick: when output, a scroll or a layout change moved the text
@@ -1264,7 +1272,10 @@ impl KovaView {
     /// Free when nothing is hovered or nothing changed.
     pub(super) fn refresh_stale_url_hover(&self) {
         let hovering = self.ivars().hovered_url.borrow().is_some();
-        let point = self.ivars().url_hover_tracker.borrow_mut()
+        let point = self
+            .ivars()
+            .url_hover_tracker
+            .borrow_mut()
             .recheck(hovering, |(px, py)| self.url_hover_stamp_at(px, py));
         if let Some((px, py)) = point {
             // A hover only exists while Cmd is held (`flagsChanged:` drops it).
@@ -1313,7 +1324,9 @@ impl KovaView {
                 let old = self.ivars().hovered_url.borrow().clone();
                 // Same cells, other text (output slid another URL under a
                 // still pointer) is a new hover too: Cmd+click opens `url`.
-                let changed = old.as_ref().map_or(true, |o| o.0 != pane.id || o.1 != segments || o.2 != url);
+                let changed = old
+                    .as_ref()
+                    .map_or(true, |o| o.0 != pane.id || o.1 != segments || o.2 != url);
                 if changed {
                     *self.ivars().hovered_url.borrow_mut() = Some((pane.id, segments, url));
                     NSCursor::pointingHandCursor().set();
@@ -1346,54 +1359,13 @@ impl KovaView {
         }
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     /// Set the highlight pulse on a pane (used by jump_to_search_hit).
     fn set_pane_flash(&self, pane_id: PaneId, frames: u32, label: Option<PaneFlashLabel>) {
-        *self.ivars().pane_flash.borrow_mut() =
-            Some(PaneFlash { pane_id, remaining_frames: frames, label });
+        *self.ivars().pane_flash.borrow_mut() = Some(PaneFlash {
+            pane_id,
+            remaining_frames: frames,
+            label,
+        });
         self.mark_dirty();
     }
 
@@ -1423,7 +1395,9 @@ impl KovaView {
     fn do_toggle_bookmark(&self) {
         let focused = {
             let tabs = self.ivars().tabs.borrow();
-            let Some(tab) = tabs.get(self.ivars().active_tab.get()) else { return };
+            let Some(tab) = tabs.get(self.ivars().active_tab.get()) else {
+                return;
+            };
             tab.focused_pane
         };
         self.toggle_pane_bookmark(focused);
@@ -1436,11 +1410,22 @@ impl KovaView {
         let tabs = self.ivars().tabs.borrow();
         let pane = tabs.iter().find_map(|t| t.pane(pane_id))?;
         let session = pane.agent_session.borrow().clone();
+        let config_dir = session.as_ref().and_then(|s| s.config_dir.clone());
         let saved = crate::bookmarks::Bookmark {
             agent: session.as_ref().map(|s| s.agent),
             session_id: session.as_ref().map(|s| s.id.clone()),
             cwd: pane.cwd().unwrap_or_default(),
             label: pane.display_title("shell"),
+            launcher: crate::claude_session::launcher(
+                pane.last_command().as_deref(),
+                config_dir.as_deref(),
+            )
+            .or_else(|| {
+                config_dir
+                    .as_deref()
+                    .and_then(crate::launchers::for_config_dir)
+            }),
+            config_dir,
         };
         (!saved.cwd.is_empty() || saved.session_id.is_some()).then_some(saved)
     }
@@ -1451,7 +1436,9 @@ impl KovaView {
     fn do_toggle_anchor(&self) {
         let focused = {
             let tabs = self.ivars().tabs.borrow();
-            let Some(tab) = tabs.get(self.ivars().active_tab.get()) else { return };
+            let Some(tab) = tabs.get(self.ivars().active_tab.get()) else {
+                return;
+            };
             tab.focused_pane
         };
         self.toggle_pane_anchor(focused);
@@ -1528,11 +1515,15 @@ impl KovaView {
     /// Show a transient status-bar message for ~2 seconds. Used to explain why an
     /// action did nothing (e.g. Break Pane on a tab that has a single pane).
     fn set_transient_status(&self, msg: &str) {
-        let fps = self.ivars().config.get().map(|c| c.terminal.fps).unwrap_or(60) as u32;
+        let fps = self
+            .ivars()
+            .config
+            .get()
+            .map(|c| c.terminal.fps)
+            .unwrap_or(60) as u32;
         *self.ivars().transient_status.borrow_mut() = Some((msg.to_string(), fps * 2));
         self.mark_dirty();
     }
-
 
     /// Activate the tab containing `tab_id`. Returns true if found.
     fn activate_tab(&self, tab_id: TabId) -> bool {
@@ -1554,28 +1545,7 @@ impl KovaView {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 impl KovaView {
-
-
-
-
-
-
-
-
     /// Close the active window (all its tabs). The timer will detect
     /// the empty tab list and remove the window. App terminates when
     /// the last window is closed (via `applicationShouldTerminateAfterLastWindowClosed`).
@@ -1593,7 +1563,14 @@ impl KovaView {
         };
         let (todos, conversations) = open_todos_of(&sessions);
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        if !confirm_close(mtm, &procs, &todos, conversations, "Close this window?", "Close") {
+        if !confirm_close(
+            mtm,
+            &procs,
+            &todos,
+            conversations,
+            "Close this window?",
+            "Close",
+        ) {
             return;
         }
         // Save all tabs to recent projects before closing (single I/O cycle)
@@ -1653,8 +1630,12 @@ impl KovaView {
             Action::CloseTab => self.do_close_tab(),
             Action::OpenRecentProject => self.do_open_recent_projects(),
             Action::OpenSearchPalette => self.do_open_search_palette(),
-            Action::OpenPaneSwitcher => self.open_pane_switcher(false, switcher::SwitcherView::Panes),
-            Action::OpenUnreadSwitcher => self.open_pane_switcher(true, switcher::SwitcherView::Panes),
+            Action::OpenPaneSwitcher => {
+                self.open_pane_switcher(false, switcher::SwitcherView::Panes)
+            }
+            Action::OpenUnreadSwitcher => {
+                self.open_pane_switcher(true, switcher::SwitcherView::Panes)
+            }
             Action::ToggleBookmark => self.do_toggle_bookmark(),
             Action::ToggleAnchor => self.do_toggle_anchor(),
             Action::FocusAnchor => self.do_focus_anchor(),
@@ -1693,7 +1674,8 @@ impl KovaView {
                 if let Some(tab) = tabs.get_mut(idx) {
                     let focused_id = tab.focused_pane;
                     if tab.adjust_ratio_directional(focused_id, *delta, *axis)
-                        || tab.adjust_ratio_nearest(focused_id, *delta, *axis) {
+                        || tab.adjust_ratio_nearest(focused_id, *delta, *axis)
+                    {
                         let full = self.drawable_viewport();
                         let min_w = self.min_split_width_px();
                         self.cap_virtual_width(tab, full.width, min_w);
@@ -1715,7 +1697,8 @@ impl KovaView {
                     let min_w = self.min_split_width_px();
                     let screen_w = full.width;
                     // Don't grow if focused pane is already at screen width
-                    let pane_vp = tab.viewport_for_pane(focused_id, self.panes_viewport_for_tab(tab));
+                    let pane_vp =
+                        tab.viewport_for_pane(focused_id, self.panes_viewport_for_tab(tab));
                     let pane_w = pane_vp.map(|vp| vp.width).unwrap_or(0.0);
                     let blocked = *delta > 0.0 && pane_w >= screen_w - 1.0;
                     let old_vw = tab.virtual_width(screen_w, min_w);
@@ -1779,7 +1762,9 @@ impl KovaView {
                 let filter_open = self.ivars().filter.borrow().is_some();
                 if palette_open || rename_open || filter_open {
                     let pasteboard = NSPasteboard::generalPasteboard();
-                    if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+                    if let Some(text) =
+                        unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) }
+                    {
                         let text = text.to_string();
                         if palette_open {
                             self.paste_into_search_palette(&text);
@@ -1794,7 +1779,9 @@ impl KovaView {
                     if let Some(path) = appkit_input::pasted_image_path(&pasteboard) {
                         // The path Kova just built holds no paste terminator.
                         pane.paste(&path);
-                    } else if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+                    } else if let Some(text) =
+                        unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) }
+                    {
                         pane.paste(&text.to_string());
                     }
                 }
@@ -1803,43 +1790,9 @@ impl KovaView {
         true
     }
 
-
-
-
-
-
-
-
-
-
-
-
     // ---------------------------------------------------------------
     // IPC methods (called from app.rs IPC command handlers)
     // ---------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     /// Minimize the focused pane.
     fn do_minimize_pane(&self) {
@@ -1878,7 +1831,6 @@ impl KovaView {
         }
     }
 
-
     /// Navigate focus to an adjacent pane.
     fn do_navigate(&self, dir: NavDirection) {
         let mut tabs = self.ivars().tabs.borrow_mut();
@@ -1892,7 +1844,10 @@ impl KovaView {
         if let Some(neighbor_id) = tab.neighbor(focused_id, dir, panes_vp) {
             tab.focused_pane = neighbor_id;
             if let Some(old) = tab.pane(focused_id) {
-                old.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                old.terminal
+                    .read()
+                    .dirty
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             if let Some(new) = tab.pane(neighbor_id) {
                 // Acknowledge completion and bell on the newly focused pane
@@ -1931,19 +1886,31 @@ impl KovaView {
                             NavDirection::Left | NavDirection::Up => new_tab.last_pane().id,
                         };
                         new_tab.focused_pane = target_id;
-                        self.scroll_to_reveal_pane(new_tab, target_id, self.drawable_viewport().width);
+                        self.scroll_to_reveal_pane(
+                            new_tab,
+                            target_id,
+                            self.drawable_viewport().width,
+                        );
                     }
                     return;
                 }
             }
 
             // First press → record hit and flash the boundary edge
-            self.ivars().boundary_hit.set(Some(BoundaryHit { time: now, direction: dir }));
+            self.ivars().boundary_hit.set(Some(BoundaryHit {
+                time: now,
+                direction: dir,
+            }));
             let flash_edge = match dir {
                 NavDirection::Right | NavDirection::Down => NavDirection::Right,
                 NavDirection::Left | NavDirection::Up => NavDirection::Left,
             };
-            let fps = self.ivars().config.get().map(|c| c.terminal.fps).unwrap_or(60) as u32;
+            let fps = self
+                .ivars()
+                .config
+                .get()
+                .map(|c| c.terminal.fps)
+                .unwrap_or(60) as u32;
             let flash_frames = fps / 4; // ~250ms
             self.ivars().boundary_flash.set(Some(BoundaryFlash {
                 edge: flash_edge,
@@ -1954,7 +1921,10 @@ impl KovaView {
             let idx = self.ivars().active_tab.get();
             if let Some(tab) = tabs.get(idx) {
                 if let Some(pane) = tab.pane(tab.focused_pane) {
-                    pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    pane.terminal
+                        .read()
+                        .dirty
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -1974,10 +1944,16 @@ impl KovaView {
             if tab.swap_panes(focused_id, neighbor_id, dir) {
                 // Mark both panes dirty so they redraw in their new positions
                 if let Some(p) = tab.pane(focused_id) {
-                    p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    p.terminal
+                        .read()
+                        .dirty
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 if let Some(p) = tab.pane(neighbor_id) {
-                    p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    p.terminal
+                        .read()
+                        .dirty
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 // Auto-scroll to reveal the focused pane in its new position
                 self.scroll_to_reveal_pane(tab, focused_id, self.drawable_viewport().width);
@@ -2002,10 +1978,6 @@ impl KovaView {
         }
     }
 
-
-
-
-
     /// Paste into whichever rename editor is open, as one sanitized line.
     fn paste_into_rename(&self, text: &str) {
         // A title is one line: no newline, tab or escape may reach the tab bar
@@ -2015,7 +1987,11 @@ impl KovaView {
             return;
         }
         let insert = |input: &mut String, cursor: &mut usize| {
-            let byte_idx = input.char_indices().nth(*cursor).map(|(i, _)| i).unwrap_or(input.len());
+            let byte_idx = input
+                .char_indices()
+                .nth(*cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(input.len());
             input.insert_str(byte_idx, &text);
             *cursor += text.chars().count();
         };
@@ -2031,19 +2007,12 @@ impl KovaView {
         if let Some(pane) = self.focused_pane() {
             // read_recursive: callers may already hold a read guard on this terminal,
             // and a plain read() queued behind a waiting writer would deadlock.
-            pane.terminal.read_recursive().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            pane.terminal
+                .read_recursive()
+                .dirty
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
-
-
-
-
-
-
-
-
-
-
 
     /// Returns (tab_title, process_name) for each pane with a running foreground process.
     pub fn running_processes(&self) -> Vec<(String, String)> {
@@ -2073,18 +2042,21 @@ impl KovaView {
             (f.origin.x, f.origin.y, f.size.width, f.size.height)
         });
         let backup = self.ivars().tab_backup.borrow();
-        let saved_tabs: Vec<crate::session::SavedTab> = tabs.iter().map(|t| {
-            backup.get(&t.id).cloned().unwrap_or_else(|| crate::session::snapshot_tab(t))
-        }).collect();
+        let saved_tabs: Vec<crate::session::SavedTab> = tabs
+            .iter()
+            .map(|t| {
+                backup
+                    .get(&t.id)
+                    .cloned()
+                    .unwrap_or_else(|| crate::session::snapshot_tab(t))
+            })
+            .collect();
         out.push(crate::session::WindowSession {
             tabs: saved_tabs,
             active_tab,
             frame,
         });
     }
-
-
-
 }
 
 /// Global counter for unique window autosave names.
@@ -2092,7 +2064,12 @@ static WINDOW_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 
 /// Show a confirmation alert listing running processes.
 /// Returns `true` if the user confirmed (or no processes are running).
-pub fn confirm_running_processes(mtm: MainThreadMarker, procs: &[(String, String)], message: &str, confirm_button: &str) -> bool {
+pub fn confirm_running_processes(
+    mtm: MainThreadMarker,
+    procs: &[(String, String)],
+    message: &str,
+    confirm_button: &str,
+) -> bool {
     confirm_close(mtm, procs, &[], 0, message, confirm_button)
 }
 
@@ -2113,7 +2090,12 @@ pub fn confirm_close(
     if procs.is_empty() && todos.is_empty() {
         return true;
     }
-    confirm_action(mtm, message, &close_dialog_text(procs, todos, conversations), confirm_button)
+    confirm_action(
+        mtm,
+        message,
+        &close_dialog_text(procs, todos, conversations),
+        confirm_button,
+    )
 }
 
 /// Informative text of the close / quit confirmation: the running processes,
@@ -2169,7 +2151,12 @@ pub(super) fn open_todos_of(sessions: &[String]) -> (Vec<String>, usize) {
 /// Ask a yes/no question in a warning alert. Returns `true` if the user picked
 /// `confirm_button`. The caller must hold no `RefCell` borrow on the view:
 /// `runModal` spins a run loop that dispatches events, which borrow again.
-pub fn confirm_action(mtm: MainThreadMarker, message: &str, informative: &str, confirm_button: &str) -> bool {
+pub fn confirm_action(
+    mtm: MainThreadMarker,
+    message: &str,
+    informative: &str,
+    confirm_button: &str,
+) -> bool {
     confirm_choice(mtm, message, informative, confirm_button, "Cancel")
 }
 
@@ -2209,7 +2196,13 @@ pub fn prompt_text(
     alert.addButtonWithTitle(&NSString::from_str(confirm_button));
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
     let field = objc2_app_kit::NSTextField::new(mtm);
-    field.setFrame(CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 280.0, height: 24.0 } });
+    field.setFrame(CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize {
+            width: 280.0,
+            height: 24.0,
+        },
+    });
     field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
     field.setStringValue(&NSString::from_str(initial));
     let view: &objc2_app_kit::NSView = &field;
@@ -2223,9 +2216,18 @@ pub fn prompt_text(
 }
 
 /// Create a new Kova window with the given tabs.
-pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, active_tab: usize, deferred_tabs: Vec<(usize, crate::session::SavedTab)>) -> Retained<NSWindow> {
+pub fn create_window(
+    mtm: MainThreadMarker,
+    config: &Config,
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    deferred_tabs: Vec<(usize, crate::session::SavedTab)>,
+) -> Retained<NSWindow> {
     let content_rect = CGRect {
-        origin: CGPoint { x: config.window.x, y: config.window.y },
+        origin: CGPoint {
+            x: config.window.x,
+            y: config.window.y,
+        },
         size: CGSize {
             width: config.window.width,
             height: config.window.height,
@@ -2280,7 +2282,9 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, act
             let tabs_ref = view.ivars().tabs.borrow();
             for tab in tabs_ref.iter() {
                 tab.for_each_pane(&mut |pane| {
-                    if pane.pty.is_live() { total += 1; }
+                    if pane.pty.is_live() {
+                        total += 1;
+                    }
                 });
             }
         }
@@ -2311,10 +2315,6 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, act
     window
 }
 
-
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2322,7 +2322,10 @@ mod tests {
     #[test]
     fn close_dialog_text_lists_the_running_processes_as_before() {
         // Frozen: the text the dialog showed before todos were added to it.
-        let procs = vec![("kova".to_string(), "claude".to_string()), ("logs".to_string(), "tail".to_string())];
+        let procs = vec![
+            ("kova".to_string(), "claude".to_string()),
+            ("logs".to_string(), "tail".to_string()),
+        ];
         assert_eq!(
             close_dialog_text(&procs, &[], 0),
             "The following processes are running:\n\u{2022} Tab \u{ab}kova\u{bb}: claude\n\u{2022} Tab \u{ab}logs\u{bb}: tail"
@@ -2349,14 +2352,6 @@ mod tests {
         );
     }
 
-
-
-
-
-
-
-
-
     #[test]
     fn flash_label_splits_a_cwd_into_directory_and_path_above() {
         let home = "/Users/sam";
@@ -2365,10 +2360,19 @@ mod tests {
             ("kova".to_string(), "~/projects/perso".to_string())
         );
         // Home itself, and the root, are their own name with nothing above.
-        assert_eq!(flash_label_parts(home, home), ("~".to_string(), String::new()));
-        assert_eq!(flash_label_parts("/", home), ("/".to_string(), String::new()));
+        assert_eq!(
+            flash_label_parts(home, home),
+            ("~".to_string(), String::new())
+        );
+        assert_eq!(
+            flash_label_parts("/", home),
+            ("/".to_string(), String::new())
+        );
         // A top-level directory keeps the root as its path line.
-        assert_eq!(flash_label_parts("/tmp", home), ("tmp".to_string(), "/".to_string()));
+        assert_eq!(
+            flash_label_parts("/tmp", home),
+            ("tmp".to_string(), "/".to_string())
+        );
         // A trailing slash must not produce an empty name.
         assert_eq!(
             flash_label_parts("/Users/sam/dev/", home),
@@ -2380,35 +2384,4 @@ mod tests {
             ("dev".to_string(), "/Users/samuel".to_string())
         );
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 }

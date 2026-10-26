@@ -513,6 +513,12 @@ impl LibPane {
         if let Some(state) = self.filter.borrow_mut().as_mut() {
             state.refresh(&s.terminal.read(), now);
         }
+        // The band a filter jump left on its line is cleared once it has run
+        // its course.
+        let showing = s.terminal.read().highlight_line.is_some();
+        if showing {
+            s.terminal.write().tick_highlight_line();
+        }
         // Output or a scroll may have slid other text under a still pointer.
         self.refresh_stale_hover();
 
@@ -564,7 +570,12 @@ impl LibPane {
         let hover = self.hovered_url.borrow();
         let filter_open = self.filter.borrow().is_some();
         // The filter draws on every frame: no need to build its data to know.
-        let filter_data = filter_open.then(|| crate::renderer::FilterRenderData { query: String::new(), matches: Vec::new(), hint: None });
+        let filter_data = filter_open.then(|| crate::renderer::FilterRenderData {
+            query: String::new(),
+            matches: Vec::new(),
+            selected: 0,
+            hint: None,
+        });
         let extras = PaneExtras {
             hovered_url: hover.as_ref().map(|(segments, url)| (segments.as_slice(), url.as_str())),
             filter: filter_data.as_ref(),
@@ -643,8 +654,9 @@ impl LibPane {
     }
 
     /// A key, before anything else sees it: while the filter is open every
-    /// key goes to it (typing filters, ↑/↓ recall, Enter jumps to the first
-    /// match, Escape or Ctrl+F closes); otherwise Ctrl+F opens it, and
+    /// key goes to it (typing filters, ↑/↓ pick a match or recall a query,
+    /// Enter jumps to the picked match, Escape or Ctrl+F closes); otherwise
+    /// Ctrl+F opens it, and
     /// Kova.app's other window keys (Ctrl+Option+arrows, its virtual width)
     /// do nothing here. True when the key was taken: it must not reach the
     /// PTY. Shared by the view and `kova_pane_key`.
@@ -675,10 +687,12 @@ impl LibPane {
             }
             FilterKeyOutcome::Jump => {
                 if let Some(mut state) = self.close_filter() {
-                    state.jump_to_pick(0, &mut self.surface.terminal.write());
+                    let picked = state.selected;
+                    state.jump_to_pick(picked, &mut self.surface.terminal.write());
                 }
             }
             FilterKeyOutcome::Rerun => self.rerun_filter(),
+            FilterKeyOutcome::Navigate => self.mark_dirty(),
             FilterKeyOutcome::Ignored => {}
         }
         true
@@ -709,11 +723,28 @@ impl LibPane {
     /// open: on a listed line, close the filter and scroll to it; below the
     /// list, close it; on the query bar, nothing.
     fn filter_click(&self, py: f32) {
-        let Some((_, (_, cell_h), _)) = self.geometry() else { return };
-        let Some(row) = filter::filter_click_row(py, 0.0, cell_h) else { return };
-        let Some(mut state) = self.close_filter() else { return };
-        if row < state.matches.len() {
-            state.jump_to_pick(row, &mut self.surface.terminal.write());
+        let Some((scale, (_, cell_h), _)) = self.geometry() else {
+            return;
+        };
+        let Some(row) = filter::filter_click_row(py, 0.0, cell_h) else {
+            return;
+        };
+        // `py` and `cell_h` are drawable pixels, `bounds()` is in points: one
+        // scale apart, and mixing the two halves the clickable window on a
+        // Retina screen, so a click below its middle lands on the wrong row.
+        let height_px = self
+            .view()
+            .map_or(0.0, |v| v.bounds().size.height as f32 * scale as f32);
+        let Some(mut state) = self.close_filter() else {
+            return;
+        };
+        // The rows are drawn from the scroll that keeps the pick in view, so a
+        // click lands on that window's row, not on the list's.
+        let max_visible = ((height_px / cell_h).floor() as usize).saturating_sub(1);
+        if let Some(idx) =
+            filter::filter_click_pick(state.selected, max_visible, row, state.matches.len())
+        {
+            state.jump_to_pick(idx, &mut self.surface.terminal.write());
         }
     }
 
@@ -1611,8 +1642,9 @@ mod tests {
     }
 
     /// Ctrl+F opens Kova.app's filter in a library pane: typing filters the
-    /// pane's lines, Enter closes it on the first match, Escape and Ctrl+F
-    /// close it; Ctrl+Option+arrows do nothing; no key reaches the PTY.
+    /// pane's lines, ↑/↓ pick a match (starting on the first) and Enter closes
+    /// it on that one, Escape and Ctrl+F close it; Ctrl+Option+arrows do
+    /// nothing; no key reaches the PTY.
     #[test]
     fn the_filter_takes_the_keys_of_a_library_pane() {
         use crate::input::tests::typed;
@@ -1640,7 +1672,7 @@ mod tests {
         assert!(pane.paste_into_filter("ta 1\nignored"));
         assert_eq!(pane.filter.borrow().as_ref().unwrap().matches.len(), 1);
 
-        // Enter: closed, scrolled back to the first match.
+        // Enter: closed, scrolled back to the picked match (the first one).
         assert!(pane.filter_key(&typed("\r", "\r", 0x24, "")));
         assert!(!pane.filter_open());
         assert!(pane.surface.terminal.read().scroll_offset() > 0, "scrolled to `beta 1` in the scrollback");
@@ -1652,6 +1684,42 @@ mod tests {
         assert!(pane.filter_key(&ctrl_f()), "Ctrl+F again closes it");
         assert!(!pane.filter_open());
         assert!(!pane.paste_into_filter("x"), "closed: the paste is the pane's");
+        assert_eq!(drain(&reader), b"", "nothing reached the PTY");
+        assert!(close(id));
+    }
+
+    /// Enter jumps to the match ↑/↓ picked, not to the first one: the line the
+    /// pane lands on follows the pick.
+    #[test]
+    fn enter_jumps_to_the_picked_match() {
+        use crate::input::tests::typed;
+        let (id, reader) = create_capture(20, 3);
+        let pane = find(id).unwrap();
+        type_lines(
+            &pane,
+            &["alpha", "beta 1", "gamma", "beta 2", "delta", "eps"],
+        );
+        // Type "bet", press ↓ `downs` times, Enter, and report where the
+        // scrollback landed. The filter closes, so each run reopens it.
+        let jump = |downs: usize| {
+            assert!(pane.filter_key(&ctrl_f()));
+            for (chars, code) in [("b", 0x0B), ("e", 0x0E), ("t", 0x11)] {
+                assert!(pane.filter_key(&typed(chars, chars, code, "")));
+            }
+            for _ in 0..downs {
+                assert!(pane.filter_key(&typed("\u{F701}", "\u{F701}", 0x7D, "")));
+            }
+            assert!(pane.filter_key(&typed("\r", "\r", 0x24, "")));
+            pane.surface.terminal.read().scroll_offset()
+        };
+        let first = jump(0);
+        let second = jump(1);
+        // The second match sits further down the buffer, so centring on it
+        // leaves a smaller offset into the scrollback.
+        assert!(
+            second < first,
+            "↓ then Enter landed on the second match: {second} vs {first}"
+        );
         assert_eq!(drain(&reader), b"", "nothing reached the PTY");
         assert!(close(id));
     }

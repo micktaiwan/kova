@@ -435,9 +435,9 @@ pub fn surface_json(
         // this Mac. False on a pane that is not waiting at all, where the bit means nothing.
         "awaiting_seen": pane.is_awaiting() && !pane.is_awaiting_unseen(),
         "minimized": minimized,
-        // Which agent holds the pane's conversation ("claude", "codex"), absent
-        // at a bare shell. `claude_session_id` stays Claude-only so a client
-        // that resumes with it never gets an id Claude cannot open; the
+        // Which agent holds the pane's conversation ("claude", "codex", "pi"),
+        // absent at a bare shell. `claude_session_id` stays Claude-only so a
+        // client that resumes with it never gets an id Claude cannot open; the
         // agent-agnostic id is next to it.
         "agent": pane.agent_kind().map(|a| a.as_str()),
         "agent_session_id": pane.agent_session_id(),

@@ -200,6 +200,55 @@ fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
     }
 }
 
+/// Drop a Pi conversation that two panes claim at once.
+///
+/// Pi writes no file per process, so the pane a conversation belongs to is read
+/// from the directory and the start time (`pi_session`). Two `pi` panes in the
+/// same directory leave that guess with one file to hand out, and it would go to
+/// both — one pane reopening the other's transcript. Neither is better than a
+/// pane that starts its own session, so both keep their last command instead.
+/// Other agents are left alone: their detection names the process itself, so the
+/// same id twice there would mean the same conversation really was open twice.
+fn drop_shared_pi_sessions(windows: &mut [WindowSession]) {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for window in windows.iter() {
+        for pane in window
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.flat_columns.iter().flatten())
+            .flat_map(|col| col.panes.iter())
+        {
+            if let Some(session) = pane
+                .agent_session
+                .as_ref()
+                .filter(|s| s.agent == crate::agent_session::Agent::Pi)
+            {
+                *counts.entry(session.id.clone()).or_default() += 1;
+            }
+        }
+    }
+    if counts.values().all(|&count| count < 2) {
+        return;
+    }
+    for window in windows.iter_mut() {
+        for pane in window
+            .tabs
+            .iter_mut()
+            .flat_map(|tab| tab.flat_columns.iter_mut().flatten())
+            .flat_map(|col| col.panes.iter_mut())
+        {
+            let shared = pane
+                .agent_session
+                .as_ref()
+                .filter(|s| s.agent == crate::agent_session::Agent::Pi)
+                .is_some_and(|s| counts.get(&s.id).copied().unwrap_or(0) > 1);
+            if shared {
+                pane.agent_session = None;
+            }
+        }
+    }
+}
+
 /// The conversation a pane is saved with: the agent running in it, or else the
 /// one a launch restore left asleep there, or woke but whose agent has not
 /// registered yet (`Surface::unregistered_session`) — no agent is seen running,
@@ -314,9 +363,11 @@ fn save_internal(windows: &[WindowSession], rotate: bool) {
     if !owns_session() {
         return;
     }
+    let mut windows = windows.to_vec();
+    drop_shared_pi_sessions(&mut windows);
     let session = Session {
         version: SESSION_VERSION,
-        windows: windows.to_vec(),
+        windows,
     };
 
     let path = session_path();
@@ -341,7 +392,7 @@ fn save_internal(windows: &[WindowSession], rotate: bool) {
             if let Err(e) = write_owner_only(&path, &json) {
                 log::warn!("Failed to write session file: {}", e);
             } else {
-                log::info!("Session saved to {} ({} window(s))", path.display(), windows.len());
+                log::info!("Session saved to {} ({} window(s))", path.display(), session.windows.len());
             }
         }
         Err(e) => log::warn!("Failed to serialize session: {}", e),
@@ -1056,8 +1107,19 @@ mod tests {
         let saved = session_to_save(None, asleep.clone()).expect("not forgotten");
         assert_eq!((saved.agent, saved.id.as_str()), (Agent::Codex, "sleeping"));
 
-        let live = AgentSession { agent: Agent::Claude, id: "live".into(), name: None, peer_name: None, config_dir: None };
-        assert_eq!(session_to_save(Some(live), asleep).unwrap().id, "live", "a running agent wins");
+        let live = AgentSession {
+            pid: None,
+            agent: Agent::Claude,
+            id: "live".into(),
+            name: None,
+            peer_name: None,
+            config_dir: None,
+        };
+        assert_eq!(
+            session_to_save(Some(live), asleep).unwrap().id,
+            "live",
+            "a running agent wins"
+        );
         assert!(session_to_save(None, None).is_none());
     }
 
@@ -1124,6 +1186,80 @@ mod tests {
         assert_eq!(
             restore_command(&sp).as_deref(),
             Some("codex resume 01a07651-015e-78a3-97f2-2eaf0f0cd663")
+        );
+    }
+
+    fn window_with(panes: Vec<SavedPane>) -> WindowSession {
+        WindowSession {
+            tabs: vec![SavedTab {
+                flat_columns: Some(vec![SavedFlatColumn {
+                    panes,
+                    row_weights: Vec::new(),
+                    custom_row_weights: None,
+                }]),
+                columns: None,
+                column_weights: None,
+                custom_weights: None,
+                tree: None,
+                focused_leaf_index: 0,
+                custom_title: None,
+                color: None,
+                virtual_width_override: None,
+                scroll_offset_x: None,
+                geometry_scale: None,
+                subjects: Vec::new(),
+                subject_colors: Default::default(),
+            }],
+            active_tab: 0,
+            frame: None,
+        }
+    }
+
+    fn pi_pane(cwd: &str, id: &str) -> SavedPane {
+        let mut sp = pane(cwd);
+        sp.last_command = Some("pi".into());
+        sp.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Pi,
+            id: id.into(),
+            config_dir: None,
+        });
+        sp
+    }
+
+    #[test]
+    fn two_panes_claiming_the_same_pi_conversation_both_drop_it() {
+        let mut windows = vec![window_with(vec![
+            pi_pane("/a", "same"),
+            pi_pane("/a", "same"),
+        ])];
+        drop_shared_pi_sessions(&mut windows);
+        let panes = &windows[0].tabs[0].flat_columns.as_ref().unwrap()[0].panes;
+        assert!(
+            panes.iter().all(|p| p.agent_session.is_none()),
+            "neither pane reopens a shared conversation"
+        );
+        assert!(
+            panes
+                .iter()
+                .all(|p| restore_command(p).as_deref() == Some("pi"))
+        );
+    }
+
+    #[test]
+    fn distinct_pi_conversations_are_left_alone() {
+        let mut windows = vec![window_with(vec![
+            pi_pane("/a", "one"),
+            pi_pane("/b", "two"),
+        ])];
+        drop_shared_pi_sessions(&mut windows);
+        let panes = &windows[0].tabs[0].flat_columns.as_ref().unwrap()[0].panes;
+        assert_eq!(
+            restore_command(&panes[0]).as_deref(),
+            Some("pi --session one")
+        );
+        assert_eq!(
+            restore_command(&panes[1]).as_deref(),
+            Some("pi --session two")
         );
     }
 

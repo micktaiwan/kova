@@ -90,10 +90,21 @@ fn default_true() -> bool {
     true
 }
 
+/// The button always added after the asker's actions when the card has a text field: a typed
+/// answer that is none of the proposed choices must not ride on one of them ("A: stop everything").
+pub const OTHER: &str = "Other";
+
 impl Question {
     /// The buttons the card shows.
     pub fn buttons(&self) -> Vec<String> {
-        if self.actions.is_empty() { vec!["Reply".to_string()] } else { self.actions.clone() }
+        if self.actions.is_empty() {
+            return vec!["Reply".to_string()];
+        }
+        let mut buttons = self.actions.clone();
+        if self.input && !buttons.iter().any(|b| b == OTHER) {
+            buttons.push(OTHER.to_string());
+        }
+        buttons
     }
 }
 
@@ -941,7 +952,8 @@ usage: kova ask \"<message>\" [--actions OK,KO] [--no-input] [--from <name>] [--
 Shows a card in Kova with the message, one button per action and a text field, then waits for
 the user and prints the answer on stdout: the action, or \"action: text\" when they typed something.
 
-  --actions     buttons, comma-separated (default: a single \"Reply\" button)
+  --actions     buttons, comma-separated (default: a single \"Reply\" button). With a text field, the
+                card adds an \"Other\" button after them, and text sent with Enter answers \"Other: text\"
   --no-input    no text field, buttons only
   --from        the name shown on the card (default: the working directory's name)
   --timeout     seconds to wait. Default: 540 inside a Claude Code conversation (under the Bash tool's
@@ -1345,8 +1357,19 @@ mod tests {
         let mut q = question(id);
         q.actions = vec!["OK".into(), "KO".into()];
         assert_eq!(check_answer(Some(&q), id, "OK", "fine"), Ok(()));
-        assert_eq!(check_answer(Some(&q), id, "Reply", ""), Err("\"action\" must be one of: OK, KO".into()));
-        assert_eq!(check_answer(Some(&q), id, "ok", ""), Err("\"action\" must be one of: OK, KO".into()));
+        assert_eq!(
+            check_answer(Some(&q), id, "Other", "my own answer"),
+            Ok(()),
+            "a text field brings Other"
+        );
+        assert_eq!(
+            check_answer(Some(&q), id, "Reply", ""),
+            Err("\"action\" must be one of: OK, KO, Other".into())
+        );
+        assert_eq!(
+            check_answer(Some(&q), id, "ok", ""),
+            Err("\"action\" must be one of: OK, KO, Other".into())
+        );
         q.actions.clear();
         assert_eq!(check_answer(Some(&q), id, "Reply", "x"), Ok(()), "no actions: the single Reply button");
         q.input = false;
@@ -1382,6 +1405,26 @@ mod tests {
         let bare: Question = serde_json::from_str(r#"{"id":"q","message":"m","from":{"name":"n"}}"#).unwrap();
         assert!(bare.input);
         assert_eq!(bare.buttons(), vec!["Reply".to_string()]);
+    }
+
+    #[test]
+    fn a_card_with_a_text_field_always_offers_other() {
+        let mut q = question("q1");
+        q.actions = vec!["A".into(), "B".into()];
+        assert_eq!(
+            q.buttons(),
+            vec!["A", "B", OTHER],
+            "typed text must not ride on A"
+        );
+        q.actions = vec!["Retry".into(), OTHER.into()];
+        assert_eq!(q.buttons(), vec!["Retry", OTHER], "never twice");
+        q.actions = vec!["A".into(), "B".into()];
+        q.input = false;
+        assert_eq!(
+            q.buttons(),
+            vec!["A", "B"],
+            "no field, nothing to type, no Other"
+        );
     }
 
     #[test]

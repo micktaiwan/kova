@@ -1,6 +1,6 @@
 ---
 name: kova
-description: "Drive Kova, a native macOS terminal (Rust + Metal), from Claude Code: open a split or a tab and run a command in it, list panes and the Claude Code or Codex sessions they hold, read a pane (its whole conversation, not just the screen), send keys, wait for a command to finish, trigger any keyboard shortcut, follow focus changes, post a notification, ask the user a question on a card. Use when: 'open a pane', 'new tab', 'run X in another pane', 'split', 'list the panes', 'read pane N', 'merge pane N', 'what is running in my terminal', 'ask me when you need an answer', or when a task needs a terminal the user can see."
+description: "Drive Kova, a native macOS terminal (Rust + Metal), from Claude Code: open a split or a tab and run a command in it, list panes and the Claude Code, Codex or Pi sessions they hold, read a pane (its whole conversation, not just the screen), send keys, wait for a command to finish, trigger any keyboard shortcut, follow focus changes, post a notification, ask the user a question on a card. Use when: 'open a pane', 'new tab', 'run X in another pane', 'split', 'list the panes', 'read pane N', 'merge pane N', 'what is running in my terminal', 'ask me when you need an answer', or when a task needs a terminal the user can see."
 ---
 
 # Kova — a scriptable terminal
@@ -58,7 +58,7 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 | Split the focused pane | `{"cmd":"split","direction":"horizontal"}` (side by side, the default) or `"vertical"` (stacked) → `pane_id` |
 | New tab | `{"cmd":"new-tab","cwd":"/abs/path","command":"…"}` → `tab_id`, `pane_id` |
 | List panes / tabs | `{"cmd":"list-panes"}`, `{"cmd":"list-tabs"}` |
-| Read a pane's screen | `{"cmd":"get-pane-content","panes":[42],"mode":"all"}` (the field is `panes`, a list or `"all"`, not `pane_id`) |
+| Read a pane's screen | `{"cmd":"get-pane-content","panes":[42],"mode":"visible"}` (the field is `panes`, a list or `"all"`, not `pane_id`; `mode` is `visible`, `scrollback` or `all`; the answer is `data.panes[]`, each `{id, text, cursor, cols, rows}`) |
 | Size before reading | `{"cmd":"count-pane-content","panes":"all","mode":"all"}` (responses have no cap) |
 | Type into a pane | `{"cmd":"send-keys","pane_id":42,"text":"make\n"}` (end with `\n` or it is typed, not run) |
 | Wait for the command | `{"cmd":"wait-for-completion","pane_id":42,"timeout_ms":300000}` |
@@ -131,12 +131,18 @@ Each pane carries `id`, `window`, `tab`, `cwd`, `title`, `focused`, `pid`, `chil
   client walking waiting panes must honor `awaiting_seen`, or it offers panes already read.
   `awaiting` shows nowhere in Kova's UI: it is an IPC field. What `Cmd+J`, the switcher's `Tab`
   and the `●N` counter walk is unread output (a bell, a finished command).
-- `agent` (`"claude"`, `"codex"` or `null` for a bare shell), `agent_session_id` and
+- `agent` (`"claude"`, `"codex"`, `"pi"` or `null` for a bare shell), `agent_session_id` and
   `agent_session_name`: the conversation in the pane, whatever the agent. For Codex the name comes
-  from `~/.codex/session_index.jsonl`. A Codex session resumes with `codex resume <id>` and is not
-  reachable through `ListAgents` / `SendMessage`.
+  from `~/.codex/session_index.jsonl`; for Pi it is the title Pi shows in `/resume` — the latest
+  `/name`, else the first message of the conversation — read from the transcript. A Codex session
+  resumes with `codex resume <id>`, a Pi one with `pi --session <id>`, and neither is reachable
+  through `ListAgents` / `SendMessage`. Pi writes no file per process: its conversation is matched
+  by directory and start time, so two `pi` panes that resumed older conversations in the same
+  directory can come out identical — when the snapshot hands both the same id, both keep their last
+  command and come back as a bare `pi`. A `pi` started with `--no-session` or `--session-dir` is not
+  detected at all.
 - `claude_session_id` (what `claude --resume` takes) and `claude_session_name` (the `/rename`
-  name, `null` until there is one): Claude only, `null` on a Codex pane so that a client passing it
+  name, `null` until there is one): Claude only, `null` on a Codex or Pi pane so that a client passing it
   to `claude --resume` never gets an id Claude cannot open. **This id is the only identifier that
   outlives the pane**: the pane id dies with its tab, and a directory is shared by every
   conversation of the same repo. Key on it.
@@ -144,7 +150,7 @@ Each pane carries `id`, `window`, `tab`, `cwd`, `title`, `focused`, `pid`, `chil
   shows. To talk to a pane's session, take its `peer_name` and pass it as is to `SendMessage`,
   never `send-keys` (typed text is not submitted the way a message is). It carries the name Claude
   Code derived from the directory even before any `/rename`, which `claude_session_name` does not.
-  `null` for Codex and for a pane without Claude.
+  `null` for Codex, for Pi, and for a pane without Claude.
 - `dormant_session_id`: **after a Kova relaunch, a restored agent resumes only once its pane is
   on screen in the active tab** (or on `wake-pane`). Until then the pane is a bare shell with this
   field set, and `agent`, the session ids and `peer_name` are `null`: the session is not in
@@ -187,7 +193,11 @@ asks nothing, unlike `Cmd+⌫` in `Cmd+P`: the panes stay open, out of any box. 
   conversation both anchored and bookmarked shows only under the anchors.
 - `Cmd+B` bookmarks the focused pane's conversation (`~/.config/kova/bookmarks.json`); `Cmd+P`
   lists bookmarks at the end, grouped by directory. Enter jumps to the pane if it still runs,
-  otherwise reopens the conversation in its project and runs its resume line. `Cmd+⌫` on a
+  otherwise reopens the conversation in its project and runs its resume line. A conversation
+  started by a launcher with its own `CLAUDE_CONFIG_DIR` (`~/.claude-<name>`) is saved with that
+  dir and launcher and reopens through the launcher (`<launcher> --resume <id>`); the last
+  launcher seen per config dir is kept in `~/.config/kova/launchers.json`, which the search
+  palette also uses to reopen a closed conversation of that dir. `Cmd+⌫` on a
   bookmark row removes it after a confirmation. Kova does not check that the transcript still
   exists: Claude Code deletes transcripts idle longer than `cleanupPeriodDays`, and such a bookmark
   reopens on an error.
@@ -270,9 +280,10 @@ action, or `action: text` when the user typed something.
   end your turn.
 - Exit 1: an error, or Kova quit while you waited (the question comes back at the next launch). If
   the message says the running Kova "predates `ask`", it learns the command at its next launch.
-- **Offered choices end with an "Other" button** (`--actions "Retry,Call,Other"`), never two closed
-  options alone: the card has a text field, but without a button announcing it the card reads as a
-  forced choice. A yes/no validation (`OK,KO`) is the exception.
+- **The card adds an "Other" button after your actions whenever it has a text field** (not with
+  `--no-input`, nor on the lone default "Reply"): don't list it yourself. Text typed and sent with
+  Enter goes out as `Other: <text>`, so a free answer never reads as one of your choices. Read
+  `Other: …` as the user's own answer, not a pick.
 - **Break a long question into short lines**: one idea per line, a blank line between blocks, a
   list as one item per line. The card shows line breaks as they are, but only real ones: inside
   `"…"` a `\n` stays a backslash and an `n` on the card. Put actual line breaks inside the quotes,

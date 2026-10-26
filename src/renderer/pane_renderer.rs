@@ -18,8 +18,8 @@
 use super::context::RenderContext;
 use super::vertex::Vertex;
 use super::{
-    bg_runs, fade_toward, format_count, format_last_activity, program_status_color, push_bg_quad,
-    PaneAttention, PaneRenderData, PaneViewport, TooltipZone, ITALIC_SHEAR,
+    ITALIC_SHEAR, PaneAttention, PaneRenderData, PaneViewport, TooltipZone, bg_runs, fade_toward,
+    format_count, format_last_activity, program_status_color, push_bg_quad, push_bg_quad_alpha,
 };
 use crate::config::{Config, DimMode};
 use crate::pane::PaneId;
@@ -37,6 +37,10 @@ pub struct PaneStyle {
     /// Colour of a block tagged to be copied out (see `terminal::paste_block`).
     pub(super) paste_block_color: [f32; 3],
     pub(super) selection_color: [f32; 3],
+    /// Band behind the row picked in a list the renderer draws over a pane
+    /// (the Ctrl+F filter's). The window's own lists read the same colour off
+    /// the config; a library pane has no window, so it comes through here.
+    pub(super) list_selected_bg: [f32; 3],
     pub(super) status_bar_enabled: bool,
     /// How much an unfocused pane is faded (see `DimMode`).
     pub(super) dim_opacity: f32,
@@ -61,6 +65,7 @@ impl PaneStyle {
             cursor_color: config.colors.cursor,
             paste_block_color: config.colors.paste_block,
             selection_color: [0.45, 0.42, 0.20],
+            list_selected_bg: config.switcher.selected_bg,
             status_bar_enabled: config.status_bar.enabled,
             dim_opacity: config.splits.dim_opacity,
             dim_mode: config.splits.dim_mode,
@@ -89,6 +94,9 @@ struct PaneVertexEntry {
     /// Status-bar tooltip zones the build registered, replayed on reuse.
     zones: Vec<TooltipZone>,
 }
+
+/// The band a filter jump leaves for a moment on the line it landed on.
+const JUMP_HIGHLIGHT: [f32; 3] = [1.0, 0.85, 0.3];
 
 /// What a pane's vertices depend on apart from its terminal grid. These
 /// change without the pane being marked dirty (a cursor blink, a hovered
@@ -373,9 +381,12 @@ impl PaneBuild<'_> {
 
         let mut vertices = Vec::with_capacity(display.len() * term.cols as usize * 6);
 
-        // Precompute selection abs_line base if selection is active
+        // Absolute line the first drawn row sits on: what anything that bands a
+        // row by its index needs — the text selection, and the transient
+        // highlight a filter jump leaves behind.
+        let highlight = term.highlight_line;
         let has_selection = term.selection.is_some();
-        let abs_line_base = if has_selection {
+        let abs_line_base = if has_selection || highlight.is_some() {
             term.scrollback_len() as i64 - term.scroll_offset() as i64
         } else {
             0
@@ -402,6 +413,28 @@ impl PaneBuild<'_> {
                     if term.is_selected(abs_line, col_idx as u16) {
                         let x = (ox + col_idx as f32 * cell_w).round();
                         push_bg_quad(&mut vertices, x, y, cell_w, cell_h, self.style.selection_color);
+                    }
+                }
+            }
+
+            // The band a filter jump leaves on the line it landed on: full
+            // width and fading, so it reads as "here" without ever looking
+            // like a selection someone made.
+            if let Some((line, since)) = highlight {
+                if abs_line == line {
+                    // Read from the clock, not from a counter: the band is as
+                    // strong as the time since the jump says, whatever the
+                    // host's frame rate.
+                    if let Some(alpha) = crate::terminal::highlight_alpha(since.elapsed()) {
+                        push_bg_quad_alpha(
+                            &mut vertices,
+                            vp.x,
+                            y,
+                            vp.width,
+                            cell_h,
+                            JUMP_HIGHLIGHT,
+                            alpha * 0.45,
+                        );
                     }
                 }
             }

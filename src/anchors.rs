@@ -62,6 +62,8 @@ pub fn from_named(
     label: Option<String>,
 ) -> Anchor {
     Anchor {
+        config_dir: None,
+        launcher: None,
         session_id: session_id.filter(|_| agent.is_some()),
         agent,
         label: label.unwrap_or_else(|| {
@@ -132,6 +134,8 @@ mod tests {
 
     fn claude(id: &str, cwd: &str) -> Anchor {
         Anchor {
+            config_dir: None,
+            launcher: None,
             agent: Some(Agent::Claude),
             session_id: Some(id.to_string()),
             cwd: cwd.to_string(),
@@ -167,6 +171,8 @@ mod tests {
     #[test]
     fn promoting_a_shell_dedupes_on_its_directory() {
         let shell = |cwd: &str| Anchor {
+            config_dir: None,
+            launcher: None,
             agent: None,
             session_id: None,
             cwd: cwd.to_string(),

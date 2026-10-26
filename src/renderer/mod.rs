@@ -64,8 +64,7 @@ fn dim_inactive_tab(c: [f32; 3]) -> [f32; 3] {
 }
 
 const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
 /// Format a Unix timestamp (seconds) as "DD/MMM HH:mm" in local time.
@@ -74,7 +73,10 @@ fn format_last_activity(ts: u64) -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&t, &mut tm) };
     let mon = MONTHS.get(tm.tm_mon as usize).copied().unwrap_or("???");
-    format!("{:02}/{} {:02}:{:02}", tm.tm_mday, mon, tm.tm_hour, tm.tm_min)
+    format!(
+        "{:02}/{} {:02}:{:02}",
+        tm.tm_mday, mon, tm.tm_hour, tm.tm_min
+    )
 }
 
 /// Format a count as human-readable string (e.g. "1.2K", "3.4M").
@@ -92,22 +94,22 @@ fn format_count(n: u64) -> String {
 
 use blink::CursorBlink;
 use context::RenderContext;
-use pane_renderer::{PaneDrawKey, PaneRenderer, PaneStyle};
-#[cfg(test)]
-use pane_renderer::{can_reuse_pane_cache, PaneBuild};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::*;
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
+#[cfg(test)]
+use pane_renderer::{PaneBuild, can_reuse_pane_cache};
+use pane_renderer::{PaneDrawKey, PaneRenderer, PaneStyle};
 use parking_lot::RwLock;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::SystemTime;
 use vertex::Vertex;
 
-use crate::config::{Config, KeysConfig};
 #[cfg(test)]
 use crate::config::DimMode;
+use crate::config::{Config, KeysConfig};
 use crate::pane::PaneId;
 
 /// Color of the minimized-pane marker (status-bar counter and switcher ⊟ icon).
@@ -162,7 +164,9 @@ pub struct SubjectStrip {
 /// among the column's panes, top first. Neighboring columns of the same
 /// subject make one segment; a column in no subject breaks the run, so the
 /// same name shows twice when a subject's panes are apart.
-pub fn subject_strip_segments(columns: &[(f32, f32, Option<(String, Option<usize>)>, bool)]) -> Vec<SubjectSegment> {
+pub fn subject_strip_segments(
+    columns: &[(f32, f32, Option<(String, Option<usize>)>, bool)],
+) -> Vec<SubjectSegment> {
     let mut out: Vec<SubjectSegment> = Vec::new();
     let mut previous_filed = false;
     for (x, width, subject, focused) in columns {
@@ -207,7 +211,13 @@ enum PaneAttention {
 
 impl PaneAttention {
     fn from_flags(has_bell: bool, has_completion: bool) -> Self {
-        if has_bell { Self::Bell } else if has_completion { Self::Completion } else { Self::None }
+        if has_bell {
+            Self::Bell
+        } else if has_completion {
+            Self::Completion
+        } else {
+            Self::None
+        }
     }
 
     fn dot_color(self) -> Option<[f32; 4]> {
@@ -226,17 +236,31 @@ impl PaneAttention {
         }
     }
 }
-use crate::terminal::{Cell, FilterMatch, TerminalState};
 #[cfg(test)]
 use crate::terminal::CursorShape;
+use crate::terminal::{Cell, FilterMatch, TerminalState};
 
 /// Data passed to the renderer for drawing filter overlay.
 pub struct FilterRenderData {
     pub query: String,
     pub matches: Vec<FilterMatch>,
+    /// The match ↑/↓ picked in the list: painted as the selected row, and the
+    /// one Enter jumps to.
+    pub selected: usize,
     /// Shown instead of the match count when there is nothing to count yet —
     /// how to get back a query filtered earlier in this run.
     pub hint: Option<String>,
+}
+
+/// First listed match the filter overlay draws, so the row at `selected` stays
+/// in view. Stateless on purpose: the list shows `max_visible` rows starting
+/// here, and both the drawing and the click hit-testing go through this one
+/// function, so a click always lands on the row it was drawn over.
+pub fn filter_list_scroll(selected: usize, max_visible: usize) -> usize {
+    if max_visible == 0 {
+        return 0;
+    }
+    selected.saturating_sub(max_visible - 1)
 }
 
 /// A single closed tab in the `Cmd+O` overlay.
@@ -443,21 +467,41 @@ fn flash_label_layout(
     let parent_scale = if parent_chars == 0 {
         FLASH_PARENT_SCALE
     } else {
-        FLASH_PARENT_SCALE.min((pw * FLASH_WIDTH_RATIO) / (parent_chars as f32 * cell_w)).max(0.6)
+        FLASH_PARENT_SCALE
+            .min((pw * FLASH_WIDTH_RATIO) / (parent_chars as f32 * cell_w))
+            .max(0.6)
     };
     let parent_w = parent_chars as f32 * cell_w * parent_scale;
-    let parent_h = if parent_chars == 0 { 0.0 } else { cell_h * parent_scale };
-    let gap = if parent_chars == 0 { 0.0 } else { name_h * 0.15 };
+    let parent_h = if parent_chars == 0 {
+        0.0
+    } else {
+        cell_h * parent_scale
+    };
+    let gap = if parent_chars == 0 {
+        0.0
+    } else {
+        name_h * 0.15
+    };
 
     // Same shrink-rather-than-clip rule as the path line.
     let session_scale = if session_chars == 0 {
         FLASH_SESSION_SCALE
     } else {
-        FLASH_SESSION_SCALE.min((pw * FLASH_WIDTH_RATIO) / (session_chars as f32 * cell_w)).max(0.6)
+        FLASH_SESSION_SCALE
+            .min((pw * FLASH_WIDTH_RATIO) / (session_chars as f32 * cell_w))
+            .max(0.6)
     };
     let session_w = session_chars as f32 * cell_w * session_scale;
-    let session_h = if session_chars == 0 { 0.0 } else { cell_h * session_scale };
-    let session_gap = if session_chars == 0 { 0.0 } else { name_h * 0.15 };
+    let session_h = if session_chars == 0 {
+        0.0
+    } else {
+        cell_h * session_scale
+    };
+    let session_gap = if session_chars == 0 {
+        0.0
+    } else {
+        name_h * 0.15
+    };
 
     let block_h = name_h + gap + parent_h + session_gap + session_h;
     let top = py + (ph - block_h) / 2.0;
@@ -526,7 +570,11 @@ struct SwitcherRowSplit {
 /// Width, in cells, of what a pane switcher row parks flush right: the binary,
 /// then two cells, then the todo count, ` · `, the idea count. Each part is
 /// optional and the gaps only appear between parts that exist.
-fn switcher_row_tail_chars(process: Option<&str>, raf_todo: Option<&str>, raf_idea: Option<&str>) -> usize {
+fn switcher_row_tail_chars(
+    process: Option<&str>,
+    raf_todo: Option<&str>,
+    raf_idea: Option<&str>,
+) -> usize {
     let n = |s: Option<&str>| s.map_or(0, |s| s.chars().count());
     let raf = match (raf_todo, raf_idea) {
         (Some(_), Some(_)) => n(raf_todo) + RAF_SEPARATOR.chars().count() + n(raf_idea),
@@ -547,15 +595,24 @@ fn switcher_row_split(
     cell_w: f32,
 ) -> SwitcherRowSplit {
     if process_chars == 0 {
-        return SwitcherRowSplit { title_limit: right_margin, process_x: None };
+        return SwitcherRowSplit {
+            title_limit: right_margin,
+            process_x: None,
+        };
     }
     let process_x = right_margin - process_chars as f32 * cell_w;
     let title_limit = process_x - cell_w * 2.0;
     let min_title = left_margin + (right_margin - left_margin) / 3.0;
     if title_limit < min_title {
-        SwitcherRowSplit { title_limit: right_margin, process_x: None }
+        SwitcherRowSplit {
+            title_limit: right_margin,
+            process_x: None,
+        }
     } else {
-        SwitcherRowSplit { title_limit, process_x: Some(process_x) }
+        SwitcherRowSplit {
+            title_limit,
+            process_x: Some(process_x),
+        }
     }
 }
 
@@ -717,8 +774,10 @@ fn bg_runs(line: &[Cell], default_bg: [u8; 3]) -> Vec<(usize, usize, [u8; 3])> {
 /// after the last pair is not part of the line. Kept apart from the drawing so
 /// the centring can be checked without a GPU.
 fn hint_line_width(hints: &[(&str, &str)]) -> usize {
-    let total: usize =
-        hints.iter().map(|(k, w)| k.chars().count() + 1 + w.chars().count() + 2).sum();
+    let total: usize = hints
+        .iter()
+        .map(|(k, w)| k.chars().count() + 1 + w.chars().count() + 2)
+        .sum();
     total.saturating_sub(2)
 }
 
@@ -733,13 +792,15 @@ impl Renderer {
         let ctx = RenderContext::new(device, layer.pixelFormat(), scale, config);
 
         let make_vertex_buf = || {
-            device.newBufferWithLength_options(
-                INITIAL_VERTEX_BYTES,
-                MTLResourceOptions(
-                    MTLResourceOptions::CPUCacheModeDefaultCache.0
-                        | MTLResourceOptions::StorageModeShared.0
-                ),
-            ).expect("failed to allocate vertex buffer")
+            device
+                .newBufferWithLength_options(
+                    INITIAL_VERTEX_BYTES,
+                    MTLResourceOptions(
+                        MTLResourceOptions::CPUCacheModeDefaultCache.0
+                            | MTLResourceOptions::StorageModeShared.0,
+                    ),
+                )
+                .expect("failed to allocate vertex buffer")
         };
 
         let viewport = [0.0f32; 2];
@@ -749,7 +810,8 @@ impl Renderer {
                 std::mem::size_of_val(&viewport),
                 MTLResourceOptions::CPUCacheModeDefaultCache,
             )
-        }.unwrap();
+        }
+        .unwrap();
 
         Renderer {
             ctx,
@@ -823,7 +885,10 @@ impl Renderer {
     /// is in that pane, nothing otherwise.
     fn pane_hover(&self, pane_id: PaneId) -> (Option<&[(usize, u16, u16)]>, Option<&str>) {
         if self.hovered_url_pane_id == Some(pane_id) {
-            (self.hovered_url.as_deref(), self.hovered_url_text.as_deref())
+            (
+                self.hovered_url.as_deref(),
+                self.hovered_url_text.as_deref(),
+            )
         } else {
             (None, None)
         }
@@ -832,7 +897,13 @@ impl Renderer {
     /// Everything `pane`'s build reads besides its grid (see `PaneDrawKey`).
     fn pane_draw_key(&self, pane: &PaneRenderData, blink_on: bool) -> PaneDrawKey {
         let (hovered_url, hovered_url_text) = self.pane_hover(pane.pane_id);
-        PaneRenderer::draw_key(pane, hovered_url, hovered_url_text, blink_on, self.ctx.atlas.generation)
+        PaneRenderer::draw_key(
+            pane,
+            hovered_url,
+            hovered_url_text,
+            blink_on,
+            self.ctx.atlas.generation,
+        )
     }
 
     /// Build one pane outside of a frame, the way `rebuild_pane_draws` does,
@@ -860,7 +931,19 @@ impl Renderer {
             hovered_url_text: self.hovered_url_text.as_deref(),
             zones: &mut self.tooltip_zones,
         }
-        .build_vertices(term, vp, blink_on, is_focused, outlined, custom_title, attention, pane_input_chars, pane_id, fg_process, bookmarked)
+        .build_vertices(
+            term,
+            vp,
+            blink_on,
+            is_focused,
+            outlined,
+            custom_title,
+            attention,
+            pane_input_chars,
+            pane_id,
+            fg_process,
+            bookmarked,
+        )
     }
 
     /// Build per-pane vertex lists into the cache and return the draw list
@@ -906,19 +989,30 @@ impl Renderer {
                 let key = self.pane_draw_key(pane, blink_on);
                 // Scope hovered URL to the pane that owns it
                 let is_hover_pane = self.hovered_url_pane_id == Some(pane.pane_id);
-                let hovered_url = if is_hover_pane { self.hovered_url.as_deref() } else { None };
-                let hovered_url_text = if is_hover_pane { self.hovered_url_text.as_deref() } else { None };
-                self.pane_renderers.entry(pane.pane_id).or_default().prepare(
-                    &mut self.ctx,
-                    &self.style,
-                    pane,
-                    hovered_url,
-                    hovered_url_text,
-                    key,
-                    in_sync,
-                    dirty_panes.contains(&pane.pane_id),
-                    &mut self.tooltip_zones,
-                );
+                let hovered_url = if is_hover_pane {
+                    self.hovered_url.as_deref()
+                } else {
+                    None
+                };
+                let hovered_url_text = if is_hover_pane {
+                    self.hovered_url_text.as_deref()
+                } else {
+                    None
+                };
+                self.pane_renderers
+                    .entry(pane.pane_id)
+                    .or_default()
+                    .prepare(
+                        &mut self.ctx,
+                        &self.style,
+                        pane,
+                        hovered_url,
+                        hovered_url_text,
+                        key,
+                        in_sync,
+                        dirty_panes.contains(&pane.pane_id),
+                        &mut self.tooltip_zones,
+                    );
                 // Compute scissor rect clamped to drawable bounds. Ceil the
                 // extent: truncation shaves up to 1px off the right/bottom
                 // painted edge at fractional split boundaries.
@@ -926,9 +1020,20 @@ impl Renderer {
                 let sy = (vp.y.max(0.0)) as usize;
                 let sw = ((vp.width).min(viewport_w - sx as f32).max(0.0)).ceil() as usize;
                 let sh = ((vp.height).min(viewport_h - sy as f32).max(0.0)).ceil() as usize;
-                let has_verts = self.pane_renderers.get(&pane.pane_id).is_some_and(|p| !p.vertices().is_empty());
+                let has_verts = self
+                    .pane_renderers
+                    .get(&pane.pane_id)
+                    .is_some_and(|p| !p.vertices().is_empty());
                 if has_verts && sw > 0 && sh > 0 {
-                    pane_draws.push((pane.pane_id, MTLScissorRect { x: sx, y: sy, width: sw, height: sh }));
+                    pane_draws.push((
+                        pane.pane_id,
+                        MTLScissorRect {
+                            x: sx,
+                            y: sy,
+                            width: sw,
+                            height: sh,
+                        },
+                    ));
                 }
             }
             if self.ctx.atlas.generation == atlas_gen {
@@ -940,7 +1045,8 @@ impl Renderer {
             self.pane_renderers.clear();
         }
         // Drop cache entries of panes that no longer exist
-        self.pane_renderers.retain(|id, _| panes.iter().any(|p| p.pane_id == *id));
+        self.pane_renderers
+            .retain(|id, _| panes.iter().any(|p| p.pane_id == *id));
         pane_draws
     }
 
@@ -975,10 +1081,12 @@ impl Renderer {
         keys_config: Option<&KeysConfig>,
     ) {
         // Reset blink on cursor movement of focused pane (see `CursorBlink`).
-        let focused_epoch = panes
-            .iter()
-            .find(|p| p.is_focused)
-            .map(|p| p.terminal.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed));
+        let focused_epoch = panes.iter().find(|p| p.is_focused).map(|p| {
+            p.terminal
+                .read()
+                .cursor_move_epoch
+                .load(std::sync::atomic::Ordering::Relaxed)
+        });
         let (blink_on, blink_changed) = self.blink.sample(
             std::time::Instant::now(),
             focused_epoch,
@@ -1035,12 +1143,19 @@ impl Renderer {
         let mut any_not_ready = false;
         let mut any_sync_deferred = false;
         for pane in panes {
-            if !pane.shell_ready { any_not_ready = true; }
+            if !pane.shell_ready {
+                any_not_ready = true;
+            }
             if PaneRenderer::in_sync_window(pane) {
                 any_sync_deferred = true;
                 continue; // Don't consume dirty flag — pane will render later
             }
-            if pane.terminal.read().dirty.load(std::sync::atomic::Ordering::Relaxed) {
+            if pane
+                .terminal
+                .read()
+                .dirty
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 any_dirty = true;
             }
         }
@@ -1062,7 +1177,24 @@ impl Renderer {
         let has_loading = self.loading_progress.is_some();
         let has_pane_flash = self.pane_flash.is_some();
         let has_status_text = self.resize_feedback_text.is_some();
-        if all_ready && !any_dirty && !any_key_changed && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && !has_status_text && help_hint_remaining == 0 && !tooltip_animating && !has_loading {
+        if all_ready
+            && !any_dirty
+            && !any_key_changed
+            && !any_sync_deferred
+            && !blink_changed
+            && !minute_changed
+            && !rss_changed
+            && !has_filter
+            && !show_help
+            && !show_mem_report
+            && !has_recent_projects
+            && !has_search_palette
+            && !has_pane_flash
+            && !has_status_text
+            && help_hint_remaining == 0
+            && !tooltip_animating
+            && !has_loading
+        {
             return;
         }
 
@@ -1087,14 +1219,27 @@ impl Renderer {
         let dirty_panes: Vec<u32> = panes
             .iter()
             .filter(|p| !sync_panes.contains(&p.pane_id))
-            .filter(|p| p.terminal.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed))
+            .filter(|p| {
+                p.terminal
+                    .read()
+                    .dirty
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+            })
             .map(|p| p.pane_id)
             .collect();
 
         // Build vertices for each pane with its own scissor rect for clipping.
         // pane_draws references the vertex cache by pane id (vertices live in
         // self.pane_renderers).
-        let mut pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on, &dirty_panes, &sync_panes);
+        let mut pane_draws = self.rebuild_pane_draws(
+            panes,
+            viewport_w,
+            viewport_h,
+            filter.is_some(),
+            blink_on,
+            &dirty_panes,
+            &sync_panes,
+        );
         let atlas_gen_after_panes = self.ctx.atlas.generation;
         let pane_zone_count = self.tooltip_zones.len();
         let mut overlay_vertices = Vec::new();
@@ -1113,22 +1258,82 @@ impl Renderer {
                     // Vertical line
                     let lx = x1 - thickness * 0.5;
                     let rx = x1 + thickness * 0.5;
-                    overlay_vertices.push(Vertex { position: [lx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    overlay_vertices.push(Vertex { position: [rx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    overlay_vertices.push(Vertex { position: [lx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    overlay_vertices.push(Vertex { position: [rx, y1], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    overlay_vertices.push(Vertex { position: [rx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    overlay_vertices.push(Vertex { position: [lx, y2], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex {
+                        position: [lx, y1],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
+                    overlay_vertices.push(Vertex {
+                        position: [rx, y1],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
+                    overlay_vertices.push(Vertex {
+                        position: [lx, y2],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
+                    overlay_vertices.push(Vertex {
+                        position: [rx, y1],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
+                    overlay_vertices.push(Vertex {
+                        position: [rx, y2],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
+                    overlay_vertices.push(Vertex {
+                        position: [lx, y2],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
                 } else {
                     // Horizontal line
                     let ty = y1 - thickness * 0.5;
                     let by = y1 + thickness * 0.5;
-                    overlay_vertices.push(Vertex { position: [x1, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    overlay_vertices.push(Vertex { position: [x2, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    overlay_vertices.push(Vertex { position: [x1, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    overlay_vertices.push(Vertex { position: [x2, ty], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    overlay_vertices.push(Vertex { position: [x2, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
-                    overlay_vertices.push(Vertex { position: [x1, by], tex_coords: no_tex, color: white, bg_color: sep_bg });
+                    overlay_vertices.push(Vertex {
+                        position: [x1, ty],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
+                    overlay_vertices.push(Vertex {
+                        position: [x2, ty],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
+                    overlay_vertices.push(Vertex {
+                        position: [x1, by],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
+                    overlay_vertices.push(Vertex {
+                        position: [x2, ty],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
+                    overlay_vertices.push(Vertex {
+                        position: [x2, by],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
+                    overlay_vertices.push(Vertex {
+                        position: [x1, by],
+                        tex_coords: no_tex,
+                        color: white,
+                        bg_color: sep_bg,
+                    });
                 }
             }
         }
@@ -1145,53 +1350,128 @@ impl Renderer {
             } else {
                 (edge_x, edge_x + thickness)
             };
-            overlay_vertices.push(Vertex { position: [lx, top_y], tex_coords: no_tex, color: white, bg_color: flash_color });
-            overlay_vertices.push(Vertex { position: [rx, top_y], tex_coords: no_tex, color: white, bg_color: flash_color });
-            overlay_vertices.push(Vertex { position: [lx, bottom_y], tex_coords: no_tex, color: white, bg_color: flash_color });
-            overlay_vertices.push(Vertex { position: [rx, top_y], tex_coords: no_tex, color: white, bg_color: flash_color });
-            overlay_vertices.push(Vertex { position: [rx, bottom_y], tex_coords: no_tex, color: white, bg_color: flash_color });
-            overlay_vertices.push(Vertex { position: [lx, bottom_y], tex_coords: no_tex, color: white, bg_color: flash_color });
+            overlay_vertices.push(Vertex {
+                position: [lx, top_y],
+                tex_coords: no_tex,
+                color: white,
+                bg_color: flash_color,
+            });
+            overlay_vertices.push(Vertex {
+                position: [rx, top_y],
+                tex_coords: no_tex,
+                color: white,
+                bg_color: flash_color,
+            });
+            overlay_vertices.push(Vertex {
+                position: [lx, bottom_y],
+                tex_coords: no_tex,
+                color: white,
+                bg_color: flash_color,
+            });
+            overlay_vertices.push(Vertex {
+                position: [rx, top_y],
+                tex_coords: no_tex,
+                color: white,
+                bg_color: flash_color,
+            });
+            overlay_vertices.push(Vertex {
+                position: [rx, bottom_y],
+                tex_coords: no_tex,
+                color: white,
+                bg_color: flash_color,
+            });
+            overlay_vertices.push(Vertex {
+                position: [lx, bottom_y],
+                tex_coords: no_tex,
+                color: white,
+                bg_color: flash_color,
+            });
         }
 
         // Draw tab bar
         if tab_titles.len() > 0 {
-            self.build_tab_bar_vertices(&mut overlay_vertices, viewport_w, tab_titles, tab_bar_left_inset);
+            self.build_tab_bar_vertices(
+                &mut overlay_vertices,
+                viewport_w,
+                tab_titles,
+                tab_bar_left_inset,
+            );
         }
         self.build_subject_strip_vertices(&mut overlay_vertices, viewport_w);
 
         // Update I/O char counters (global totals, persist across pane closures)
         if rss_changed {
-            let total_in = crate::terminal::pty::GLOBAL_INPUT_CHARS.load(std::sync::atomic::Ordering::Relaxed);
-            let total_out = crate::terminal::pty::GLOBAL_PRINTABLE_CHARS.load(std::sync::atomic::Ordering::Relaxed);
-            self.cached_io_str = format!("↑{} ↓{}", format_count(total_in), format_count(total_out));
+            let total_in =
+                crate::terminal::pty::GLOBAL_INPUT_CHARS.load(std::sync::atomic::Ordering::Relaxed);
+            let total_out = crate::terminal::pty::GLOBAL_PRINTABLE_CHARS
+                .load(std::sync::atomic::Ordering::Relaxed);
+            self.cached_io_str =
+                format!("↑{} ↓{}", format_count(total_in), format_count(total_out));
         }
 
         // Draw global status bar
-        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, working_agents, unread_panes, sleeping_panes, minimized_counts.0, minimized_counts.1, help_hint_remaining, keys_config);
+        self.build_global_status_bar_vertices(
+            &mut overlay_vertices,
+            viewport_w,
+            viewport_h,
+            hidden_left,
+            hidden_right,
+            focused_column,
+            total_columns,
+            active_tab,
+            total_tabs,
+            active_tab_name,
+            working_agents,
+            unread_panes,
+            sleeping_panes,
+            minimized_counts.0,
+            minimized_counts.1,
+            help_hint_remaining,
+            keys_config,
+        );
 
         // Attention banner over the focused pane's status bar. Drawn in the
         // overlay pass rather than inside the pane's own vertices: those are
         // cached per pane and would keep a stale banner alive across frames.
-        if let (Some((text, color)), Some(focused)) =
-            (self.pane_banner.clone(), panes.iter().find(|p| p.is_focused))
-        {
+        if let (Some((text, color)), Some(focused)) = (
+            self.pane_banner.clone(),
+            panes.iter().find(|p| p.is_focused),
+        ) {
             // The banner hides the bar's right-hand title, which is the only
             // place an unrenamed session shows its name: carry it over.
-            let title = focused.custom_title.clone().or_else(|| focused.terminal.read().title.clone());
-            self.build_pane_banner_vertices(&mut overlay_vertices, &focused.viewport, &text, title.as_deref(), color);
+            let title = focused
+                .custom_title
+                .clone()
+                .or_else(|| focused.terminal.read().title.clone());
+            self.build_pane_banner_vertices(
+                &mut overlay_vertices,
+                &focused.viewport,
+                &text,
+                title.as_deref(),
+                color,
+            );
         }
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
             if let Some(focused_pane) = panes.iter().find(|p| p.is_focused) {
-                self.build_filter_overlay_vertices(&mut overlay_vertices, &focused_pane.viewport, filter_data);
+                self.build_filter_overlay_vertices(
+                    &mut overlay_vertices,
+                    &focused_pane.viewport,
+                    filter_data,
+                );
             }
         }
 
         // Draw help overlay (on top of everything)
         if show_help {
             if let Some(keys_config) = keys_config {
-                self.build_help_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, keys_config);
+                self.build_help_overlay_vertices(
+                    &mut overlay_vertices,
+                    viewport_w,
+                    viewport_h,
+                    keys_config,
+                );
             }
         }
 
@@ -1202,17 +1482,32 @@ impl Renderer {
 
         // Draw recent projects overlay
         if let Some(rp) = recent_projects {
-            self.build_recent_projects_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, rp);
+            self.build_recent_projects_overlay_vertices(
+                &mut overlay_vertices,
+                viewport_w,
+                viewport_h,
+                rp,
+            );
         }
 
         // Draw send-to-window overlay
         if let Some(stw) = send_to_window {
-            self.build_send_to_window_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, stw);
+            self.build_send_to_window_overlay_vertices(
+                &mut overlay_vertices,
+                viewport_w,
+                viewport_h,
+                stw,
+            );
         }
 
         // Draw tab/pane switcher overlay
         if let Some(ps) = pane_switcher {
-            self.build_pane_switcher_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, ps);
+            self.build_pane_switcher_overlay_vertices(
+                &mut overlay_vertices,
+                viewport_w,
+                viewport_h,
+                ps,
+            );
         }
 
         // Draw pane flash border (search-palette jump highlight) — drawn before
@@ -1224,12 +1519,42 @@ impl Renderer {
             let color = [1.0_f32, 0.85, 0.3, alpha];
             let thickness = 4.0_f32;
             let mut push_quad = |x: f32, y: f32, w: f32, h: f32| {
-                overlay_vertices.push(Vertex { position: [x, y], tex_coords: no_tex, color: white, bg_color: color });
-                overlay_vertices.push(Vertex { position: [x + w, y], tex_coords: no_tex, color: white, bg_color: color });
-                overlay_vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: color });
-                overlay_vertices.push(Vertex { position: [x + w, y], tex_coords: no_tex, color: white, bg_color: color });
-                overlay_vertices.push(Vertex { position: [x + w, y + h], tex_coords: no_tex, color: white, bg_color: color });
-                overlay_vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: color });
+                overlay_vertices.push(Vertex {
+                    position: [x, y],
+                    tex_coords: no_tex,
+                    color: white,
+                    bg_color: color,
+                });
+                overlay_vertices.push(Vertex {
+                    position: [x + w, y],
+                    tex_coords: no_tex,
+                    color: white,
+                    bg_color: color,
+                });
+                overlay_vertices.push(Vertex {
+                    position: [x, y + h],
+                    tex_coords: no_tex,
+                    color: white,
+                    bg_color: color,
+                });
+                overlay_vertices.push(Vertex {
+                    position: [x + w, y],
+                    tex_coords: no_tex,
+                    color: white,
+                    bg_color: color,
+                });
+                overlay_vertices.push(Vertex {
+                    position: [x + w, y + h],
+                    tex_coords: no_tex,
+                    color: white,
+                    bg_color: color,
+                });
+                overlay_vertices.push(Vertex {
+                    position: [x, y + h],
+                    tex_coords: no_tex,
+                    color: white,
+                    bg_color: color,
+                });
             };
             // Top, bottom, left, right edges as four thin quads.
             push_quad(x, y, w, thickness);
@@ -1253,7 +1578,12 @@ impl Renderer {
 
         // Draw search palette overlay (on top of everything except tooltip)
         if let Some(sp) = search_palette {
-            self.build_search_palette_overlay_vertices(&mut overlay_vertices, viewport_w, viewport_h, sp);
+            self.build_search_palette_overlay_vertices(
+                &mut overlay_vertices,
+                viewport_w,
+                viewport_h,
+                sp,
+            );
         }
 
         // Tooltip animation: update visible state and animation counter
@@ -1287,13 +1617,23 @@ impl Renderer {
         if self.ctx.atlas.generation != atlas_gen_after_panes {
             let overlay_zones: Vec<TooltipZone> = self.tooltip_zones.split_off(pane_zone_count);
             self.pane_renderers.clear();
-            pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on, &dirty_panes, &sync_panes);
+            pane_draws = self.rebuild_pane_draws(
+                panes,
+                viewport_w,
+                viewport_h,
+                filter.is_some(),
+                blink_on,
+                &dirty_panes,
+                &sync_panes,
+            );
             self.tooltip_zones.extend(overlay_zones);
         }
 
         let mut total_vertices = 0usize;
         for (pane_id, scissor) in &pane_draws {
-            let Some(pane) = self.pane_renderers.get(pane_id) else { continue };
+            let Some(pane) = self.pane_renderers.get(pane_id) else {
+                continue;
+            };
             let verts = pane.vertices();
             draw_calls.push((total_vertices, verts.len(), *scissor, Some(*pane_id)));
             total_vertices += verts.len();
@@ -1318,9 +1658,7 @@ impl Renderer {
 
         let pass_desc = {
             let desc = MTLRenderPassDescriptor::new();
-            let color = unsafe {
-                desc.colorAttachments().objectAtIndexedSubscript(0)
-            };
+            let color = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
             let tex = drawable.texture();
             color.setTexture(Some(&tex));
             color.setLoadAction(MTLLoadAction::Clear);
@@ -1336,11 +1674,17 @@ impl Renderer {
 
         let cmd_buf = match self.ctx.command_queue.commandBuffer() {
             Some(buf) => buf,
-            None => { log::error!("Metal: failed to create command buffer, skipping frame"); return; }
+            None => {
+                log::error!("Metal: failed to create command buffer, skipping frame");
+                return;
+            }
         };
         let encoder = match cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) {
             Some(enc) => enc,
-            None => { log::error!("Metal: failed to create render encoder, skipping frame"); return; }
+            None => {
+                log::error!("Metal: failed to create render encoder, skipping frame");
+                return;
+            }
         };
 
         if total_vertices > 0 {
@@ -1353,17 +1697,23 @@ impl Renderer {
             if total_bytes > current_capacity {
                 // Grow to next power-of-two that fits
                 let new_capacity = total_bytes.next_power_of_two();
-                log::warn!("Vertex data ({} bytes) exceeds buffer ({} bytes), growing to {} bytes",
-                    total_bytes, current_capacity, new_capacity);
+                log::warn!(
+                    "Vertex data ({} bytes) exceeds buffer ({} bytes), growing to {} bytes",
+                    total_bytes,
+                    current_capacity,
+                    new_capacity
+                );
                 let device = layer.device().expect("no Metal device on layer");
                 for i in 0..2 {
-                    self.vertex_bufs[i] = device.newBufferWithLength_options(
-                        new_capacity,
-                        MTLResourceOptions(
-                            MTLResourceOptions::CPUCacheModeDefaultCache.0
-                                | MTLResourceOptions::StorageModeShared.0
-                        ),
-                    ).expect("failed to reallocate vertex buffer");
+                    self.vertex_bufs[i] = device
+                        .newBufferWithLength_options(
+                            new_capacity,
+                            MTLResourceOptions(
+                                MTLResourceOptions::CPUCacheModeDefaultCache.0
+                                    | MTLResourceOptions::StorageModeShared.0,
+                            ),
+                        )
+                        .expect("failed to reallocate vertex buffer");
                 }
                 self.vertex_buf_capacity = new_capacity;
             }
@@ -1411,8 +1761,7 @@ impl Renderer {
         }
 
         encoder.endEncoding();
-        let mtl_drawable: &ProtocolObject<dyn MTLDrawable> =
-            ProtocolObject::from_ref(&*drawable);
+        let mtl_drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
         cmd_buf.presentDrawable(mtl_drawable);
         cmd_buf.commit();
     }
@@ -1439,12 +1788,22 @@ impl Renderer {
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let text_x = vp.x + self.ctx.h_padding() + cell_w;
         let right_edge = vp.x + vp.width - cell_w;
-        let label_end = self.ctx.render_status_text(vertices, text, text_x, bar_y, right_edge, fg, no_bg);
+        let label_end = self
+            .ctx
+            .render_status_text(vertices, text, text_x, bar_y, right_edge, fg, no_bg);
         if let Some(title) = title.filter(|t| !t.is_empty()) {
             let title_x = banner_title_x(title.chars().count(), label_end, right_edge, cell_w);
             // Faux-bold, as for terminal cells: the same glyphs again, 1px right.
             for dx in [0.0, 1.0] {
-                self.ctx.render_status_text(vertices, title, title_x + dx, bar_y, right_edge + dx, fg, no_bg);
+                self.ctx.render_status_text(
+                    vertices,
+                    title,
+                    title_x + dx,
+                    bar_y,
+                    right_edge + dx,
+                    fg,
+                    no_bg,
+                );
             }
         }
     }
@@ -1478,9 +1837,24 @@ impl Renderer {
         push_bg_quad(vertices, 0.0, bar_y, viewport_w, cell_h, self.global_bar_bg);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
-        let time_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 1.0];
-        let scroll_fg = [self.global_bar_scroll_color[0], self.global_bar_scroll_color[1], self.global_bar_scroll_color[2], 1.0];
-        let tab_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.5];
+        let time_fg = [
+            self.global_bar_time_color[0],
+            self.global_bar_time_color[1],
+            self.global_bar_time_color[2],
+            1.0,
+        ];
+        let scroll_fg = [
+            self.global_bar_scroll_color[0],
+            self.global_bar_scroll_color[1],
+            self.global_bar_scroll_color[2],
+            1.0,
+        ];
+        let tab_fg = [
+            self.global_bar_time_color[0],
+            self.global_bar_time_color[1],
+            self.global_bar_time_color[2],
+            0.5,
+        ];
 
         // Center: [tab/total] - col/total, combined with scroll arrows
         // Pre-compute the full text to measure total width for centering
@@ -1491,38 +1865,90 @@ impl Renderer {
             let col_text = format!("{}/{}", focused_column, total_columns);
 
             // Build optional left/right scroll parts
-            let left_arrow = if hidden_left > 0 { format!("⟵ {} | ", hidden_left) } else { String::new() };
-            let right_arrow = if hidden_right > 0 { format!(" | {} ⟶", hidden_right) } else { String::new() };
+            let left_arrow = if hidden_left > 0 {
+                format!("⟵ {} | ", hidden_left)
+            } else {
+                String::new()
+            };
+            let right_arrow = if hidden_right > 0 {
+                format!(" | {} ⟶", hidden_right)
+            } else {
+                String::new()
+            };
 
             // Total char width for centering
-            let total_chars = left_arrow.chars().count() + tab_name_text.chars().count() + tab_text.chars().count() + sep.chars().count() + col_text.chars().count() + right_arrow.chars().count();
+            let total_chars = left_arrow.chars().count()
+                + tab_name_text.chars().count()
+                + tab_text.chars().count()
+                + sep.chars().count()
+                + col_text.chars().count()
+                + right_arrow.chars().count();
             let text_w = total_chars as f32 * cell_w;
             let center_start = (viewport_w - text_w) / 2.0;
             let mut x = center_start;
 
             if hidden_left > 0 {
-                x = self.ctx.render_status_text(vertices, &left_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
+                x = self.ctx.render_status_text(
+                    vertices,
+                    &left_arrow,
+                    x,
+                    bar_y,
+                    viewport_w,
+                    scroll_fg,
+                    no_bg,
+                );
             }
-            x = self.ctx.render_status_text(vertices, &tab_name_text, x, bar_y, viewport_w, tab_fg, no_bg);
-            x = self.ctx.render_status_text(vertices, &tab_text, x, bar_y, viewport_w, tab_fg, no_bg);
-            x = self.ctx.render_status_text(vertices, sep, x, bar_y, viewport_w, tab_fg, no_bg);
-            x = self.ctx.render_status_text(vertices, &col_text, x, bar_y, viewport_w, scroll_fg, no_bg);
+            x = self.ctx.render_status_text(
+                vertices,
+                &tab_name_text,
+                x,
+                bar_y,
+                viewport_w,
+                tab_fg,
+                no_bg,
+            );
+            x = self
+                .ctx
+                .render_status_text(vertices, &tab_text, x, bar_y, viewport_w, tab_fg, no_bg);
+            x = self
+                .ctx
+                .render_status_text(vertices, sep, x, bar_y, viewport_w, tab_fg, no_bg);
+            x = self
+                .ctx
+                .render_status_text(vertices, &col_text, x, bar_y, viewport_w, scroll_fg, no_bg);
             if hidden_right > 0 {
-                x = self.ctx.render_status_text(vertices, &right_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
+                x = self.ctx.render_status_text(
+                    vertices,
+                    &right_arrow,
+                    x,
+                    bar_y,
+                    viewport_w,
+                    scroll_fg,
+                    no_bg,
+                );
             }
-            self.push_tooltip_zone(center_start, bar_y, x - center_start, cell_h, "Tab / total — focused column / total columns");
+            self.push_tooltip_zone(
+                center_start,
+                bar_y,
+                x - center_start,
+                cell_h,
+                "Tab / total — focused column / total columns",
+            );
         }
 
         // Left: loading progress (highest priority)
         if let Some((ready, total)) = self.loading_progress {
             let text = format!("Loading {}/{}...", ready, total);
             let loading_fg = [0.6, 0.85, 0.6, 1.0];
-            self.ctx.render_status_text(vertices, &text, cell_w, bar_y, viewport_w, loading_fg, no_bg);
+            self.ctx.render_status_text(
+                vertices, &text, cell_w, bar_y, viewport_w, loading_fg, no_bg,
+            );
         }
         // Left: resize feedback (takes priority over help hint)
         else if let Some(text) = self.resize_feedback_text.clone() {
             let info_fg = [0.6, 0.85, 0.6, 1.0];
-            self.ctx.render_status_text(vertices, &text, cell_w, bar_y, viewport_w, info_fg, no_bg);
+            self.ctx
+                .render_status_text(vertices, &text, cell_w, bar_y, viewport_w, info_fg, no_bg);
         }
         // Left: permanent shortcuts reminder (help + overlays), unless loading
         // or resize feedback is shown. Brighter for the first few seconds after
@@ -1543,7 +1969,8 @@ impl Renderer {
                 let alpha = if help_hint_remaining > 0 { 0.85 } else { 0.4 };
                 let hint_fg = [0.6, 0.75, 1.0, alpha];
                 let hint = self.cached_shortcuts_hint.clone();
-                self.ctx.render_status_text(vertices, &hint, cell_w, bar_y, viewport_w, hint_fg, no_bg);
+                self.ctx
+                    .render_status_text(vertices, &hint, cell_w, bar_y, viewport_w, hint_fg, no_bg);
             }
         }
 
@@ -1553,38 +1980,73 @@ impl Renderer {
             let rss_str = self.cached_rss_str.clone();
             let time_w = time_str.chars().count() as f32 * cell_w;
             let right_x = viewport_w - time_w - cell_w;
-            self.ctx.render_status_text(vertices, &time_str, right_x, bar_y, viewport_w, time_fg, no_bg);
+            self.ctx.render_status_text(
+                vertices, &time_str, right_x, bar_y, viewport_w, time_fg, no_bg,
+            );
 
             let mut left_edge = right_x;
             let gap = cell_w * 2.0;
 
             if !rss_str.is_empty() {
-                let rss_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.6];
+                let rss_fg = [
+                    self.global_bar_time_color[0],
+                    self.global_bar_time_color[1],
+                    self.global_bar_time_color[2],
+                    0.6,
+                ];
                 let rss_w = rss_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - rss_w - gap;
-                self.ctx.render_status_text(vertices, &rss_str, left_edge, bar_y, viewport_w, rss_fg, no_bg);
+                self.ctx.render_status_text(
+                    vertices, &rss_str, left_edge, bar_y, viewport_w, rss_fg, no_bg,
+                );
                 self.push_tooltip_zone(left_edge, bar_y, rss_w, cell_h, "Memory usage (RSS)");
             }
 
             if !self.cached_io_str.is_empty() {
-                let io_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.5];
+                let io_fg = [
+                    self.global_bar_time_color[0],
+                    self.global_bar_time_color[1],
+                    self.global_bar_time_color[2],
+                    0.5,
+                ];
                 let io_w = self.cached_io_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - io_w - gap;
                 let io_str = self.cached_io_str.clone();
-                self.ctx.render_status_text(vertices, &io_str, left_edge, bar_y, viewport_w, io_fg, no_bg);
-                self.push_tooltip_zone(left_edge, bar_y, io_w, cell_h, "Total I/O — ↑ chars sent  ↓ chars received");
+                self.ctx.render_status_text(
+                    vertices, &io_str, left_edge, bar_y, viewport_w, io_fg, no_bg,
+                );
+                self.push_tooltip_zone(
+                    left_edge,
+                    bar_y,
+                    io_w,
+                    cell_h,
+                    "Total I/O — ↑ chars sent  ↓ chars received",
+                );
             }
 
             let proc_fg = if self.cached_proc_count > 0 {
                 [0.6, 0.85, 0.6, 1.0]
             } else {
-                [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.4]
+                [
+                    self.global_bar_time_color[0],
+                    self.global_bar_time_color[1],
+                    self.global_bar_time_color[2],
+                    0.4,
+                ]
             };
             let proc_w = self.cached_proc_str.chars().count() as f32 * cell_w;
             left_edge = left_edge - proc_w - gap;
             let proc_str = self.cached_proc_str.clone();
-            self.ctx.render_status_text(vertices, &proc_str, left_edge, bar_y, viewport_w, proc_fg, no_bg);
-            self.push_tooltip_zone(left_edge, bar_y, proc_w, cell_h, "Programs running in panes (an asleep agent pane starts its own when first shown)");
+            self.ctx.render_status_text(
+                vertices, &proc_str, left_edge, bar_y, viewport_w, proc_fg, no_bg,
+            );
+            self.push_tooltip_zone(
+                left_edge,
+                bar_y,
+                proc_w,
+                cell_h,
+                "Programs running in panes (an asleep agent pane starts its own when first shown)",
+            );
 
             // Number of panes whose Claude Code is actively working (OSC-title
             // activity marker present). Hidden when none are busy.
@@ -1592,8 +2054,22 @@ impl Renderer {
                 let agents_str = format!("\u{2733}{}", working_agents);
                 let agents_w = agents_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - agents_w - gap;
-                self.ctx.render_status_text(vertices, &agents_str, left_edge, bar_y, viewport_w, WORKING_FG, no_bg);
-                self.push_tooltip_zone(left_edge, bar_y, agents_w, cell_h, "Claude Code panes working right now");
+                self.ctx.render_status_text(
+                    vertices,
+                    &agents_str,
+                    left_edge,
+                    bar_y,
+                    viewport_w,
+                    WORKING_FG,
+                    no_bg,
+                );
+                self.push_tooltip_zone(
+                    left_edge,
+                    bar_y,
+                    agents_w,
+                    cell_h,
+                    "Claude Code panes working right now",
+                );
             }
 
             // Panes carrying output nobody has looked at yet — a bell, or a
@@ -1604,8 +2080,22 @@ impl Renderer {
                 let unread_str = format!("\u{25cf}{}", unread_panes);
                 let unread_w = unread_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - unread_w - gap;
-                self.ctx.render_status_text(vertices, &unread_str, left_edge, bar_y, viewport_w, UNREAD_FG, no_bg);
-                self.push_tooltip_zone(left_edge, bar_y, unread_w, cell_h, "Panes with unread output (bell or finished command)");
+                self.ctx.render_status_text(
+                    vertices,
+                    &unread_str,
+                    left_edge,
+                    bar_y,
+                    viewport_w,
+                    UNREAD_FG,
+                    no_bg,
+                );
+                self.push_tooltip_zone(
+                    left_edge,
+                    bar_y,
+                    unread_w,
+                    cell_h,
+                    "Panes with unread output (bell or finished command)",
+                );
             }
 
             // Agent panes restored asleep: their conversation resumes the first
@@ -1615,8 +2105,15 @@ impl Renderer {
                 let sleep_str = format!("\u{25cc}{}", sleeping_panes);
                 let sleep_w = sleep_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - sleep_w - gap;
-                let sleep_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.6];
-                self.ctx.render_status_text(vertices, &sleep_str, left_edge, bar_y, viewport_w, sleep_fg, no_bg);
+                let sleep_fg = [
+                    self.global_bar_time_color[0],
+                    self.global_bar_time_color[1],
+                    self.global_bar_time_color[2],
+                    0.6,
+                ];
+                self.ctx.render_status_text(
+                    vertices, &sleep_str, left_edge, bar_y, viewport_w, sleep_fg, no_bg,
+                );
                 self.push_tooltip_zone(left_edge, bar_y, sleep_w, cell_h, "Agent panes still asleep — each resumes its conversation when first shown, and is saved on quit");
             }
 
@@ -1632,8 +2129,16 @@ impl Renderer {
                 };
                 let min_w = min_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - min_w - gap;
-                self.ctx.render_status_text(vertices, &min_str, left_edge, bar_y, viewport_w, min_fg, no_bg);
-                self.push_tooltip_zone(left_edge, bar_y, min_w, cell_h, "Minimized panes — this tab / all windows (click: switcher)");
+                self.ctx.render_status_text(
+                    vertices, &min_str, left_edge, bar_y, viewport_w, min_fg, no_bg,
+                );
+                self.push_tooltip_zone(
+                    left_edge,
+                    bar_y,
+                    min_w,
+                    cell_h,
+                    "Minimized panes — this tab / all windows (click: switcher)",
+                );
                 self.minimized_counter_zone = Some((left_edge, bar_y, min_w, cell_h));
             }
         }
@@ -1650,7 +2155,14 @@ impl Renderer {
         let cell_w = self.ctx.atlas.cell_width;
         let cell_h = self.ctx.atlas.cell_height;
         let strip = std::mem::take(&mut self.subject_strip);
-        push_bg_quad(vertices, 0.0, strip.y, viewport_w, strip.height, self.tab_bar_bg);
+        push_bg_quad(
+            vertices,
+            0.0,
+            strip.y,
+            viewport_w,
+            strip.height,
+            self.tab_bar_bg,
+        );
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         for seg in &strip.segments {
             let x0 = seg.x.max(0.0);
@@ -1658,17 +2170,38 @@ impl Renderer {
             if x1 <= x0 {
                 continue;
             }
-            let base = seg.color.map_or(SUBJECT_FRAME, |i| TAB_COLORS[i % TAB_COLORS.len()]);
-            let bg = if seg.focused { base } else { dim_inactive_tab(base) };
+            let base = seg
+                .color
+                .map_or(SUBJECT_FRAME, |i| TAB_COLORS[i % TAB_COLORS.len()]);
+            let bg = if seg.focused {
+                base
+            } else {
+                dim_inactive_tab(base)
+            };
             // One pixel apart: two subjects sharing a color stay two bands.
-            push_bg_quad(vertices, x0, strip.y, (x1 - x0 - 1.0).max(0.0), strip.height, bg);
+            push_bg_quad(
+                vertices,
+                x0,
+                strip.y,
+                (x1 - x0 - 1.0).max(0.0),
+                strip.height,
+                bg,
+            );
             let fg = if seg.focused {
                 [1.0, 1.0, 1.0, 1.0]
             } else {
                 [DIM_BRIGHTNESS, DIM_BRIGHTNESS, DIM_BRIGHTNESS, 1.0]
             };
             let text_y = strip.y + (strip.height - cell_h) / 2.0;
-            self.ctx.render_status_text(vertices, &seg.name, x0 + cell_w, text_y, x1 - cell_w, fg, no_bg);
+            self.ctx.render_status_text(
+                vertices,
+                &seg.name,
+                x0 + cell_w,
+                text_y,
+                x1 - cell_w,
+                fg,
+                no_bg,
+            );
         }
         self.subject_strip = strip;
     }
@@ -1696,10 +2229,16 @@ impl Renderer {
         // Fixed width per tab, capped at cell_w * 20, reserving right inset
         let max_tab_w = cell_w * 20.0;
         let full_available_w = viewport_w - left_inset - right_inset;
-        let tab_width = (full_available_w / tab_count as f32).max(cell_w * 4.0).min(max_tab_w);
+        let tab_width = (full_available_w / tab_count as f32)
+            .max(cell_w * 4.0)
+            .min(max_tab_w);
         let no_bg = [0.0, 0.0, 0.0, 0.0];
 
-        for (i, (title, is_active, color_idx, is_renaming, has_bell, has_completion, has_running)) in tab_titles.iter().enumerate() {
+        for (
+            i,
+            (title, is_active, color_idx, is_renaming, has_bell, has_completion, has_running),
+        ) in tab_titles.iter().enumerate()
+        {
             let x = left_inset + i as f32 * tab_width;
 
             // Tab background color. Inactive colored tabs are dimmed: with
@@ -1722,7 +2261,14 @@ impl Renderer {
             // Active tab: white border at bottom, the same on every tab color
             if *is_active {
                 let border_h = 4.0_f32;
-                push_bg_quad(vertices, x, bar_h - border_h, tab_width, border_h, [1.0, 1.0, 1.0]);
+                push_bg_quad(
+                    vertices,
+                    x,
+                    bar_h - border_h,
+                    tab_width,
+                    border_h,
+                    [1.0, 1.0, 1.0],
+                );
             }
 
             // Tab indicator: bell (orange ●) > completion (green ●) > running
@@ -1765,7 +2311,12 @@ impl Renderer {
             } else if color_idx.is_some() {
                 [DIM_BRIGHTNESS, DIM_BRIGHTNESS, DIM_BRIGHTNESS, 1.0]
             } else {
-                [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 1.0]
+                [
+                    self.tab_bar_fg[0],
+                    self.tab_bar_fg[1],
+                    self.tab_bar_fg[2],
+                    1.0,
+                ]
             };
 
             // Center text vertically and horizontally in the tab.
@@ -1779,7 +2330,15 @@ impl Renderer {
             } else {
                 x + tab_width - cell_w
             };
-            self.ctx.render_status_text(vertices, &label, text_x.max(x + cell_w * 0.5), text_y, max_x, fg, no_bg);
+            self.ctx.render_status_text(
+                vertices,
+                &label,
+                text_x.max(x + cell_w * 0.5),
+                text_y,
+                max_x,
+                fg,
+                no_bg,
+            );
 
             if let Some((color, glyph)) = indicator {
                 let dot_x = x + tab_width - cell_w * 2.0;
@@ -1794,19 +2353,46 @@ impl Renderer {
                 } else {
                     [color[0], color[1], color[2], 1.0]
                 };
-                self.ctx.render_status_text(vertices, glyph, dot_x, dot_y, x + tab_width, dot_color, no_bg);
+                self.ctx.render_status_text(
+                    vertices,
+                    glyph,
+                    dot_x,
+                    dot_y,
+                    x + tab_width,
+                    dot_color,
+                    no_bg,
+                );
             }
         }
 
         // Render drag grip + version label on the right (always visible — drag handle zone)
         {
-            let grip_fg = [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 1.0];
-            let version_fg = [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 0.5];
+            let grip_fg = [
+                self.tab_bar_fg[0],
+                self.tab_bar_fg[1],
+                self.tab_bar_fg[2],
+                1.0,
+            ];
+            let version_fg = [
+                self.tab_bar_fg[0],
+                self.tab_bar_fg[1],
+                self.tab_bar_fg[2],
+                0.5,
+            ];
             let grip_x = viewport_w - right_inset + cell_w * 0.25;
             let version_x = grip_x + cell_w * 1.5;
             let version_y = (bar_h - cell_h) / 2.0;
-            self.ctx.render_status_text(vertices, "⠿", grip_x, version_y, viewport_w, grip_fg, no_bg);
-            self.ctx.render_status_text(vertices, &version_label, version_x, version_y, viewport_w - cell_w * 0.5, version_fg, no_bg);
+            self.ctx
+                .render_status_text(vertices, "⠿", grip_x, version_y, viewport_w, grip_fg, no_bg);
+            self.ctx.render_status_text(
+                vertices,
+                &version_label,
+                version_x,
+                version_y,
+                viewport_w - cell_w * 0.5,
+                version_fg,
+                no_bg,
+            );
         }
     }
 
@@ -1816,7 +2402,8 @@ impl Renderer {
         vp: &PaneViewport,
         filter: &FilterRenderData,
     ) {
-        build_filter_overlay(&mut self.ctx, vertices, vp, filter);
+        let selected_bg = self.switcher_selected_bg;
+        build_filter_overlay(&mut self.ctx, vertices, vp, filter, selected_bg);
     }
 
     pub fn rebuild_atlas(&mut self, scale: f64) {
@@ -1849,7 +2436,15 @@ impl Renderer {
         let base_ch = self.ctx.atlas.cell_height;
 
         // Semi-transparent dark overlay
-        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+        push_bg_quad_alpha(
+            vertices,
+            0.0,
+            0.0,
+            viewport_w,
+            viewport_h,
+            [0.0, 0.0, 0.0],
+            0.9,
+        );
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0]; // accent yellow
@@ -1865,7 +2460,16 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * ocw * title_scale) / 2.0;
         let mut y = och * 2.0;
-        self.ctx.render_overlay_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        self.ctx.render_overlay_text(
+            vertices,
+            title,
+            title_x,
+            y,
+            viewport_w,
+            title_fg,
+            no_bg,
+            title_scale,
+        );
         y += och * title_scale * 1.6;
 
         // Subtitle
@@ -1875,7 +2479,9 @@ impl Renderer {
         let subtitle = format!("Press {} or Esc to close", &self.cached_help_hint);
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * ocw) / 2.0;
-        self.ctx.render_overlay_text(vertices, &subtitle, sub_x, y, viewport_w, label_fg, no_bg, 1.0);
+        self.ctx.render_overlay_text(
+            vertices, &subtitle, sub_x, y, viewport_w, label_fg, no_bg, 1.0,
+        );
         drop(subtitle);
         y += och * 1.4;
 
@@ -1894,7 +2500,9 @@ impl Renderer {
         };
         let fl_chars = font_line.chars().count() as f32;
         let fl_x = (viewport_w - fl_chars * ocw) / 2.0;
-        self.ctx.render_overlay_text(vertices, &font_line, fl_x, y, viewport_w, dim_fg, no_bg, 1.0);
+        self.ctx.render_overlay_text(
+            vertices, &font_line, fl_x, y, viewport_w, dim_fg, no_bg, 1.0,
+        );
         drop(font_line);
         y += och * 2.2;
 
@@ -1905,72 +2513,169 @@ impl Renderer {
             let kc = keys_config;
             type Section<'a> = (&'a str, Vec<(&'a str, &'a str, &'a str)>);
             let left: Vec<Section> = vec![
-                ("TABS & WINDOWS", vec![
-                    ("New Tab", kc.new_tab.as_str(), ""),
-                    ("Close Pane/Tab", kc.close_pane_or_tab.as_str(), "pane, or tab if last one"),
-                    ("Close Tab", kc.close_tab.as_str(), "whole tab at once"),
-                    ("Previous Tab", kc.prev_tab.as_str(), ""),
-                    ("Next Tab", kc.next_tab.as_str(), ""),
-                    ("Jump to Tab", "cmd+1-9", ""),
-                    ("Rename Tab", kc.rename_tab.as_str(), ""),
-                    ("New Window", kc.new_window.as_str(), ""),
-                    ("Close Window", kc.close_window.as_str(), ""),
-                    ("Kill Window", kc.kill_window.as_str(), "force, no prompt"),
-                    ("Reopen Tab", kc.open_recent_project.as_str(), "closed tabs"),
-                ]),
-                ("SPLITS", vec![
-                    ("Vertical Split", kc.vsplit.as_str(), "side by side"),
-                    ("Horizontal Split", kc.hsplit.as_str(), "stacked"),
-                    ("V Split (Root)", kc.vsplit_root.as_str(), "full column height"),
-                    ("H Split (Root)", kc.hsplit_root.as_str(), "full row width"),
-                    ("Equalize", kc.equalize.as_str(), "even out sizes"),
-                ]),
-                ("MOVE PANES & TABS", vec![
-                    ("Break Pane", kc.break_pane.as_str(), "pane → new tab (needs 2+ panes)"),
-                    ("Merge Tab", kc.merge_tab.as_str(), "fold this tab into another"),
-                    ("Detach Tab", kc.detach_tab.as_str(), "tab → new window"),
-                    ("Merge Window", kc.merge_window.as_str(), "fold window into another"),
-                    ("Swap Pane", kc.swap_up.as_str(), "trade two panes"),
-                    ("Reparent Pane", kc.reparent_up.as_str(), "move across the split tree"),
-                ]),
-                ("MISC", vec![
-                    ("Memory Report", "cmd+shift+i", ""),
-                    ("Help", kc.toggle_help.as_str(), "this screen"),
-                ]),
+                (
+                    "TABS & WINDOWS",
+                    vec![
+                        ("New Tab", kc.new_tab.as_str(), ""),
+                        (
+                            "Close Pane/Tab",
+                            kc.close_pane_or_tab.as_str(),
+                            "pane, or tab if last one",
+                        ),
+                        ("Close Tab", kc.close_tab.as_str(), "whole tab at once"),
+                        ("Previous Tab", kc.prev_tab.as_str(), ""),
+                        ("Next Tab", kc.next_tab.as_str(), ""),
+                        ("Jump to Tab", "cmd+1-9", ""),
+                        ("Rename Tab", kc.rename_tab.as_str(), ""),
+                        ("New Window", kc.new_window.as_str(), ""),
+                        ("Close Window", kc.close_window.as_str(), ""),
+                        ("Kill Window", kc.kill_window.as_str(), "force, no prompt"),
+                        ("Reopen Tab", kc.open_recent_project.as_str(), "closed tabs"),
+                    ],
+                ),
+                (
+                    "SPLITS",
+                    vec![
+                        ("Vertical Split", kc.vsplit.as_str(), "side by side"),
+                        ("Horizontal Split", kc.hsplit.as_str(), "stacked"),
+                        (
+                            "V Split (Root)",
+                            kc.vsplit_root.as_str(),
+                            "full column height",
+                        ),
+                        ("H Split (Root)", kc.hsplit_root.as_str(), "full row width"),
+                        ("Equalize", kc.equalize.as_str(), "even out sizes"),
+                    ],
+                ),
+                (
+                    "MOVE PANES & TABS",
+                    vec![
+                        (
+                            "Break Pane",
+                            kc.break_pane.as_str(),
+                            "pane → new tab (needs 2+ panes)",
+                        ),
+                        (
+                            "Merge Tab",
+                            kc.merge_tab.as_str(),
+                            "fold this tab into another",
+                        ),
+                        ("Detach Tab", kc.detach_tab.as_str(), "tab → new window"),
+                        (
+                            "Merge Window",
+                            kc.merge_window.as_str(),
+                            "fold window into another",
+                        ),
+                        ("Swap Pane", kc.swap_up.as_str(), "trade two panes"),
+                        (
+                            "Reparent Pane",
+                            kc.reparent_up.as_str(),
+                            "move across the split tree",
+                        ),
+                    ],
+                ),
+                (
+                    "MISC",
+                    vec![
+                        ("Memory Report", "cmd+shift+i", ""),
+                        ("Help", kc.toggle_help.as_str(), "this screen"),
+                    ],
+                ),
             ];
             let right: Vec<Section> = vec![
-                ("PANES", vec![
-                    ("Navigate", kc.navigate_up.as_str(), "move focus"),
-                    ("Resize Pane", kc.resize_up.as_str(), "adjust split ratio"),
-                    ("Edge Grow", kc.edge_grow_right.as_str(), "grow one edge"),
-                    ("Virtual Width", "ctrl+option+right", "widen / narrow the tab"),
-                    ("Minimize Pane", kc.minimize_pane.as_str(), ""),
-                    ("Restore Minimized", kc.restore_minimized.as_str(), ""),
-                    ("Rename Pane", kc.rename_pane.as_str(), "sticky title"),
-                    ("Repaint Pane", kc.repaint_pane.as_str(), "redraw / fix winsize"),
-                    ("Next Unread", kc.next_attention.as_str(), "unread, else idle agent session"),
-                    ("Back / Forward", kc.history_back.as_str(), "panes you visited"),
-                ]),
-                ("EDIT & SEARCH", vec![
-                    ("Copy", kc.copy.as_str(), ""),
-                    ("Copy Raw", kc.copy_raw.as_str(), ""),
-                    ("Paste", kc.paste.as_str(), ""),
-                    ("Find", kc.toggle_filter.as_str(), "search in this pane"),
-                    ("Global Search", kc.open_search.as_str(), "panes + closed Claude sessions"),
-                    ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "switcher + bookmarks; \u{2318}\u{2190}\u{2192} file into subjects"),
-                    ("Bookmark Pane", kc.toggle_bookmark.as_str(), "keep this conversation"),
-                    ("Anchor Pane", kc.toggle_anchor.as_str(), "what today is for"),
-                    ("Go To Anchor", kc.focus_anchor.as_str(), "back to the first anchor"),
-                    ("Unread Panes", kc.open_unread_switcher.as_str(), "switcher, attention only"),
-                ]),
-                ("TERMINAL", vec![
-                    ("Line Start / End", kc.terminal.home.as_str(), "\u{2190} / \u{2192}"),
-                    ("Word Jump", kc.terminal.word_back.as_str(), "\u{2190} / \u{2192}"),
-                    ("Kill Line", kc.terminal.kill_line.as_str(), ""),
-                    ("Newline", kc.terminal.shift_enter.as_str(), "without running"),
-                    ("Clear Scrollback", "ctrl+l", "passed to the app too"),
-                    ("Open URL", "cmd+click", ""),
-                ]),
+                (
+                    "PANES",
+                    vec![
+                        ("Navigate", kc.navigate_up.as_str(), "move focus"),
+                        ("Resize Pane", kc.resize_up.as_str(), "adjust split ratio"),
+                        ("Edge Grow", kc.edge_grow_right.as_str(), "grow one edge"),
+                        (
+                            "Virtual Width",
+                            "ctrl+option+right",
+                            "widen / narrow the tab",
+                        ),
+                        ("Minimize Pane", kc.minimize_pane.as_str(), ""),
+                        ("Restore Minimized", kc.restore_minimized.as_str(), ""),
+                        ("Rename Pane", kc.rename_pane.as_str(), "sticky title"),
+                        (
+                            "Repaint Pane",
+                            kc.repaint_pane.as_str(),
+                            "redraw / fix winsize",
+                        ),
+                        (
+                            "Next Unread",
+                            kc.next_attention.as_str(),
+                            "unread, else idle agent session",
+                        ),
+                        (
+                            "Back / Forward",
+                            kc.history_back.as_str(),
+                            "panes you visited",
+                        ),
+                    ],
+                ),
+                (
+                    "EDIT & SEARCH",
+                    vec![
+                        ("Copy", kc.copy.as_str(), ""),
+                        ("Copy Raw", kc.copy_raw.as_str(), ""),
+                        ("Paste", kc.paste.as_str(), ""),
+                        ("Find", kc.toggle_filter.as_str(), "search in this pane"),
+                        (
+                            "Global Search",
+                            kc.open_search.as_str(),
+                            "panes + closed Claude sessions",
+                        ),
+                        (
+                            "Switch Tab/Pane",
+                            kc.open_pane_switcher.as_str(),
+                            "switcher + bookmarks; \u{2318}\u{2190}\u{2192} file into subjects",
+                        ),
+                        (
+                            "Bookmark Pane",
+                            kc.toggle_bookmark.as_str(),
+                            "keep this conversation",
+                        ),
+                        (
+                            "Anchor Pane",
+                            kc.toggle_anchor.as_str(),
+                            "what today is for",
+                        ),
+                        (
+                            "Go To Anchor",
+                            kc.focus_anchor.as_str(),
+                            "back to the first anchor",
+                        ),
+                        (
+                            "Unread Panes",
+                            kc.open_unread_switcher.as_str(),
+                            "switcher, attention only",
+                        ),
+                    ],
+                ),
+                (
+                    "TERMINAL",
+                    vec![
+                        (
+                            "Line Start / End",
+                            kc.terminal.home.as_str(),
+                            "\u{2190} / \u{2192}",
+                        ),
+                        (
+                            "Word Jump",
+                            kc.terminal.word_back.as_str(),
+                            "\u{2190} / \u{2192}",
+                        ),
+                        ("Kill Line", kc.terminal.kill_line.as_str(), ""),
+                        (
+                            "Newline",
+                            kc.terminal.shift_enter.as_str(),
+                            "without running",
+                        ),
+                        ("Clear Scrollback", "ctrl+l", "passed to the app too"),
+                        ("Open URL", "cmd+click", ""),
+                    ],
+                ),
             ];
             let build = |sections: Vec<Section>| -> Vec<HelpRow> {
                 let mut rows = Vec::new();
@@ -2010,10 +2715,16 @@ impl Renderer {
         // Tighten the spacing when the tallest column would run past the
         // status bar, so a short window still shows every row.
         let avail = viewport_h - base_ch - y;
-        let scale = columns.iter().map(|col| {
-            let headers = col.iter().filter(|r| matches!(r, HelpRow::Header(_))).count();
-            help_row_scale(headers, col.len() - headers, avail, och)
-        }).fold(1.0_f32, f32::min);
+        let scale = columns
+            .iter()
+            .map(|col| {
+                let headers = col
+                    .iter()
+                    .filter(|r| matches!(r, HelpRow::Header(_)))
+                    .count();
+                help_row_scale(headers, col.len() - headers, avail, och)
+            })
+            .fold(1.0_f32, f32::min);
         let row_h = och * HELP_ROW_STEP * scale;
         let header_gap = och * HELP_HEADER_GAP * scale;
 
@@ -2027,14 +2738,50 @@ impl Renderer {
                 match row {
                     HelpRow::Header(h) => {
                         row_y += header_gap; // breathing room above each section
-                        self.ctx.render_overlay_text(vertices, h, base_x + label_off, row_y, base_x + col_width - ocw, title_fg, no_bg, 1.0);
+                        self.ctx.render_overlay_text(
+                            vertices,
+                            h,
+                            base_x + label_off,
+                            row_y,
+                            base_x + col_width - ocw,
+                            title_fg,
+                            no_bg,
+                            1.0,
+                        );
                         row_y += row_h;
                     }
                     HelpRow::Item { label, key, desc } => {
-                        self.ctx.render_overlay_text(vertices, label, base_x + label_off, row_y, base_x + key_off - ocw, label_fg, no_bg, 1.0);
-                        self.ctx.render_overlay_text(vertices, key, base_x + key_off, row_y, base_x + desc_off - ocw, key_fg, no_bg, 1.0);
+                        self.ctx.render_overlay_text(
+                            vertices,
+                            label,
+                            base_x + label_off,
+                            row_y,
+                            base_x + key_off - ocw,
+                            label_fg,
+                            no_bg,
+                            1.0,
+                        );
+                        self.ctx.render_overlay_text(
+                            vertices,
+                            key,
+                            base_x + key_off,
+                            row_y,
+                            base_x + desc_off - ocw,
+                            key_fg,
+                            no_bg,
+                            1.0,
+                        );
                         if !desc.is_empty() {
-                            self.ctx.render_overlay_text(vertices, desc, base_x + desc_off, row_y, base_x + col_width - ocw, dim_fg, no_bg, 1.0);
+                            self.ctx.render_overlay_text(
+                                vertices,
+                                desc,
+                                base_x + desc_off,
+                                row_y,
+                                base_x + col_width - ocw,
+                                dim_fg,
+                                no_bg,
+                                1.0,
+                            );
                         }
                         row_y += row_h;
                     }
@@ -2056,7 +2803,15 @@ impl Renderer {
         let overlay_ch = self.ctx.atlas.overlay_cell_height;
 
         // Semi-transparent dark overlay
-        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+        push_bg_quad_alpha(
+            vertices,
+            0.0,
+            0.0,
+            viewport_w,
+            viewport_h,
+            [0.0, 0.0, 0.0],
+            0.9,
+        );
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0];
@@ -2069,14 +2824,17 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * overlay_cw) / 2.0;
         let mut y = overlay_ch * 2.0;
-        self.ctx.render_overlay_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, 1.0);
+        self.ctx.render_overlay_text(
+            vertices, title, title_x, y, viewport_w, title_fg, no_bg, 1.0,
+        );
         y += overlay_ch * 2.0;
 
         // Subtitle
         let subtitle = "Press Esc to close";
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * overlay_cw) / 2.0;
-        self.ctx.render_overlay_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, 1.0);
+        self.ctx
+            .render_overlay_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, 1.0);
         y += overlay_ch * 2.5;
 
         // Report lines
@@ -2095,7 +2853,16 @@ impl Renderer {
             } else {
                 (line.as_str(), label_fg)
             };
-            self.ctx.render_overlay_text(vertices, text, left_margin, y, viewport_w - overlay_cw, fg, no_bg, 1.0);
+            self.ctx.render_overlay_text(
+                vertices,
+                text,
+                left_margin,
+                y,
+                viewport_w - overlay_cw,
+                fg,
+                no_bg,
+                1.0,
+            );
             y += overlay_ch * 1.3;
         }
         self.cached_mem_report = report;
@@ -2112,8 +2879,14 @@ impl Renderer {
         // Rows sized for the terminal's own glyphs (the list draws them at 1.0).
         let row_height = cell_h * 1.7;
         let content_bottom = viewport_h - cell_h * 2.0;
-        let max_visible = (((content_bottom - content_top) / row_height).floor().max(0.0)) as usize;
-        OverlayListGeometry { content_top, row_height, max_visible }
+        let max_visible = (((content_bottom - content_top) / row_height)
+            .floor()
+            .max(0.0)) as usize;
+        OverlayListGeometry {
+            content_top,
+            row_height,
+            max_visible,
+        }
     }
 
     fn build_pane_switcher_overlay_vertices(
@@ -2127,7 +2900,15 @@ impl Renderer {
         let cell_h = self.ctx.atlas.cell_height;
 
         // Opaque backdrop: terminal text showing through competed with the list.
-        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.04, 0.04, 0.05], 1.0);
+        push_bg_quad_alpha(
+            vertices,
+            0.0,
+            0.0,
+            viewport_w,
+            viewport_h,
+            [0.04, 0.04, 0.05],
+            1.0,
+        );
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0];
@@ -2200,7 +2981,9 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = ((viewport_w - title_chars * overlay_cw) / 2.0).max(0.0);
         let mut y = cell_h * 3.0;
-        self.ctx.render_overlay_text(vertices, &title, title_x, y, viewport_w, title_fg, no_bg, 1.0);
+        self.ctx.render_overlay_text(
+            vertices, &title, title_x, y, viewport_w, title_fg, no_bg, 1.0,
+        );
         y += cell_h * title_scale * 2.0;
 
         // Subtitle: the keys the overlay answers, each one a (key, what it does)
@@ -2254,9 +3037,13 @@ impl Renderer {
         // centred line wider than the window would start off its left edge.
         let mut sub_x = ((viewport_w - sub_chars * scaled_cell_w) / 2.0).max(0.0);
         for (key, what) in hints {
-            self.ctx.render_text(vertices, key, sub_x, y, viewport_w, key_fg, no_bg, body_scale);
+            self.ctx.render_text(
+                vertices, key, sub_x, y, viewport_w, key_fg, no_bg, body_scale,
+            );
             sub_x += (key.chars().count() + 1) as f32 * scaled_cell_w;
-            self.ctx.render_text(vertices, what, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(
+                vertices, what, sub_x, y, viewport_w, dim_fg, no_bg, body_scale,
+            );
             sub_x += (what.chars().count() + 2) as f32 * scaled_cell_w;
         }
 
@@ -2310,22 +3097,48 @@ impl Renderer {
                         let gap = SUBJECT_FRAME_PX + 2.0;
                         let top = if row.box_top { y0 + gap } else { y0 };
                         let bottom = if row.box_bottom { y1 - gap } else { y1 };
-                        push_bg_quad_alpha(vertices, x0 + gap, top, x1 - x0 - 2.0 * gap, bottom - top, color, 0.8);
+                        push_bg_quad_alpha(
+                            vertices,
+                            x0 + gap,
+                            top,
+                            x1 - x0 - 2.0 * gap,
+                            bottom - top,
+                            color,
+                            0.8,
+                        );
                     } else {
                         push_bg_quad_alpha(vertices, x0, row_y, x1 - x0, row_height, color, 0.8);
                     }
                 }
 
                 // The subject's own color, the one its strip wears above the panes.
-                let frame = row.subject_color.map_or(SUBJECT_FRAME, |i| TAB_COLORS[i % TAB_COLORS.len()]);
+                let frame = row
+                    .subject_color
+                    .map_or(SUBJECT_FRAME, |i| TAB_COLORS[i % TAB_COLORS.len()]);
                 if row.subject_header || row.in_subject {
                     push_bg_quad_alpha(vertices, x0, y0, SUBJECT_FRAME_PX, y1 - y0, frame, 0.9);
-                    push_bg_quad_alpha(vertices, x1 - SUBJECT_FRAME_PX, y0, SUBJECT_FRAME_PX, y1 - y0, frame, 0.9);
+                    push_bg_quad_alpha(
+                        vertices,
+                        x1 - SUBJECT_FRAME_PX,
+                        y0,
+                        SUBJECT_FRAME_PX,
+                        y1 - y0,
+                        frame,
+                        0.9,
+                    );
                     if row.box_top {
                         push_bg_quad_alpha(vertices, x0, y0, x1 - x0, SUBJECT_FRAME_PX, frame, 0.9);
                     }
                     if row.box_bottom {
-                        push_bg_quad_alpha(vertices, x0, y1 - SUBJECT_FRAME_PX, x1 - x0, SUBJECT_FRAME_PX, frame, 0.9);
+                        push_bg_quad_alpha(
+                            vertices,
+                            x0,
+                            y1 - SUBJECT_FRAME_PX,
+                            x1 - x0,
+                            SUBJECT_FRAME_PX,
+                            frame,
+                            0.9,
+                        );
                     }
                 }
 
@@ -2338,11 +3151,37 @@ impl Renderer {
                     // No fill: a filled bar read like a bookmarked row's band.
                     // A rule under the name separates it from its panes.
                     if !row.box_bottom {
-                        push_bg_quad_alpha(vertices, x0 + gap, bar_bottom - 1.0, x1 - x0 - 2.0 * gap, 1.0, frame, 0.6);
+                        push_bg_quad_alpha(
+                            vertices,
+                            x0 + gap,
+                            bar_bottom - 1.0,
+                            x1 - x0 - 2.0 * gap,
+                            1.0,
+                            frame,
+                            0.6,
+                        );
                     }
-                    self.ctx.render_text(vertices, row.text, left_margin + scaled_cell_w, text_y, right_margin, SUBJECT_TITLE_FG, no_bg, body_scale);
+                    self.ctx.render_text(
+                        vertices,
+                        row.text,
+                        left_margin + scaled_cell_w,
+                        text_y,
+                        right_margin,
+                        SUBJECT_TITLE_FG,
+                        no_bg,
+                        body_scale,
+                    );
                 } else if row.is_header {
-                    self.ctx.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
+                    self.ctx.render_text(
+                        vertices,
+                        row.text,
+                        left_margin,
+                        text_y,
+                        right_margin,
+                        header_fg,
+                        no_bg,
+                        body_scale,
+                    );
                 } else {
                     // No current-pane marker: the focused pane renders like any
                     // other row (the blue selection highlight is the only cursor).
@@ -2357,7 +3196,14 @@ impl Renderer {
                     let lead = if row.anchored { "     " } else { "    " };
                     let text = format!("{}{}", lead, row.text);
                     let (row_fg, row_dim_fg) = if row.bookmarked {
-                        (if row.minimized { bookmark_dim_fg } else { bookmark_fg }, bookmark_dim_fg)
+                        (
+                            if row.minimized {
+                                bookmark_dim_fg
+                            } else {
+                                bookmark_fg
+                            },
+                            bookmark_dim_fg,
+                        )
                     } else {
                         (if row.minimized { dim_fg } else { label_fg }, dim_fg)
                     };
@@ -2373,23 +3219,68 @@ impl Renderer {
                         switcher_row_tail_chars(row.process, row.raf_todo, row.raf_idea),
                         scaled_cell_w,
                     );
-                    self.ctx.render_text(vertices, &text, left_margin, text_y, split.title_limit, row_fg, no_bg, body_scale);
+                    self.ctx.render_text(
+                        vertices,
+                        &text,
+                        left_margin,
+                        text_y,
+                        split.title_limit,
+                        row_fg,
+                        no_bg,
+                        body_scale,
+                    );
                     if let Some(mut tail_x) = split.process_x {
                         if let Some(process) = row.process {
-                            self.ctx.render_text(vertices, process, tail_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                            self.ctx.render_text(
+                                vertices,
+                                process,
+                                tail_x,
+                                text_y,
+                                right_margin,
+                                row_dim_fg,
+                                no_bg,
+                                body_scale,
+                            );
                             tail_x += (process.chars().count() + 2) as f32 * scaled_cell_w;
                         }
                         if let Some(todo) = row.raf_todo {
                             let todo_fg = if row.bookmarked { row_fg } else { RAF_TODO_FG };
-                            self.ctx.render_text(vertices, todo, tail_x, text_y, right_margin, todo_fg, no_bg, body_scale);
+                            self.ctx.render_text(
+                                vertices,
+                                todo,
+                                tail_x,
+                                text_y,
+                                right_margin,
+                                todo_fg,
+                                no_bg,
+                                body_scale,
+                            );
                             tail_x += todo.chars().count() as f32 * scaled_cell_w;
                             if row.raf_idea.is_some() {
-                                self.ctx.render_text(vertices, RAF_SEPARATOR, tail_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                                self.ctx.render_text(
+                                    vertices,
+                                    RAF_SEPARATOR,
+                                    tail_x,
+                                    text_y,
+                                    right_margin,
+                                    row_dim_fg,
+                                    no_bg,
+                                    body_scale,
+                                );
                                 tail_x += RAF_SEPARATOR.chars().count() as f32 * scaled_cell_w;
                             }
                         }
                         if let Some(idea) = row.raf_idea {
-                            self.ctx.render_text(vertices, idea, tail_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                            self.ctx.render_text(
+                                vertices,
+                                idea,
+                                tail_x,
+                                text_y,
+                                right_margin,
+                                row_dim_fg,
+                                no_bg,
+                                body_scale,
+                            );
                         }
                     }
                     if row.anchored {
@@ -2397,23 +3288,59 @@ impl Renderer {
                         // title: the three slots before it are taken by the
                         // minimized, working and attention markers.
                         let anchor_x = left_margin + 3.0 * scaled_cell_w;
-                        self.ctx.render_text(vertices, "\u{2693}", anchor_x, text_y, right_margin, ANCHOR_FG, no_bg, body_scale);
+                        self.ctx.render_text(
+                            vertices,
+                            "\u{2693}",
+                            anchor_x,
+                            text_y,
+                            right_margin,
+                            ANCHOR_FG,
+                            no_bg,
+                            body_scale,
+                        );
                     }
                     if row.minimized {
                         // Minimized marker in the 1st char slot, in a color of
                         // its own so hidden panes stand out in the list.
-                        self.ctx.render_text(vertices, "\u{229f}", left_margin, text_y, right_margin, MINIMIZED_FG, no_bg, body_scale);
+                        self.ctx.render_text(
+                            vertices,
+                            "\u{229f}",
+                            left_margin,
+                            text_y,
+                            right_margin,
+                            MINIMIZED_FG,
+                            no_bg,
+                            body_scale,
+                        );
                     }
                     if let Some(color) = attention.dot_color() {
                         // Dot occupies the 3rd char slot (after the "    " lead-in).
                         let dot_x = left_margin + 2.0 * scaled_cell_w;
-                        self.ctx.render_text(vertices, "\u{25cf}", dot_x, text_y, right_margin, color, no_bg, body_scale);
+                        self.ctx.render_text(
+                            vertices,
+                            "\u{25cf}",
+                            dot_x,
+                            text_y,
+                            right_margin,
+                            color,
+                            no_bg,
+                            body_scale,
+                        );
                     }
                     // Claude Code state in the 2nd char slot: "✳" while the
                     // session works.
                     if row.working {
                         let state_x = left_margin + scaled_cell_w;
-                        self.ctx.render_text(vertices, "\u{2733}", state_x, text_y, right_margin, WORKING_FG, no_bg, body_scale);
+                        self.ctx.render_text(
+                            vertices,
+                            "\u{2733}",
+                            state_x,
+                            text_y,
+                            right_margin,
+                            WORKING_FG,
+                            no_bg,
+                            body_scale,
+                        );
                     }
                 }
             }
@@ -2421,10 +3348,28 @@ impl Renderer {
             // Per-column scroll indicators (centered in the column)
             let ind_x = col_x + col_w / 2.0;
             if scroll > 0 {
-                self.ctx.render_text(vertices, "\u{25b2}", ind_x, content_top - scaled_cell_h, right_margin, dim_fg, no_bg, body_scale);
+                self.ctx.render_text(
+                    vertices,
+                    "\u{25b2}",
+                    ind_x,
+                    content_top - scaled_cell_h,
+                    right_margin,
+                    dim_fg,
+                    no_bg,
+                    body_scale,
+                );
             }
             if end < column.rows.len() {
-                self.ctx.render_text(vertices, "\u{25bc}", ind_x, content_top + max_visible as f32 * row_height, right_margin, dim_fg, no_bg, body_scale);
+                self.ctx.render_text(
+                    vertices,
+                    "\u{25bc}",
+                    ind_x,
+                    content_top + max_visible as f32 * row_height,
+                    right_margin,
+                    dim_fg,
+                    no_bg,
+                    body_scale,
+                );
             }
         }
     }
@@ -2440,7 +3385,15 @@ impl Renderer {
         let cell_h = self.ctx.atlas.cell_height;
 
         // Semi-transparent dark overlay
-        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+        push_bg_quad_alpha(
+            vertices,
+            0.0,
+            0.0,
+            viewport_w,
+            viewport_h,
+            [0.0, 0.0, 0.0],
+            0.9,
+        );
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0];
@@ -2460,14 +3413,25 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
         let mut y = cell_h * 3.0;
-        self.ctx.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        self.ctx.render_text(
+            vertices,
+            title,
+            title_x,
+            y,
+            viewport_w,
+            title_fg,
+            no_bg,
+            title_scale,
+        );
         y += cell_h * title_scale * 2.0;
 
         // Subtitle
         let subtitle = "\u{2191}\u{2193} Navigate  \u{23ce} Send  esc Cancel";
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
-        self.ctx.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        self.ctx.render_text(
+            vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale,
+        );
         y += scaled_cell_h * 2.0;
 
         let left_margin = scaled_cell_w * 3.0;
@@ -2479,15 +3443,36 @@ impl Renderer {
 
             // Selected row background
             if i == data.selected {
-                push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+                push_bg_quad_alpha(
+                    vertices,
+                    left_margin - scaled_cell_w,
+                    row_y,
+                    right_margin - left_margin + scaled_cell_w * 2.0,
+                    row_height,
+                    selected_bg,
+                    0.8,
+                );
             }
 
             // "New Window" gets a distinct color (only if flagged)
             let is_new_window = data.has_new_entry && i == data.entries.len() - 1;
-            let fg = if is_new_window { new_window_fg } else { label_fg };
+            let fg = if is_new_window {
+                new_window_fg
+            } else {
+                label_fg
+            };
             let prefix = if is_new_window { "+ " } else { "" };
             let text = format!("{}{}", prefix, label);
-            self.ctx.render_text(vertices, &text, left_margin, text_y, right_margin, fg, no_bg, body_scale);
+            self.ctx.render_text(
+                vertices,
+                &text,
+                left_margin,
+                text_y,
+                right_margin,
+                fg,
+                no_bg,
+                body_scale,
+            );
         }
     }
 
@@ -2502,7 +3487,15 @@ impl Renderer {
         let cell_h = self.ctx.atlas.cell_height;
 
         // Semi-transparent dark overlay
-        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+        push_bg_quad_alpha(
+            vertices,
+            0.0,
+            0.0,
+            viewport_w,
+            viewport_h,
+            [0.0, 0.0, 0.0],
+            0.9,
+        );
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0];
@@ -2523,14 +3516,25 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
         let mut y = cell_h * 3.0;
-        self.ctx.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        self.ctx.render_text(
+            vertices,
+            title,
+            title_x,
+            y,
+            viewport_w,
+            title_fg,
+            no_bg,
+            title_scale,
+        );
         y += cell_h * title_scale * 2.0;
 
         // Subtitle
         let subtitle = "↑↓ Navigate  ⏎ Open  ⌘⌫ Remove  esc Cancel";
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
-        self.ctx.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        self.ctx.render_text(
+            vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale,
+        );
         y += scaled_cell_h * 2.0;
 
         let left_margin = scaled_cell_w * 3.0;
@@ -2538,21 +3542,65 @@ impl Renderer {
 
         // Filter input: same box as the search palette's, focused on open.
         let input_h = row_height;
-        push_bg_quad(vertices, left_margin - scaled_cell_w, y, right_margin - left_margin + scaled_cell_w * 2.0, input_h, [0.18, 0.18, 0.22]);
+        push_bg_quad(
+            vertices,
+            left_margin - scaled_cell_w,
+            y,
+            right_margin - left_margin + scaled_cell_w * 2.0,
+            input_h,
+            [0.18, 0.18, 0.22],
+        );
         let prompt = "› ";
         let input_text_y = y + (input_h - scaled_cell_h) / 2.0;
-        self.ctx.render_text(vertices, prompt, left_margin, input_text_y, right_margin, dim_fg, no_bg, body_scale);
+        self.ctx.render_text(
+            vertices,
+            prompt,
+            left_margin,
+            input_text_y,
+            right_margin,
+            dim_fg,
+            no_bg,
+            body_scale,
+        );
         let prompt_w = prompt.chars().count() as f32 * scaled_cell_w;
-        let visible_chars = ((right_margin - left_margin - prompt_w) / scaled_cell_w).floor().max(1.0) as usize;
+        let visible_chars = ((right_margin - left_margin - prompt_w) / scaled_cell_w)
+            .floor()
+            .max(1.0) as usize;
         let input_scroll = input_scroll(data.cursor, visible_chars);
         if data.query.is_empty() {
-            self.ctx.render_text(vertices, "Type to filter by name or path", left_margin + prompt_w, input_text_y, right_margin, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(
+                vertices,
+                "Type to filter by name or path",
+                left_margin + prompt_w,
+                input_text_y,
+                right_margin,
+                dim_fg,
+                no_bg,
+                body_scale,
+            );
         } else {
             let shown: String = data.query.chars().skip(input_scroll).collect();
-            self.ctx.render_text(vertices, &shown, left_margin + prompt_w, input_text_y, right_margin, label_fg, no_bg, body_scale);
+            self.ctx.render_text(
+                vertices,
+                &shown,
+                left_margin + prompt_w,
+                input_text_y,
+                right_margin,
+                label_fg,
+                no_bg,
+                body_scale,
+            );
         }
-        let caret_x = left_margin + prompt_w + ((data.cursor - input_scroll) as f32) * scaled_cell_w;
-        push_bg_quad(vertices, caret_x, input_text_y, 1.5, scaled_cell_h, [1.0, 1.0, 1.0]);
+        let caret_x =
+            left_margin + prompt_w + ((data.cursor - input_scroll) as f32) * scaled_cell_w;
+        push_bg_quad(
+            vertices,
+            caret_x,
+            input_text_y,
+            1.5,
+            scaled_cell_h,
+            [1.0, 1.0, 1.0],
+        );
         y += input_h + scaled_cell_h;
 
         let content_top = y;
@@ -2567,14 +3615,33 @@ impl Renderer {
         };
 
         if data.entries.is_empty() {
-            let msg = if data.total == 0 { "No closed tabs to reopen" } else { "No closed tab matches" };
+            let msg = if data.total == 0 {
+                "No closed tabs to reopen"
+            } else {
+                "No closed tab matches"
+            };
             let msg_w = msg.chars().count() as f32 * scaled_cell_w;
             let msg_x = (viewport_w - msg_w) / 2.0;
-            self.ctx.render_text(vertices, msg, msg_x, content_top + row_height, viewport_w, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(
+                vertices,
+                msg,
+                msg_x,
+                content_top + row_height,
+                viewport_w,
+                dim_fg,
+                no_bg,
+                body_scale,
+            );
             return;
         }
 
-        for (i, entry) in data.entries.iter().enumerate().skip(scroll).take(max_visible) {
+        for (i, entry) in data
+            .entries
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(max_visible)
+        {
             let row_y = content_top + (i - scroll) as f32 * row_height;
             let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
 
@@ -2598,7 +3665,14 @@ impl Renderer {
             // Selection marker: on a colored list the background alone does not
             // say which row is picked (a dimmed blue reads like the selection).
             if is_selected {
-                push_bg_quad(vertices, row_x, row_y, scaled_cell_w * 0.3, row_height, [1.0, 1.0, 1.0]);
+                push_bg_quad(
+                    vertices,
+                    row_x,
+                    row_y,
+                    scaled_cell_w * 0.3,
+                    row_height,
+                    [1.0, 1.0, 1.0],
+                );
             }
 
             // Text on a colored row follows the tab bar: white when selected,
@@ -2618,12 +3692,39 @@ impl Renderer {
             let text_max_x = right_margin - scaled_cell_w * 12.0;
             match entry.title {
                 Some(ref title) => {
-                    self.ctx.render_text(vertices, title, left_margin, text_y, text_max_x, fg, no_bg, body_scale);
+                    self.ctx.render_text(
+                        vertices,
+                        title,
+                        left_margin,
+                        text_y,
+                        text_max_x,
+                        fg,
+                        no_bg,
+                        body_scale,
+                    );
                     let path_x = left_margin + (title.chars().count() as f32 + 3.0) * scaled_cell_w;
-                    self.ctx.render_text(vertices, &entry.path, path_x, text_y, text_max_x, dim_fg, no_bg, body_scale);
+                    self.ctx.render_text(
+                        vertices,
+                        &entry.path,
+                        path_x,
+                        text_y,
+                        text_max_x,
+                        dim_fg,
+                        no_bg,
+                        body_scale,
+                    );
                 }
                 None => {
-                    self.ctx.render_text(vertices, &entry.path, left_margin, text_y, text_max_x, fg, no_bg, body_scale);
+                    self.ctx.render_text(
+                        vertices,
+                        &entry.path,
+                        left_margin,
+                        text_y,
+                        text_max_x,
+                        fg,
+                        no_bg,
+                        body_scale,
+                    );
                 }
             }
 
@@ -2635,19 +3736,46 @@ impl Renderer {
             };
             let info_w = info.chars().count() as f32 * scaled_cell_w;
             let info_x = right_margin - info_w;
-            self.ctx.render_text(vertices, &info, info_x, text_y, right_margin, time_fg, no_bg, body_scale);
+            self.ctx.render_text(
+                vertices,
+                &info,
+                info_x,
+                text_y,
+                right_margin,
+                time_fg,
+                no_bg,
+                body_scale,
+            );
         }
 
         // Scroll indicators
         if scroll > 0 {
             let arrow = "▲";
             let ax = (viewport_w - scaled_cell_w) / 2.0;
-            self.ctx.render_text(vertices, arrow, ax, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(
+                vertices,
+                arrow,
+                ax,
+                content_top - scaled_cell_h,
+                viewport_w,
+                dim_fg,
+                no_bg,
+                body_scale,
+            );
         }
         if scroll + max_visible < data.entries.len() {
             let arrow = "▼";
             let ax = (viewport_w - scaled_cell_w) / 2.0;
-            self.ctx.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(
+                vertices,
+                arrow,
+                ax,
+                content_bottom,
+                viewport_w,
+                dim_fg,
+                no_bg,
+                body_scale,
+            );
         }
     }
 
@@ -2666,7 +3794,11 @@ impl Renderer {
             + scaled_cell_h * 1.5;
         let content_bottom = viewport_h - cell_h * 2.0;
         let max_visible = ((content_bottom - content_top) / row_height).max(0.0) as usize;
-        OverlayListGeometry { content_top, row_height, max_visible }
+        OverlayListGeometry {
+            content_top,
+            row_height,
+            max_visible,
+        }
     }
 
     fn build_search_palette_overlay_vertices(
@@ -2680,7 +3812,15 @@ impl Renderer {
         let cell_h = self.ctx.atlas.cell_height;
 
         // Dim the world behind the palette.
-        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.85);
+        push_bg_quad_alpha(
+            vertices,
+            0.0,
+            0.0,
+            viewport_w,
+            viewport_h,
+            [0.0, 0.0, 0.0],
+            0.85,
+        );
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0];
@@ -2701,31 +3841,69 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
         let mut y = cell_h * 3.0;
-        self.ctx.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        self.ctx.render_text(
+            vertices,
+            title,
+            title_x,
+            y,
+            viewport_w,
+            title_fg,
+            no_bg,
+            title_scale,
+        );
         y += cell_h * title_scale * 1.5;
 
         // Subtitle
         let subtitle = "↑↓ Navigate  ⏎ Open  esc Cancel";
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
-        self.ctx.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        self.ctx.render_text(
+            vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale,
+        );
         y += scaled_cell_h * 2.0;
 
         // Input box: a single full-width row with the query and caret.
         let left_margin = scaled_cell_w * 3.0;
         let right_margin = viewport_w - scaled_cell_w * 3.0;
         let input_h = row_height;
-        push_bg_quad(vertices, left_margin - scaled_cell_w, y, right_margin - left_margin + scaled_cell_w * 2.0, input_h, input_bg);
+        push_bg_quad(
+            vertices,
+            left_margin - scaled_cell_w,
+            y,
+            right_margin - left_margin + scaled_cell_w * 2.0,
+            input_h,
+            input_bg,
+        );
 
         let prompt = "› ";
         let text_y = y + (input_h - scaled_cell_h) / 2.0;
-        self.ctx.render_text(vertices, prompt, left_margin, text_y, right_margin, dim_fg, no_bg, body_scale);
+        self.ctx.render_text(
+            vertices,
+            prompt,
+            left_margin,
+            text_y,
+            right_margin,
+            dim_fg,
+            no_bg,
+            body_scale,
+        );
         let prompt_w = prompt.chars().count() as f32 * scaled_cell_w;
         // A query wider than the box scrolls so the caret stays in view.
-        let visible_chars = ((right_margin - left_margin - prompt_w) / scaled_cell_w).floor().max(1.0) as usize;
+        let visible_chars = ((right_margin - left_margin - prompt_w) / scaled_cell_w)
+            .floor()
+            .max(1.0) as usize;
         let scroll = input_scroll(data.cursor, visible_chars);
         let shown: String = data.query.chars().skip(scroll).collect();
-        self.ctx.render_text(vertices, &shown, left_margin + prompt_w, text_y, right_margin, label_fg, no_bg, body_scale);
+        self.ctx.render_text(
+            vertices,
+            &shown,
+            left_margin + prompt_w,
+            text_y,
+            right_margin,
+            label_fg,
+            no_bg,
+            body_scale,
+        );
 
         // Caret as a thin vertical bar at the cursor position.
         let caret_x = left_margin + prompt_w + ((data.cursor - scroll) as f32) * scaled_cell_w;
@@ -2742,9 +3920,23 @@ impl Renderer {
         } else if hit_count == 0 {
             format!("No matches for \"{}\".", data.submitted_query)
         } else {
-            format!("{} match{} for \"{}\"", hit_count, if hit_count == 1 { "" } else { "es" }, data.submitted_query)
+            format!(
+                "{} match{} for \"{}\"",
+                hit_count,
+                if hit_count == 1 { "" } else { "es" },
+                data.submitted_query
+            )
         };
-        self.ctx.render_text(vertices, &status, left_margin, y, right_margin, dim_fg, no_bg, body_scale);
+        self.ctx.render_text(
+            vertices,
+            &status,
+            left_margin,
+            y,
+            right_margin,
+            dim_fg,
+            no_bg,
+            body_scale,
+        );
         y += scaled_cell_h * 1.5;
 
         if data.rows.is_empty() {
@@ -2752,7 +3944,10 @@ impl Renderer {
         }
 
         let geom = self.search_palette_list_geometry(viewport_h);
-        debug_assert!((geom.content_top - y).abs() < 0.01, "geometry out of sync with the layout");
+        debug_assert!(
+            (geom.content_top - y).abs() < 0.01,
+            "geometry out of sync with the layout"
+        );
         let content_top = geom.content_top;
         let content_bottom = viewport_h - cell_h * 2.0;
         let max_visible = geom.max_visible;
@@ -2770,24 +3965,68 @@ impl Renderer {
 
             if row.is_header {
                 // Group header: tab name (section 1) or the "Tabs" divider.
-                self.ctx.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
+                self.ctx.render_text(
+                    vertices,
+                    row.text,
+                    left_margin,
+                    text_y,
+                    right_margin,
+                    header_fg,
+                    no_bg,
+                    body_scale,
+                );
             } else {
                 if i == data.selected {
-                    push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+                    push_bg_quad_alpha(
+                        vertices,
+                        left_margin - scaled_cell_w,
+                        row_y,
+                        right_margin - left_margin + scaled_cell_w * 2.0,
+                        row_height,
+                        selected_bg,
+                        0.8,
+                    );
                 }
-                self.ctx.render_text(vertices, row.text, left_margin + hit_indent, text_y, right_margin, label_fg, no_bg, body_scale);
+                self.ctx.render_text(
+                    vertices,
+                    row.text,
+                    left_margin + hit_indent,
+                    text_y,
+                    right_margin,
+                    label_fg,
+                    no_bg,
+                    body_scale,
+                );
             }
         }
 
         if scroll > 0 {
             let arrow = "▲";
             let ax = (viewport_w - scaled_cell_w) / 2.0;
-            self.ctx.render_text(vertices, arrow, ax, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(
+                vertices,
+                arrow,
+                ax,
+                content_top - scaled_cell_h,
+                viewport_w,
+                dim_fg,
+                no_bg,
+                body_scale,
+            );
         }
         if scroll + max_visible < data.rows.len() {
             let arrow = "▼";
             let ax = (viewport_w - scaled_cell_w) / 2.0;
-            self.ctx.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(
+                vertices,
+                arrow,
+                ax,
+                content_bottom,
+                viewport_w,
+                dim_fg,
+                no_bg,
+                body_scale,
+            );
         }
     }
 
@@ -2805,15 +4044,24 @@ impl Renderer {
 
     /// Hit-test mouse position against tooltip zones. Returns an ActiveTooltip if hovering.
     pub fn hit_test_tooltip(&self, px: f32, py: f32) -> Option<ActiveTooltip> {
-        self.tooltip_zones.iter().find(|z| z.contains(px, py)).map(|z| ActiveTooltip {
-            text: z.text,
-            anchor_x: z.x + z.width / 2.0,
-            anchor_y: z.y,
-        })
+        self.tooltip_zones
+            .iter()
+            .find(|z| z.contains(px, py))
+            .map(|z| ActiveTooltip {
+                text: z.text,
+                anchor_x: z.x + z.width / 2.0,
+                anchor_y: z.y,
+            })
     }
 
     fn push_tooltip_zone(&mut self, x: f32, y: f32, width: f32, height: f32, text: &'static str) {
-        self.tooltip_zones.push(TooltipZone { x, y, width, height, text });
+        self.tooltip_zones.push(TooltipZone {
+            x,
+            y,
+            width,
+            height,
+            text,
+        });
     }
 
     fn build_tooltip_vertices(&mut self, vertices: &mut Vec<Vertex>, viewport_w: f32) {
@@ -2848,7 +4096,15 @@ impl Renderer {
         let text_y = box_y + padding_y;
         let fg = [0.85, 0.85, 0.85, alpha];
         let no_bg = [0.0, 0.0, 0.0, 0.0];
-        self.ctx.render_status_text(vertices, text_str, text_x, text_y, text_x + text_w + cell_w, fg, no_bg);
+        self.ctx.render_status_text(
+            vertices,
+            text_str,
+            text_x,
+            text_y,
+            text_x + text_w + cell_w,
+            fg,
+            no_bg,
+        );
     }
 
     /// Draw the big directory label of a pane flash: the directory name, the
@@ -2957,19 +4213,28 @@ pub(super) fn fade_toward(c: [f32; 3], bg: [f32; 3], t: f32) -> [f32; 3] {
 
 /// The Ctrl+F filter overlay over the pane at `vp`: a dark veil, the query
 /// bar with the match count (or the recall hint), then one row per match,
-/// the query highlighted. Kova.app draws it over its focused pane, the
-/// library over its pane alone (`layer::LayerRenderer`).
+/// the query highlighted and the picked one banded. Kova.app draws it over its
+/// focused pane, the library over its pane alone (`layer::LayerRenderer`).
 pub(super) fn build_filter_overlay(
     ctx: &mut RenderContext,
     vertices: &mut Vec<Vertex>,
     vp: &PaneViewport,
     filter: &FilterRenderData,
+    selected_bg: [f32; 3],
 ) {
     let cell_w = ctx.atlas.cell_width;
     let cell_h = ctx.atlas.cell_height;
 
     // 1. Semi-transparent dark overlay covering the entire pane
-    push_bg_quad_alpha(vertices, vp.x, vp.y, vp.width, vp.height, [0.0, 0.0, 0.0], 0.85);
+    push_bg_quad_alpha(
+        vertices,
+        vp.x,
+        vp.y,
+        vp.width,
+        vp.height,
+        [0.0, 0.0, 0.0],
+        0.85,
+    );
 
     let no_bg = [0.0, 0.0, 0.0, 0.0];
 
@@ -2980,7 +4245,15 @@ pub(super) fn build_filter_overlay(
     // 3. Search bar text: "/ query▏"
     let bar_text = format!("/ {}▏", &filter.query);
     let bar_fg = [1.0, 0.8, 0.2, 1.0]; // accent yellow
-    ctx.render_status_text(vertices, &bar_text, vp.x + ctx.h_padding(), vp.y, vp.x + vp.width - cell_w, bar_fg, no_bg);
+    ctx.render_status_text(
+        vertices,
+        &bar_text,
+        vp.x + ctx.h_padding(),
+        vp.y,
+        vp.x + vp.width - cell_w,
+        bar_fg,
+        no_bg,
+    );
 
     // Match count — or, on an empty query, how to recall an earlier one.
     let count_text = match &filter.hint {
@@ -2989,23 +4262,52 @@ pub(super) fn build_filter_overlay(
     };
     let count_fg = [0.6, 0.6, 0.6, 1.0];
     let count_w = count_text.chars().count() as f32 * cell_w;
-    ctx.render_status_text(vertices, &count_text, vp.x + vp.width - count_w - ctx.h_padding(), vp.y, vp.x + vp.width, count_fg, no_bg);
+    ctx.render_status_text(
+        vertices,
+        &count_text,
+        vp.x + vp.width - count_w - ctx.h_padding(),
+        vp.y,
+        vp.x + vp.width,
+        count_fg,
+        no_bg,
+    );
 
     // 4. List matched lines — truncate text to visible columns to limit vertices
     let max_visible = ((vp.height / cell_h).floor() as usize).saturating_sub(1);
+    let scroll = filter_list_scroll(filter.selected, max_visible);
     let match_fg = [0.85, 0.85, 0.85, 1.0];
     let highlight_fg = [1.0, 0.8, 0.2, 1.0];
     let query_lower = filter.query.to_lowercase();
     let max_chars = ((vp.width - 2.0 * ctx.h_padding()) / cell_w) as usize;
 
-    for (i, m) in filter.matches.iter().take(max_visible).enumerate() {
-        let y = vp.y + (i + 1) as f32 * cell_h;
+    for (i, m) in filter
+        .matches
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(max_visible)
+    {
+        let y = vp.y + (i - scroll + 1) as f32 * cell_h;
         let max_x = vp.x + vp.width - ctx.h_padding();
+
+        // The row ↑/↓ sits on, banded as the Cmd+P list bands its own: without
+        // it the list never says what Enter would jump to.
+        if i == filter.selected {
+            push_bg_quad_alpha(vertices, vp.x, y, vp.width, cell_h, selected_bg, 0.8);
+        }
 
         // Line number prefix
         let prefix = format!("{:>6}: ", m.abs_line);
         let prefix_fg = [0.5, 0.5, 0.5, 1.0];
-        let after_prefix = ctx.render_status_text(vertices, &prefix, vp.x + ctx.h_padding(), y, max_x, prefix_fg, no_bg);
+        let after_prefix = ctx.render_status_text(
+            vertices,
+            &prefix,
+            vp.x + ctx.h_padding(),
+            y,
+            max_x,
+            prefix_fg,
+            no_bg,
+        );
 
         // Truncate line text to what fits on screen
         let prefix_chars = prefix.chars().count();
@@ -3013,7 +4315,15 @@ pub(super) fn build_filter_overlay(
         let display_text: String = m.text.chars().take(text_limit).collect();
 
         if query_lower.is_empty() {
-            ctx.render_status_text(vertices, &display_text, after_prefix, y, max_x, match_fg, no_bg);
+            ctx.render_status_text(
+                vertices,
+                &display_text,
+                after_prefix,
+                y,
+                max_x,
+                match_fg,
+                no_bg,
+            );
         } else {
             // Split text into spans: alternating normal/highlighted.
             // to_lowercase() is not byte-length-preserving ('İ' is 2
@@ -3084,18 +4394,52 @@ pub(super) fn push_bg_quad_alpha(
     let no_tex = [0.0, 0.0];
     let white = [1.0, 1.0, 1.0, 0.0];
 
-    vertices.push(Vertex { position: [x, y], tex_coords: no_tex, color: white, bg_color: bg4 });
-    vertices.push(Vertex { position: [x + w, y], tex_coords: no_tex, color: white, bg_color: bg4 });
-    vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
-    vertices.push(Vertex { position: [x + w, y], tex_coords: no_tex, color: white, bg_color: bg4 });
-    vertices.push(Vertex { position: [x + w, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
-    vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
+    vertices.push(Vertex {
+        position: [x, y],
+        tex_coords: no_tex,
+        color: white,
+        bg_color: bg4,
+    });
+    vertices.push(Vertex {
+        position: [x + w, y],
+        tex_coords: no_tex,
+        color: white,
+        bg_color: bg4,
+    });
+    vertices.push(Vertex {
+        position: [x, y + h],
+        tex_coords: no_tex,
+        color: white,
+        bg_color: bg4,
+    });
+    vertices.push(Vertex {
+        position: [x + w, y],
+        tex_coords: no_tex,
+        color: white,
+        bg_color: bg4,
+    });
+    vertices.push(Vertex {
+        position: [x + w, y + h],
+        tex_coords: no_tex,
+        color: white,
+        bg_color: bg4,
+    });
+    vertices.push(Vertex {
+        position: [x, y + h],
+        tex_coords: no_tex,
+        color: white,
+        bg_color: bg4,
+    });
 }
 
 /// One row of the help overlay: either a section header or a shortcut entry.
 enum HelpRow {
     Header(String),
-    Item { label: String, key: String, desc: String },
+    Item {
+        label: String,
+        key: String,
+        desc: String,
+    },
 }
 
 /// Help overlay spacing, in overlay cell heights: the step from one row to the
@@ -3163,7 +4507,9 @@ fn format_key_combo(s: &str) -> String {
             "ctrl" | "control" => result.push('\u{2303}'),
             "option" | "alt" | "opt" => result.push('\u{2325}'),
             "shift" => result.push('\u{21E7}'),
-            _ => { result.push_str(trimmed); }
+            _ => {
+                result.push_str(trimmed);
+            }
         }
     }
     let key_trimmed = key_str.trim();
@@ -3187,14 +4533,33 @@ fn format_key_combo(s: &str) -> String {
 mod tests {
     #[test]
     fn viewport_off_screen_only_when_no_column_is_visible() {
-        let vp = |x: f32, width: f32| super::PaneViewport { x, y: 0.0, width, height: 100.0 };
-        assert!(vp(-500.0, 500.0).off_screen(1000.0), "ends exactly at the left edge");
-        assert!(!vp(-499.0, 500.0).off_screen(1000.0), "one pixel still visible on the left");
-        assert!(vp(1000.0, 500.0).off_screen(1000.0), "starts exactly at the right edge");
-        assert!(!vp(999.0, 500.0).off_screen(1000.0), "one pixel still visible on the right");
-        assert!(!vp(-100.0, 2000.0).off_screen(1000.0), "wider than the screen");
+        let vp = |x: f32, width: f32| super::PaneViewport {
+            x,
+            y: 0.0,
+            width,
+            height: 100.0,
+        };
+        assert!(
+            vp(-500.0, 500.0).off_screen(1000.0),
+            "ends exactly at the left edge"
+        );
+        assert!(
+            !vp(-499.0, 500.0).off_screen(1000.0),
+            "one pixel still visible on the left"
+        );
+        assert!(
+            vp(1000.0, 500.0).off_screen(1000.0),
+            "starts exactly at the right edge"
+        );
+        assert!(
+            !vp(999.0, 500.0).off_screen(1000.0),
+            "one pixel still visible on the right"
+        );
+        assert!(
+            !vp(-100.0, 2000.0).off_screen(1000.0),
+            "wider than the screen"
+        );
     }
-
 
     fn draw_key() -> PaneDrawKey {
         PaneDrawKey {
@@ -3216,7 +4581,12 @@ mod tests {
     }
 
     fn bg_line(bgs: &[[u8; 3]]) -> Vec<Cell> {
-        bgs.iter().map(|&bg| Cell { bg, ..Cell::default() }).collect()
+        bgs.iter()
+            .map(|&bg| Cell {
+                bg,
+                ..Cell::default()
+            })
+            .collect()
     }
 
     #[test]
@@ -3236,13 +4606,25 @@ mod tests {
     #[test]
     fn a_clean_unchanged_pane_is_drawn_from_its_cache() {
         let k = draw_key();
-        assert!(can_reuse_pane_cache(Some((&k, false, true)), &k, true, false, false));
+        assert!(can_reuse_pane_cache(
+            Some((&k, false, true)),
+            &k,
+            true,
+            false,
+            false
+        ));
     }
 
     #[test]
     fn a_dirty_pane_is_rebuilt() {
         let k = draw_key();
-        assert!(!can_reuse_pane_cache(Some((&k, false, true)), &k, true, false, true));
+        assert!(!can_reuse_pane_cache(
+            Some((&k, false, true)),
+            &k,
+            true,
+            false,
+            true
+        ));
     }
 
     #[test]
@@ -3272,7 +4654,13 @@ mod tests {
         for change in changes {
             let mut now = cached.clone();
             change(&mut now);
-            assert!(!can_reuse_pane_cache(Some((&cached, false, true)), &now, true, false, false));
+            assert!(!can_reuse_pane_cache(
+                Some((&cached, false, true)),
+                &now,
+                true,
+                false,
+                false
+            ));
         }
     }
 
@@ -3281,17 +4669,47 @@ mod tests {
         let cached = draw_key();
         let mut now = cached.clone();
         now.input_chars = 42;
-        assert!(can_reuse_pane_cache(Some((&cached, false, true)), &now, true, true, true));
+        assert!(can_reuse_pane_cache(
+            Some((&cached, false, true)),
+            &now,
+            true,
+            true,
+            true
+        ));
         now.vp[3] = 500.0;
-        assert!(!can_reuse_pane_cache(Some((&cached, false, true)), &now, true, true, true));
+        assert!(!can_reuse_pane_cache(
+            Some((&cached, false, true)),
+            &now,
+            true,
+            true,
+            true
+        ));
     }
 
     #[test]
     fn a_torn_or_placeholder_build_is_never_reused() {
         let k = draw_key();
-        assert!(!can_reuse_pane_cache(Some((&k, true, true)), &k, true, false, false));
-        assert!(!can_reuse_pane_cache(Some((&k, false, false)), &k, true, false, false));
-        assert!(!can_reuse_pane_cache(Some((&k, false, true)), &k, false, false, false));
+        assert!(!can_reuse_pane_cache(
+            Some((&k, true, true)),
+            &k,
+            true,
+            false,
+            false
+        ));
+        assert!(!can_reuse_pane_cache(
+            Some((&k, false, false)),
+            &k,
+            true,
+            false,
+            false
+        ));
+        assert!(!can_reuse_pane_cache(
+            Some((&k, false, true)),
+            &k,
+            false,
+            false,
+            false
+        ));
     }
 
     #[test]
@@ -3316,7 +4734,10 @@ mod tests {
     #[test]
     fn the_hint_line_measures_what_it_draws() {
         // "\u{23ce} Focus  esc Cancel" — 7 + 2 + 10, no trailing gap.
-        assert_eq!(super::hint_line_width(&[("\u{23ce}", "Focus"), ("esc", "Cancel")]), 19);
+        assert_eq!(
+            super::hint_line_width(&[("\u{23ce}", "Focus"), ("esc", "Cancel")]),
+            19
+        );
         assert_eq!(super::hint_line_width(&[]), 0);
     }
     use super::*;
@@ -3354,10 +4775,17 @@ mod tests {
         let bg = [0.1, 0.1, 0.12];
         let fg = [1.0, 0.5, 0.0];
         assert_eq!(fade_toward(fg, bg, 0.0), fg);
-        assert_eq!(fade_toward(fg, bg, -1.0), fg, "a negative amount is a no-op");
+        assert_eq!(
+            fade_toward(fg, bg, -1.0),
+            fg,
+            "a negative amount is a no-op"
+        );
         let close = |a: [f32; 3], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 1e-6);
         assert!(close(fade_toward(fg, bg, 1.0), bg));
-        assert!(close(fade_toward(fg, bg, 2.0), bg), "clamped, never past the background");
+        assert!(
+            close(fade_toward(fg, bg, 2.0), bg),
+            "clamped, never past the background"
+        );
         let half = fade_toward(fg, bg, 0.5);
         for i in 0..3 {
             assert!((half[i] - (fg[i] + bg[i]) * 0.5).abs() < 1e-6);
@@ -3380,10 +4808,17 @@ mod tests {
         let (cx, cy) = (cell_w * 0.5, cell_h * 0.5);
         for (x, y, w, h) in edges {
             let inside = cx >= x && cx < x + w && cy >= y && cy < y + h;
-            assert!(!inside, "edge quad {:?} covers the cell centre", (x, y, w, h));
+            assert!(
+                !inside,
+                "edge quad {:?} covers the cell centre",
+                (x, y, w, h)
+            );
         }
         let covered: f32 = edges.iter().map(|(_, _, w, h)| w * h).sum();
-        assert!(covered < cell_w * cell_h, "the outline must not fill the cell");
+        assert!(
+            covered < cell_w * cell_h,
+            "the outline must not fill the cell"
+        );
     }
 
     #[test]
@@ -3396,7 +4831,9 @@ mod tests {
             let mut x = max_x - n as f32 * cell_w;
             let mut drawn = 0;
             for _ in 0..n {
-                if !glyph_fits(x, cell_w, max_x) { break; }
+                if !glyph_fits(x, cell_w, max_x) {
+                    break;
+                }
                 drawn += 1;
                 x += cell_w;
             }
@@ -3438,7 +4875,10 @@ mod tests {
         let with_session = flash_label_layout((0.0, 0.0, 800.0, 400.0), 4, 16, 12, 10.0, 20.0);
         let without = flash_label_layout((0.0, 0.0, 800.0, 400.0), 4, 16, 0, 10.0, 20.0);
         assert!(without.box_h < with_session.box_h);
-        assert_eq!(without.session_y, without.parent_y + 20.0 * without.parent_scale);
+        assert_eq!(
+            without.session_y,
+            without.parent_y + 20.0 * without.parent_scale
+        );
     }
 
     #[test]
@@ -3447,7 +4887,10 @@ mod tests {
         assert_eq!(l.name_scale, 1.0, "never shrinks below the overlay size");
         let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 12, 0, 0, 10.0, 20.0);
         assert!(l.name_scale < 3.0 && l.name_scale > 1.0);
-        assert!(12.0 * 10.0 * l.name_scale <= 300.0, "name must fit the pane");
+        assert!(
+            12.0 * 10.0 * l.name_scale <= 300.0,
+            "name must fit the pane"
+        );
     }
 
     #[test]
@@ -3475,16 +4918,28 @@ mod tests {
 
     #[test]
     fn switcher_row_tail_is_the_binary_alone_without_a_raf() {
-        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), None, None), 14);
+        assert_eq!(
+            switcher_row_tail_chars(Some("claude 2.1.226"), None, None),
+            14
+        );
         assert_eq!(switcher_row_tail_chars(None, None, None), 0);
     }
 
     #[test]
     fn switcher_row_tail_adds_the_raf_after_a_two_cell_gap() {
         // "claude 2.1.226" + 2 + "3 todo" + " · " + "1 idea"
-        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), Some("3 todo"), Some("1 idea")), 14 + 2 + 6 + 3 + 6);
-        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), Some("3 todo"), None), 14 + 2 + 6);
-        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), None, Some("2 ideas")), 14 + 2 + 7);
+        assert_eq!(
+            switcher_row_tail_chars(Some("claude 2.1.226"), Some("3 todo"), Some("1 idea")),
+            14 + 2 + 6 + 3 + 6
+        );
+        assert_eq!(
+            switcher_row_tail_chars(Some("claude 2.1.226"), Some("3 todo"), None),
+            14 + 2 + 6
+        );
+        assert_eq!(
+            switcher_row_tail_chars(Some("claude 2.1.226"), None, Some("2 ideas")),
+            14 + 2 + 7
+        );
         assert_eq!(switcher_row_tail_chars(None, Some("3 todo"), None), 6);
     }
 
@@ -3556,7 +5011,13 @@ mod tests {
 
     #[test]
     fn tooltip_zone_contains_is_half_open() {
-        let z = TooltipZone { x: 10.0, y: 20.0, width: 30.0, height: 8.0, text: "x" };
+        let z = TooltipZone {
+            x: 10.0,
+            y: 20.0,
+            width: 30.0,
+            height: 8.0,
+            text: "x",
+        };
         // Inside.
         assert!(z.contains(10.0, 20.0)); // top-left corner is inclusive
         assert!(z.contains(25.0, 24.0));
@@ -3572,7 +5033,10 @@ mod tests {
     fn pane_attention_bell_wins_over_completion() {
         assert_eq!(PaneAttention::from_flags(true, true), PaneAttention::Bell);
         assert_eq!(PaneAttention::from_flags(true, false), PaneAttention::Bell);
-        assert_eq!(PaneAttention::from_flags(false, true), PaneAttention::Completion);
+        assert_eq!(
+            PaneAttention::from_flags(false, true),
+            PaneAttention::Completion
+        );
         assert_eq!(PaneAttention::from_flags(false, false), PaneAttention::None);
     }
 
@@ -3593,7 +5057,9 @@ mod tests {
 
     #[test]
     fn neighboring_columns_of_a_subject_make_one_segment() {
-        let col = |x: f32, name: Option<&str>, focused: bool| (x, 10.0, name.map(|n| (n.to_string(), Some(1))), focused);
+        let col = |x: f32, name: Option<&str>, focused: bool| {
+            (x, 10.0, name.map(|n| (n.to_string(), Some(1))), focused)
+        };
         let segs = subject_strip_segments(&[
             col(0.0, Some("auth"), false),
             col(10.0, Some("auth"), true),
@@ -3601,10 +5067,17 @@ mod tests {
             col(30.0, None, false),
             col(40.0, Some("auth"), false),
         ]);
-        let spans: Vec<(f32, f32, &str, bool)> = segs.iter().map(|s| (s.x, s.width, s.name.as_str(), s.focused)).collect();
+        let spans: Vec<(f32, f32, &str, bool)> = segs
+            .iter()
+            .map(|s| (s.x, s.width, s.name.as_str(), s.focused))
+            .collect();
         assert_eq!(
             spans,
-            [(0.0, 20.0, "auth", true), (20.0, 10.0, "api", false), (40.0, 10.0, "auth", false)],
+            [
+                (0.0, 20.0, "auth", true),
+                (20.0, 10.0, "api", false),
+                (40.0, 10.0, "auth", false)
+            ],
             "a column in no subject breaks the run: the name shows twice"
         );
         // A minimized column (no width) neither shows nor breaks the run.
@@ -3625,10 +5098,15 @@ mod tests {
             // Always darker than the full-color version the active tab keeps.
             assert!(lum(d) < lum(c), "{c:?} -> {d:?} should be darker");
             // Still tinted: the widest channel gap survives the desaturation.
-            let spread = |v: [f32; 3]| v.iter().cloned().fold(f32::MIN, f32::max)
-                - v.iter().cloned().fold(f32::MAX, f32::min);
+            let spread = |v: [f32; 3]| {
+                v.iter().cloned().fold(f32::MIN, f32::max)
+                    - v.iter().cloned().fold(f32::MAX, f32::min)
+            };
             assert!(spread(d) > spread(c) * 0.4, "{c:?} -> {d:?} lost its hue");
-            assert!(d.iter().all(|v| (0.0..=1.0).contains(v)), "{d:?} out of range");
+            assert!(
+                d.iter().all(|v| (0.0..=1.0).contains(v)),
+                "{d:?} out of range"
+            );
         }
     }
 }
@@ -3668,7 +5146,11 @@ mod vertex_snapshots {
         GlyphInfo {
             x: (code % 32) * 32,
             y: (code / 32 % 16) * 32,
-            width: if wide { 2 * CELL_W as u32 } else { CELL_W as u32 - 2 },
+            width: if wide {
+                2 * CELL_W as u32
+            } else {
+                CELL_W as u32 - 2
+            },
             height: CELL_H as u32 - 4,
             is_color: false,
         }
@@ -3714,12 +5196,29 @@ mod vertex_snapshots {
     }
 
     fn vp() -> PaneViewport {
-        PaneViewport { x: 100.0, y: 50.0, width: 140.0, height: 90.0 }
+        PaneViewport {
+            x: 100.0,
+            y: 50.0,
+            width: 140.0,
+            height: 90.0,
+        }
     }
 
     fn build(r: &mut Renderer, t: &TerminalState, focused: bool) -> Vec<Vertex> {
         fill_atlas(r, t);
-        r.build_vertices(t, &vp(), true, focused, focused, None, PaneAttention::None, 0, 1, None, false)
+        r.build_vertices(
+            t,
+            &vp(),
+            true,
+            focused,
+            focused,
+            None,
+            PaneAttention::None,
+            0,
+            1,
+            None,
+            false,
+        )
     }
 
     fn dump(vs: &[Vertex]) -> String {
@@ -3731,10 +5230,18 @@ mod vertex_snapshots {
             }
             out.push_str(&format!(
                 "pos {} {} | uv {} {} | fg {} {} {} {} | bg {} {} {} {}\n",
-                f(v.position[0]), f(v.position[1]),
-                f(v.tex_coords[0]), f(v.tex_coords[1]),
-                f(v.color[0]), f(v.color[1]), f(v.color[2]), f(v.color[3]),
-                f(v.bg_color[0]), f(v.bg_color[1]), f(v.bg_color[2]), f(v.bg_color[3]),
+                f(v.position[0]),
+                f(v.position[1]),
+                f(v.tex_coords[0]),
+                f(v.tex_coords[1]),
+                f(v.color[0]),
+                f(v.color[1]),
+                f(v.color[2]),
+                f(v.color[3]),
+                f(v.bg_color[0]),
+                f(v.bg_color[1]),
+                f(v.bg_color[2]),
+                f(v.bg_color[3]),
             ));
         }
         out
@@ -3752,8 +5259,11 @@ mod vertex_snapshots {
                     let first = want.lines().zip(got.lines()).position(|(a, b)| a != b);
                     panic!(
                         "vertex snapshot {name} moved ({} lines expected, {} got); first difference at line {:?}:\n  want: {:?}\n  got:  {:?}",
-                        want.lines().count(), got.lines().count(), first.map(|i| i + 1),
-                        first.and_then(|i| want.lines().nth(i)), first.and_then(|i| got.lines().nth(i)),
+                        want.lines().count(),
+                        got.lines().count(),
+                        first.map(|i| i + 1),
+                        first.and_then(|i| want.lines().nth(i)),
+                        first.and_then(|i| got.lines().nth(i)),
                     );
                 }
             }
@@ -3890,22 +5400,56 @@ mod vertex_snapshots {
     #[test]
     fn filter_overlay() {
         let mut r = renderer();
-        let vp = PaneViewport { x: 100.0, y: 50.0, width: 300.0, height: 90.0 };
+        let vp = PaneViewport {
+            x: 100.0,
+            y: 50.0,
+            width: 300.0,
+            height: 90.0,
+        };
         let filter = FilterRenderData {
             query: "err".into(),
             matches: vec![
-                FilterMatch { abs_line: 3, text: "an error here".into() },
-                FilterMatch { abs_line: 12, text: "ERR \u{130}x err".into() },
-                FilterMatch { abs_line: 40, text: "third err".into() },
-                FilterMatch { abs_line: 41, text: "not shown".into() },
+                FilterMatch {
+                    abs_line: 3,
+                    text: "an error here".into(),
+                },
+                FilterMatch {
+                    abs_line: 12,
+                    text: "ERR \u{130}x err".into(),
+                },
+                FilterMatch {
+                    abs_line: 40,
+                    text: "third err".into(),
+                },
+                FilterMatch {
+                    abs_line: 41,
+                    text: "not shown".into(),
+                },
             ],
+            selected: 1,
             hint: None,
         };
-        fake_text(&mut r, &["/ err\u{258F}", "4 matches 0123456789: ", "an error here", "ERR \u{130}x err", "third", "not shown", "\u{2191} recall"]);
+        fake_text(
+            &mut r,
+            &[
+                "/ err\u{258F}",
+                "4 matches 0123456789: ",
+                "an error here",
+                "ERR \u{130}x err",
+                "third",
+                "not shown",
+                "\u{2191} recall",
+            ],
+        );
         let mut vs = Vec::new();
         r.build_filter_overlay_vertices(&mut vs, &vp, &filter);
         check("filter_overlay", &vs);
-        let hinted = FilterRenderData { query: String::new(), matches: Vec::new(), hint: Some("\u{2191} recall".into()) };
+        let hinted = FilterRenderData {
+            query: String::new(),
+            matches: Vec::new(),
+            selected: 0,
+            hint: Some("\u{2191} recall".into()),
+        };
         let mut vs = Vec::new();
         r.build_filter_overlay_vertices(&mut vs, &vp, &hinted);
         check("filter_overlay_hint", &vs);
@@ -3928,11 +5472,51 @@ mod vertex_snapshots {
         let mut t = term(12, 3);
         type_lines(&mut t, &["ab"]);
         fill_atlas(&mut r, &t);
-        let on = r.build_vertices(&t, &vp(), true, true, true, None, PaneAttention::None, 0, 1, None, false);
-        let off = r.build_vertices(&t, &vp(), false, true, true, None, PaneAttention::None, 0, 1, None, false);
-        assert_eq!(on.len() - off.len(), 6, "blink off drops exactly the cursor quad");
+        let on = r.build_vertices(
+            &t,
+            &vp(),
+            true,
+            true,
+            true,
+            None,
+            PaneAttention::None,
+            0,
+            1,
+            None,
+            false,
+        );
+        let off = r.build_vertices(
+            &t,
+            &vp(),
+            false,
+            true,
+            true,
+            None,
+            PaneAttention::None,
+            0,
+            1,
+            None,
+            false,
+        );
+        assert_eq!(
+            on.len() - off.len(),
+            6,
+            "blink off drops exactly the cursor quad"
+        );
         t.cursor_visible = false;
-        let hidden = r.build_vertices(&t, &vp(), true, true, true, None, PaneAttention::None, 0, 1, None, false);
+        let hidden = r.build_vertices(
+            &t,
+            &vp(),
+            true,
+            true,
+            true,
+            None,
+            PaneAttention::None,
+            0,
+            1,
+            None,
+            false,
+        );
         assert_eq!(hidden.len(), off.len());
     }
 
@@ -3942,10 +5526,42 @@ mod vertex_snapshots {
         let mut t = term(12, 3);
         type_lines(&mut t, &["ab"]);
         fill_atlas(&mut r, &t);
-        let outlined = r.build_vertices(&t, &vp(), true, true, true, None, PaneAttention::None, 0, 1, None, false);
-        let plain = r.build_vertices(&t, &vp(), true, true, false, None, PaneAttention::None, 0, 1, None, false);
-        assert_eq!(outlined.len() - plain.len(), 4 * 6, "the outline is exactly four quads");
-        assert_eq!(dump(&outlined[..plain.len()]), dump(&plain), "nothing else changes");
+        let outlined = r.build_vertices(
+            &t,
+            &vp(),
+            true,
+            true,
+            true,
+            None,
+            PaneAttention::None,
+            0,
+            1,
+            None,
+            false,
+        );
+        let plain = r.build_vertices(
+            &t,
+            &vp(),
+            true,
+            true,
+            false,
+            None,
+            PaneAttention::None,
+            0,
+            1,
+            None,
+            false,
+        );
+        assert_eq!(
+            outlined.len() - plain.len(),
+            4 * 6,
+            "the outline is exactly four quads"
+        );
+        assert_eq!(
+            dump(&outlined[..plain.len()]),
+            dump(&plain),
+            "nothing else changes"
+        );
     }
 
     #[test]

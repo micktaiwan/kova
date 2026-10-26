@@ -146,6 +146,20 @@ enum TermOp {
     SetProgramStatus(Option<ProgramStatus>),
     /// OSC 7501 ; ? — feature detection: the terminal answers `QUERY_REPLY`.
     ProgramStatusQuery,
+    /// OSC 10/11/4;N;? — a program asks which colour the terminal draws with.
+    /// Answered in `apply_ops`, where the defaults and the palette live.
+    ReportColor(ColorQuery),
+}
+
+/// Which colour an OSC 4/10/11 query asks about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorQuery {
+    /// OSC 10 — the default foreground.
+    Foreground,
+    /// OSC 11 — the default background.
+    Background,
+    /// OSC 4;N — an entry of the 256-colour palette.
+    Palette(u8),
 }
 
 pub struct VteHandler {
@@ -479,6 +493,24 @@ impl VteHandler {
                         // VT220-class, "firmware version" 100, no options
                         pty_responses.push(b"\x1b[>1;100;0c".to_vec());
                     }
+                    TermOp::ReportColor(query) => {
+                        let (code, [r, g, b]) = match query {
+                            ColorQuery::Foreground => ("10".to_string(), term.default_fg),
+                            ColorQuery::Background => ("11".to_string(), term.default_bg),
+                            ColorQuery::Palette(index) => {
+                                (format!("4;{}", index), AnsiColor::from_256(index))
+                            }
+                        };
+                        // xterm's reply shape, and the one TUIs parse: four hex
+                        // digits per channel, `rgb:rrrr/gggg/bbbb`, ST-terminated.
+                        pty_responses.push(
+                            format!(
+                                "\x1b]{};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x1b\\",
+                                code
+                            )
+                            .into_bytes(),
+                        );
+                    }
                     TermOp::SetCharset(g1, dec) => term.set_charset(g1, dec),
                     TermOp::SetTabStop => term.set_tab_stop(),
                     TermOp::ClearTabStops(mode) => term.clear_tab_stops(mode),
@@ -739,6 +771,38 @@ impl Perform for VteHandler {
                     if !command.is_empty() {
                         log::debug!("OSC 7777 last_command: {}", command);
                         self.ops.push(TermOp::SetLastCommand(command));
+                    }
+                }
+                b"10" | b"11" => {
+                    // A TUI asks what the terminal draws with before it picks a
+                    // theme (pi sends OSC 11, OSC 10, then one OSC 4 per slot).
+                    // Only the query form is answered: a program *setting* the
+                    // default colours stays ignored, as it always was.
+                    if params[1] == &b"?"[..] {
+                        self.ops.push(TermOp::ReportColor(if params[0] == b"10" {
+                            ColorQuery::Foreground
+                        } else {
+                            ColorQuery::Background
+                        }));
+                    }
+                }
+                b"4" => {
+                    // OSC 4 ; index ; ? [; index ; ? ...] — pairs, so read them
+                    // two at a time instead of assuming one per escape.
+                    let mut i = 1;
+                    while i + 1 < params.len() {
+                        if params[i + 1] == &b"?"[..] {
+                            match std::str::from_utf8(params[i])
+                                .ok()
+                                .and_then(|index| index.parse::<u8>().ok())
+                            {
+                                Some(index) => self
+                                    .ops
+                                    .push(TermOp::ReportColor(ColorQuery::Palette(index))),
+                                None => log::debug!("OSC 4: unreadable palette index, ignored"),
+                            }
+                        }
+                        i += 2;
                     }
                 }
                 _ => {
@@ -1619,6 +1683,57 @@ mod tests {
     fn osc7501_query_is_answered_with_the_states_we_accept() {
         let reply = drive_capturing("7501-query", b"\x1b]7501;?\x1b\\");
         assert_eq!(reply, program_status::QUERY_REPLY.to_vec());
+    }
+
+    /// A TUI (pi, and anything else that picks its own colours) asks OSC 11, OSC 10
+    /// and one OSC 4 per palette slot before it draws. Each answer has to name the
+    /// colour Kova actually uses, or the client falls back to a dull theme: pi then
+    /// paints no panel background at all, which is what hid the user-message block.
+    #[test]
+    fn colour_queries_are_answered_with_the_colours_kova_draws() {
+        let reply = drive_capturing("colour-query", b"\x1b]11;?\x07\x1b]10;?\x07\x1b]4;1;?\x07");
+        let [fr, fg, fb] = DEFAULT_FG;
+        let [br, bg, bb] = DEFAULT_BG;
+        let [r, g, b] = AnsiColor::from_index(1).to_rgb();
+        assert_eq!(
+            String::from_utf8(reply).unwrap(),
+            format!(
+                "\x1b]11;rgb:{br:02x}{br:02x}/{bg:02x}{bg:02x}/{bb:02x}{bb:02x}\x1b\\\
+                 \x1b]10;rgb:{fr:02x}{fr:02x}/{fg:02x}{fg:02x}/{fb:02x}{fb:02x}\x1b\\\
+                 \x1b]4;1;rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x1b\\"
+            )
+        );
+    }
+
+    /// Several pairs in one OSC 4, and a palette index above 15.
+    #[test]
+    fn one_osc4_carries_several_pairs() {
+        let reply = drive_capturing("colour-query-pairs", b"\x1b]4;0;?;200;?\x07");
+        let text = String::from_utf8(reply).unwrap();
+        let [r0, g0, b0] = AnsiColor::from_256(0);
+        let [r2, g2, b2] = AnsiColor::from_256(200);
+        assert_eq!(
+            text,
+            format!(
+                "\x1b]4;0;rgb:{r0:02x}{r0:02x}/{g0:02x}{g0:02x}/{b0:02x}{b0:02x}\x1b\\\
+                 \x1b]4;200;rgb:{r2:02x}{r2:02x}/{g2:02x}{g2:02x}/{b2:02x}{b2:02x}\x1b\\"
+            )
+        );
+    }
+
+    /// Setting a colour is not implemented and must stay silent: answering a set
+    /// request would inject bytes the client never asked for.
+    #[test]
+    fn colour_set_requests_are_not_answered() {
+        let reply = drive_capturing(
+            "colour-set",
+            b"\x1b]11;rgb:0000/0000/0000\x07\x1b]4;1;rgb:ffff/0000/0000\x07\x1b]10;not-a-query\x07",
+        );
+        assert!(
+            reply.is_empty(),
+            "unexpected reply: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
     }
 
     #[test]

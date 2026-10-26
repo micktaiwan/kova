@@ -6,7 +6,7 @@ pub mod pty;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthChar;
 
@@ -47,13 +47,21 @@ pub struct DumpResult {
 /// (Cell is 48→32 bytes, saving ~300MB+ with 10k scrollback × multiple panes)
 #[inline]
 pub fn color_to_f32(c: [u8; 3]) -> [f32; 3] {
-    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
+    [
+        c[0] as f32 / 255.0,
+        c[1] as f32 / 255.0,
+        c[2] as f32 / 255.0,
+    ]
 }
 
 /// Convert [f32; 3] color (from config/renderer) to compact [u8; 3] for cell storage.
 #[inline]
 pub fn color_to_u8(c: [f32; 3]) -> [u8; 3] {
-    [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8]
+    [
+        (c[0] * 255.0) as u8,
+        (c[1] * 255.0) as u8,
+        (c[2] * 255.0) as u8,
+    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,10 +184,7 @@ impl Row {
         // '\0' wide-char continuations count as content: trimming one would
         // orphan its base (a wide glyph with no second column).
         let last = self.cells.iter().rposition(|c| {
-            c.c != ' '
-                || c.cluster.is_some()
-                || c.fg != default_fg
-                || c.bg != default_bg
+            c.c != ' ' || c.cluster.is_some() || c.fg != default_fg || c.bg != default_bg
         });
         match last {
             Some(idx) => {
@@ -338,6 +343,10 @@ pub struct TerminalState {
     /// compare it to the value they saw to know when to recompute. Coarse on
     /// purpose: a false positive costs one recompute, a miss a wrong jump.
     content_generation: u64,
+    /// A line to band for a moment, and when the band started: what a filter
+    /// jump leaves behind so the eye finds the row it landed on. Purely
+    /// visual, never read by the PTY side.
+    pub highlight_line: Option<(usize, Instant)>,
 }
 
 /// A single line matching a filter query.
@@ -347,12 +356,49 @@ pub struct FilterMatch {
     pub text: String,
 }
 
+/// How long the band a filter jump leaves on its line stays at full strength,
+/// and then fades out. A duration, not a frame count: the window and a library
+/// pane tick at their own rates, and a frame count ran out in half the time on
+/// the faster one. Long enough to find the line in a screen the eye was not
+/// reading, short enough not to pass for a text selection.
+pub const HIGHLIGHT_LINE_HOLD: Duration = Duration::from_millis(600);
+pub const HIGHLIGHT_LINE_FADE: Duration = Duration::from_millis(600);
+
+/// How strong the band is `elapsed` after the jump: full through the hold, then
+/// straight down to nothing. `None` once it is over, so the pane can stop
+/// repainting. One function for the drawing and for the tick that ends it, so
+/// the two cannot disagree about when it is gone.
+pub fn highlight_alpha(elapsed: Duration) -> Option<f32> {
+    if elapsed < HIGHLIGHT_LINE_HOLD {
+        return Some(1.0);
+    }
+    let faded = elapsed - HIGHLIGHT_LINE_HOLD;
+    if faded >= HIGHLIGHT_LINE_FADE {
+        return None;
+    }
+    Some(1.0 - faded.as_secs_f32() / HIGHLIGHT_LINE_FADE.as_secs_f32())
+}
+
 impl TerminalState {
     pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [u8; 3], bg: [u8; 3]) -> Self {
-        let blank = Cell { c: ' ', cluster: None, fg, bg, hyperlink_id: 0, attrs: CellAttrs::empty() };
-        let grid = (0..rows as usize).map(|_| Row::new(cols as usize, &blank)).collect();
+        let blank = Cell {
+            c: ' ',
+            cluster: None,
+            fg,
+            bg,
+            hyperlink_id: 0,
+            attrs: CellAttrs::empty(),
+        };
+        let grid = (0..rows as usize)
+            .map(|_| Row::new(cols as usize, &blank))
+            .collect();
         let terminal_id = TERMINAL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        log::info!("TerminalState::new id={} cols={} rows={}", terminal_id, cols, rows);
+        log::info!(
+            "TerminalState::new id={} cols={} rows={}",
+            terminal_id,
+            cols,
+            rows
+        );
         TerminalState {
             terminal_id,
             cols,
@@ -421,7 +467,34 @@ impl TerminalState {
             hyperlinks: vec![String::new()], // slot 0 = no hyperlink
             rows_touched: vec![false; rows as usize],
             content_generation: 0,
+            highlight_line: None,
         }
+    }
+
+    /// Band `abs_line` for a moment: a filter jump landed there and the eye
+    /// has to find it in a screen it did not have in focus.
+    pub fn flash_line(&mut self, abs_line: usize) {
+        self.highlight_line = Some((abs_line, Instant::now()));
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Drop the band a filter jump left. Called wherever the lines it indexed
+    /// are rebuilt or wiped — the absolute index no longer names the same
+    /// content, so keeping it would band an unrelated row for the rest of its
+    /// life. The same reason the selection is dropped at those sites.
+    fn clear_highlight_line(&mut self) {
+        self.highlight_line = None;
+    }
+
+    /// One tick of the band's life: it is gone once `highlight_alpha` says so.
+    /// Keeps the pane marked dirty while it shows, so the fade is drawn frame
+    /// after frame and then painted away.
+    pub fn tick_highlight_line(&mut self) {
+        let Some((line, since)) = self.highlight_line else {
+            return;
+        };
+        self.highlight_line = highlight_alpha(since.elapsed()).map(|_| (line, since));
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// See the `content_generation` field: changes whenever cached absolute
@@ -442,14 +515,18 @@ impl TerminalState {
     /// True if a command completed here and the user hasn't looked at the pane
     /// since. This — not `command_completed` — drives every completion dot.
     pub fn unread_completion(&self) -> bool {
-        self.command_completed.load(std::sync::atomic::Ordering::Relaxed)
-            && !self.completion_seen.load(std::sync::atomic::Ordering::Relaxed)
+        self.command_completed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !self
+                .completion_seen
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Mark the completion as seen (call while the pane is focused). Leaves
     /// `command_completed` alone so IPC `wait-for-completion` still sees it.
     pub fn ack_completion(&self) {
-        self.completion_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.completion_seen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Set or clear the active OSC 8 hyperlink.
@@ -474,7 +551,9 @@ impl TerminalState {
 
     /// Look up a hyperlink URL by ID.
     pub fn hyperlink_url(&self, id: u16) -> Option<&str> {
-        if id == 0 { return None; }
+        if id == 0 {
+            return None;
+        }
         self.hyperlinks.get(id as usize).map(|s| s.as_str())
     }
 
@@ -557,7 +636,10 @@ impl TerminalState {
 
     pub fn visible_lines(&self) -> Vec<Cow<'_, [Cell]>> {
         if self.scroll_offset == 0 {
-            self.grid.iter().map(|r| Cow::Borrowed(r.cells.as_slice())).collect()
+            self.grid
+                .iter()
+                .map(|r| Cow::Borrowed(r.cells.as_slice()))
+                .collect()
         } else {
             let sb_len = self.scrollback.len() as i32;
             let offset = self.scroll_offset.min(sb_len);
@@ -584,28 +666,54 @@ impl TerminalState {
         let old_offset = self.scroll_offset;
         self.scroll_offset = (self.scroll_offset + lines).clamp(0, max_offset);
         if self.scroll_offset == max_offset && old_offset == max_offset {
-            log::debug!("scroll: at max offset {}/{}, scrollback_limit={}", self.scroll_offset, max_offset, self.scrollback_limit);
+            log::debug!(
+                "scroll: at max offset {}/{}, scrollback_limit={}",
+                self.scroll_offset,
+                max_offset,
+                self.scrollback_limit
+            );
         }
         // Log scroll state for cross-terminal debugging
         if self.scroll_offset > 0 && old_offset == 0 {
             // Just started scrolling — log terminal identity + first scrollback line
-            let first_sb_text: String = self.scrollback.front()
+            let first_sb_text: String = self
+                .scrollback
+                .front()
                 .map(|r| r.cells.iter().take(60).map(|c| c.c).collect())
                 .unwrap_or_default();
-            log::info!("SCROLL-START term_id={} sb_len={} offset={} cwd={:?} first_sb=\"{}\"",
-                self.terminal_id, self.scrollback.len(), self.scroll_offset,
-                self.cwd, first_sb_text);
+            log::info!(
+                "SCROLL-START term_id={} sb_len={} offset={} cwd={:?} first_sb=\"{}\"",
+                self.terminal_id,
+                self.scrollback.len(),
+                self.scroll_offset,
+                self.cwd,
+                first_sb_text
+            );
         }
         // One line per page scrolled, with the text actually at the top of the
         // view: tells whether foreign content seen while scrolled is in this
         // terminal's own scrollback or only on screen.
         if scroll_crossed_page(old_offset, self.scroll_offset, self.rows) {
             let top = (self.scrollback.len() as i32 - self.scroll_offset).max(0) as usize;
-            let top_text: String = self.scrollback.get(top)
-                .map(|r| r.cells.iter().take(60).map(|c| c.c).filter(|&c| c != '\0').collect())
+            let top_text: String = self
+                .scrollback
+                .get(top)
+                .map(|r| {
+                    r.cells
+                        .iter()
+                        .take(60)
+                        .map(|c| c.c)
+                        .filter(|&c| c != '\0')
+                        .collect()
+                })
                 .unwrap_or_default();
-            log::info!("SCROLL-AT term_id={} sb_len={} offset={} top=\"{}\"",
-                self.terminal_id, self.scrollback.len(), self.scroll_offset, top_text);
+            log::info!(
+                "SCROLL-AT term_id={} sb_len={} offset={} top=\"{}\"",
+                self.terminal_id,
+                self.scrollback.len(),
+                self.scroll_offset,
+                top_text
+            );
         }
         self.user_scrolled = self.scroll_offset > 0;
         self.cursor_moved();
@@ -629,7 +737,11 @@ impl TerminalState {
     /// This is how ncurses draws box borders (terminfo acsc): without the
     /// mapping they render as letters (qqq/xxx) instead of lines.
     fn map_charset(&self, c: char) -> char {
-        let dec = if self.active_charset_g1 { self.g1_dec_graphics } else { self.g0_dec_graphics };
+        let dec = if self.active_charset_g1 {
+            self.g1_dec_graphics
+        } else {
+            self.g0_dec_graphics
+        };
         if !dec {
             return c;
         }
@@ -705,7 +817,13 @@ impl TerminalState {
     pub fn put_char(&mut self, c: char) {
         let c = self.map_charset(c);
         if c >= '\u{2500}' && c <= '\u{257F}' {
-            log::trace!("put_char box-drawing: '{}' U+{:04X} at ({}, {})", c, c as u32, self.cursor_x, self.cursor_y);
+            log::trace!(
+                "put_char box-drawing: '{}' U+{:04X} at ({}, {})",
+                c,
+                c as u32,
+                self.cursor_x,
+                self.cursor_y
+            );
         }
         self.cursor_moved();
 
@@ -914,7 +1032,12 @@ impl TerminalState {
                 None => return,
             }
         };
-        while col > 0 && self.grid[row].cells.get(col).map_or(false, |cell| cell.c == '\0') {
+        while col > 0
+            && self.grid[row]
+                .cells
+                .get(col)
+                .map_or(false, |cell| cell.c == '\0')
+        {
             col -= 1;
         }
         let (old_w, merged) = {
@@ -1054,6 +1177,16 @@ impl TerminalState {
                     sel.end.line -= 1;
                 }
             }
+            // The band a filter jump leaves is an absolute index like the
+            // selection, so it shifts with it: without this it would slide one
+            // line per output line and band the row below the one it landed on,
+            // which is exactly the line the eye is trying to find. A band on the
+            // line that just fell out of the buffer has nothing left to mark.
+            if let Some((line, since)) = self.highlight_line {
+                // `then_some` would compute `line - 1` before the test and
+                // underflow on a band sitting on row 0.
+                self.highlight_line = if line > 0 { Some((line - 1, since)) } else { None };
+            }
         }
         // Keep a scrolled-up viewport anchored to the SAME content as new lines
         // arrive. The bottom advances by one line on every push (whether the
@@ -1086,7 +1219,10 @@ impl TerminalState {
         }
 
         // Ensure grid has correct number of rows
-        self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
+        self.grid.resize(
+            self.rows as usize,
+            Row::new(self.cols as usize, &self.blank),
+        );
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -1103,7 +1239,10 @@ impl TerminalState {
             self.grid.insert(top, new_line);
         }
 
-        self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
+        self.grid.resize(
+            self.rows as usize,
+            Row::new(self.cols as usize, &self.blank),
+        );
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -1230,6 +1369,7 @@ impl TerminalState {
                 self.scrollback.clear();
                 self.reset_scroll();
                 self.selection = None;
+                self.clear_highlight_line();
             }
             2 => {
                 // Erase entire display — push current content to scrollback first
@@ -1237,11 +1377,17 @@ impl TerminalState {
                     // Find last row with visible content to avoid trailing blanks
                     // (colored-bg cells are visible content)
                     let default_bg = self.default_bg;
-                    let last_content = self.grid.iter().rposition(|row|
-                        row.cells.iter().any(|c| !c.is_blank() || c.bg != default_bg)
-                    );
+                    let last_content = self.grid.iter().rposition(|row| {
+                        row.cells
+                            .iter()
+                            .any(|c| !c.is_blank() || c.bg != default_bg)
+                    });
                     if let Some(last) = last_content {
-                        log::debug!("ED 2/3: pushing {} rows to scrollback (scrollback_len={})", last + 1, self.scrollback.len());
+                        log::debug!(
+                            "ED 2/3: pushing {} rows to scrollback (scrollback_len={})",
+                            last + 1,
+                            self.scrollback.len()
+                        );
                         let rows: Vec<Row> = self.grid[..=last].to_vec();
                         for row in rows {
                             self.push_to_scrollback(row);
@@ -1279,6 +1425,7 @@ impl TerminalState {
         self.scrollback.clear();
         self.reset_scroll();
         self.selection = None;
+        self.clear_highlight_line();
         for row in &mut self.grid {
             for cell in row.cells.iter_mut() {
                 *cell = self.blank.clone();
@@ -1307,7 +1454,9 @@ impl TerminalState {
                 self.grid[row].wrapped = false;
             }
             1 => {
-                for c in 0..=(self.cursor_x as usize).min(self.grid[row].cells.len().saturating_sub(1)) {
+                for c in
+                    0..=(self.cursor_x as usize).min(self.grid[row].cells.len().saturating_sub(1))
+                {
                     self.grid[row].cells[c] = fill.clone();
                 }
             }
@@ -1324,7 +1473,11 @@ impl TerminalState {
     pub fn cursor_up(&mut self, n: u16) {
         self.pending_wrap = false;
         // Per xterm: a cursor inside the scroll region stops at its top margin
-        let limit = if self.cursor_y >= self.scroll_top { self.scroll_top } else { 0 };
+        let limit = if self.cursor_y >= self.scroll_top {
+            self.scroll_top
+        } else {
+            0
+        };
         self.cursor_y = self.cursor_y.saturating_sub(n).max(limit);
         self.cursor_moved();
     }
@@ -1342,7 +1495,10 @@ impl TerminalState {
     }
 
     pub fn cursor_forward(&mut self, n: u16) {
-        self.cursor_x = self.cursor_x.saturating_add(n).min(self.cols.saturating_sub(1));
+        self.cursor_x = self
+            .cursor_x
+            .saturating_add(n)
+            .min(self.cols.saturating_sub(1));
         self.pending_wrap = false;
         self.cursor_moved();
     }
@@ -1457,7 +1613,10 @@ impl TerminalState {
             }
             self.grid.insert(row_u, Row::new(self.cols as usize, &fill));
         }
-        self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
+        self.grid.resize(
+            self.rows as usize,
+            Row::new(self.cols as usize, &self.blank),
+        );
         self.cursor_x = 0;
         self.pending_wrap = false;
         self.cursor_moved();
@@ -1483,9 +1642,13 @@ impl TerminalState {
                 self.grid.remove(row_u);
             }
             let insert_pos = bottom_u.min(self.grid.len());
-            self.grid.insert(insert_pos, Row::new(self.cols as usize, &fill));
+            self.grid
+                .insert(insert_pos, Row::new(self.cols as usize, &fill));
         }
-        self.grid.resize(self.rows as usize, Row::new(self.cols as usize, &self.blank));
+        self.grid.resize(
+            self.rows as usize,
+            Row::new(self.cols as usize, &self.blank),
+        );
         self.cursor_x = 0;
         self.pending_wrap = false;
         self.cursor_moved();
@@ -1581,7 +1744,9 @@ impl TerminalState {
         self.alt_cursor = Some((self.cursor_x, self.cursor_y));
         let alt_grid = std::mem::replace(
             &mut self.grid,
-            (0..self.rows as usize).map(|_| Row::new(self.cols as usize, &self.blank)).collect(),
+            (0..self.rows as usize)
+                .map(|_| Row::new(self.cols as usize, &self.blank))
+                .collect(),
         );
         self.alt_grid = Some(alt_grid);
         self.cursor_x = 0;
@@ -1589,6 +1754,7 @@ impl TerminalState {
         self.pending_wrap = false;
         self.reset_scroll();
         self.selection = None;
+        self.clear_highlight_line();
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -1608,6 +1774,7 @@ impl TerminalState {
         self.pending_wrap = false;
         self.reset_scroll();
         self.selection = None;
+        self.clear_highlight_line();
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -1636,7 +1803,14 @@ impl TerminalState {
         if bg == self.blank.bg {
             self.blank.clone()
         } else {
-            Cell { c: ' ', cluster: None, fg: self.blank.fg, bg, hyperlink_id: 0, attrs: CellAttrs::empty() }
+            Cell {
+                c: ' ',
+                cluster: None,
+                fg: self.blank.fg,
+                bg,
+                hyperlink_id: 0,
+                attrs: CellAttrs::empty(),
+            }
         }
     }
 
@@ -1667,7 +1841,8 @@ impl TerminalState {
     /// `wait-for-completion`. What OSC 133;C does to the flag, reached by the
     /// IPC `mark-started` command.
     pub fn mark_command_started(&self) {
-        self.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.command_completed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Soft reset: restore rendering-critical state to sane defaults without
@@ -1758,6 +1933,7 @@ impl TerminalState {
         // Reflow rebuilds the scrollback/grid — absolute line indices held by
         // the selection no longer point at the same content.
         self.selection = None;
+        self.clear_highlight_line();
         self.bump_content_generation();
         self.rows_touched = vec![false; new_rows as usize];
 
@@ -1770,7 +1946,8 @@ impl TerminalState {
             self.tab_stops.truncate(new_cols as usize);
         } else {
             let from = self.tab_stops.len();
-            self.tab_stops.extend((from..new_cols as usize).map(|i| i % 8 == 0));
+            self.tab_stops
+                .extend((from..new_cols as usize).map(|i| i % 8 == 0));
         }
 
         // Alt screen: the visible (alt) grid is truncated/padded — TUIs fully
@@ -1779,7 +1956,8 @@ impl TerminalState {
         if self.in_alt_screen {
             if new_cols != old_cols && !self.scrollback.is_empty() {
                 let sb: Vec<Row> = self.scrollback.drain(..).collect();
-                let mut reflowed = Self::reflow_rows(sb, old_cols as usize, new_cols as usize, &self.blank);
+                let mut reflowed =
+                    Self::reflow_rows(sb, old_cols as usize, new_cols as usize, &self.blank);
                 for row in reflowed.iter_mut() {
                     row.trim_trailing_blanks(self.default_fg, self.default_bg);
                 }
@@ -1789,7 +1967,8 @@ impl TerminalState {
                 row.cells.resize(new_cols as usize, self.blank.clone());
             }
             let nr = new_rows as usize;
-            self.grid.resize(nr, Row::new(new_cols as usize, &self.blank));
+            self.grid
+                .resize(nr, Row::new(new_cols as usize, &self.blank));
 
             // alt_grid holds the SAVED PRIMARY screen here. When shrinking,
             // drop rows from the TOP into scrollback (the bottom holds the
@@ -1804,7 +1983,8 @@ impl TerminalState {
                 let default_bg = self.default_bg;
                 while alt_grid.len() > nr {
                     let saved_y = self.alt_cursor.map_or(0, |(_, y)| y as usize);
-                    let is_blank_row = alt_grid.last()
+                    let is_blank_row = alt_grid
+                        .last()
                         .map(|row| row.cells.iter().all(|c| c.is_blank() && c.bg == default_bg))
                         .unwrap_or(true);
                     if is_blank_row && alt_grid.len() > saved_y + 1 {
@@ -1917,7 +2097,8 @@ impl TerminalState {
                 cells
             };
 
-            let mut reflowed = Self::reflow_rows(stream, old_cols as usize, new_cols as usize, &self.blank);
+            let mut reflowed =
+                Self::reflow_rows(stream, old_cols as usize, new_cols as usize, &self.blank);
 
             // Locate the cursor: first row of its logical line in the
             // reflowed stream + pad-aware offset within the line
@@ -1938,7 +2119,8 @@ impl TerminalState {
                 }
                 i
             };
-            let cursor_new_row = (line_first_row + row_within).min(reflowed.len().saturating_sub(1));
+            let cursor_new_row =
+                (line_first_row + row_within).min(reflowed.len().saturating_sub(1));
             let new_cx: u16 = (col_within as u16).min(new_cols.saturating_sub(1));
 
             // Drop trailing blank rows before splitting — otherwise they
@@ -1946,7 +2128,8 @@ impl TerminalState {
             // scrollback while blank rows stay on screen.
             let default_bg = self.default_bg;
             while reflowed.len() > nr {
-                let is_blank = reflowed.last()
+                let is_blank = reflowed
+                    .last()
                     .map(|row| row.cells.iter().all(|c| c.is_blank() && c.bg == default_bg))
                     .unwrap_or(true);
                 if is_blank && reflowed.len() > cursor_new_row + 1 {
@@ -1967,7 +2150,8 @@ impl TerminalState {
             // then truncate, to fit new_rows
             let cursor_in_grid = cursor_new_row - grid_start;
             while grid.len() > nr {
-                let is_blank = grid.last()
+                let is_blank = grid
+                    .last()
                     .map(|row| row.cells.iter().all(|c| c.is_blank() && c.bg == default_bg))
                     .unwrap_or(true);
                 if !is_blank && grid.len() <= cursor_in_grid + 1 {
@@ -1993,7 +2177,9 @@ impl TerminalState {
             // Remove blank rows from bottom first (colored-bg rows are content)
             let default_bg = self.default_bg;
             while self.grid.len() > nr {
-                let is_blank = self.grid.last()
+                let is_blank = self
+                    .grid
+                    .last()
                     .map(|row| row.cells.iter().all(|c| c.is_blank() && c.bg == default_bg))
                     .unwrap_or(true);
                 if is_blank && self.grid.len() > self.cursor_y as usize + 1 {
@@ -2023,7 +2209,8 @@ impl TerminalState {
                 let count = pulled.len();
                 pulled.reverse();
                 self.grid.splice(0..0, pulled);
-                self.cursor_y = ((self.cursor_y as usize + count).min(new_rows as usize - 1)) as u16;
+                self.cursor_y =
+                    ((self.cursor_y as usize + count).min(new_rows as usize - 1)) as u16;
             }
             // Add blank rows if still needed
             while self.grid.len() < nr {
@@ -2093,7 +2280,8 @@ impl TerminalState {
     fn wrap_logical_line(cells: Vec<Cell>, new_cols: usize, blank: &Cell) -> Vec<Row> {
         // Trim trailing blank cells. '\0' continuations are content — see
         // trim_trailing_blanks.
-        let len = cells.iter()
+        let len = cells
+            .iter()
             .rposition(|c| c.c != ' ' || c.cluster.is_some() || c.bg != blank.bg)
             .map_or(0, |i| i + 1);
 
@@ -2109,9 +2297,7 @@ impl TerminalState {
         while i < trimmed.len() {
             // A wide char occupies (base, '\0' continuation) — never split
             // the pair across a row boundary
-            let pair = trimmed[i].c != '\0'
-                && i + 1 < trimmed.len()
-                && trimmed[i + 1].c == '\0';
+            let pair = trimmed[i].c != '\0' && i + 1 < trimmed.len() && trimmed[i + 1].c == '\0';
             let needed = if pair { 2 } else { 1 };
             if current.len() + needed > new_cols {
                 if needed > new_cols {
@@ -2120,7 +2306,10 @@ impl TerminalState {
                     continue;
                 }
                 current.resize(new_cols, blank.clone());
-                rows.push(Row { cells: current, wrapped: true });
+                rows.push(Row {
+                    cells: current,
+                    wrapped: true,
+                });
                 current = Vec::with_capacity(new_cols);
             }
             current.push(trimmed[i].clone());
@@ -2131,7 +2320,10 @@ impl TerminalState {
         }
         if !current.is_empty() || rows.is_empty() {
             current.resize(new_cols, blank.clone());
-            rows.push(Row { cells: current, wrapped: true });
+            rows.push(Row {
+                cells: current,
+                wrapped: true,
+            });
         }
         // Last row of a logical line is not wrapped (it ends with a hard newline)
         if let Some(last) = rows.last_mut() {
@@ -2145,8 +2337,14 @@ impl TerminalState {
     /// its pad cells at wide-pair row boundaries). Returns
     /// (row_within_line, col). Walking the reflowed rows by raw lengths is
     /// wrong: pads shift every later cell by one.
-    fn locate_in_wrapped_line(cells: &[Cell], new_cols: usize, target: usize, blank: &Cell) -> (usize, usize) {
-        let len = cells.iter()
+    fn locate_in_wrapped_line(
+        cells: &[Cell],
+        new_cols: usize,
+        target: usize,
+        blank: &Cell,
+    ) -> (usize, usize) {
+        let len = cells
+            .iter()
             .rposition(|c| c.c != ' ' || c.cluster.is_some() || c.bg != blank.bg)
             .map_or(0, |i| i + 1);
         let cols = new_cols.max(1);
@@ -2191,7 +2389,6 @@ impl TerminalState {
 
     // --- Compact reflow helpers ---
 
-
     pub fn reverse_index(&mut self) {
         self.pending_wrap = false;
         if self.cursor_y == self.scroll_top {
@@ -2214,10 +2411,14 @@ impl TerminalState {
         let cell_size = std::mem::size_of::<Cell>();
         let row_overhead = std::mem::size_of::<Row>();
         let row_bytes = |rows: &[Row]| -> usize {
-            rows.iter().map(|r| row_overhead + r.cells.capacity() * cell_size).sum::<usize>()
+            rows.iter()
+                .map(|r| row_overhead + r.cells.capacity() * cell_size)
+                .sum::<usize>()
         };
         let grid = row_bytes(&self.grid);
-        let sb: usize = self.scrollback.iter()
+        let sb: usize = self
+            .scrollback
+            .iter()
             .map(|r| row_overhead + r.cells.capacity() * cell_size)
             .sum();
         let alt = self.alt_grid.as_ref().map(|g| row_bytes(g)).unwrap_or(0);
@@ -2237,10 +2438,14 @@ impl TerminalState {
     /// A "word" is a contiguous run of non-whitespace, non-delimiter characters,
     /// or a single delimiter/whitespace.
     pub fn word_bounds_at(&self, pos: GridPos) -> (u16, u16) {
-        let Some(row) = self.row_at(pos.line) else { return (pos.col, pos.col) };
+        let Some(row) = self.row_at(pos.line) else {
+            return (pos.col, pos.col);
+        };
         let cells = &row.cells;
         let col = pos.col as usize;
-        if col >= cells.len() { return (pos.col, pos.col) }
+        if col >= cells.len() {
+            return (pos.col, pos.col);
+        }
 
         let ch = cells[col].c;
         let is_word_char = |c: char| -> bool {
@@ -2273,8 +2478,12 @@ impl TerminalState {
     }
 
     pub fn is_selected(&self, abs_line: usize, col: u16) -> bool {
-        let Some((start, end)) = self.ordered_selection() else { return false };
-        if abs_line < start.line || abs_line > end.line { return false; }
+        let Some((start, end)) = self.ordered_selection() else {
+            return false;
+        };
+        if abs_line < start.line || abs_line > end.line {
+            return false;
+        }
         if start.line == end.line {
             col >= start.col && col <= end.col
         } else if abs_line == start.line {
@@ -2287,10 +2496,14 @@ impl TerminalState {
     }
 
     pub fn selected_text(&self) -> String {
-        let Some((start, end)) = self.ordered_selection() else { return String::new() };
+        let Some((start, end)) = self.ordered_selection() else {
+            return String::new();
+        };
         let mut result = String::new();
         for line_idx in start.line..=end.line {
-            let Some(row) = self.row_at(line_idx) else { continue };
+            let Some(row) = self.row_at(line_idx) else {
+                continue;
+            };
             let cells = &row.cells;
             if cells.is_empty() {
                 // Blank scrollback row (trimmed) — treat as empty line
@@ -2304,22 +2517,29 @@ impl TerminalState {
             if paste_block::is_marker_line(cells, self.default_fg) {
                 continue;
             }
-            let col_start = if line_idx == start.line { start.col as usize } else { 0 };
+            let col_start = if line_idx == start.line {
+                start.col as usize
+            } else {
+                0
+            };
             let col_end = if line_idx == end.line {
                 (end.col as usize).min(cells.len() - 1)
             } else {
                 cells.len() - 1
             };
             if col_start <= col_end {
-                let text: String = cells[col_start..=col_end].iter().map(|c| {
-                    if let Some(ref cluster) = c.cluster {
-                        cluster.to_string()
-                    } else if c.c == '\0' {
-                        String::new()
-                    } else {
-                        c.c.to_string()
-                    }
-                }).collect();
+                let text: String = cells[col_start..=col_end]
+                    .iter()
+                    .map(|c| {
+                        if let Some(ref cluster) = c.cluster {
+                            cluster.to_string()
+                        } else if c.c == '\0' {
+                            String::new()
+                        } else {
+                            c.c.to_string()
+                        }
+                    })
+                    .collect();
                 result.push_str(text.trim_end());
             }
             // Only insert newline if this row is NOT soft-wrapped
@@ -2334,7 +2554,9 @@ impl TerminalState {
     /// Empty lines (paragraph breaks) are preserved as newlines.
     pub fn selected_text_joined(&self) -> String {
         let raw = self.selected_text();
-        if raw.is_empty() { return raw; }
+        if raw.is_empty() {
+            return raw;
+        }
         let mut result = String::new();
         let mut prev_blank = false;
         for (i, line) in raw.split('\n').enumerate() {
@@ -2364,7 +2586,9 @@ impl TerminalState {
         let mut prev_space = false;
         result.retain(|c| {
             if c == ' ' {
-                if prev_space { return false; }
+                if prev_space {
+                    return false;
+                }
                 prev_space = true;
             } else {
                 prev_space = false;
@@ -2398,14 +2622,24 @@ impl TerminalState {
             return None;
         }
 
-        let abs_line = (self.scrollback_len() as i64 - self.scroll_offset() as i64 + visible_row as i64) as usize;
-        Some(GridPos { line: abs_line, col })
+        let abs_line = (self.scrollback_len() as i64 - self.scroll_offset() as i64
+            + visible_row as i64) as usize;
+        Some(GridPos {
+            line: abs_line,
+            col,
+        })
     }
 
     /// 1-based (col, row) for SGR mouse reports under the same point as
     /// [`grid_pos_at`](Self::grid_pos_at). Past the right or bottom edge clamps
     /// to the last cell; above or left of the grid is None.
-    pub fn sgr_cell_at(&self, rel_x: f32, rel_y: f32, cell_w: f32, cell_h: f32) -> Option<(u16, u16)> {
+    pub fn sgr_cell_at(
+        &self,
+        rel_x: f32,
+        rel_y: f32,
+        cell_w: f32,
+        cell_h: f32,
+    ) -> Option<(u16, u16)> {
         let y_offset = self.y_offset_rows();
         let col = (rel_x / cell_w).floor() as i32;
         let row = (rel_y / cell_h).floor() as i32 - y_offset as i32;
@@ -2426,22 +2660,39 @@ impl TerminalState {
             // Double-click: select word
             let (wstart, wend) = self.word_bounds_at(pos);
             self.selection = Some(Selection {
-                anchor: GridPos { line: pos.line, col: wstart },
-                end: GridPos { line: pos.line, col: wend },
+                anchor: GridPos {
+                    line: pos.line,
+                    col: wstart,
+                },
+                end: GridPos {
+                    line: pos.line,
+                    col: wend,
+                },
                 mode: SelectionMode::Word,
             });
         } else if click_count >= 3 {
             // Triple-click: select entire line
-            let row_len = self.row_at(pos.line)
+            let row_len = self
+                .row_at(pos.line)
                 .map(|r| r.cells.len().saturating_sub(1) as u16)
                 .unwrap_or(0);
             self.selection = Some(Selection {
-                anchor: GridPos { line: pos.line, col: 0 },
-                end: GridPos { line: pos.line, col: row_len },
+                anchor: GridPos {
+                    line: pos.line,
+                    col: 0,
+                },
+                end: GridPos {
+                    line: pos.line,
+                    col: row_len,
+                },
                 mode: SelectionMode::Line,
             });
         } else {
-            self.selection = Some(Selection { anchor: pos, end: pos, mode: SelectionMode::Normal });
+            self.selection = Some(Selection {
+                anchor: pos,
+                end: pos,
+                mode: SelectionMode::Normal,
+            });
         }
         self.dirty.store(true, Ordering::Relaxed);
     }
@@ -2450,33 +2701,49 @@ impl TerminalState {
     /// or row). No-op without a selection.
     pub fn extend_selection(&mut self, pos: GridPos) {
         // Read mode and anchor before mutating selection
-        let Some((mode, anchor)) = self.selection.as_ref().map(|s| (s.mode, s.anchor)) else { return };
+        let Some((mode, anchor)) = self.selection.as_ref().map(|s| (s.mode, s.anchor)) else {
+            return;
+        };
         match mode {
             SelectionMode::Word => {
                 let (wstart, wend) = self.word_bounds_at(pos);
                 let anchor_before = (anchor.line, anchor.col) <= (pos.line, wstart);
                 if let Some(sel) = self.selection.as_mut() {
                     if anchor_before {
-                        sel.end = GridPos { line: pos.line, col: wend };
+                        sel.end = GridPos {
+                            line: pos.line,
+                            col: wend,
+                        };
                     } else {
-                        sel.end = GridPos { line: pos.line, col: wstart };
+                        sel.end = GridPos {
+                            line: pos.line,
+                            col: wstart,
+                        };
                     }
                 }
             }
             SelectionMode::Line => {
-                let row_len = self.row_at(pos.line)
+                let row_len = self
+                    .row_at(pos.line)
                     .map(|r| r.cells.len().saturating_sub(1) as u16)
                     .unwrap_or(0);
-                let anchor_row_len = self.row_at(anchor.line)
+                let anchor_row_len = self
+                    .row_at(anchor.line)
                     .map(|r| r.cells.len().saturating_sub(1) as u16)
                     .unwrap_or(0);
                 if let Some(sel) = self.selection.as_mut() {
                     if pos.line >= anchor.line {
                         sel.anchor.col = 0;
-                        sel.end = GridPos { line: pos.line, col: row_len };
+                        sel.end = GridPos {
+                            line: pos.line,
+                            col: row_len,
+                        };
                     } else {
                         sel.anchor.col = anchor_row_len;
-                        sel.end = GridPos { line: pos.line, col: 0 };
+                        sel.end = GridPos {
+                            line: pos.line,
+                            col: 0,
+                        };
                     }
                 }
             }
@@ -2563,7 +2830,10 @@ impl TerminalState {
             if hit {
                 // Scrollback rows come first, then the grid: the chained
                 // index is the absolute line (grid row j = sb_len + j).
-                results.push(FilterMatch { abs_line: i, text: text.to_string() });
+                results.push(FilterMatch {
+                    abs_line: i,
+                    text: text.to_string(),
+                });
             }
         }
 
@@ -2579,7 +2849,9 @@ impl TerminalState {
             self.reset_scroll();
         } else {
             let half_screen = self.rows as i32 / 2;
-            let offset = (sb_len as i32).saturating_sub(abs_line as i32).saturating_add(half_screen);
+            let offset = (sb_len as i32)
+                .saturating_sub(abs_line as i32)
+                .saturating_add(half_screen);
             self.scroll_offset = offset.clamp(0, sb_len as i32);
         }
         self.cursor_moved();
@@ -2598,7 +2870,9 @@ impl TerminalState {
             let sb_start = (sb_len - offset) as usize;
             let sb_visible = self.scrollback.len() - sb_start;
             if visible_row < sb_visible {
-                self.scrollback.get(sb_start + visible_row).map_or(false, |r| r.wrapped)
+                self.scrollback
+                    .get(sb_start + visible_row)
+                    .map_or(false, |r| r.wrapped)
             } else {
                 let grid_idx = visible_row - sb_visible;
                 self.grid.get(grid_idx).map_or(false, |r| r.wrapped)
@@ -2679,14 +2953,15 @@ impl TerminalState {
         let mut i = 0;
         while i < len {
             // Check for "https://" (8 chars) or "http://" (7 chars)
-            let prefix_len = if i + 8 <= len && chars[i..i + 8] == ['h', 't', 't', 'p', 's', ':', '/', '/'] {
-                8
-            } else if i + 7 <= len && chars[i..i + 7] == ['h', 't', 't', 'p', ':', '/', '/'] {
-                7
-            } else {
-                i += 1;
-                continue;
-            };
+            let prefix_len =
+                if i + 8 <= len && chars[i..i + 8] == ['h', 't', 't', 'p', 's', ':', '/', '/'] {
+                    8
+                } else if i + 7 <= len && chars[i..i + 7] == ['h', 't', 't', 'p', ':', '/', '/'] {
+                    7
+                } else {
+                    i += 1;
+                    continue;
+                };
 
             let start = i;
             let mut end = start + prefix_len;
@@ -2753,7 +3028,11 @@ impl TerminalState {
         // A cell with a non-default background is visible content even when
         // its char is a space (colored bands painted by TUIs).
         let default_bg = self.default_bg;
-        let has_content = |row: &Row| row.cells.iter().any(|c| !c.is_blank() || c.bg != default_bg);
+        let has_content = |row: &Row| {
+            row.cells
+                .iter()
+                .any(|c| !c.is_blank() || c.bg != default_bg)
+        };
         // Empty grid: nothing to anchor.
         if self.grid.iter().position(has_content).is_none() {
             return 0;
@@ -2763,8 +3042,7 @@ impl TerminalState {
         // leading newline before its output (e.g. Vite's startup banner) is
         // still shell flow. Whether to keep gravity is decided solely by where
         // the cursor sits relative to the content — handled by the check below.
-        let last_used = self.grid.iter().rposition(has_content)
-            .map_or(0, |i| i + 1);
+        let last_used = self.grid.iter().rposition(has_content).map_or(0, |i| i + 1);
         // Shell-like flow only: the cursor sits on the last content row (the
         // prompt) or below it. A TUI that paints from row 0 but parks its
         // cursor higher up (e.g. Claude Code's input box above its status
@@ -2811,8 +3089,44 @@ mod tests {
         assert!(scroll_crossed_page(20, 24, 24));
         assert!(!scroll_crossed_page(24, 30, 24));
         assert!(scroll_crossed_page(0, 100, 24));
-        assert!(!scroll_crossed_page(48, 20, 24), "scrolling down never logs");
-        assert!(scroll_crossed_page(0, 1, 0), "zero rows counts as one-line pages");
+        assert!(
+            !scroll_crossed_page(48, 20, 24),
+            "scrolling down never logs"
+        );
+        assert!(
+            scroll_crossed_page(0, 1, 0),
+            "zero rows counts as one-line pages"
+        );
+    }
+
+    /// The band a jump leaves is read from the clock, so it lasts the same
+    /// wall-clock time in the window and in a library pane whatever their tick
+    /// rates. Full strength while the eye has to catch it, then a straight
+    /// fade, and nothing left after the two.
+    #[test]
+    fn the_jump_band_holds_then_fades_by_the_clock() {
+        assert_eq!(highlight_alpha(Duration::ZERO), Some(1.0));
+        assert_eq!(
+            highlight_alpha(HIGHLIGHT_LINE_HOLD - Duration::from_millis(1)),
+            Some(1.0),
+            "still full just before the hold ends"
+        );
+        assert_eq!(highlight_alpha(HIGHLIGHT_LINE_HOLD), Some(1.0));
+        let half = highlight_alpha(HIGHLIGHT_LINE_HOLD + HIGHLIGHT_LINE_FADE / 2)
+            .expect("still showing mid-fade");
+        assert!(
+            (half - 0.5).abs() < 0.01,
+            "halfway through the fade it is half strength, got {half}"
+        );
+        assert_eq!(
+            highlight_alpha(HIGHLIGHT_LINE_HOLD + HIGHLIGHT_LINE_FADE),
+            None,
+            "gone at the end of the fade"
+        );
+        assert_eq!(
+            highlight_alpha(HIGHLIGHT_LINE_HOLD + HIGHLIGHT_LINE_FADE + Duration::from_secs(5)),
+            None
+        );
     }
 
     const FG: [u8; 3] = DEFAULT_FG;
@@ -2844,7 +3158,10 @@ mod tests {
         put_str(&mut t, "hello");
         t.title = Some("vim notes.md".into());
         t.clear_scrollback_and_screen();
-        assert_eq!(t.title, None, "a wiped pane must not keep the old app's title");
+        assert_eq!(
+            t.title, None,
+            "a wiped pane must not keep the old app's title"
+        );
         assert_eq!(row_text(&t, 0), "");
     }
 
@@ -2976,7 +3293,10 @@ mod tests {
         t.set_sgr(&[1, 3, 4]); // bold + italic + underline in one SGR
         put_str(&mut t, "X");
         let cell = &t.visible_lines()[0][0];
-        assert!(cell.attrs.contains(CellAttrs::BOLD | CellAttrs::ITALIC | CellAttrs::UNDERLINE));
+        assert!(
+            cell.attrs
+                .contains(CellAttrs::BOLD | CellAttrs::ITALIC | CellAttrs::UNDERLINE)
+        );
         assert!(!cell.attrs.contains(CellAttrs::STRIKETHROUGH));
     }
 
@@ -2986,7 +3306,10 @@ mod tests {
     fn full_width_line_keeps_cursor_on_last_column() {
         let mut t = term(10, 5);
         put_str(&mut t, "0123456789");
-        assert_eq!(t.cursor_x, 9, "cursor must stay on the last column, not pass it");
+        assert_eq!(
+            t.cursor_x, 9,
+            "cursor must stay on the last column, not pass it"
+        );
         assert_eq!(t.cursor_y, 0);
     }
 
@@ -3045,7 +3368,11 @@ mod tests {
         t.newline();
         t.put_char('A');
         assert_eq!(t.cursor_y, 1);
-        assert_eq!(row_text(&t, 1), "         A", "char prints at the preserved column");
+        assert_eq!(
+            row_text(&t, 1),
+            "         A",
+            "char prints at the preserved column"
+        );
     }
 
     #[test]
@@ -3094,7 +3421,10 @@ mod tests {
         t.erase_in_line(2);
         let lines = t.visible_lines();
         let red = AnsiColor::from_index(1).to_rgb();
-        assert!(lines[0].iter().all(|c| c.bg == red), "EL must fill with current bg");
+        assert!(
+            lines[0].iter().all(|c| c.bg == red),
+            "EL must fill with current bg"
+        );
     }
 
     #[test]
@@ -3110,14 +3440,20 @@ mod tests {
     #[test]
     fn color_set_inside_reverse_lands_in_logical_slot() {
         let mut t = term(10, 5);
-        t.set_sgr(&[7]);  // reverse on
+        t.set_sgr(&[7]); // reverse on
         t.set_sgr(&[34]); // blue foreground (logical)
         t.put_char('x');
         let blue = AnsiColor::from_index(4).to_rgb();
         {
             let lines = t.visible_lines();
-            assert_eq!(lines[0][0].bg, blue, "logical fg must display as bg under reverse");
-            assert_eq!(lines[0][0].fg, BG, "logical bg must display as fg under reverse");
+            assert_eq!(
+                lines[0][0].bg, blue,
+                "logical fg must display as bg under reverse"
+            );
+            assert_eq!(
+                lines[0][0].fg, BG,
+                "logical bg must display as fg under reverse"
+            );
         }
         // Reverse off: same color now displays as foreground
         t.set_sgr(&[27]);
@@ -3168,7 +3504,11 @@ mod tests {
             t.put_char('x');
         }
         t.set_cursor_pos(1, 1);
-        assert_eq!(t.y_offset_rows(), 0, "absolute-positioned TUI must not be shifted");
+        assert_eq!(
+            t.y_offset_rows(),
+            0,
+            "absolute-positioned TUI must not be shifted"
+        );
     }
 
     #[test]
@@ -3214,7 +3554,11 @@ mod tests {
         t.set_cursor_pos(9, 0);
         t.erase_in_line(2); // bottom row painted red, chars blank
         t.set_cursor_pos(0, 1);
-        assert_eq!(t.y_offset_rows(), 0, "colored bottom row is visible content");
+        assert_eq!(
+            t.y_offset_rows(),
+            0,
+            "colored bottom row is visible content"
+        );
     }
 
     // --- Alt-screen resize ---
@@ -3264,7 +3608,10 @@ mod tests {
         t.scroll(3);
         assert_eq!(t.scroll_offset(), 3);
         let top_before = row_text(&t, 0);
-        assert!(!top_before.is_empty(), "viewport top should show real content");
+        assert!(
+            !top_before.is_empty(),
+            "viewport top should show real content"
+        );
 
         // More output streams in. The viewed line is still within the buffer,
         // so it must remain exactly where it was — not drift toward the bottom.
@@ -3329,14 +3676,24 @@ mod tests {
                 if cell.c == '\0' {
                     assert!(i > 0, "continuation cell at row start");
                     let prev = &line[i - 1];
-                    assert!(prev.c != ' ' && prev.c != '\0',
-                        "continuation cell must follow a wide base");
+                    assert!(
+                        prev.c != ' ' && prev.c != '\0',
+                        "continuation cell must follow a wide base"
+                    );
                 }
             }
         }
         let dump = t.dump_text(DumpMode::All, true).text;
-        assert!(dump.contains("日"), "wide chars must survive reflow: {}", dump);
-        assert!(dump.contains("語"), "wide chars must survive reflow: {}", dump);
+        assert!(
+            dump.contains("日"),
+            "wide chars must survive reflow: {}",
+            dump
+        );
+        assert!(
+            dump.contains("語"),
+            "wide chars must survive reflow: {}",
+            dump
+        );
     }
 
     #[test]
@@ -3382,8 +3739,10 @@ mod tests {
         for line in lines.iter() {
             for (i, cell) in line.iter().enumerate() {
                 if cell.c == '日' {
-                    assert!(i + 1 < line.len() && line[i + 1].c == '\0',
-                        "wide base must be followed by its continuation");
+                    assert!(
+                        i + 1 < line.len() && line[i + 1].c == '\0',
+                        "wide base must be followed by its continuation"
+                    );
                 }
             }
         }
@@ -3403,7 +3762,11 @@ mod tests {
         t.put_char('X');
         let dump = t.dump_text(DumpMode::All, true).text;
         assert!(dump.contains('語'), "no glyph may be overwritten: {}", dump);
-        assert!(dump.contains("xX"), "cursor must land right after 'x': {}", dump);
+        assert!(
+            dump.contains("xX"),
+            "cursor must land right after 'x': {}",
+            dump
+        );
     }
 
     #[test]
@@ -3447,7 +3810,7 @@ mod tests {
         let mut t = term(10, 5);
         t.set_sgr(&[34]); // blue fg
         t.save_cursor();
-        t.set_sgr(&[0]);  // reset
+        t.set_sgr(&[0]); // reset
         t.restore_cursor();
         t.put_char('x');
         let blue = AnsiColor::from_index(4).to_rgb();
@@ -3463,7 +3826,7 @@ mod tests {
         t.set_sgr(&[0]);
         t.set_cursor_pos(0, 0);
         t.put_char('x'); // ensure row 0 counts as content
-        t.resize(8, 5);  // cols change -> reflow
+        t.resize(8, 5); // cols change -> reflow
         let red = AnsiColor::from_index(1).to_rgb();
         let lines = t.visible_lines();
         assert!(
@@ -3490,7 +3853,7 @@ mod tests {
         }
         t.set_scroll_region(1, 3);
         t.set_cursor_pos(3, 0); // bottom of region
-        t.newline();            // scrolls region only
+        t.newline(); // scrolls region only
         assert_eq!(row_text(&t, 0), "L0", "above region untouched");
         assert_eq!(row_text(&t, 1), "L2");
         assert_eq!(row_text(&t, 2), "L3");
@@ -3505,7 +3868,11 @@ mod tests {
         let mut t = term(20, 5);
         put_str(&mut t, "前 hello");
         let res = t.search_lines("前 hello");
-        assert_eq!(res.len(), 1, "wide-char continuation cells must not break matching");
+        assert_eq!(
+            res.len(),
+            1,
+            "wide-char continuation cells must not break matching"
+        );
         assert_eq!(res[0].text, "前 hello");
     }
 
@@ -3513,7 +3880,9 @@ mod tests {
     fn url_detection_spans_wide_chars() {
         let mut t = term(30, 5);
         put_str(&mut t, "https://例.jp next");
-        let (_, url) = t.url_at(0, 2).expect("URL with a wide char must be detected");
+        let (_, url) = t
+            .url_at(0, 2)
+            .expect("URL with a wide char must be detected");
         assert_eq!(url, "https://例.jp", "URL must not be cut at the wide char");
     }
 
@@ -3542,55 +3911,130 @@ mod tests {
         // One more line scrolls in → scrollback pops the oldest row.
         put_str(&mut t, "L8");
         t.newline();
-        assert_eq!(t.selected_text(), "L4", "selection must follow its content after trim");
+        assert_eq!(
+            t.selected_text(),
+            "L4",
+            "selection must follow its content after trim"
+        );
+    }
+
+    /// A filter jump's band is an absolute index like the selection: when the
+    /// full scrollback drops its oldest line, every index shifts down by one
+    /// and the band has to follow its content. Left alone it slides one row
+    /// per output line and ends up banding the neighbour of the row the jump
+    /// landed on — the one row the eye is trying to find.
+    #[test]
+    fn the_jump_band_follows_content_when_scrollback_trims() {
+        let mut t = TerminalState::new(10, 3, 5, FG, BG); // scrollback limit 5
+        for i in 0..8 {
+            put_str(&mut t, &format!("L{}", i));
+            t.newline();
+            t.carriage_return();
+        }
+        let (line, _) = (0..t.scrollback.len() + t.grid.len())
+            .find_map(|i| {
+                let row = t.row_at(i)?;
+                let text: String = row.cells.iter().map(|c| c.c).collect();
+                text.starts_with("L4").then_some((i, ()))
+            })
+            .expect("L4 must exist");
+        t.flash_line(line);
+        assert_eq!(t.highlight_line.expect("banded").0, line);
+        // One more line scrolls in → the scrollback pops its oldest row.
+        put_str(&mut t, "L8");
+        t.newline();
+        assert_eq!(
+            t.highlight_line.expect("still banded").0,
+            line - 1,
+            "the band moved with the line it marks"
+        );
+        // A band on the row that just fell out of the buffer has nothing left
+        // to mark, so it goes instead of sliding onto the new first row.
+        t.flash_line(0);
+        put_str(&mut t, "L9");
+        t.newline();
+        assert!(t.highlight_line.is_none(), "a band on the trimmed row is dropped");
     }
 
     #[test]
     fn sgr_clamps_out_of_range_color_params() {
         let mut t = term(10, 5);
         t.set_sgr(&[38, 2, 300, 50, 100]);
-        assert_eq!(t.current_fg, [255, 50, 100], "RGB params >255 must clamp, not truncate");
+        assert_eq!(
+            t.current_fg,
+            [255, 50, 100],
+            "RGB params >255 must clamp, not truncate"
+        );
         t.set_sgr(&[48, 2, 10, 999, 20]);
         assert_eq!(t.current_bg, [10, 255, 20]);
     }
 
     // --- Cmd+R rows-nudge round-trip (probe) ---
     fn sb_dump(t: &TerminalState) -> Vec<String> {
-        (0..t.scrollback_len()).map(|i| {
-            t.scrollback[i].cells.iter().filter(|c| c.c != '\0').map(|c| c.c).collect::<String>().trim_end().to_string()
-        }).collect()
+        (0..t.scrollback_len())
+            .map(|i| {
+                t.scrollback[i]
+                    .cells
+                    .iter()
+                    .filter(|c| c.c != '\0')
+                    .map(|c| c.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
     }
 
     #[test]
     fn probe_scroll_region_top0_pushes_blank_to_scrollback() {
         // Layout like Claude Code: content area = region [0..2], footer rows 3,4.
         let mut t = term(10, 5);
-        for i in 0..5u16 { t.set_cursor_pos(i, 0); put_str(&mut t, &format!("R{}", i)); }
+        for i in 0..5u16 {
+            t.set_cursor_pos(i, 0);
+            put_str(&mut t, &format!("R{}", i));
+        }
         // Set scroll region top=0 bottom=2 (content scrolls above a fixed footer)
         t.set_scroll_region(0, 2);
         // Reverse-index at top of region: inserts a BLANK at grid[0]
         t.set_cursor_pos(0, 0);
         t.reverse_index();
-        eprintln!("AFTER RI grid: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+        eprintln!(
+            "AFTER RI grid: {:?}",
+            (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>()
+        );
         // Now drop the region back to full screen (TUI exits its region)
         t.set_scroll_region(0, 4);
         // Normal output scrolls the screen; the blank at grid[0] gets pushed to scrollback
         t.set_cursor_pos(4, 0);
-        for _ in 0..3 { t.newline(); }
+        for _ in 0..3 {
+            t.newline();
+        }
         eprintln!("scrollback: {:?}", sb_dump(&t));
-        eprintln!("grid: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+        eprintln!(
+            "grid: {:?}",
+            (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn probe_ri_full_screen_no_region() {
         let mut t = term(10, 5);
-        for i in 0..10u16 { put_str(&mut t, &format!("A{}", i)); t.newline(); t.set_cursor_pos(t.cursor_y, 0); }
+        for i in 0..10u16 {
+            put_str(&mut t, &format!("A{}", i));
+            t.newline();
+            t.set_cursor_pos(t.cursor_y, 0);
+        }
         // No DECSTBM. Reverse Index at top of full screen (ESC M when cursor at row 0).
         t.set_cursor_pos(0, 0);
         t.reverse_index(); // scroll_down(1): blank at grid[0]
-        eprintln!("grid after RI: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+        eprintln!(
+            "grid after RI: {:?}",
+            (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>()
+        );
         t.set_cursor_pos(4, 0);
-        for _ in 0..3 { t.newline(); }
+        for _ in 0..3 {
+            t.newline();
+        }
         eprintln!("sb after scroll: {:?}", sb_dump(&t));
     }
 
@@ -3598,9 +4042,16 @@ mod tests {
     fn probe_blank_lands_mid_scrollback() {
         let mut t = term(10, 5);
         // Fill scrollback with real content A0..A5 via scrolling.
-        for i in 0..10u16 { put_str(&mut t, &format!("A{}", i)); t.newline(); t.set_cursor_pos(t.cursor_y, 0); }
+        for i in 0..10u16 {
+            put_str(&mut t, &format!("A{}", i));
+            t.newline();
+            t.set_cursor_pos(t.cursor_y, 0);
+        }
         eprintln!("sb after fill: {:?}", sb_dump(&t));
-        eprintln!("grid: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+        eprintln!(
+            "grid: {:?}",
+            (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>()
+        );
         // A TUI sets a region with top=0 and reverse-indexes (inserts blank at grid[0]).
         t.set_scroll_region(0, 2);
         t.set_cursor_pos(0, 0);
@@ -3608,21 +4059,32 @@ mod tests {
         // TUI exits region, normal flow resumes, blank scrolls into scrollback.
         t.set_scroll_region(0, 4);
         t.set_cursor_pos(4, 0);
-        for _ in 0..4 { t.newline(); }
+        for _ in 0..4 {
+            t.newline();
+        }
         eprintln!("sb after blank scrolls in: {:?}", sb_dump(&t));
     }
 
     #[test]
     fn probe_il_dl_in_region() {
         let mut t = term(10, 5);
-        for i in 0..5u16 { t.set_cursor_pos(i, 0); put_str(&mut t, &format!("R{}", i)); }
+        for i in 0..5u16 {
+            t.set_cursor_pos(i, 0);
+            put_str(&mut t, &format!("R{}", i));
+        }
         t.set_scroll_region(0, 3); // region 0..3, footer row 4
         t.set_cursor_pos(1, 0);
         t.insert_lines(1);
-        eprintln!("after IL@1: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+        eprintln!(
+            "after IL@1: {:?}",
+            (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>()
+        );
         t.set_cursor_pos(1, 0);
         t.delete_lines(1);
-        eprintln!("after DL@1: {:?}", (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>());
+        eprintln!(
+            "after DL@1: {:?}",
+            (0..5).map(|r| row_text(&t, r)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -3642,9 +4104,21 @@ mod tests {
         let after: Vec<String> = (0..5).map(|r| row_text(&t, r)).collect();
         eprintln!("BEFORE {:?} sb={}", before, sb_before);
         eprintln!("AFTER  {:?} sb={}", after, t.scrollback_len());
-        eprintln!("SCROLLBACK {:?}", (0..t.scrollback_len()).map(|i| {
-            t.scrollback[i].cells.iter().filter(|c| c.c != '\0').map(|c| c.c).collect::<String>().trim_end().to_string()
-        }).collect::<Vec<_>>());
+        eprintln!(
+            "SCROLLBACK {:?}",
+            (0..t.scrollback_len())
+                .map(|i| {
+                    t.scrollback[i]
+                        .cells
+                        .iter()
+                        .filter(|c| c.c != '\0')
+                        .map(|c| c.c)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -3657,15 +4131,33 @@ mod tests {
         }
         // Now scrollback has older lines; grid bottom row is the blank line after L11.
         let before: Vec<String> = (0..5).map(|r| row_text(&t, r)).collect();
-        let sb_before: Vec<String> = (0..t.scrollback_len()).map(|i| {
-            t.scrollback[i].cells.iter().filter(|c| c.c != '\0').map(|c| c.c).collect::<String>().trim_end().to_string()
-        }).collect();
+        let sb_before: Vec<String> = (0..t.scrollback_len())
+            .map(|i| {
+                t.scrollback[i]
+                    .cells
+                    .iter()
+                    .filter(|c| c.c != '\0')
+                    .map(|c| c.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
         t.resize(10, 4);
         t.resize(10, 5);
         let after: Vec<String> = (0..5).map(|r| row_text(&t, r)).collect();
-        let sb_after: Vec<String> = (0..t.scrollback_len()).map(|i| {
-            t.scrollback[i].cells.iter().filter(|c| c.c != '\0').map(|c| c.c).collect::<String>().trim_end().to_string()
-        }).collect();
+        let sb_after: Vec<String> = (0..t.scrollback_len())
+            .map(|i| {
+                t.scrollback[i]
+                    .cells
+                    .iter()
+                    .filter(|c| c.c != '\0')
+                    .map(|c| c.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
         eprintln!("GRID BEFORE {:?}", before);
         eprintln!("GRID AFTER  {:?}", after);
         eprintln!("SB BEFORE {:?}", sb_before);
@@ -3693,8 +4185,14 @@ mod tests {
 
         fn select(t: &mut TerminalState, a: (usize, u16), e: (usize, u16)) {
             t.selection = Some(Selection {
-                anchor: GridPos { line: a.0, col: a.1 },
-                end: GridPos { line: e.0, col: e.1 },
+                anchor: GridPos {
+                    line: a.0,
+                    col: a.1,
+                },
+                end: GridPos {
+                    line: e.0,
+                    col: e.1,
+                },
                 mode: SelectionMode::Normal,
             });
         }
@@ -3991,7 +4489,10 @@ mod tests {
         #[test]
         fn quotes_angles_and_backticks_end_the_url() {
             let mut t = term(60, 4);
-            lines(&mut t, &["<https://a.com>", "\"https://b.com\"", "`https://c.com`"]);
+            lines(
+                &mut t,
+                &["<https://a.com>", "\"https://b.com\"", "`https://c.com`"],
+            );
             assert_eq!(t.url_at(0, 3).unwrap().1, "https://a.com");
             assert_eq!(t.url_at(1, 3).unwrap().1, "https://b.com");
             assert_eq!(t.url_at(2, 3).unwrap().1, "https://c.com");
@@ -4078,7 +4579,11 @@ mod tests {
             assert_eq!(at(9.9, 19.9), Some(GridPos { line: 0, col: 0 }));
             assert_eq!(at(10.0, 20.0), Some(GridPos { line: 1, col: 1 }));
             assert_eq!(at(95.0, 79.0), Some(GridPos { line: 3, col: 9 }));
-            assert_eq!(at(500.0, 10.0), Some(GridPos { line: 0, col: 9 }), "right edge clamps");
+            assert_eq!(
+                at(500.0, 10.0),
+                Some(GridPos { line: 0, col: 9 }),
+                "right edge clamps"
+            );
             assert_eq!(at(-0.1, 10.0), None, "left of the grid");
             assert_eq!(at(5.0, -0.1), None, "above the grid");
             assert_eq!(at(5.0, 80.0), None, "below the last row");
@@ -4089,11 +4594,20 @@ mod tests {
             let mut t = term(10, 2);
             lines(&mut t, &["one", "two", "three", "four"]);
             assert_eq!(t.scrollback_len(), 2);
-            assert_eq!(t.grid_pos_at(0.0, 0.0, 10.0, 20.0), Some(GridPos { line: 2, col: 0 }));
+            assert_eq!(
+                t.grid_pos_at(0.0, 0.0, 10.0, 20.0),
+                Some(GridPos { line: 2, col: 0 })
+            );
             t.scroll(1);
-            assert_eq!(t.grid_pos_at(0.0, 0.0, 10.0, 20.0), Some(GridPos { line: 1, col: 0 }));
+            assert_eq!(
+                t.grid_pos_at(0.0, 0.0, 10.0, 20.0),
+                Some(GridPos { line: 1, col: 0 })
+            );
             t.scroll(5);
-            assert_eq!(t.grid_pos_at(0.0, 25.0, 10.0, 20.0), Some(GridPos { line: 1, col: 0 }));
+            assert_eq!(
+                t.grid_pos_at(0.0, 25.0, 10.0, 20.0),
+                Some(GridPos { line: 1, col: 0 })
+            );
         }
 
         #[test]
@@ -4102,8 +4616,15 @@ mod tests {
             let mut t = term(10, 5);
             put_str(&mut t, "$ ls");
             assert_eq!(t.y_offset_rows(), 4);
-            assert_eq!(t.grid_pos_at(0.0, 0.0, 10.0, 20.0), None, "padding rows are not cells");
-            assert_eq!(t.grid_pos_at(15.0, 85.0, 10.0, 20.0), Some(GridPos { line: 0, col: 1 }));
+            assert_eq!(
+                t.grid_pos_at(0.0, 0.0, 10.0, 20.0),
+                None,
+                "padding rows are not cells"
+            );
+            assert_eq!(
+                t.grid_pos_at(15.0, 85.0, 10.0, 20.0),
+                Some(GridPos { line: 0, col: 1 })
+            );
             assert_eq!(t.sgr_cell_at(15.0, 85.0, 10.0, 20.0), Some((2, 1)));
         }
 
@@ -4121,7 +4642,9 @@ mod tests {
 
         // Selection by click and drag
 
-        fn pos(line: usize, col: u16) -> GridPos { GridPos { line, col } }
+        fn pos(line: usize, col: u16) -> GridPos {
+            GridPos { line, col }
+        }
 
         fn sel_of(t: &TerminalState) -> (GridPos, GridPos, SelectionMode) {
             let s = t.selection.as_ref().expect("selection");
@@ -4172,10 +4695,17 @@ mod tests {
             t.start_selection(pos(0, 6), 1);
             t.extend_selection(pos(1, 2));
             assert_eq!(sel_of(&t), (pos(0, 6), pos(1, 2), SelectionMode::Normal));
-            assert_eq!(t.selected_text(), "world
-sec");
+            assert_eq!(
+                t.selected_text(),
+                "world
+sec"
+            );
             t.extend_selection(pos(0, 2));
-            assert_eq!(t.selected_text(), "llo w", "dragging back before the anchor");
+            assert_eq!(
+                t.selected_text(),
+                "llo w",
+                "dragging back before the anchor"
+            );
         }
 
         #[test]
@@ -4200,12 +4730,18 @@ sec");
             t.start_selection(pos(1, 1), 3);
             t.extend_selection(pos(2, 0));
             assert_eq!(sel_of(&t), (pos(1, 0), pos(2, 9), SelectionMode::Line));
-            assert_eq!(t.selected_text(), "two
-three");
+            assert_eq!(
+                t.selected_text(),
+                "two
+three"
+            );
             t.extend_selection(pos(0, 5));
             assert_eq!(sel_of(&t), (pos(1, 9), pos(0, 0), SelectionMode::Line));
-            assert_eq!(t.selected_text(), "one
-two");
+            assert_eq!(
+                t.selected_text(),
+                "one
+two"
+            );
         }
 
         #[test]
@@ -4264,7 +4800,11 @@ two");
             assert_eq!(t.drag_autoscroll_speed(-41.0, 20.0), -3);
             assert_eq!(t.drag_autoscroll_speed(81.0, 20.0), 1);
             assert_eq!(t.drag_autoscroll_speed(121.0, 20.0), 3);
-            assert_eq!(t.drag_autoscroll_speed(5000.0, 20.0), 10, "capped at 10 lines per tick");
+            assert_eq!(
+                t.drag_autoscroll_speed(5000.0, 20.0),
+                10,
+                "capped at 10 lines per tick"
+            );
             assert_eq!(t.drag_autoscroll_speed(-5000.0, 20.0), -10);
         }
 
@@ -4311,7 +4851,11 @@ two");
 
         push_lines(&mut t, 10, 1);
         assert_eq!(t.scrollback_len(), 5, "1-in/1-out");
-        assert_ne!(t.content_generation(), g0, "a trim must invalidate cached indices");
+        assert_ne!(
+            t.content_generation(),
+            g0,
+            "a trim must invalidate cached indices"
+        );
         let after = t.search_lines("line 7");
         assert_eq!(
             after[0].abs_line + 1,
@@ -4327,7 +4871,11 @@ two");
         let g0 = t.content_generation();
         let _ = t.search_lines("line");
         t.scroll(1);
-        assert_eq!(t.content_generation(), g0, "reading and scrolling change no content");
+        assert_eq!(
+            t.content_generation(),
+            g0,
+            "reading and scrolling change no content"
+        );
     }
 
     #[test]
@@ -4352,7 +4900,11 @@ two");
         assert_eq!(sb, 3);
         let hits = t.search_lines("LINE 4");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].abs_line, sb + 1, "grid row 1 = scrollback length + 1");
+        assert_eq!(
+            hits[0].abs_line,
+            sb + 1,
+            "grid row 1 = scrollback length + 1"
+        );
         assert_eq!(hits[0].text, "line 4");
         assert_eq!(t.search_lines("Line 0")[0].abs_line, 0);
         // Non-ASCII lines take the Unicode lowercasing path.
@@ -4378,8 +4930,25 @@ two");
                 seed ^= seed << 17;
                 seed % n
             };
-            let words = ["cargo", "build", "warning:", "src/main.rs", "fn", "let", "error[E0308]",
-                "-->", "Compiling", "kova", "v2.0.1", "|", "=", "note:", "ok", "test", "passed"];
+            let words = [
+                "cargo",
+                "build",
+                "warning:",
+                "src/main.rs",
+                "fn",
+                "let",
+                "error[E0308]",
+                "-->",
+                "Compiling",
+                "kova",
+                "v2.0.1",
+                "|",
+                "=",
+                "note:",
+                "ok",
+                "test",
+                "passed",
+            ];
             let wide = ["日本語", "✅", "🚀", "中文"];
             let total = limit + 50 + 200;
             for _ in 0..total {
@@ -4415,14 +4984,22 @@ two");
 
         let t0 = Instant::now();
         let base = build();
-        eprintln!("fill: scrollback_len={} (limit {limit}) in {:?}", base.scrollback_len(), t0.elapsed());
+        eprintln!(
+            "fill: scrollback_len={} (limit {limit}) in {:?}",
+            base.scrollback_len(),
+            t0.elapsed()
+        );
         assert_eq!(base.scrollback_len(), limit);
 
         // (a) one resize 200 -> 199 cols
         let mut t = build();
         let s = Instant::now();
         t.resize(199, 50);
-        eprintln!("(a) 200->199 cols, 1 resize: {:?} (scrollback after {})", s.elapsed(), t.scrollback_len());
+        eprintln!(
+            "(a) 200->199 cols, 1 resize: {:?} (scrollback after {})",
+            s.elapsed(),
+            t.scrollback_len()
+        );
 
         // (b) live drag: 30 resizes 200 -> 170, one column at a time
         let mut t = build();
@@ -4436,8 +5013,13 @@ two");
         let total = s.elapsed();
         let max = steps.iter().max().unwrap();
         let min = steps.iter().min().unwrap();
-        eprintln!("(b) 30 resizes 200->170: total {:?}, mean {:?}/step, min {:?}, max {:?}",
-            total, total / 30, min, max);
+        eprintln!(
+            "(b) 30 resizes 200->170: total {:?}, mean {:?}/step, min {:?}, max {:?}",
+            total,
+            total / 30,
+            min,
+            max
+        );
 
         // (c) rows-only resize (cols unchanged)
         let mut t = build();

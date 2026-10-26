@@ -21,7 +21,7 @@ Every frame is drawn on the GPU via Apple's Metal API. Glyph atlas with on-deman
 
 ### Session persistence
 
-Layout (tabs, splits, CWD) is saved on quit and restored on launch. Panes that were running Claude Code or Codex resume their conversation by themselves after a relaunch, each one the first time it is on screen in the active tab (focused or not), so fifty restored agents do not all start at once; a tab reopened with Cmd+O pre-types the resume line and waits for Enter. Window position is remembered automatically.
+Layout (tabs, splits, CWD) is saved on quit and restored on launch. Panes that were running Claude Code, Codex or Pi resume their conversation by themselves after a relaunch, each one the first time it is on screen in the active tab (focused or not), so fifty restored agents do not all start at once; a tab reopened with Cmd+O pre-types the resume line and waits for Enter. Window position is remembered automatically.
 
 ### Clickable URLs
 

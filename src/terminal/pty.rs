@@ -171,6 +171,16 @@ pub fn process_info(pid: u32) -> ProcessInfo {
     ProcessInfo { name, version }
 }
 
+/// Which process names the foreground group: the agent when it belongs to
+/// that group (`agent` = its pid and pgid), else the group leader. An agent
+/// suspended or sent to the background has another pgid and is not described.
+fn described_pid(fg_pgid: i32, agent: Option<(u32, i32)>) -> u32 {
+    match agent {
+        Some((pid, pgid)) if pgid == fg_pgid => pid,
+        _ => fg_pgid as u32,
+    }
+}
+
 /// The executable path and argv[0] of `pid`, via `KERN_PROCARGS2`.
 ///
 /// The area is laid out as: argc (i32), the executable path, NUL padding, then
@@ -660,11 +670,20 @@ impl Pty {
     /// process does; `info.name` is empty when the name could not be resolved,
     /// so an empty name must never be read as "no foreground process".
     pub fn foreground_process(&self) -> Option<ProcessInfo> {
+        self.foreground_process_preferring(None)
+    }
+
+    /// `foreground_process`, but describing `agent_pid` instead of the group
+    /// leader when the agent runs in the foreground group. A launcher script
+    /// (`#!/usr/bin/env bash` that sets up a proxy, then runs `claude`) leads
+    /// the group, so its argv[0] — `bash` — would otherwise name the pane.
+    pub fn foreground_process_preferring(&self, agent_pid: Option<u32>) -> Option<ProcessInfo> {
         if self.is_dummy {
             return None;
         }
         let fg_pgid = foreground_pgid(self.master_fd.as_raw_fd(), self.child_pid)?;
-        Some(process_info(fg_pgid as u32))
+        let agent = agent_pid.map(|pid| (pid, unsafe { libc::getpgid(pid as i32) }));
+        Some(process_info(described_pid(fg_pgid, agent)))
     }
 
     /// Returns the name of the foreground process if it differs from the shell
@@ -984,6 +1003,19 @@ mod tests {
         assert_eq!(version_from_exe_path("/usr/bin/python3.12"), None);
         assert_eq!(version_from_exe_path("/usr/bin/2"), None);
         assert_eq!(version_from_exe_path("/usr/bin/1."), None);
+    }
+
+    #[test]
+    fn an_agent_under_a_launcher_names_the_foreground_group() {
+        // deepseek-cc (bash, pid 100) leads the group and runs claude (pid 130).
+        assert_eq!(described_pid(100, Some((130, 100))), 130);
+    }
+
+    #[test]
+    fn the_group_leader_names_it_when_the_agent_is_elsewhere() {
+        // claude suspended with ^Z, vim (pid 200) in the foreground.
+        assert_eq!(described_pid(200, Some((130, 100))), 200);
+        assert_eq!(described_pid(200, None), 200);
     }
 
     #[test]

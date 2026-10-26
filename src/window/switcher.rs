@@ -2048,6 +2048,8 @@ mod tests {
 
     fn saved(id: &str) -> crate::bookmarks::Bookmark {
         crate::bookmarks::Bookmark {
+            config_dir: None,
+            launcher: None,
             agent: Some(crate::agent_session::Agent::Claude),
             session_id: Some(id.into()),
             cwd: "/Users/x/projects/kova".into(),
@@ -2218,6 +2220,8 @@ mod tests {
     #[test]
     fn a_bookmark_row_names_its_agent_only() {
         let bm = crate::bookmarks::Bookmark {
+            config_dir: None,
+            launcher: None,
             agent: Some(crate::agent_session::Agent::Codex),
             session_id: Some("id".into()),
             cwd: "/Users/x/projects/kova".into(),
@@ -2225,6 +2229,8 @@ mod tests {
         };
         assert_eq!(bookmark_detail(&bm).as_deref(), Some("codex"));
         let shell = crate::bookmarks::Bookmark {
+            config_dir: None,
+            launcher: None,
             agent: None,
             session_id: None,
             cwd: "/Users/x/projects/kova".into(),

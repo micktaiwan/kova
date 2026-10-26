@@ -765,7 +765,18 @@ impl KovaView {
         crate::claude_session::end_orphan(session_id);
         // Same guard as the restore path: an id that cannot make a safe command
         // line never reaches a PTY.
-        let command = match crate::claude_session::resume_command(None, session_id, None) {
+        // A conversation started by a launcher with its own config dir
+        // (`deepseek-cc`) comes back through that launcher, or at least under
+        // that dir, rather than under the default account.
+        let config_dir = crate::claude_session::config_dir_of(session_id);
+        let launcher = config_dir
+            .as_deref()
+            .and_then(crate::launchers::for_config_dir);
+        let command = match crate::claude_session::resume_command(
+            launcher.as_deref(),
+            session_id,
+            config_dir.as_deref(),
+        ) {
             Some(c) => c,
             None => {
                 log::warn!("Refusing to resume an unsafe session id: {:?}", session_id);
@@ -1381,6 +1392,8 @@ mod tests {
 
     fn bookmark(id: Option<&str>, cwd: &str, label: &str) -> crate::bookmarks::Bookmark {
         crate::bookmarks::Bookmark {
+            config_dir: None,
+            launcher: None,
             agent: id.map(|_| crate::agent_session::Agent::Claude),
             session_id: id.map(str::to_string),
             cwd: cwd.to_string(),

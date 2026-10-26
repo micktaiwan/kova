@@ -252,7 +252,13 @@ impl LayerRenderer {
             // Kova.app skips its focused pane): the cache is dropped so the
             // grid is rebuilt once the filter closes.
             self.pane = PaneRenderer::default();
-            super::build_filter_overlay(ctx, &mut overlay, &pane.viewport, filter);
+            super::build_filter_overlay(
+                ctx,
+                &mut overlay,
+                &pane.viewport,
+                filter,
+                style.list_selected_bg,
+            );
         } else {
             let (segments, text) = split_hover(extras);
             let mut zones = Vec::new();

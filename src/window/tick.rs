@@ -179,6 +179,20 @@ impl KovaView {
 
         self.extend_drag_selection();
 
+        // The band a filter jump left on its line is cleared once it has run
+        // its course. A pane without one pays a read lock and nothing else.
+        {
+            let tabs = ivars.tabs.borrow();
+            for tab in tabs.iter() {
+                tab.for_each_pane(&mut |pane| {
+                    let showing = pane.terminal.read().highlight_line.is_some();
+                    if showing {
+                        pane.terminal.write().tick_highlight_line();
+                    }
+                });
+            }
+        }
+
         // --- Deferred winsize restores, debounced robust repaint after a
         // resize burst settles, post-restore hole check ---
         self.tick_resize_repairs();

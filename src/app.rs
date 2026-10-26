@@ -1097,6 +1097,7 @@ fn handle_ipc_set_anchor(
             match agent.as_deref() {
                 Some("claude") => Some(crate::agent_session::Agent::Claude),
                 Some("codex") => Some(crate::agent_session::Agent::Codex),
+                Some("pi") => Some(crate::agent_session::Agent::Pi),
                 _ => None,
             },
             label,

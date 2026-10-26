@@ -38,12 +38,15 @@ def list_panes():
     return json.loads(buf)["data"]
 
 
-def transcript(session_id, cwd):
+def transcript(session_id, cwd, config_dir=None):
+    # A session started under its own CLAUDE_CONFIG_DIR (a launcher like deepseek-cc) keeps
+    # its transcripts under that directory, not under ~/.claude.
+    root = config_dir or os.path.expanduser("~/.claude")
     d = re.sub(r"[^A-Za-z0-9]", "-", cwd or "")
-    p = os.path.expanduser(f"~/.claude/projects/{d}/{session_id}.jsonl")
+    p = os.path.join(root, "projects", d, f"{session_id}.jsonl")
     if os.path.exists(p):
         return p
-    found = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl"))
+    found = glob.glob(os.path.join(root, "projects", "*", f"{session_id}.jsonl"))
     return found[0] if found else None
 
 
@@ -82,7 +85,7 @@ def main():
         sid = p.get("agent_session_id") or p.get("claude_session_id")
         if not sid or sid == me:
             continue
-        path = transcript(sid, p.get("cwd"))
+        path = transcript(sid, p.get("cwd"), p.get("claude_config_dir"))
         if not path:
             missing.append(p["id"])
             continue

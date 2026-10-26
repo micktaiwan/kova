@@ -8,6 +8,10 @@ use crate::terminal::TerminalState;
 pub(crate) struct FilterState {
     pub(crate) query: String,
     pub(crate) matches: Vec<FilterMatch>,
+    /// The listed match ↑/↓ has picked, once the search has rows. Enter jumps
+    /// to this one and the list paints it. Back to 0 whenever the query
+    /// changes: a new search starts on its first match, as Enter always did.
+    pub(crate) selected: usize,
     /// Where ↑/↓ currently sits in this run's filter history; `None` when the
     /// query on screen is the one being typed rather than a recalled one.
     pub(crate) history_pos: Option<usize>,
@@ -48,6 +52,7 @@ impl FilterState {
         FilterState {
             query: String::new(),
             matches: Vec::new(),
+            selected: 0,
             history_pos: None,
             draft: String::new(),
             searched: None,
@@ -62,6 +67,7 @@ impl FilterState {
         crate::renderer::FilterRenderData {
             query: self.query.clone(),
             matches: self.matches.clone(),
+            selected: self.selected,
             hint: (self.query.is_empty()
                 && !crate::search_history::is_empty(crate::search_history::Scope::Filter))
             .then(|| "↑ recent".to_string()),
@@ -76,11 +82,13 @@ impl FilterState {
     }
 
     /// Scroll `term` to the match the user picked at `idx` in the list they
-    /// saw (`resolve_pick`). Resolved and scrolled under the caller's one
-    /// write lock: output landing between the two would shift the line again.
+    /// saw (`resolve_pick`) and flash that line. Resolved, scrolled and flashed
+    /// under the caller's one write lock: output landing between the two would
+    /// shift the line again.
     pub(crate) fn jump_to_pick(&mut self, idx: usize, term: &mut TerminalState) {
         if let Some(abs_line) = self.resolve_pick(idx, term) {
             term.scroll_to_abs_line(abs_line);
+            term.flash_line(abs_line);
         }
     }
 
@@ -89,6 +97,11 @@ impl FilterState {
         self.matches = term.search_lines(&self.query);
         self.searched = Some((term.terminal_id, term.content_generation()));
         self.last_run = Some(std::time::Instant::now());
+        // The pick is an index into the list drawn a moment ago: output or a
+        // reflow just changed its length. Stay on a row that exists.
+        if self.selected >= self.matches.len() {
+            self.selected = self.matches.len().saturating_sub(1);
+        }
     }
 
     /// Whether `matches` no longer reflect `term`'s current content.
@@ -218,16 +231,19 @@ pub(crate) enum FilterKeyOutcome {
     Toggle,
     /// Escape: close without scrolling.
     Close,
-    /// Enter: close and scroll to the first match (`jump_to_pick(0, …)`).
+    /// Enter: close and scroll to the picked match (`FilterState::selected`).
     Jump,
     /// The query changed: re-run the search and redraw.
     Rerun,
+    /// ↑/↓ moved the pick through the listed matches: redraw the list.
+    Navigate,
     /// Nothing to do.
     Ignored,
 }
 
-/// Apply one key to an open filter: edit the query or walk the recall list
-/// (read through `history` only on ↑/↓), and say what the caller must do.
+/// Apply one key to an open filter: edit the query; ↑/↓ pick among the listed
+/// matches once the user has launched a search, and walk the recall list
+/// otherwise (`history` is read only then). Says what the caller must do.
 pub(crate) fn filter_key(
     state: &mut FilterState,
     key: &FilterKey,
@@ -242,9 +258,22 @@ pub(crate) fn filter_key(
     // which is neither a control char nor below ' ', so the printable branch
     // below would happily type it into the query.
     if let Some(older) = key.arrow {
-        // ↑/↓ walk the queries filtered earlier in this run.
-        return if recall_filter_query(state, older, &history()) {
-            FilterKeyOutcome::Rerun
+        // No search of the user's own on screen: the empty query Cmd+F opens
+        // on, or a query recalled earlier and not edited since. There is
+        // nothing of theirs to walk, so ↑/↓ keep walking the queries filtered
+        // earlier in this run (`history_pos` is Some exactly while the query
+        // on screen came from that list).
+        if state.query.is_empty() || state.history_pos.is_some() {
+            return if recall_filter_query(state, older, &history()) {
+                FilterKeyOutcome::Rerun
+            } else {
+                FilterKeyOutcome::Ignored
+            };
+        }
+        // A search the user launched: ↑/↓ pick among its results, which is
+        // what the list is for. An empty result list has nothing to pick.
+        return if navigate_match(state, older) {
+            FilterKeyOutcome::Navigate
         } else {
             FilterKeyOutcome::Ignored
         };
@@ -257,6 +286,8 @@ pub(crate) fn filter_key(
             // Editing a recalled query makes it the draft again, so ↓ does
             // not throw the edit away.
             state.history_pos = None;
+            // A new search starts on its first match.
+            state.selected = 0;
             FilterKeyOutcome::Rerun
         }
         c if is_typed_char(c) && !key.shortcut => {
@@ -265,10 +296,31 @@ pub(crate) fn filter_key(
             }
             state.query.push_str(key.text);
             state.history_pos = None;
+            state.selected = 0;
             FilterKeyOutcome::Rerun
         }
         _ => FilterKeyOutcome::Ignored,
     }
+}
+
+/// Move the pick through the listed matches: ↑ (older) is the row above,
+/// clamped at the top; ↓ the row below, clamped at the bottom. Returns true
+/// when it moved, so the list is redrawn.
+fn navigate_match(state: &mut FilterState, older: bool) -> bool {
+    let len = state.matches.len();
+    if len == 0 {
+        return false;
+    }
+    let next = if older {
+        state.selected.saturating_sub(1)
+    } else {
+        (state.selected + 1).min(len - 1)
+    };
+    if next == state.selected {
+        return false;
+    }
+    state.selected = next;
+    true
 }
 
 /// Walk the filter's recall list (`history`, most recent first). `older` is ↑
@@ -300,7 +352,28 @@ fn recall_filter_query(state: &mut FilterState, older: bool, history: &[String])
         None => state.draft.clone(),
     };
     state.history_pos = next_pos;
+    state.selected = 0;
     true
+}
+
+/// The listed match a click at `row` lands on, when the list is drawn from the
+/// scroll that keeps `selected` in view. The window and a library pane both go
+/// through here: the scroll, the row and the bounds are one computation, so the
+/// two hosts cannot disagree and a test can pin the whole hit-testing.
+pub(crate) fn filter_click_pick(
+    selected: usize,
+    max_visible: usize,
+    row: usize,
+    len: usize,
+) -> Option<usize> {
+    // A row past the ones the overlay drew is not a match: with ten results
+    // and three rows on screen, a click on the fourth row of that pane lands
+    // in the pane below, and must not jump the filtered one anywhere.
+    if row >= max_visible {
+        return None;
+    }
+    let idx = crate::renderer::filter_list_scroll(selected, max_visible) + row;
+    (idx < len).then_some(idx)
 }
 
 /// The listed line a click at `py` pixels lands on, the overlay's top being at
@@ -321,6 +394,7 @@ pub(crate) fn paste_into_filter_state(state: &mut FilterState, text: &str) -> bo
     }
     state.query.push_str(&pasted);
     state.history_pos = None;
+    state.selected = 0;
     true
 }
 
@@ -413,7 +487,8 @@ impl KovaView {
             FilterKeyOutcome::Jump => {
                 if let Some(mut state) = self.close_filter() {
                     if let Some(pane) = self.focused_pane() {
-                        state.jump_to_pick(0, &mut pane.terminal.write());
+                        let picked = state.selected;
+                        state.jump_to_pick(picked, &mut pane.terminal.write());
                     }
                 }
             }
@@ -423,6 +498,14 @@ impl KovaView {
                     let term = pane.terminal.read();
                     state.rerun(&term);
                     term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            FilterKeyOutcome::Navigate => {
+                if let Some(pane) = self.focused_pane() {
+                    pane.terminal
+                        .read()
+                        .dirty
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             FilterKeyOutcome::Ignored => {}
@@ -622,17 +705,38 @@ impl KovaView {
         };
         let (_, cell_h) = renderer.read().cell_size();
 
-        let Some(click_row) = filter_click_row(py, self.panes_viewport().y, cell_h) else { return };
+        // The overlay is drawn over the focused pane: its top and height are
+        // what the click has to be measured against.
+        let panes_vp = self.panes_viewport();
+        let focused_vp = {
+            let tabs = self.ivars().tabs.borrow();
+            let tab = match tabs.get(self.ivars().active_tab.get()) {
+                Some(t) => t,
+                None => return,
+            };
+            tab.viewport_for_pane(tab.focused_pane, panes_vp)
+        };
+        let Some(focused_vp) = focused_vp else { return };
+        let Some(click_row) = filter_click_row(py, focused_vp.y, cell_h) else {
+            return;
+        };
 
         if self.ivars().filter.borrow().is_none() {
             return;
         }
-        let Some(mut state) = self.close_filter() else { return };
-        if click_row >= state.matches.len() {
+        let Some(mut state) = self.close_filter() else {
+            return;
+        };
+        // Rows are drawn from the scroll that keeps the pick in view: the
+        // click lands on that window's row, not on the list's.
+        let max_visible = ((focused_vp.height / cell_h).floor() as usize).saturating_sub(1);
+        let Some(idx) =
+            filter_click_pick(state.selected, max_visible, click_row, state.matches.len())
+        else {
             return; // below the list the user was looking at
-        }
+        };
         if let Some(pane) = self.focused_pane() {
-            state.jump_to_pick(click_row, &mut pane.terminal.write());
+            state.jump_to_pick(idx, &mut pane.terminal.write());
         }
     }
 
@@ -727,6 +831,7 @@ mod filter_refresh_tests {
         FilterState {
             query: query.to_string(),
             matches: Vec::new(),
+            selected: 0,
             history_pos: None,
             draft: String::new(),
             searched: None,
@@ -936,20 +1041,221 @@ mod filter_key_tests {
         assert_eq!(s.query, "x");
     }
 
+    /// Once the search has rows, ↑/↓ move the pick through them — that is
+    /// what the list is for. Clamped at both ends, and never touching the
+    /// recall list, which is what ↑/↓ do while there is nothing to pick.
     #[test]
-    fn arrows_walk_the_recall_list_and_come_back_to_the_draft() {
+    fn arrows_pick_among_the_matches_once_the_search_has_rows() {
+        let mut s = state("line");
+        s.matches = vec![
+            FilterMatch {
+                abs_line: 1,
+                text: "line 1".into(),
+            },
+            FilterMatch {
+                abs_line: 4,
+                text: "line 4".into(),
+            },
+            FilterMatch {
+                abs_line: 9,
+                text: "line 9".into(),
+            },
+        ];
+        assert_eq!(
+            filter_key(&mut s, &arrow(false), no_history),
+            FilterKeyOutcome::Navigate
+        );
+        assert_eq!(s.selected, 1, "↓ moves down the list");
+        assert_eq!(
+            filter_key(&mut s, &arrow(false), no_history),
+            FilterKeyOutcome::Navigate
+        );
+        assert_eq!(s.selected, 2);
+        assert_eq!(
+            filter_key(&mut s, &arrow(false), no_history),
+            FilterKeyOutcome::Ignored,
+            "already the last"
+        );
+        assert_eq!(s.selected, 2, "clamped at the bottom");
+        assert_eq!(
+            filter_key(&mut s, &arrow(true), no_history),
+            FilterKeyOutcome::Navigate
+        );
+        assert_eq!(s.selected, 1, "↑ moves up");
+        assert_eq!(
+            filter_key(&mut s, &arrow(true), no_history),
+            FilterKeyOutcome::Navigate
+        );
+        assert_eq!(s.selected, 0);
+        assert_eq!(
+            filter_key(&mut s, &arrow(true), no_history),
+            FilterKeyOutcome::Ignored,
+            "already the first"
+        );
+        assert_eq!(s.selected, 0, "clamped at the top");
+    }
+
+    /// A new search starts on its first match, so Enter keeps meaning what it
+    /// always meant until the user picks something else.
+    #[test]
+    fn a_new_search_starts_on_its_first_match() {
+        let mut s = state("lin");
+        s.matches = vec![
+            FilterMatch {
+                abs_line: 1,
+                text: "line 1".into(),
+            },
+            FilterMatch {
+                abs_line: 4,
+                text: "line 4".into(),
+            },
+        ];
+        s.selected = 1;
+        assert_eq!(
+            filter_key(&mut s, &key('e', "", "e"), no_history),
+            FilterKeyOutcome::Rerun
+        );
+        assert_eq!(s.selected, 0, "typing starts over on the first match");
+        s.selected = 1;
+        assert_eq!(
+            filter_key(&mut s, &key('\u{7F}', "", ""), no_history),
+            FilterKeyOutcome::Rerun
+        );
+        assert_eq!(s.selected, 0, "so does backspace");
+        s.selected = 1;
+        assert!(paste_into_filter_state(&mut s, "x"));
+        assert_eq!(s.selected, 0, "and so does a paste");
+    }
+
+    /// A pane's worth of lines for `rerun` to search, the way the filter
+    /// searches a live terminal.
+    fn term_with_lines(lines: &[&str]) -> TerminalState {
+        let mut t = TerminalState::new(20, 6, 5, [200; 3], [0; 3]);
+        for l in lines {
+            t.carriage_return();
+            for c in l.chars() {
+                t.put_char(c);
+            }
+            t.newline();
+        }
+        t
+    }
+
+    /// The pick is an index into a list the output can shorten under it: it
+    /// never points past the last row.
+    #[test]
+    fn the_pick_stays_on_a_row_that_exists() {
+        let mut s = state("line");
+        s.selected = 2;
+        s.rerun(&term_with_lines(&["line 1"]));
+        assert_eq!(s.selected, 0, "one match left: the pick moved onto it");
+        s.selected = 1;
+        s.rerun(&term_with_lines(&["nothing here"]));
+        assert_eq!(
+            s.selected, 0,
+            "no match left: the pick has nowhere else to go"
+        );
+    }
+
+    /// With no search of the user's own on screen — the empty query Cmd+F
+    /// opens on, or a query recalled and not edited since — ↑/↓ walk the
+    /// queries filtered earlier in this run, the whole list and back. A query
+    /// the user launched owns the arrows: they walk its results instead.
+    #[test]
+    fn arrows_walk_the_recall_list_until_a_search_is_launched() {
         let history = || vec!["newest".to_string(), "older".to_string()];
-        let mut s = state("draft");
-        assert_eq!(filter_key(&mut s, &arrow(true), history), FilterKeyOutcome::Rerun);
-        assert_eq!(s.query, "newest");
-        assert_eq!(filter_key(&mut s, &arrow(true), history), FilterKeyOutcome::Rerun);
-        assert_eq!(s.query, "older");
-        assert_eq!(filter_key(&mut s, &arrow(true), history), FilterKeyOutcome::Ignored, "already the oldest");
-        assert_eq!(filter_key(&mut s, &arrow(false), history), FilterKeyOutcome::Rerun);
-        assert_eq!(filter_key(&mut s, &arrow(false), history), FilterKeyOutcome::Rerun);
-        assert_eq!(s.query, "draft", "past the newest: what was typed");
-        assert_eq!(filter_key(&mut s, &arrow(false), history), FilterKeyOutcome::Ignored);
-        assert_eq!(filter_key(&mut s, &arrow(true), Vec::new), FilterKeyOutcome::Ignored, "nothing to recall");
+        let mut s = state("");
+        assert_eq!(
+            filter_key(&mut s, &arrow(false), history),
+            FilterKeyOutcome::Ignored,
+            "↓ on an empty query has nowhere to go"
+        );
+        assert_eq!(
+            filter_key(&mut s, &arrow(true), Vec::new),
+            FilterKeyOutcome::Ignored,
+            "nothing to recall"
+        );
+        assert_eq!(
+            filter_key(&mut s, &arrow(true), history),
+            FilterKeyOutcome::Rerun
+        );
+        assert_eq!(s.query, "newest", "the most recent query comes back");
+        assert_eq!(
+            filter_key(&mut s, &arrow(true), history),
+            FilterKeyOutcome::Rerun
+        );
+        assert_eq!(s.query, "older", "↑ keeps walking, one step further back");
+        assert_eq!(
+            filter_key(&mut s, &arrow(true), history),
+            FilterKeyOutcome::Ignored,
+            "already at the oldest"
+        );
+        assert_eq!(s.query, "older", "stopped on it");
+        assert_eq!(
+            filter_key(&mut s, &arrow(false), history),
+            FilterKeyOutcome::Rerun
+        );
+        assert_eq!(s.query, "newest", "↓ comes back through the list");
+        assert_eq!(
+            filter_key(&mut s, &arrow(false), history),
+            FilterKeyOutcome::Rerun
+        );
+        assert_eq!(s.query, "", "past the most recent one, the draft is back");
+        // A query the user launches owns the arrows from then on.
+        s.query = "line".to_string();
+        s.matches = vec![
+            FilterMatch {
+                abs_line: 1,
+                text: "line 1".into(),
+            },
+            FilterMatch {
+                abs_line: 4,
+                text: "line 4".into(),
+            },
+        ];
+        assert_eq!(
+            filter_key(&mut s, &arrow(false), history),
+            FilterKeyOutcome::Navigate
+        );
+        assert_eq!(
+            s.selected, 1,
+            "the pick walks the results, not the recall list"
+        );
+        assert_eq!(
+            s.query, "line",
+            "the query the user launched stays on screen"
+        );
+    }
+
+    /// A typed search owns ↑/↓: they move the pick through the results and
+    /// never reach for the recall list, even when nothing matches. This is the
+    /// case the user asked for — a NEW search, not the queries from before.
+    #[test]
+    fn a_typed_search_never_falls_back_to_the_recall_list() {
+        let history = || vec!["newest".to_string()];
+        let mut s = state("zzz");
+        assert!(s.matches.is_empty());
+        assert_eq!(
+            filter_key(&mut s, &arrow(true), history),
+            FilterKeyOutcome::Ignored
+        );
+        assert_eq!(s.query, "zzz", "the query the user typed stays on screen");
+        s.matches = vec![
+            FilterMatch {
+                abs_line: 1,
+                text: "zzz 1".into(),
+            },
+            FilterMatch {
+                abs_line: 4,
+                text: "zzz 2".into(),
+            },
+        ];
+        assert_eq!(
+            filter_key(&mut s, &arrow(false), history),
+            FilterKeyOutcome::Navigate
+        );
+        assert_eq!(s.selected, 1, "the pick moved through the results");
+        assert_eq!(s.query, "zzz", "still the search, not a recalled query");
     }
 
     /// The library reads a key from its `KeyEvent`, Kova.app from the
@@ -987,6 +1293,60 @@ mod filter_key_tests {
         assert_eq!(filter_click_row(20.0, 0.0, 20.0), Some(0));
         assert_eq!(filter_click_row(59.0, 0.0, 20.0), Some(1));
         assert_eq!(filter_click_row(75.0, 50.0, 20.0), Some(0), "a pane lower in the window");
+    }
+
+    /// The list moves only as far as it must to keep the pick in view — one
+    /// function, one answer, whichever host draws it.
+    #[test]
+    fn the_list_scrolls_just_enough_to_show_the_pick() {
+        use crate::renderer::filter_list_scroll;
+        assert_eq!(filter_list_scroll(0, 3), 0);
+        assert_eq!(filter_list_scroll(2, 3), 0, "still fully visible");
+        assert_eq!(filter_list_scroll(3, 3), 1, "one row down");
+        assert_eq!(
+            filter_list_scroll(9, 3),
+            7,
+            "the pick is the last row drawn"
+        );
+        assert_eq!(filter_list_scroll(5, 0), 0, "no room: nothing scrolls");
+    }
+
+    /// A click is resolved through that same scroll, so it lands on the row it
+    /// was drawn over — the place a library pane once mixed points and drawable
+    /// pixels, and where a scrolled list would otherwise jump a row off.
+    #[test]
+    fn a_click_lands_on_the_row_it_was_drawn_over() {
+        assert_eq!(
+            filter_click_pick(0, 3, 0, 10),
+            Some(0),
+            "no scroll at the top"
+        );
+        assert_eq!(
+            filter_click_pick(3, 3, 0, 10),
+            Some(1),
+            "the list scrolled by one"
+        );
+        assert_eq!(
+            filter_click_pick(3, 3, 2, 10),
+            Some(3),
+            "row 2 of a list scrolled by one"
+        );
+        assert_eq!(
+            filter_click_pick(3, 3, 9, 10),
+            None,
+            "below the listed rows"
+        );
+        assert_eq!(
+            filter_click_pick(0, 3, 5, 10),
+            None,
+            "a row the overlay never drew: the click landed in the pane below"
+        );
+        assert_eq!(
+            filter_click_pick(0, 0, 0, 10),
+            None,
+            "a pane too short to list anything"
+        );
+        assert_eq!(filter_click_pick(0, 3, 0, 0), None, "nothing listed");
     }
 
     #[test]
