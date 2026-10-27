@@ -2454,6 +2454,21 @@ mod tests {
         assert_eq!(weights, vec![1.0, 1.0]);
     }
 
+    #[test]
+    fn a_pane_whose_program_reports_working_is_counted_by_the_status_bar() {
+        // The status bar's `✳N` counts `Pane::is_working()` per pane across the
+        // window (window/tick.rs). Pi reports through OSC 7501 instead of
+        // animating its title, so that record is what puts it in the count.
+        let (pane, _fd) = super::Pane::capture(10, 2);
+        assert!(!pane.is_working(), "a pane nobody says anything about is idle");
+        pane.terminal.write().program_status = Some(crate::terminal::program_status::ProgramStatus {
+            state: Some(crate::terminal::program_status::ProgramState::Working),
+            app: Some("pi".into()),
+            ..Default::default()
+        });
+        assert!(pane.is_working(), "the pane of a working Pi is busy");
+    }
+
     fn claude_session() -> crate::agent_session::AgentSession {
         crate::agent_session::AgentSession {
             pid: None,

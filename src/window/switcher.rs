@@ -21,7 +21,9 @@ pub(super) enum SwitcherRow {
         has_bell: bool,
         has_completion: bool,
         minimized: bool,
-        /// Claude Code is generating / running a tool in this pane (✳).
+        /// The agent in this pane is working: Claude Code generating or running a
+        /// tool, or any program reporting `state=working` (OSC 7501, Pi's way).
+        /// Drawn as ✳.
         working: bool,
         /// The binary running in the pane, with its version when known
         /// ("claude 2.1.226"). `None` at a bare shell prompt, and also when the

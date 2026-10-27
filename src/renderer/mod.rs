@@ -2048,8 +2048,9 @@ impl Renderer {
                 "Programs running in panes (an asleep agent pane starts its own when first shown)",
             );
 
-            // Number of panes whose Claude Code is actively working (OSC-title
-            // activity marker present). Hidden when none are busy.
+            // Number of panes whose app is actively working — Claude Code's
+            // spinner in the OSC title, or a `working` record from the Program
+            // Status Protocol (Pi's way in). Hidden when none are busy.
             if working_agents > 0 {
                 let agents_str = format!("\u{2733}{}", working_agents);
                 let agents_w = agents_str.chars().count() as f32 * cell_w;
@@ -2068,7 +2069,7 @@ impl Renderer {
                     bar_y,
                     agents_w,
                     cell_h,
-                    "Claude Code panes working right now",
+                    "Panes working right now (Claude Code's spinner or a program's OSC 7501 status)",
                 );
             }
 

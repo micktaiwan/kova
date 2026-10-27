@@ -1,3 +1,6 @@
 skill/LOCAL.md
 track.md
 CLAUDE.local.md
+
+# pi, when a session runs in this repo: its own task and loop state, not the project's.
+/.pi/

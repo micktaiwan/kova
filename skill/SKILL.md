@@ -280,6 +280,12 @@ action, or `action: text` when the user typed something.
   end your turn.
 - Exit 1: an error, or Kova quit while you waited (the question comes back at the next launch). If
   the message says the running Kova "predates `ask`", it learns the command at its next launch.
+- **Outside a Claude Code conversation there is no default timeout and no late delivery.** Only a
+  `CLAUDE_CODE_SESSION_ID` lets Kova deliver an answer later; a script, or a harness that does not
+  export it, leaves the wait unlimited, so the call is killed by whatever wraps it: no exit code,
+  no answer, the card still on screen. Pass `--timeout` yourself, below that caller's cap (a Bash
+  tool caps at 600 s: `--timeout 540`). Its exit 2 then says the answer stays in Kova's log
+  alone: do not end the turn as if it would arrive.
 - **The card adds an "Other" button after your actions whenever it has a text field** (not with
   `--no-input`, nor on the lone default "Reply"): don't list it yourself. Text typed and sent with
   Enter goes out as `Other: <text>`, so a free answer never reads as one of your choices. Read

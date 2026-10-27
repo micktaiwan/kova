@@ -461,6 +461,21 @@ impl VteHandler {
                     }
                     TermOp::SetCommandCompleted => {
                         log::debug!("OSC 133;D command completed (terminal {})", term.terminal_id);
+                        // The foreground command ended, so the program that held
+                        // this pane is gone: its `working`/`blocked` record (OSC
+                        // 7501) goes with it — a Pi killed mid-run never sends
+                        // its own `idle`, and the pane would stay counted as busy
+                        // forever. `done` and `error` survive on purpose: they
+                        // are the result the eye has not looked at yet. Same
+                        // lifetime rule as the 133;C block above, on the other end.
+                        if term.program_status.as_ref().is_some_and(|s| {
+                            matches!(
+                                s.state,
+                                Some(program_status::ProgramState::Working | program_status::ProgramState::Blocked)
+                            )
+                        }) {
+                            term.program_status = None;
+                        }
                         // The first D with no prior C is the shell's startup
                         // precmd — swallow it (no command actually completed).
                         // Later D-without-C (a program printing 133;D itself)
@@ -1749,6 +1764,22 @@ mod tests {
         }
         feed(&term, b"\x1b]7501;state=clear\x07");
         assert_eq!(term.read().program_status, None, "clear removes the record");
+    }
+
+    #[test]
+    fn a_finished_command_ends_the_working_record_but_not_its_result() {
+        // A Pi killed mid-run never gets to send its own `idle`: the shell's
+        // 133;D is what retracts `working`, so the pane stops counting as busy.
+        let term = drive(20, 5, &[b"\x1b]133;C\x07\x1b]7501;state=working:app=pi\x1b\\"]);
+        assert!(term.read().program_status.is_some(), "the program says it works");
+        feed(&term, b"\x1b]133;D\x07");
+        assert_eq!(term.read().program_status, None, "a program that exited is not busy");
+
+        // A result is the whole point of keeping the record: `done` survives the
+        // prompt, where the eye still has not looked at it.
+        feed(&term, b"\x1b]7501;state=done:app=pi\x07");
+        feed(&term, b"\x1b]133;D\x07");
+        assert!(term.read().program_status.is_some(), "the result still waits for the eye");
     }
 
     #[test]

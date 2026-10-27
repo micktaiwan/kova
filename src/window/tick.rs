@@ -983,8 +983,9 @@ impl KovaView {
                 let active_tab_1based = active_idx + 1;
                 let total_tabs = tabs.len();
                 let active_tab_name = tabs[active_idx].title();
-                // Count panes across every tab of this window whose app is signalling
-                // activity via the OSC-title marker (Claude Code busy).
+                // Count panes across every tab of this window whose app is busy —
+                // Claude Code's OSC-title spinner, or a `working` record from the
+                // Program Status Protocol (OSC 7501, what Pi sends).
                 let mut working_agents = 0usize;
                 // Panes carrying output nobody has looked at: a bell, or a command
                 // that finished while the eye was elsewhere — the same signal as the

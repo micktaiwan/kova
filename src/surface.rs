@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::terminal::program_status::{ProgramState, ProgramStatus};
 use crate::terminal::pty::{ProcessInfo, Pty, SpawnEnv};
 use crate::terminal::TerminalState;
 
@@ -146,6 +147,17 @@ fn is_working_marker(title: &str) -> bool {
         Some(c) if ('\u{2800}'..='\u{28FF}').contains(&c)
             || matches!(c, '\u{25D0}' | '\u{25D1}')
     ) && chars.next() == Some(' ')
+}
+
+/// True if the app in this pane is busy, whichever way it says so: Claude Code
+/// animates its OSC title (`is_working_marker`), Pi never touches its title and
+/// reports through the Program Status Protocol instead (`OSC 7501`,
+/// `state=working`). Both are the same fact to the user, so they are one
+/// signal here — the status bar's `✳N` counter, Cmd+J's tiers and IPC's
+/// `working` all read this.
+fn is_busy(title: Option<&str>, status: Option<&ProgramStatus>) -> bool {
+    title.map_or(false, is_working_marker)
+        || status.is_some_and(|s| s.state == Some(ProgramState::Working))
 }
 
 /// True if `title` begins with any Claude Code status marker followed by a
@@ -628,16 +640,15 @@ impl Surface {
             .and_then(|s| s.peer_name.clone())
     }
 
-    /// True if the app in this pane is actively working: its live OSC 0/2 title
-    /// leads with one of Claude Code's animated spinners (see `is_working_marker`).
-    /// The asterisk idle marker (`✳ Claude Code`) does NOT count. Reads the live
-    /// OSC 0/2 title even when a sticky custom title shadows it in the display.
+    /// True if the app in this pane is actively working: either its live OSC 0/2
+    /// title leads with one of Claude Code's animated spinners (see
+    /// `is_working_marker`), or it reports `state=working` through the Program
+    /// Status Protocol (`is_busy`) — Pi's way. The asterisk idle marker
+    /// (`✳ Claude Code`) does NOT count. Reads the live OSC 0/2 title even when
+    /// a sticky custom title shadows it in the display.
     pub fn is_working(&self) -> bool {
-        self.terminal
-            .read()
-            .title
-            .as_deref()
-            .map_or(false, is_working_marker)
+        let term = self.terminal.read();
+        is_busy(term.title.as_deref(), term.program_status.as_ref())
     }
 
     /// True if the app in this pane says it is waiting for the user, and
@@ -834,9 +845,10 @@ fn injected_line(command: &str, run: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AwaitingFlag, claude_flavor_name, derive_display_title, injected_line, is_working_marker,
+        AwaitingFlag, claude_flavor_name, derive_display_title, injected_line, is_busy, is_working_marker,
         normalize_process_name, strip_activity_prefix,
     };
+    use crate::terminal::program_status::{ProgramState, ProgramStatus};
 
     #[test]
     fn a_read_waiting_pane_re_enters_the_jump_cycle_only_on_a_new_question() {
@@ -860,6 +872,24 @@ mod tests {
         let asked_again = seen.armed(160);
         assert!(!asked_again.is_read(), "a fresh question must resurface the pane");
         assert_eq!(asked_again.since(), Some(100), "the waiting clock keeps its origin");
+    }
+
+    #[test]
+    fn a_pi_working_record_makes_a_pane_busy_without_any_spinner() {
+        // Pi keeps the same title while it works (`π - <cwd>`) and reports
+        // through OSC 7501 instead: that record alone has to count.
+        let pi = |state| ProgramStatus { state: Some(state), app: Some("pi".into()), ..Default::default() };
+        let title = Some("\u{3c0} - kova");
+        assert!(is_busy(title, Some(&pi(ProgramState::Working))));
+        // Every other state is a resting one: idle, done, waiting, failed.
+        for resting in [ProgramState::Idle, ProgramState::Done, ProgramState::Blocked, ProgramState::Error] {
+            assert!(!is_busy(title, Some(&pi(resting))), "{:?} is not working", resting);
+        }
+        assert!(!is_busy(title, None));
+        // Claude's spinner still works on its own, no record needed.
+        assert!(is_busy(Some("\u{2802} Revue"), None));
+        // Neither signal, no work.
+        assert!(!is_busy(None, None));
     }
 
     #[test]
