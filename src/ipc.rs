@@ -1023,8 +1023,8 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             let cwd = text("cwd")?;
             let agent = text("agent")?;
             if let Some(a) = agent.as_deref() {
-                if a != "claude" && a != "codex" && a != "pi" {
-                    return Err("\"agent\" must be \"claude\", \"codex\" or \"pi\"".to_string());
+                if a != "claude" && a != "codex" && a != "pi" && a != "omp" {
+                    return Err("\"agent\" must be \"claude\", \"codex\", \"pi\" or \"omp\"".to_string());
                 }
             }
             if pane_id.is_none() && cwd.is_none() {

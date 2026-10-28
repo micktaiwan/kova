@@ -1,6 +1,6 @@
 ---
 name: kova
-description: "Drive Kova, a native macOS terminal (Rust + Metal), from Claude Code: open a split or a tab and run a command in it, list panes and the Claude Code, Codex or Pi sessions they hold, read a pane (its whole conversation, not just the screen), send keys, wait for a command to finish, trigger any keyboard shortcut, follow focus changes, post a notification, ask the user a question on a card. Use when: 'open a pane', 'new tab', 'run X in another pane', 'split', 'list the panes', 'read pane N', 'merge pane N', 'what is running in my terminal', 'ask me when you need an answer', or when a task needs a terminal the user can see."
+description: "Drive Kova, a native macOS terminal (Rust + Metal), from Claude Code: open a split or a tab and run a command in it, list panes and the Claude Code, Codex, Pi or omp sessions they hold, read a pane (its whole conversation, not just the screen), send keys, wait for a command to finish, trigger any keyboard shortcut, follow focus changes, post a notification, ask the user a question on a card. Use when: 'open a pane', 'new tab', 'run X in another pane', 'split', 'list the panes', 'read pane N', 'merge pane N', 'what is running in my terminal', 'ask me when you need an answer', or when a task needs a terminal the user can see."
 ---
 
 # Kova — a scriptable terminal
@@ -58,7 +58,7 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 | Split the focused pane | `{"cmd":"split","direction":"horizontal"}` (side by side, the default) or `"vertical"` (stacked) → `pane_id` |
 | New tab | `{"cmd":"new-tab","cwd":"/abs/path","command":"…"}` → `tab_id`, `pane_id` |
 | List panes / tabs | `{"cmd":"list-panes"}`, `{"cmd":"list-tabs"}` |
-| Read a pane's screen | `{"cmd":"get-pane-content","panes":[42],"mode":"visible"}` (the field is `panes`, a list or `"all"`, not `pane_id`; `mode` is `visible`, `scrollback` or `all`; the answer is `data.panes[]`, each `{id, text, cursor, cols, rows}`) |
+| Read a pane's screen | `{"cmd":"get-pane-content","panes":[42],"mode":"visible"}` (the field is `panes`, a list or `"all"`, not `pane_id`; `mode` is `visible`, `scrollback` or `all`; the answer is `data.panes[]`, each `{id, text, cursor, cols, rows}` — and `{id, error:"not found"}` when the pane closed meanwhile, so read `text` through `.get`) |
 | Size before reading | `{"cmd":"count-pane-content","panes":"all","mode":"all"}` (responses have no cap) |
 | Type into a pane | `{"cmd":"send-keys","pane_id":42,"text":"make\n"}` (end with `\n` or it is typed, not run) |
 | Wait for the command | `{"cmd":"wait-for-completion","pane_id":42,"timeout_ms":300000}` |
@@ -131,26 +131,36 @@ Each pane carries `id`, `window`, `tab`, `cwd`, `title`, `focused`, `pid`, `chil
   client walking waiting panes must honor `awaiting_seen`, or it offers panes already read.
   `awaiting` shows nowhere in Kova's UI: it is an IPC field. What `Cmd+J`, the switcher's `Tab`
   and the `●N` counter walk is unread output (a bell, a finished command).
-- `agent` (`"claude"`, `"codex"`, `"pi"` or `null` for a bare shell), `agent_session_id` and
-  `agent_session_name`: the conversation in the pane, whatever the agent. For Codex the name comes
-  from `~/.codex/session_index.jsonl`; for Pi it is the title Pi shows in `/resume` — the latest
-  `/name`, else the first message of the conversation — read from the transcript. A Codex session
-  resumes with `codex resume <id>`, a Pi one with `pi --session <id>`, and neither is reachable
-  through `ListAgents` / `SendMessage`. Pi writes no file per process: its conversation is matched
-  by directory and start time, so two `pi` panes that resumed older conversations in the same
-  directory can come out identical — when the snapshot hands both the same id, both keep their last
-  command and come back as a bare `pi`. A `pi` started with `--no-session` or `--session-dir` is not
-  detected at all.
+- `agent` (`"claude"`, `"codex"`, `"pi"`, `"omp"` or `null` for a bare shell), `agent_session_id`
+  and `agent_session_name`: the conversation in the pane, whatever the agent. For Codex the name
+  comes from `~/.codex/session_index.jsonl`; for Pi it is the title Pi shows in `/resume` — the
+  latest `/name`, else the first message of the conversation — read from the transcript. omp's name
+  is its `type: "title"` slot, else the latest `/rename`, else the first message. A Codex session
+  resumes with `codex resume <id>`, a Pi one with `pi --session <id>`, an omp one with
+  `omp --resume <id>`, and none is reachable through `ListAgents` / `SendMessage`. Pi writes no file
+  per process: its conversation is matched by directory and start time, so two `pi` panes that
+  resumed older conversations in the same directory can come out identical — when the snapshot
+  hands both the same id, both keep their last command and come back as a bare `pi`. A `pi` started
+  with `--no-session` or `--session-dir` is not detected at all. omp holds its journal open, so its
+  pane is matched exactly through that file descriptor; failing that, only a transcript created the
+  instant the process started names it. A fresh `omp` whose transcript does not exist yet answers
+  no conversation — it never inherits the newest file of its directory, which used to make a brand
+  new pane look like a duplicate of the pane next door, and the window closed it (27/10/2026).
+  `omp --no-session` is not detected. **A pane the snapshot left unnamed still comes
+  back**: the title omp writes on the terminal is saved with the pane, and when it matches exactly
+  one transcript of that directory and the pane's last command is still `omp`, the restore resumes
+  that conversation (`recover_agent_sessions_by_title` in `session.rs`). A title two conversations
+  share names neither.
 - `claude_session_id` (what `claude --resume` takes) and `claude_session_name` (the `/rename`
-  name, `null` until there is one): Claude only, `null` on a Codex or Pi pane so that a client passing it
-  to `claude --resume` never gets an id Claude cannot open. **This id is the only identifier that
-  outlives the pane**: the pane id dies with its tab, and a directory is shared by every
-  conversation of the same repo. Key on it.
+  name, `null` until there is one): Claude only, `null` on a Codex, Pi or omp pane so that a client
+  passing it to `claude --resume` never gets an id Claude cannot open. **This id is the only
+  identifier that outlives the pane**: the pane id dies with its tab, and a directory is shared by
+  every conversation of the same repo. Key on it (`agent_session_id` for the other agents).
 - `peer_name`: **the `SendMessage` address** of the pane's Claude session, the name `ListAgents`
   shows. To talk to a pane's session, take its `peer_name` and pass it as is to `SendMessage`,
   never `send-keys` (typed text is not submitted the way a message is). It carries the name Claude
   Code derived from the directory even before any `/rename`, which `claude_session_name` does not.
-  `null` for Codex, for Pi, and for a pane without Claude.
+  `null` for Codex, Pi, omp, and for a pane without Claude.
 - `dormant_session_id`: **after a Kova relaunch, a restored agent resumes only once its pane is
   on screen in the active tab** (or on `wake-pane`). Until then the pane is a bare shell with this
   field set, and `agent`, the session ids and `peer_name` are `null`: the session is not in
@@ -273,8 +283,9 @@ action, or `action: text` when the user typed something.
 
 - Exit 0: answered. Exit 2: no answer within the timeout (540 s by default inside a Claude Code
   conversation); **end your turn**: Kova delivers the late answer to the conversation itself, typed
-  into its pane, after a routine still running there, or by reopening it in a new tab with
-  `claude --resume`. It arrives as a message starting with `[Kova] The user answered your question`.
+  into its pane, after a routine still running there, or by reopening it in a new tab with the
+  agent's own resume line (`claude --resume`, `codex resume`, `pi --session` or `omp --resume`).
+  It arrives as a message starting with `[Kova] The user answered your question`.
 - Exit 3: the user answered in the conversation instead, and the card was withdrawn (a
   `UserPromptSubmit` hook runs `kova ask --withdraw --session -`). Their message is the answer:
   end your turn.

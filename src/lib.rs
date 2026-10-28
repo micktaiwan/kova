@@ -25,6 +25,7 @@ mod ipc;
 mod keybindings;
 mod launchers;
 mod notification;
+mod omp_session;
 mod pane;
 mod pane_history;
 mod pi_session;

@@ -326,7 +326,7 @@ fn user_message_text(content: &serde_json::Value) -> Option<String> {
 }
 
 /// BSD info of a live process — parent and start time.
-fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+pub(crate) fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let ret = unsafe {
         libc::proc_pidinfo(
@@ -341,7 +341,7 @@ fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
 }
 
 /// Working directory of a live process.
-fn cwd_of(pid: u32) -> Option<String> {
+pub(crate) fn cwd_of(pid: u32) -> Option<String> {
     let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
     let ret = unsafe {
         libc::proc_pidinfo(
@@ -372,7 +372,7 @@ fn cwd_of(pid: u32) -> Option<String> {
 }
 
 /// Live processes whose parent is `pid`.
-fn children_of(pid: u32) -> Vec<u32> {
+pub(crate) fn children_of(pid: u32) -> Vec<u32> {
     // Ask for the size first, then read with room to spare: children come and go
     // between the two calls.
     let bytes = unsafe { libc::proc_listchildpids(pid as libc::pid_t, std::ptr::null_mut(), 0) };
@@ -401,7 +401,7 @@ fn children_of(pid: u32) -> Vec<u32> {
 
 /// The environment and arguments of a live process, as `sysctl KERN_PROCARGS2`
 /// returns them. `None` when the process is gone, or when it is not ours to read.
-fn args_and_env_of(pid: u32) -> Option<Vec<u8>> {
+pub(crate) fn args_and_env_of(pid: u32) -> Option<Vec<u8>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let mut size: libc::size_t = 0;
     let ret = unsafe {
@@ -548,7 +548,7 @@ fn process_name(pid: u32) -> Option<String> {
 }
 
 /// Every PID alive right now.
-fn live_pids() -> Vec<u32> {
+pub(crate) fn live_pids() -> Vec<u32> {
     // Ask for the size first, then read with room to spare: processes come and
     // go between the two calls.
     let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
@@ -580,7 +580,7 @@ fn live_pids() -> Vec<u32> {
 const PROC_ALL_PIDS: u32 = 1;
 
 /// Parent PID of a live process.
-fn parent_of(pid: u32) -> Option<u32> {
+pub(crate) fn parent_of(pid: u32) -> Option<u32> {
     bsd_info(pid).map(|info| info.pbi_ppid)
 }
 

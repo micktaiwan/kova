@@ -1,13 +1,16 @@
-//! Index of past Claude Code conversations, so the search palette can find a
-//! session that is no longer open in any pane and bring it back.
+//! Index of past Claude Code and omp conversations, so the search palette can
+//! find a session that is no longer open in any pane and bring it back.
 //!
 //! Claude Code appends one JSON record per event to
-//! `~/.claude/projects/<slug>/<session-id>.jsonl`. Those transcripts are big
-//! (1.4 GB on this machine) and almost entirely tool output, so the index keeps
-//! only what a search needs: the prompts the user typed, the project directory,
-//! and when the file last moved. A transcript is append-only, so re-indexing
-//! reads just the bytes added since last time — the first pass is the only one
-//! that walks everything.
+//! `~/.claude/projects/<slug>/<session-id>.jsonl`; omp writes its own journal
+//! under `~/.omp/agent/sessions/<bucket>/<created>_<id>.jsonl`. Those
+//! transcripts are big (1.4 GB of Claude alone on this machine) and almost
+//! entirely tool output, so the index keeps only what a search needs: the
+//! prompts the user typed, the text of the agent's own replies, the project
+//! directory, the title, and when the file last moved. Tool calls and thinking
+//! blocks stay out: they are most of the bytes and never what someone searches
+//! for. A transcript is append-only, so re-indexing reads just the bytes added
+//! since last time — the first pass is the only one that walks everything.
 //!
 //! The index is rebuilt from the search worker thread (never on the main
 //! thread) and cached in `INDEX` for the rest of the process' life.
@@ -19,11 +22,21 @@ use std::path::PathBuf;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::agent_session::Agent;
+
 /// Cap on the searchable text kept per session. A long session's prompts fit in
 /// far less; the cap only bounds the pathological case so the index file cannot
 /// grow without limit. Past it the oldest prompts go, not the newest: the
 /// conversation just had is the one most likely to be searched for.
 const MAX_TEXT_PER_SESSION: usize = 256 * 1024;
+
+/// Cap on the agent's own text kept per session, counted apart from the
+/// prompts: a long answer must not push the questions out of the index, and the
+/// two are searched for different reasons. Measured on the 1.4 GB corpus here,
+/// every transcript's replies fit under 32 KB and the whole set costs 20 MB at
+/// this cap (the prompts cost 8.5 MB), so the ceiling only bounds a runaway
+/// session.
+const MAX_REPLY_PER_SESSION: usize = 256 * 1024;
 
 /// Chars of the first prompt kept as the row's title.
 const MAX_TITLE_CHARS: usize = 100;
@@ -38,8 +51,12 @@ const MAX_RESULTS: usize = 8;
 /// What the index remembers about one transcript file.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct IndexedSession {
-    /// Conversation id — the argument `claude --resume` expects. Same as the
-    /// file stem.
+    /// Which agent wrote the transcript, and therefore which `resume` line
+    /// reopens it.
+    #[serde(default = "claude_agent")]
+    pub agent: Agent,
+    /// Conversation id — the argument the agent's `resume` expects. Same as
+    /// the file stem for Claude, and the suffix after the timestamp for omp.
     pub id: String,
     /// Directory the session ran in. `claude --resume` only finds a session
     /// from its own project directory, so this is what a reopen must `cd` to.
@@ -53,17 +70,38 @@ pub struct IndexedSession {
     pub indexed_len: u64,
     /// Lowercased typed prompts, newline-separated: what a query matches on.
     pub text: String,
+    /// Lowercased text of the agent's own replies, newline-separated: the other
+    /// half of what a query matches on. Kept apart from `text` so each side has
+    /// its own cap and a long answer cannot evict the questions. Empty for an
+    /// index written before version 5 until its session is re-read.
+    #[serde(default)]
+    pub reply: String,
     /// Number of prompts the user typed in this session.
     #[serde(default)]
     pub prompts: u32,
+    /// First typed prompt, kept even when a real title shadows it. omp can
+    /// clear its title slot later, and the row then falls back to this without
+    /// re-reading the transcript.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fallback_title: String,
+    /// True when `title` came from an explicit title (Claude's row title
+    /// always does; omp's title slot or `/rename`). A first prompt must not
+    /// overwrite it.
+    #[serde(default)]
+    pub titled: bool,
+}
+
+fn claude_agent() -> Agent {
+    Agent::Claude
 }
 
 /// Schema of the on-disk index. Bumped whenever what goes into an entry
 /// changes: an entry already at its file's length is never re-read, so the
 /// sessions indexed under the old rules would keep them. A bump costs one full
 /// pass (8 s here for 1.4 GB), once. Version 3 started indexing slash commands
-/// with their arguments and prompts sent with an image.
-const INDEX_VERSION: u32 = 3;
+/// with their arguments and prompts sent with an image; version 5 indexes the
+/// agent's own replies too (`reply`), not only what the user typed.
+const INDEX_VERSION: u32 = 5;
 
 /// The on-disk index, keyed by transcript path.
 #[derive(Default, Serialize, Deserialize)]
@@ -87,6 +125,7 @@ pub struct Results {
 /// One archived session matching a query.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hit {
+    pub agent: Agent,
     pub id: String,
     pub cwd: String,
     pub title: String,
@@ -233,7 +272,39 @@ pub fn typed_prompt(line: &str) -> Option<Prompt> {
     Some(Prompt { text, cwd, titled })
 }
 
-/// `/name args` out of a slash command record, or `None` if `content` is not
+/// The text an assistant record carries: its `text` blocks only. Thinking
+/// blocks and tool calls are skipped — they are the bulk of a transcript and
+/// what a search for a phrase never means.
+pub fn assistant_text(line: &str) -> Option<String> {
+    // Same cheap gate as `typed_prompt`: an array of blocks with no `text` one
+    // in it (a tool call, a thinking-only record) cannot yield a reply, so it is
+    // skipped without a JSON parse.
+    if !line.contains("\"type\":\"assistant\"") {
+        return None;
+    }
+    if line.contains("\"content\":[") && !line.contains("\"text\":\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type")?.as_str()? != "assistant" {
+        return None;
+    }
+    let content = v.get("message")?.get("content")?;
+    let text = match content {
+        serde_json::Value::String(s) => s.clone(),
+        array => array
+            .as_array()?
+            .iter()
+            .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// `/name args` out of a slash command record, or `None` when `content` is not
 /// one. The record carries the name and the arguments in their own tags.
 fn slash_command(content: &str) -> Option<String> {
     let trimmed = content.trim_start();
@@ -342,13 +413,17 @@ fn index_file(path: &std::path::Path, len: u64, mtime: u64, entry: &mut IndexedS
     }
     let from = if len < entry.indexed_len {
         entry.text.clear();
+        entry.reply.clear();
         entry.title.clear();
         entry.cwd.clear();
         entry.prompts = 0;
+        entry.fallback_title.clear();
+        entry.titled = false;
         0
     } else {
         entry.indexed_len
     };
+    let omp = entry.agent == Agent::Omp;
 
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -388,11 +463,39 @@ fn index_file(path: &std::path::Path, len: u64, mtime: u64, entry: &mut IndexedS
         }
         consumed += n as u64;
         let line = String::from_utf8_lossy(&buf);
-        let prompt = match typed_prompt(&line) {
-            Some(p) => p,
-            None => continue,
+        if omp && omp_title_line(&line, entry) {
+            continue;
+        }
+        // A Claude line carries at most one of the two; an omp `message` record
+        // is one or the other by its role. Both halves go in: the user's
+        // questions under `text`, the agent's own words under `reply`.
+        let (prompt, reply) = if omp {
+            match omp_message(&line) {
+                Some((true, text)) => (
+                    Some(Prompt {
+                        text,
+                        cwd: None,
+                        titled: true,
+                    }),
+                    None,
+                ),
+                Some((false, text)) => (None, Some(text)),
+                None => (None, None),
+            }
+        } else {
+            (typed_prompt(&line), assistant_text(&line))
         };
-        if entry.title.is_empty() {
+        if let Some(reply) = reply {
+            entry.reply.push_str(&reply.to_lowercase());
+            entry.reply.push('\n');
+        }
+        let Some(prompt) = prompt else {
+            continue;
+        };
+        if omp && entry.fallback_title.is_empty() && prompt.titled {
+            entry.fallback_title = title_from_prompt(&prompt.text);
+        }
+        if entry.title.is_empty() && !entry.titled {
             if prompt.titled {
                 entry.title = title_from_prompt(&prompt.text);
             } else if fallback_title.is_none() {
@@ -406,16 +509,95 @@ fn index_file(path: &std::path::Path, len: u64, mtime: u64, entry: &mut IndexedS
         entry.text.push_str(&prompt.text.to_lowercase());
         entry.text.push('\n');
     }
-    if entry.title.is_empty() {
+    if omp && entry.title.is_empty() && !entry.fallback_title.is_empty() {
+        entry.title = entry.fallback_title.clone();
+        entry.titled = false;
+    } else if entry.title.is_empty() {
         if let Some(title) = fallback_title {
             entry.title = title;
         }
     }
     trim_oldest(&mut entry.text, MAX_TEXT_PER_SESSION);
+    trim_oldest(&mut entry.reply, MAX_REPLY_PER_SESSION);
 
     entry.indexed_len = consumed;
     entry.last_active = mtime;
     true
+}
+
+/// The title an omp record carries, if it carries one: the fixed-width slot,
+/// a `/rename`, or the logical header title. Returns true when the line was
+/// consumed, so it is not parsed as a prompt too.
+fn omp_title_line(line: &str, entry: &mut IndexedSession) -> bool {
+    if !line.contains("\"type\":\"title\"")
+        && !line.contains("\"title_change\"")
+        && !line.contains("\"type\":\"session\"")
+    {
+        return false;
+    }
+    let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    match entry_json["type"].as_str().unwrap_or_default() {
+        "title" | "title_change" => {
+            let title = entry_json["title"].as_str().unwrap_or("").trim();
+            if title.is_empty() {
+                // `/rename` with no title, or a slot cleared by an automatic
+                // rename: the first prompt is the row's title again.
+                entry.title.clear();
+                entry.titled = false;
+            } else {
+                entry.title = title.to_string();
+                entry.titled = true;
+            }
+            true
+        }
+        "session" => {
+            if let Some(cwd) = entry_json["cwd"].as_str() {
+                entry.cwd = cwd.to_string();
+            }
+            let title = entry_json["title"].as_str().unwrap_or("").trim();
+            if !title.is_empty() && entry.title.is_empty() {
+                entry.title = title.to_string();
+                entry.titled = true;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The text of an omp message record, and whether the user typed it. omp
+/// persists ordinary turns as `type: "message"` with the role nested, like Pi,
+/// for both sides of the conversation; tool results carry the `toolResult` role
+/// and are skipped here.
+fn omp_message(line: &str) -> Option<(bool, String)> {
+    if !line.contains("\"type\":\"message\"") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value["type"] != "message" {
+        return None;
+    }
+    let user = match value["message"]["role"].as_str()? {
+        "user" => true,
+        "assistant" => false,
+        _ => return None,
+    };
+    let content = &value["message"]["content"];
+    let text = if let Some(text) = content.as_str() {
+        text.to_string()
+    } else {
+        content
+            .as_array()?
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some((user, text))
 }
 
 /// Cut `text` down to at most `max` bytes by dropping whole lines from the
@@ -447,6 +629,22 @@ fn trim_oldest(text: &mut String, max: usize) {
 /// Bring the index in line with what is on disk. Returns the number of
 /// transcripts that were read.
 fn refresh(index: &mut Index) -> usize {
+    let mut seen: Vec<String> = Vec::new();
+    let mut changed = refresh_claude(index, &mut seen);
+    changed += refresh_omp(index, &mut seen);
+
+    // Drop entries whose transcript is gone, so a deleted conversation stops
+    // showing up as something to resume.
+    if seen.len() != index.sessions.len() {
+        let alive: std::collections::HashSet<&String> = seen.iter().collect();
+        index.sessions.retain(|k, _| alive.contains(k));
+        changed += 1;
+    }
+    changed
+}
+
+/// Every Claude Code transcript under `~/.claude/projects/<slug>/`.
+fn refresh_claude(index: &mut Index, seen: &mut Vec<String>) -> usize {
     let root = transcripts_root();
     let project_dirs = match std::fs::read_dir(&root) {
         Ok(d) => d,
@@ -456,7 +654,6 @@ fn refresh(index: &mut Index) -> usize {
         }
     };
 
-    let mut seen: Vec<String> = Vec::new();
     let mut changed = 0usize;
     for project in project_dirs.flatten() {
         let files = match std::fs::read_dir(project.path()) {
@@ -477,42 +674,93 @@ fn refresh(index: &mut Index) -> usize {
             if crate::claude_session::resume_command(None, &id, None).is_none() {
                 continue;
             }
-            let meta = match file.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let len = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let key = path.to_string_lossy().to_string();
-            seen.push(key.clone());
-            let entry = index.sessions.entry(key).or_insert_with(|| IndexedSession {
-                id: id.clone(),
-                cwd: String::new(),
-                title: String::new(),
-                last_active: 0,
-                indexed_len: 0,
-                text: String::new(),
-                prompts: 0,
-            });
-            if index_file(&path, len, mtime, entry) {
-                changed += 1;
-            }
+            changed += index_one(index, seen, &file, &path, Agent::Claude, id);
         }
     }
+    changed
+}
 
-    // Drop entries whose transcript is gone, so a deleted conversation stops
-    // showing up as something to resume.
-    if seen.len() != index.sessions.len() {
-        let alive: std::collections::HashSet<&String> = seen.iter().collect();
-        index.sessions.retain(|k, _| alive.contains(k));
-        changed += 1;
+/// Every top-level omp transcript under
+/// `~/.omp/agent/sessions/<bucket>/<created>_<id>.jsonl`.
+///
+/// Only the bucket's direct files are read: a session's artifact directory
+/// holds subagent transcripts, which are not conversations the palette should
+/// offer to reopen.
+fn refresh_omp(index: &mut Index, seen: &mut Vec<String>) -> usize {
+    let root = home().join(".omp/agent/sessions");
+    let buckets = match std::fs::read_dir(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            log::debug!("omp history: no transcripts at {} ({})", root.display(), e);
+            return 0;
+        }
+    };
+
+    let mut changed = 0usize;
+    for bucket in buckets.flatten() {
+        let files = match std::fs::read_dir(bucket.path()) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let id = match path.file_name().and_then(|s| s.to_str()) {
+                Some(name) => crate::omp_session::session_id_from_file_name(name),
+                None => None,
+            };
+            let Some(id) = id else { continue };
+            // Same guard as the restore path: an id that cannot produce a safe
+            // `omp --resume` line is not something to offer.
+            if crate::omp_session::resume_command(None, &id).is_none() {
+                continue;
+            }
+            changed += index_one(index, seen, &file, &path, Agent::Omp, id);
+        }
     }
     changed
+}
+
+/// Fold one transcript file into `index`, and record its path as still alive.
+fn index_one(
+    index: &mut Index,
+    seen: &mut Vec<String>,
+    file: &std::fs::DirEntry,
+    path: &std::path::Path,
+    agent: Agent,
+    id: String,
+) -> usize {
+    let Ok(meta) = file.metadata() else {
+        return 0;
+    };
+    let len = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let key = path.to_string_lossy().to_string();
+    seen.push(key.clone());
+    let entry = index.sessions.entry(key).or_insert_with(|| IndexedSession {
+        agent,
+        id: id.clone(),
+        cwd: String::new(),
+        title: String::new(),
+        last_active: 0,
+        indexed_len: 0,
+        text: String::new(),
+        reply: String::new(),
+        prompts: 0,
+        fallback_title: String::new(),
+        titled: false,
+    });
+    // A path is one conversation; an agent never changes hands at the same one.
+    entry.agent = agent;
+    entry.id = id;
+    usize::from(index_file(path, len, mtime, entry))
 }
 
 /// Bring the index up to date without searching, off the calling thread.
@@ -532,8 +780,10 @@ pub fn warm() {
 }
 
 /// Refresh the index, then return the archived sessions matching `query`,
-/// most recent first. Sessions listed in `live_ids` are left out: they are
-/// already open in a pane, and the palette lists those in its own section.
+/// most recent first. Sessions listed in `live` are left out: they are already
+/// open in a pane, and the palette lists those in its own section. The pair
+/// carries the agent, so an omp id never hides a Claude conversation with the
+/// same one.
 ///
 /// Sorted by date and nothing else: the session wanted is almost always one
 /// from the last days, and a ranking that mixes in other signals moves it
@@ -541,7 +791,7 @@ pub fn warm() {
 ///
 /// Called from the search worker thread — the first call after a cold start
 /// reads every transcript, which takes a moment.
-pub fn search(query: &str, live_ids: &[String]) -> Results {
+pub fn search(query: &str, live: &[(Agent, String)]) -> Results {
     let terms = split_terms(query);
     let empty = Results { hits: Vec::new(), total: 0, inside: Vec::new(), inside_total: 0 };
     if terms.is_empty() {
@@ -557,20 +807,25 @@ pub fn search(query: &str, live_ids: &[String]) -> Results {
     let mut hits: Vec<Hit> = Vec::new();
     let mut inside: Vec<Hit> = Vec::new();
     for s in index.sessions.values() {
-        if s.title.is_empty() || live_ids.iter().any(|id| id == &s.id) {
+        if s.title.is_empty()
+            || live
+                .iter()
+                .any(|(agent, id)| *agent == s.agent && id == &s.id)
+        {
             continue;
         }
-        // Per field rather than one concatenated haystack: `text` alone can
-        // reach 256 KB, and copying it for every session of every keystroke
-        // is the one thing that would make a live search feel slow.
+        // Per field rather than one concatenated haystack: `text` and `reply`
+        // can reach 256 KB each, and copying them for every session of every
+        // keystroke is the one thing that would make a live search feel slow.
         let title = s.title.to_lowercase();
         let cwd = s.cwd.to_lowercase();
         let worst = terms
             .iter()
-            .map(|t| fit(&title, t).max(fit(&cwd, t)).max(fit(&s.text, t)))
+            .map(|t| fit(&title, t).max(fit(&cwd, t)).max(fit(&s.text, t)).max(fit(&s.reply, t)))
             .min()
             .unwrap_or(Fit::Absent);
         let hit = Hit {
+            agent: s.agent,
             id: s.id.clone(),
             cwd: s.cwd.clone(),
             title: s.title.clone(),
@@ -594,19 +849,27 @@ pub fn search(query: &str, live_ids: &[String]) -> Results {
     Results { hits, total, inside, inside_total }
 }
 
-/// The indexed prompts of the sessions in `ids`, keyed by session id. Lets the
-/// palette search a live Claude pane by what was said in it, not only by what
-/// its screen shows: Claude Code draws on the alternate screen, which keeps no
+/// The indexed prompts of the sessions in `ids`, keyed by `(agent, id)`. Lets
+/// the palette search a live pane by what was said in it, not only by what its
+/// screen shows: Claude Code draws on the alternate screen, which keeps no
 /// scrollback, so a pane's terminal holds one screen of the conversation.
 ///
 /// Reads the index as the last `search` left it, without refreshing it again.
-pub fn texts_of(ids: &[String]) -> HashMap<String, String> {
+pub fn texts_of(ids: &[(Agent, String)]) -> HashMap<(Agent, String), String> {
     let mut guard = INDEX.lock();
     let index = guard.get_or_insert_with(load_index);
     // One id can have a transcript in two project directories: keep both.
-    let mut texts: HashMap<String, String> = HashMap::new();
-    for s in index.sessions.values().filter(|s| ids.iter().any(|id| id == &s.id)) {
-        texts.entry(s.id.clone()).or_default().push_str(&s.text);
+    let mut texts: HashMap<(Agent, String), String> = HashMap::new();
+    for s in index.sessions.values().filter(|s| {
+        ids.iter()
+            .any(|(agent, id)| *agent == s.agent && id == &s.id)
+    }) {
+        let said = texts
+            .entry((s.agent, s.id.clone()))
+            .or_default();
+        said.push_str(&s.text);
+        said.push('\n');
+        said.push_str(&s.reply);
     }
     texts
 }
@@ -618,7 +881,8 @@ pub fn hit_label(hit: &Hit) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("?");
     format!(
-        "{} · {} · {}",
+        "{} · {} · {} · {}",
+        hit.agent.label(),
         project,
         crate::recent_projects::time_ago(hit.last_active),
         hit.title
@@ -762,13 +1026,17 @@ mod tests {
         std::fs::write(&path, first).unwrap();
 
         let mut entry = IndexedSession {
+            agent: Agent::Claude,
             id: "s".into(),
             cwd: String::new(),
             title: String::new(),
             last_active: 0,
             indexed_len: 0,
             text: String::new(),
+            reply: String::new(),
             prompts: 0,
+            fallback_title: String::new(),
+            titled: false,
         };
         assert!(index_file(&path, first.len() as u64, 10, &mut entry));
         assert_eq!(entry.title, "one");
@@ -793,6 +1061,156 @@ mod tests {
         assert_eq!(entry.title, "TWO");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_omp_transcript_keeps_its_slot_title_and_first_prompt() {
+        let dir = std::env::temp_dir().join(format!("kova-omp-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-10-27T15-54-09-646Z_abc.jsonl");
+        let slot = "{\"type\":\"title\",\"v\":1,\"title\":\"Titre auto\",\"source\":\"auto\",\"pad\":\"\"}\n";
+        let header = "{\"type\":\"session\",\"version\":3,\"id\":\"abc\",\"timestamp\":\"t\",\"cwd\":\"/Users/x/app\"}\n";
+        let prompt = "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"t\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"lis le parser\"}]}}\n";
+        std::fs::write(&path, format!("{slot}{header}{prompt}")).unwrap();
+
+        let mut entry = IndexedSession {
+            agent: Agent::Omp,
+            id: "abc".into(),
+            cwd: String::new(),
+            title: String::new(),
+            last_active: 0,
+            indexed_len: 0,
+            text: String::new(),
+            reply: String::new(),
+            prompts: 0,
+            fallback_title: String::new(),
+            titled: false,
+        };
+        let len = (slot.len() + header.len() + prompt.len()) as u64;
+        assert!(index_file(&path, len, 10, &mut entry));
+        assert_eq!(entry.cwd, "/Users/x/app");
+        assert_eq!(entry.title, "Titre auto");
+        assert_eq!(entry.fallback_title, "lis le parser");
+        assert_eq!(entry.text, "lis le parser\n");
+
+        // A rename replaces the automatic title; clearing it falls back to the
+        // first prompt without re-reading the transcript.
+        let rename = "{\"type\":\"title_change\",\"id\":\"t1\",\"parentId\":\"m1\",\"timestamp\":\"t\",\"title\":\"Renommé\",\"source\":\"user\"}\n";
+        std::fs::write(&path, format!("{slot}{header}{prompt}{rename}")).unwrap();
+        let len = (slot.len() + header.len() + prompt.len() + rename.len()) as u64;
+        assert!(index_file(&path, len, 20, &mut entry));
+        assert_eq!(entry.title, "Renommé");
+        let clear = "{\"type\":\"title_change\",\"id\":\"t2\",\"parentId\":\"t1\",\"timestamp\":\"t\",\"title\":\"\",\"source\":\"user\"}\n";
+        std::fs::write(&path, format!("{slot}{header}{prompt}{rename}{clear}")).unwrap();
+        let len = (slot.len() + header.len() + prompt.len() + rename.len() + clear.len()) as u64;
+        assert!(index_file(&path, len, 30, &mut entry));
+        assert_eq!(entry.title, "lis le parser");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_the_text_blocks_of_an_assistant_record_are_kept() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"first"},{"type":"text","text":"second"}]}}"#;
+        assert_eq!(assistant_text(line).as_deref(), Some("first\nsecond"));
+        assert_eq!(
+            assistant_text(r#"{"type":"assistant","message":{"content":"plain string"}}"#).as_deref(),
+            Some("plain string")
+        );
+        // A tool call carries no answer, and a record that is not the agent's
+        // own is not a reply.
+        assert!(assistant_text(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"read"}]}}"#).is_none());
+        assert!(assistant_text(r#"{"type":"user","message":{"content":"hi"}}"#).is_none());
+        assert!(assistant_text(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"   "}]}}"#).is_none());
+    }
+
+    #[test]
+    fn a_claude_answer_is_indexed_apart_from_the_prompts() {
+        let dir = std::env::temp_dir().join(format!("kova-reply-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.jsonl");
+        let prompt = "{\"type\":\"user\",\"promptSource\":\"typed\",\"cwd\":\"/tmp/p\",\"message\":{\"content\":\"where is the parser\"}}\n";
+        let thinking = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"secret reasoning\"}]}}\n";
+        let answer = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"In `src/parser.rs`\"},{\"type\":\"tool_use\",\"name\":\"read\",\"input\":{}}]}}\n";
+        std::fs::write(&path, format!("{prompt}{thinking}{answer}")).unwrap();
+
+        let mut entry = IndexedSession {
+            agent: Agent::Claude,
+            id: "r".into(),
+            cwd: String::new(),
+            title: String::new(),
+            last_active: 0,
+            indexed_len: 0,
+            text: String::new(),
+            reply: String::new(),
+            prompts: 0,
+            fallback_title: String::new(),
+            titled: false,
+        };
+        let len = (prompt.len() + thinking.len() + answer.len()) as u64;
+        assert!(index_file(&path, len, 10, &mut entry));
+        assert_eq!(entry.text, "where is the parser\n");
+        assert_eq!(entry.reply, "in `src/parser.rs`\n", "the answer, lowercased");
+        assert_eq!(entry.prompts, 1, "an answer is not a prompt");
+        assert_eq!(entry.title, "where is the parser");
+
+        // A replaced file rebuilds both halves, not one over the other.
+        std::fs::write(&path, answer).unwrap();
+        assert!(index_file(&path, answer.len() as u64, 20, &mut entry));
+        assert_eq!(entry.text, "");
+        assert_eq!(entry.reply, "in `src/parser.rs`\n");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_omp_answer_goes_to_the_reply_and_the_question_to_the_prompts() {
+        let dir = std::env::temp_dir().join(format!("kova-omp-reply-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-10-27T15-54-09-646Z_abc.jsonl");
+        let header = "{\"type\":\"session\",\"version\":3,\"id\":\"abc\",\"timestamp\":\"t\",\"cwd\":\"/Users/x/app\"}\n";
+        let question = "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"lis le parser\"}]}}\n";
+        let answer = "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"hmm\"},{\"type\":\"text\",\"text\":\"Il est dans parser.rs\"}]}}\n";
+        let tool = "{\"type\":\"message\",\"message\":{\"role\":\"toolResult\",\"content\":[{\"type\":\"text\",\"text\":\"file contents\"}]}}\n";
+        std::fs::write(&path, format!("{header}{question}{answer}{tool}")).unwrap();
+
+        let mut entry = IndexedSession {
+            agent: Agent::Omp,
+            id: "abc".into(),
+            cwd: String::new(),
+            title: String::new(),
+            last_active: 0,
+            indexed_len: 0,
+            text: String::new(),
+            reply: String::new(),
+            prompts: 0,
+            fallback_title: String::new(),
+            titled: false,
+        };
+        let len = (header.len() + question.len() + answer.len() + tool.len()) as u64;
+        assert!(index_file(&path, len, 10, &mut entry));
+        assert_eq!(entry.text, "lis le parser\n");
+        assert_eq!(entry.reply, "il est dans parser.rs\n");
+        assert_eq!(entry.prompts, 1);
+        assert_eq!(entry.title, "lis le parser");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Manual check that the real omp transcripts are indexed: run it with
+    /// `cargo test claude_history -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn indexes_the_real_omp_transcripts() {
+        let found = search("omp support", &[]);
+        for hit in &found.hits {
+            println!("{}", hit_label(hit));
+        }
+        assert!(
+            found.hits.iter().any(|hit| hit.agent == Agent::Omp),
+            "no omp session in {} hits",
+            found.total
+        );
     }
 
     /// Not part of the suite: it reads the real transcripts of this machine and
@@ -830,6 +1248,7 @@ mod tests {
     #[test]
     fn a_label_names_the_project_then_the_prompt() {
         let hit = Hit {
+            agent: Agent::Claude,
             id: "abc".into(),
             cwd: "/Users/x/projects/app".into(),
             title: "reread the thread".into(),
@@ -839,7 +1258,7 @@ mod tests {
                 .as_secs(),
         };
         let label = hit_label(&hit);
-        assert!(label.starts_with("app · "), "got {}", label);
+        assert!(label.starts_with("Claude · app · "), "got {}", label);
         assert!(label.ends_with("· reread the thread"), "got {}", label);
     }
 }

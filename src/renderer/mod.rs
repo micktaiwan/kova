@@ -2625,7 +2625,7 @@ impl Renderer {
                         (
                             "Global Search",
                             kc.open_search.as_str(),
-                            "panes + closed Claude sessions",
+                            "panes + closed sessions",
                         ),
                         (
                             "Switch Tab/Pane",
@@ -3917,7 +3917,7 @@ impl Renderer {
         let status = if data.searching {
             format!("Searching for \"{}\"...", data.submitted_query)
         } else if data.submitted_query.is_empty() {
-            "Type to search across all panes and closed Claude sessions.".to_string()
+            "Type to search across all panes and closed sessions.".to_string()
         } else if hit_count == 0 {
             format!("No matches for \"{}\".", data.submitted_query)
         } else {
@@ -5562,6 +5562,53 @@ mod vertex_snapshots {
             dump(&outlined[..plain.len()]),
             dump(&plain),
             "nothing else changes"
+        );
+    }
+
+    #[test]
+    fn the_working_counter_paints_the_global_bar() {
+        // The status bar's `✳N` is the count `window::tick` makes with
+        // `p.is_working()` — the spinner in the OSC title, or a program's
+        // `state=working` record (OSC 7501). This closes the other end: the
+        // count has to reach the bar, with the ✳ glyphs and its tooltip.
+        let mut r = renderer();
+        r.cached_time_str = "12:00".into();
+        // Every glyph the bar draws gets a fake slot, `✳` included: nothing is
+        // rasterized, so the test needs no atlas texture.
+        for c in (0x20u8..0x7f)
+            .map(char::from)
+            .chain(['✳', '●', '◌', '▶', '↑', '↓', '⟵', '⟶'])
+        {
+            r.ctx.atlas.fake_glyph(c, slot(c as u32, false));
+        }
+        let bar = |r: &mut Renderer, working: usize| {
+            let mut vs = Vec::new();
+            r.tooltip_zones.clear();
+            r.build_global_status_bar_vertices(
+                &mut vs, 1400.0, 800.0, 0, 0, 1, 1, 1, 1, "tab", working, 0, 0, 0, 0, 0, None,
+            );
+            let zones: Vec<&'static str> = r.tooltip_zones.iter().map(|z| z.text).collect();
+            (dump(&vs), zones)
+        };
+        let (idle_bar, idle_zones) = bar(&mut r, 0);
+        let (working_bar, working_zones) = bar(&mut r, 1);
+        let (busy_bar, _) = bar(&mut r, 2);
+        let working_zone = "Panes working right now";
+        assert!(
+            !idle_zones.iter().any(|t| t.starts_with(working_zone)),
+            "nothing busy, nothing shown"
+        );
+        assert!(
+            working_zones.iter().any(|t| t.starts_with(working_zone)),
+            "one pane working: the counter is on the bar"
+        );
+        assert_ne!(
+            idle_bar, working_bar,
+            "and its glyphs are painted, not just a tooltip"
+        );
+        assert_ne!(
+            working_bar, busy_bar,
+            "the count itself is painted: ✳1 is not ✳2"
         );
     }
 

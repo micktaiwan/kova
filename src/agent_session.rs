@@ -1,22 +1,30 @@
 //! One face for the coding agents a pane can be running — Claude Code, Codex
-//! and Pi — so everything downstream (pane title, Cmd+J, session restore, IPC)
-//! treats them alike instead of knowing only about Claude.
+//! and Pi, plus omp — so everything downstream (pane title, Cmd+J, session
+//! restore, IPC) treats them alike instead of knowing only about Claude.
 //!
-//! The per-agent detection stays in `claude_session`, `codex_session` and
-//! `pi_session`: they find a live session in completely different ways (a file
-//! per process on one side, the open transcript of a process on the other, the
-//! start time of a process against the names of its session files on the third).
+//! The per-agent detection stays in `claude_session`, `codex_session`,
+//! `pi_session` and `omp_session`: they find a live session in completely
+//! different ways (a file per process on one side, the open transcript of a
+//! process on the other, the start time of a process against the names of its
+//! session files elsewhere).
 //! This module only picks between them and says how to reopen what it found.
 
 use serde::{Deserialize, Serialize};
 
 /// Which agent a pane is running.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Agent {
     Claude,
     Codex,
     Pi,
+    Omp,
+}
+
+impl Default for Agent {
+    fn default() -> Self {
+        Agent::Claude
+    }
 }
 
 impl Agent {
@@ -26,6 +34,17 @@ impl Agent {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
             Agent::Pi => "pi",
+            Agent::Omp => "omp",
+        }
+    }
+
+    /// Human name for a row or a label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Agent::Claude => "Claude",
+            Agent::Codex => "Codex",
+            Agent::Pi => "Pi",
+            Agent::Omp => "Omp",
         }
     }
 }
@@ -77,6 +96,16 @@ pub fn for_shell(shell_pid: u32) -> Option<AgentSession> {
             config_dir: None,
         });
     }
+    if let Some(s) = crate::omp_session::for_shell(shell_pid) {
+        return Some(AgentSession {
+            agent: Agent::Omp,
+            pid: None,
+            id: s.id,
+            name: s.name,
+            peer_name: None,
+            config_dir: None,
+        });
+    }
     let s = crate::pi_session::for_shell(shell_pid)?;
     Some(AgentSession {
         agent: Agent::Pi,
@@ -104,6 +133,7 @@ pub fn resume_command(
         Agent::Claude => crate::claude_session::resume_command(last_command, session_id, config_dir),
         Agent::Codex => crate::codex_session::resume_command(session_id),
         Agent::Pi => crate::pi_session::resume_command(last_command, session_id),
+        Agent::Omp => crate::omp_session::resume_command(last_command, session_id),
     }
 }
 
@@ -125,6 +155,10 @@ mod tests {
             resume_command(Agent::Pi, id, Some("pi"), None).as_deref(),
             Some("pi --session 01a07651-015e-78a3-97f2-2eaf0f0cd663")
         );
+        assert_eq!(
+            resume_command(Agent::Omp, id, Some("omp"), None).as_deref(),
+            Some("omp --resume 01a07651-015e-78a3-97f2-2eaf0f0cd663")
+        );
     }
 
     #[test]
@@ -132,11 +166,12 @@ mod tests {
         assert!(resume_command(Agent::Claude, "id\nrm -rf ~", None, None).is_none());
         assert!(resume_command(Agent::Codex, "id\nrm -rf ~", None, None).is_none());
         assert!(resume_command(Agent::Pi, "id\nrm -rf ~", None, None).is_none());
+        assert!(resume_command(Agent::Omp, "id\nrm -rf ~", None, None).is_none());
     }
 
     #[test]
     fn the_agent_name_round_trips_through_the_session_file() {
-        for agent in [Agent::Claude, Agent::Codex, Agent::Pi] {
+        for agent in [Agent::Claude, Agent::Codex, Agent::Pi, Agent::Omp] {
             let json = serde_json::to_string(&agent).unwrap();
             assert_eq!(json, format!("\"{}\"", agent.as_str()));
             assert_eq!(serde_json::from_str::<Agent>(&json).unwrap(), agent);

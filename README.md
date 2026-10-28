@@ -21,7 +21,7 @@ Every frame is drawn on the GPU via Apple's Metal API. Glyph atlas with on-deman
 
 ### Session persistence
 
-Layout (tabs, splits, CWD) is saved on quit and restored on launch. Panes that were running Claude Code, Codex or Pi resume their conversation by themselves after a relaunch, each one the first time it is on screen in the active tab (focused or not), so fifty restored agents do not all start at once; a tab reopened with Cmd+O pre-types the resume line and waits for Enter. Window position is remembered automatically.
+Layout (tabs, splits, CWD) is saved on quit and restored on launch. Panes that were running Claude Code, Codex, Pi or omp resume their conversation by themselves after a relaunch, each one the first time it is on screen in the active tab (focused or not), so fifty restored agents do not all start at once; a tab reopened with Cmd+O pre-types the resume line and waits for Enter. A pane whose agent the snapshot could not name — a Kova built before that agent existed, a probe that missed at that instant — still comes back with its conversation when the title the agent wrote on the pane matches exactly one transcript of its directory, which is what an omp pane keeps. Window position is remembered automatically.
 
 ### Clickable URLs
 
@@ -31,7 +31,7 @@ Cmd+hover highlights URLs with an underline and pointer cursor. Cmd+click opens 
 
 Cmd+F opens an inline search overlay with match highlighting. Click a match to jump to it.
 
-Cmd+Shift+F searches every pane of every tab at once, and the same palette also reaches the Claude Code sessions that are no longer open: closed transcripts are indexed by the prompts you typed in them, and picking one reopens it with `claude --resume` in its own project directory. Bookmarks (Cmd+B) are listed too, matched on their name, directory and prompts. An empty input offers what you searched earlier in the run.
+Cmd+Shift+F searches every pane of every tab at once, and the same palette also reaches the Claude Code and omp sessions that are no longer open: closed transcripts are indexed by the prompts you typed and by what the agent answered, and picking one reopens it with that agent's `--resume` in its own project directory. Bookmarks (Cmd+B) are listed too, matched on their name, directory and prompts. An empty input offers what you searched earlier in the run.
 
 ### Attention routing
 

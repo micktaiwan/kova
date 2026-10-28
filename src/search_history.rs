@@ -6,7 +6,7 @@
 //! nothing anyone would miss. The list dies with the process.
 //!
 //! Two independent lists, because the two searches answer different questions:
-//! the palette (Cmd+Shift+F) looks across every pane and every closed Claude
+//! the palette (Cmd+Shift+F) looks across every pane and every closed agent
 //! session, the filter (Cmd+F) looks inside one pane's scrollback.
 
 use parking_lot::Mutex;

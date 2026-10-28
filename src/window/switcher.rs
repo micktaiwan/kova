@@ -716,16 +716,20 @@ impl KovaView {
     /// does — jumping to it beats opening a second pane on the same session.
     pub(super) fn pane_holding_session(&self, bm: &crate::bookmarks::Bookmark) -> Option<PaneId> {
         let session_id = bm.session_id.as_deref()?;
+        // A bookmark written before agents were named is a Claude one.
+        let agent = bm.agent.unwrap_or(crate::agent_session::Agent::Claude);
         let tabs = self.ivars().tabs.borrow();
         let mut found = None;
         for tab in tabs.iter() {
             tab.for_each_pane(&mut |pane| {
                 // A pane still asleep since launch holds it too: focusing it
                 // wakes that one instead of resuming the session a second time.
-                if found.is_none()
-                    && (pane.agent_session_id().as_deref() == Some(session_id)
-                        || pane.dormant_session_id().as_deref() == Some(session_id))
-                {
+                let live = pane.agent_kind() == Some(agent)
+                    && pane.agent_session_id().as_deref() == Some(session_id);
+                let asleep = pane
+                    .dormant_session()
+                    .is_some_and(|(owner, id)| owner == agent && id == session_id);
+                if found.is_none() && (live || asleep) {
                     found = Some(pane.id);
                 }
             });

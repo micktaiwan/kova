@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::pane::{alloc_tab_id, Column, Pane, PaneId, Tab};
@@ -200,16 +200,17 @@ fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
     }
 }
 
-/// Drop a Pi conversation that two panes claim at once.
+/// Drop a Pi or omp conversation that two panes claim at once.
 ///
-/// Pi writes no file per process, so the pane a conversation belongs to is read
-/// from the directory and the start time (`pi_session`). Two `pi` panes in the
-/// same directory leave that guess with one file to hand out, and it would go to
-/// both — one pane reopening the other's transcript. Neither is better than a
-/// pane that starts its own session, so both keep their last command instead.
-/// Other agents are left alone: their detection names the process itself, so the
-/// same id twice there would mean the same conversation really was open twice.
-fn drop_shared_pi_sessions(windows: &mut [WindowSession]) {
+/// Pi writes no file per process, and omp's exact source (its open transcript)
+/// can be missing right after start, so both fall back to reading the directory
+/// and the start time. Two panes in the same directory then leave that guess
+/// with one file to hand out, and it would go to both — one pane reopening the
+/// other's transcript. Neither is better than a pane that starts its own
+/// session, so both keep their last command instead. Other agents are left
+/// alone: their detection names the process itself, so the same id twice there
+/// would mean the same conversation really was open twice.
+fn drop_shared_guessed_sessions(windows: &mut [WindowSession]) {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for window in windows.iter() {
         for pane in window
@@ -218,11 +219,12 @@ fn drop_shared_pi_sessions(windows: &mut [WindowSession]) {
             .flat_map(|tab| tab.flat_columns.iter().flatten())
             .flat_map(|col| col.panes.iter())
         {
-            if let Some(session) = pane
-                .agent_session
-                .as_ref()
-                .filter(|s| s.agent == crate::agent_session::Agent::Pi)
-            {
+            if let Some(session) = pane.agent_session.as_ref().filter(|s| {
+                matches!(
+                    s.agent,
+                    crate::agent_session::Agent::Pi | crate::agent_session::Agent::Omp
+                )
+            }) {
                 *counts.entry(session.id.clone()).or_default() += 1;
             }
         }
@@ -240,7 +242,12 @@ fn drop_shared_pi_sessions(windows: &mut [WindowSession]) {
             let shared = pane
                 .agent_session
                 .as_ref()
-                .filter(|s| s.agent == crate::agent_session::Agent::Pi)
+                .filter(|s| {
+                    matches!(
+                        s.agent,
+                        crate::agent_session::Agent::Pi | crate::agent_session::Agent::Omp
+                    )
+                })
                 .is_some_and(|s| counts.get(&s.id).copied().unwrap_or(0) > 1);
             if shared {
                 pane.agent_session = None;
@@ -364,7 +371,7 @@ fn save_internal(windows: &[WindowSession], rotate: bool) {
         return;
     }
     let mut windows = windows.to_vec();
-    drop_shared_pi_sessions(&mut windows);
+    drop_shared_guessed_sessions(&mut windows);
     let session = Session {
         version: SESSION_VERSION,
         windows,
@@ -994,9 +1001,96 @@ fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>,
     Some((tabs, active_idx, deferred))
 }
 
+/// Every saved pane of a session, flat column format and the legacy trees.
+fn panes_mut(session: &mut Session) -> impl Iterator<Item = &mut SavedPane> {
+    session
+        .windows
+        .iter_mut()
+        .flat_map(|window| window.tabs.iter_mut())
+        .flat_map(|tab| tab.flat_columns.iter_mut().flatten())
+        .flat_map(|column| column.panes.iter_mut())
+}
+
+/// Name the conversation of every pane the snapshot left without one.
+///
+/// The agent of a pane is named at snapshot time by looking at the processes
+/// alive in it. When that lookup cannot see the agent — a Kova built before the
+/// agent was known, a probe that missed at that instant — the pane is saved with
+/// its last command alone, and `omp` on its own is a *fresh* conversation on
+/// restore: the user comes back to an empty pane and reads it as lost, while the
+/// old transcript sits untouched on disk.
+///
+/// The pane does keep the title its agent wrote, though, and an omp transcript
+/// carries its own (see `omp_session::session_by_title`), so the conversation is
+/// recoverable with no process alive. Two guards keep that honest: the last
+/// command in the pane must still be that very agent's (a pane where the agent
+/// was quit and another command typed holds a stale title, and keeps its last
+/// command), and the match must be unique.
+fn recover_agent_sessions_by_title(session: &mut Session, home: &Path) {
+    for pane in panes_mut(session) {
+        if pane.agent_session.is_some() {
+            continue;
+        }
+        let (Some(cwd), Some(title)) = (pane.cwd.as_deref(), pane.title.as_deref()) else {
+            continue;
+        };
+        let Some(command) = pane.last_command.as_deref() else {
+            continue;
+        };
+        if !crate::omp_session::is_omp_invocation(command) {
+            continue;
+        }
+        let Some(found) = crate::omp_session::session_by_title(home, cwd, title) else {
+            continue;
+        };
+        log::info!("Restore: pane at {} matched omp {} by its title", cwd, found.id);
+        pane.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Omp,
+            id: found.id,
+            config_dir: None,
+        });
+    }
+    drop_shared_recovered_sessions(session);
+}
+
+/// Give up on an omp conversation two panes of the restored session claim.
+///
+/// Same rule as `drop_shared_guessed_sessions`, on the other side of the file:
+/// resuming one transcript in two panes writes the same conversation from two
+/// processes, so neither gets it and both keep their last command.
+fn drop_shared_recovered_sessions(session: &mut Session) {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for pane in panes_mut(session) {
+        if let Some(id) = pane
+            .agent_session
+            .as_ref()
+            .filter(|s| s.agent == crate::agent_session::Agent::Omp)
+            .map(|s| s.id.clone())
+        {
+            *counts.entry(id).or_default() += 1;
+        }
+    }
+    if counts.values().all(|&count| count < 2) {
+        return;
+    }
+    for pane in panes_mut(session) {
+        let shared = pane
+            .agent_session
+            .as_ref()
+            .filter(|s| s.agent == crate::agent_session::Agent::Omp)
+            .is_some_and(|s| counts.get(&s.id).copied().unwrap_or(0) > 1);
+        if shared {
+            pane.agent_session = None;
+        }
+    }
+}
+
 /// Restore a multi-window session. Returns a list of windows to create.
 pub fn restore_session(session: Session, config: &Config) -> Option<Vec<RestoredWindow>> {
     let mut windows = Vec::new();
+    let mut session = session;
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    recover_agent_sessions_by_title(&mut session, &home);
 
     for ws in &session.windows {
         if let Some((tabs, active_tab, deferred_tabs)) = restore_window_tabs(ws, config) {
@@ -1147,6 +1241,85 @@ mod tests {
         assert_eq!(restore_command(&sp).as_deref(), Some("npm run dev"));
     }
 
+    /// A home holding one stored omp conversation for `/nowhere/proj`, titled
+    /// `title`, plus the pane title omp writes for it on the terminal.
+    fn omp_home_with_title(test: &str, title: &str) -> (std::path::PathBuf, String) {
+        let home = std::env::temp_dir().join(format!("kova-session-title-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let dir = crate::omp_session::session_dir(&home, "/nowhere/proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "01a17eab-44d5-7315-878f-1c81149f5013";
+        let slot = serde_json::json!({"type": "title", "v": 1, "title": title, "source": "auto"});
+        std::fs::write(dir.join(format!("2026-10-27T15-54-09-646Z_{id}.jsonl")), format!("{slot}\n"))
+            .unwrap();
+        (home, format!("π > {title}"))
+    }
+
+    fn panes_of(session: &Session) -> Vec<&SavedPane> {
+        session
+            .windows
+            .iter()
+            .flat_map(|w| w.tabs.iter())
+            .flat_map(|t| t.flat_columns.iter().flatten())
+            .flat_map(|c| c.panes.iter())
+            .collect()
+    }
+
+    #[test]
+    fn a_pane_whose_agent_was_not_named_comes_back_with_its_conversation() {
+        let (home, pane_title) = omp_home_with_title("recovered", "🔑 PRIV: Passe sur les besoins");
+        let id = "01a17eab-44d5-7315-878f-1c81149f5013";
+
+        let mut dormant = pane("/nowhere/proj");
+        dormant.last_command = Some("omp".into());
+        dormant.title = Some(pane_title.clone());
+        // The agent was quit here and another command run since: the stale
+        // title must not bring it back.
+        let mut moved_on = dormant.clone();
+        moved_on.last_command = Some("npm run dev".into());
+        // A pane the snapshot already named keeps its own conversation.
+        let mut named = dormant.clone();
+        named.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Codex,
+            id: "codex-id".into(),
+            config_dir: None,
+        });
+
+        let mut session = Session {
+            version: SESSION_VERSION,
+            windows: vec![window_with(vec![dormant, moved_on, named])],
+        };
+        recover_agent_sessions_by_title(&mut session, &home);
+
+        let panes = panes_of(&session);
+        assert_eq!(panes[0].agent_session.as_ref().map(|s| (s.agent, s.id.as_str())), Some((crate::agent_session::Agent::Omp, id)));
+        assert_eq!(restore_command(panes[0]).as_deref(), Some("omp --resume 01a17eab-44d5-7315-878f-1c81149f5013"));
+        assert!(panes[1].agent_session.is_none(), "a stale title names nothing");
+        assert_eq!(panes[2].agent_session.as_ref().map(|s| s.id.as_str()), Some("codex-id"));
+        // And the recovered pane resumes on its own at launch.
+        assert!(runs_on_launch(panes[0]));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn one_conversation_shared_by_two_panes_comes_back_in_neither() {
+        let (home, pane_title) = omp_home_with_title("shared", "📂 SESS: même titre");
+        let mut twice = pane("/nowhere/proj");
+        twice.last_command = Some("omp".into());
+        twice.title = Some(pane_title);
+        let mut session = Session {
+            version: SESSION_VERSION,
+            windows: vec![window_with(vec![twice.clone(), twice])],
+        };
+        recover_agent_sessions_by_title(&mut session, &home);
+
+        let panes = panes_of(&session);
+        assert!(panes.iter().all(|p| p.agent_session.is_none()), "two panes, one transcript");
+        assert!(panes.iter().all(|p| restore_command(p).as_deref() == Some("omp")));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn a_pane_that_was_running_claude_code_gets_its_resume_line() {
         let mut sp = pane("/a");
@@ -1232,7 +1405,7 @@ mod tests {
             pi_pane("/a", "same"),
             pi_pane("/a", "same"),
         ])];
-        drop_shared_pi_sessions(&mut windows);
+        drop_shared_guessed_sessions(&mut windows);
         let panes = &windows[0].tabs[0].flat_columns.as_ref().unwrap()[0].panes;
         assert!(
             panes.iter().all(|p| p.agent_session.is_none()),
@@ -1251,7 +1424,7 @@ mod tests {
             pi_pane("/a", "one"),
             pi_pane("/b", "two"),
         ])];
-        drop_shared_pi_sessions(&mut windows);
+        drop_shared_guessed_sessions(&mut windows);
         let panes = &windows[0].tabs[0].flat_columns.as_ref().unwrap()[0].panes;
         assert_eq!(
             restore_command(&panes[0]).as_deref(),
@@ -1338,4 +1511,6 @@ mod tests {
         assert!(restore_command(&expands).is_some_and(|l| l.contains("$(")), "the line is still offered");
         assert!(!runs_on_launch(&expands), "but not run");
     }
+
+
 }
