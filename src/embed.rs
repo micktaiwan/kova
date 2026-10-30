@@ -204,8 +204,9 @@ pub struct LibPane {
     /// Frames of the config's fps elapsed between two ticks: the host's
     /// clock is not Kova's, the repair countdowns are counted in frames.
     repair_clock: RefCell<FrameClock>,
-    /// Whether the view is the first responder, as last reported to the
-    /// program (DEC mode 1004). Also what the socket's `focus` events follow.
+    /// The first-responder state as last reported to the program (DEC mode
+    /// 1004): how a real change is detected. The socket reads the live state
+    /// (`holds_focus`); this flag is what a pane without a view falls back on.
     has_focus: Cell<bool>,
     /// The URL under the pointer while Cmd is held: its segments and text
     /// (Kova.app's Cmd+hover, `input::url_hover_update`).
@@ -415,9 +416,9 @@ impl LibPane {
     }
 
     /// The view became (`true`) or stopped being (`false`) the first
-    /// responder: redraw (the cursor and the dimming follow focus), and tell
-    /// the program when it asked for focus events (DEC mode 1004) and the
-    /// focus really changed.
+    /// responder: redraw (the cursor follows focus, nothing fades — see
+    /// `render_data`), and tell the program when it asked for focus events
+    /// (DEC mode 1004) and the focus really changed.
     fn set_focus(&self, focused: bool) {
         let was = self.has_focus.replace(focused);
         self.surface.report_focus(was, focused);
@@ -462,16 +463,14 @@ impl LibPane {
         })
     }
 
-    /// The pane holds the keyboard for the socket's `focus` events: its view
-    /// is the first responder (`set_focus`) of its window, and that window is
-    /// key. A pane without view only holds it when a test says so.
+    /// The pane holds the keyboard: one fact for the socket's `focus` events,
+    /// `panes[].focused` and `list-tabs`' `active`, so no two of them can
+    /// disagree. A pane with a view answers from the live first responder
+    /// (`is_focused`); without a view, only a test can say so (`set_focus`).
     fn holds_focus(&self) -> bool {
-        if !self.has_focus.get() {
-            return false;
-        }
         match self.view() {
-            Some(view) => view.window().is_some_and(|w| w.isKeyWindow()),
-            None => true,
+            Some(_) => self.is_focused(),
+            None => self.has_focus.get(),
         }
     }
 
@@ -552,6 +551,11 @@ impl LibPane {
             // The host marks which of its views has the keyboard: the
             // library cannot know whether this pane is the only one shown.
             outlined: false,
+            // A host app manages its own panes: it alone knows which of its
+            // views has the keyboard, and a pane alone on its layer has nothing
+            // to be told apart from. So the library fades nothing when the
+            // pane loses it (the cursor still says where the keys go).
+            dim_unfocused: false,
             pane_id: s.id,
             custom_title: None,
             has_completion,
@@ -1536,7 +1540,9 @@ impl IpcHost for LibHost {
                 title: pane.title(),
                 pane_count: 1,
                 focused_pane_id: s.id,
-                active: pane.is_focused(),
+                // One tab per pane: a tab is "active" when its pane holds the
+                // keyboard, the same fact `focused` and the `focus` topic use.
+                active: pane.holds_focus(),
                 has_bell,
                 has_completion,
                 has_running: command_running || s.fg_process().is_some(),

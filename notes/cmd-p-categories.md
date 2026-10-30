@@ -80,6 +80,13 @@ it. A tab is a broad project tied to a directory; inside it, the user works on s
   - **Cmd+↑ / Cmd+↓** keep moving the pane, as today.
 - **Cmd+D** is unchanged (new column on the right); the new pane inherits the subject of the
   pane it was split from.
+- **`n` opens a pane in a box** (2026-10-28): on a subject's header or on any pane filed under
+  it, a new pane in that subject — a column right after the box's last member, starting in the
+  box's first member's directory, focused, and `Cmd+P` closes. An empty box is filled from the
+  tab's focused pane, having no column of its own to open next to. A pane outside any box, and
+  the bookmark and anchor sections, name no box: `n` does nothing there rather than guess one.
+  The cwd comes from the box rather than from the selected row, so the gesture gives the same
+  pane from the header as from any member.
 - **A subject lives in one tab.**
 - **An empty subject stays**, moved to the top of its tab's list.
 - **Subjects survive a restart** (saved with the session).

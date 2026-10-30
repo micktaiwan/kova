@@ -176,40 +176,59 @@ impl KovaView {
 
     /// Split the focused pane in the given direction.
     pub(super) fn do_split(&self, direction: SplitDirection) {
-        let config = match self.ivars().config.get() {
-            Some(c) => c,
-            None => return,
-        };
-
-        let (focused_id, current_vp, focused_cwd, focused_subject) = {
+        let (focused, cwd) = {
             let tabs = self.ivars().tabs.borrow();
             let idx = self.ivars().active_tab.get();
             let tab = match tabs.get(idx) {
                 Some(t) => t,
                 None => return,
             };
-            let fid = tab.focused_pane;
-            let vp = match tab.viewport_for_pane(fid, self.panes_viewport_for_tab(tab)) {
-                Some(vp) => vp,
-                None => return,
-            };
-            let cwd = tab.pane(fid).and_then(|p| p.cwd());
-            let subject = tab.pane(fid).and_then(|p| p.subject.clone());
-            (fid, vp, cwd, subject)
+            (
+                tab.focused_pane,
+                tab.pane(tab.focused_pane).and_then(|p| p.cwd()),
+            )
+        };
+        self.do_split_at(focused, direction, cwd.as_deref());
+    }
+
+    /// Split `anchor` in the given direction, the new pane starting in `cwd`
+    /// (`None`: the pane's own directory, which is what `Cmd+D` does).
+    ///
+    /// The split is anchored on a pane rather than on the focused one because
+    /// `n` in `Cmd+P` opens a pane next to a subject's box, which is closed by
+    /// its last member — a pane that may sit in a tab other than the active one,
+    /// so that tab becomes the active one before the new pane takes the focus.
+    /// `None` when no tab of this window holds that pane, or when it has no
+    /// viewport to size the new pane against.
+    pub(super) fn do_split_at(
+        &self,
+        anchor: PaneId,
+        direction: SplitDirection,
+        cwd: Option<&str>,
+    ) -> Option<PaneId> {
+        let config = self.ivars().config.get()?;
+
+        let (tab_idx, anchor_vp, inherited_subject) = {
+            let tabs = self.ivars().tabs.borrow();
+            let idx = tabs.iter().position(|t| t.contains(anchor))?;
+            let tab = &tabs[idx];
+            let vp = tab.viewport_for_pane(anchor, self.panes_viewport_for_tab(tab))?;
+            let subject = tab.pane(anchor).and_then(|p| p.subject.clone());
+            (idx, vp, subject)
         };
 
         let half_vp = match direction {
             SplitDirection::Horizontal => PaneViewport {
-                x: current_vp.x,
-                y: current_vp.y,
-                width: current_vp.width / 2.0,
-                height: current_vp.height,
+                x: anchor_vp.x,
+                y: anchor_vp.y,
+                width: anchor_vp.width / 2.0,
+                height: anchor_vp.height,
             },
             SplitDirection::Vertical => PaneViewport {
-                x: current_vp.x,
-                y: current_vp.y,
-                width: current_vp.width,
-                height: current_vp.height / 2.0,
+                x: anchor_vp.x,
+                y: anchor_vp.y,
+                width: anchor_vp.width,
+                height: anchor_vp.height / 2.0,
             },
         };
         let (cols, rows) = self.viewport_to_grid(&half_vp);
@@ -218,57 +237,62 @@ impl KovaView {
             SplitDirection::Horizontal => "horizontal",
             SplitDirection::Vertical => "vertical",
         };
-        log::debug!("Split pane {}: direction={}, new size={}x{}", focused_id, dir_name, cols, rows);
+        log::debug!(
+            "Split pane {} in tab {}: direction={}, new size={}x{}",
+            anchor, tab_idx, dir_name, cols, rows
+        );
 
-        let mut new_pane = match Pane::spawn(cols, rows, config, focused_cwd.as_deref()) {
+        let mut new_pane = match Pane::spawn(cols, rows, config, cwd) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("failed to spawn pane for split: {}", e);
-                return;
+                return None;
             }
         };
         // Joins the subject of the pane it was split from, so it shows in that
         // pane's box in Cmd+P (gathered there even when the new column does not
-        // land right after it) — the split itself is unchanged.
-        new_pane.subject = focused_subject;
+        // land right after it) — the split itself is unchanged. A caller that
+        // asked for another box files it there afterwards.
+        new_pane.subject = inherited_subject;
         let new_id = new_pane.id;
         let open_timer = new_pane.open_timer.clone();
 
-        let mut tabs = self.ivars().tabs.borrow_mut();
-        let idx = self.ivars().active_tab.get();
-        if let Some(tab) = tabs.get_mut(idx) {
+        {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let tab = tabs.get_mut(tab_idx)?;
             match direction {
                 SplitDirection::Horizontal => {
-                    // Insert new column after the focused pane's column. If we
-                    // are already scrolling (virtual width > screen), grow the
-                    // virtual space by the new column's width instead of
+                    // Insert the new column right after the anchor's column. If
+                    // we are already scrolling (virtual width > screen), grow
+                    // the virtual space by the new column's width instead of
                     // shrinking the existing panes.
                     let screen = self.drawable_viewport().width;
                     let min_w = self.min_split_width_px();
                     let old_virtual = tab.virtual_width(screen, min_w);
-                    tab.insert_column_after_focused(new_pane);
+                    tab.insert_column_after(anchor, new_pane)?;
                     if old_virtual > screen {
                         if let Some(new_col_idx) = tab.column_index_of(new_id) {
                             // New pane is born at the same width as the pane it
                             // was split from, so it doesn't look shrunk.
-                            let new_col_px = current_vp.width.max(min_w);
+                            let new_col_px = anchor_vp.width.max(min_w);
                             tab.grow_virtual_for_scrolled_split(new_col_idx, old_virtual, new_col_px, screen);
                         }
                     }
                 }
                 SplitDirection::Vertical => {
-                    // Split focused pane vertically within its column
-                    tab.vsplit_at_pane(focused_id, new_pane);
+                    // Split the anchor vertically within its column
+                    tab.vsplit_at_pane(anchor, new_pane);
                 }
             }
             tab.focused_pane = new_id;
             // Auto-scroll to reveal the new pane
             self.scroll_to_reveal_pane(tab, new_id, self.drawable_viewport().width);
         }
-        drop(tabs);
+        self.ivars().active_tab.set(tab_idx);
 
         open_timer.mark_inserted(new_id);
         self.resize_all_panes();
+        Some(new_id)
     }
 
     /// Split at the root level: the new pane spans the full width/height.
@@ -374,6 +398,11 @@ impl KovaView {
             }
         };
         let mut tabs = self.ivars().tabs.borrow_mut();
+        // Recorded while the pane is still alive: the undo needs its
+        // conversation id, which an agent forgets on exit.
+        if let Some(entry) = tabs[idx].closed_pane_record(pane_id) {
+            crate::closed_pane::push(entry);
+        }
         if tabs[idx].is_single_pane() {
             drop(tabs);
             self.remove_tab(idx);
@@ -435,6 +464,13 @@ impl KovaView {
             return;
         }
 
+        // Recorded after the confirmation (a cancelled dialog closes nothing)
+        // and while the pane is still alive: the undo needs its conversation
+        // id, which an agent forgets on exit.
+        if let Some(entry) = tabs[idx].closed_pane_record(tabs[idx].focused_pane) {
+            crate::closed_pane::push(entry);
+        }
+
         if tabs[idx].is_single_pane() {
             log::debug!("Closing tab {}", idx);
             drop(tabs);
@@ -479,6 +515,91 @@ impl KovaView {
         self.scroll_to_reveal_pane(tab, new_focus, full.width);
         drop(tabs);
         self.resize_all_panes();
+    }
+
+    /// Put the most recently closed pane back where it was (`cmd+shift+z`).
+    ///
+    /// What comes back is a fresh shell, not the dead one: same directory, the
+    /// slot the pane left, its last command pre-typed — and, for an agent pane,
+    /// its resume line, which Kova runs itself so the conversation is there
+    /// without a second gesture. What the old terminal had scrolled up is gone
+    /// with its PTY: only the conversation is restored, not the raw output.
+    pub(super) fn do_reopen_closed_pane(&self) {
+        let Some(entry) = crate::closed_pane::pop() else {
+            log::info!("Reopen closed pane: nothing closed since the last undo");
+            return;
+        };
+        let config = match self.ivars().config.get() {
+            Some(c) => c,
+            None => return,
+        };
+        let (cols, rows) = (config.terminal.columns, config.terminal.rows);
+        let (line, run) = crate::session::reopen_line(&entry.saved);
+
+        let tab_idx = {
+            let tabs = self.ivars().tabs.borrow();
+            tabs.iter().position(|t| t.id == entry.tab_id)
+        };
+        let Some(tab_idx) = tab_idx else {
+            // Its tab went with it (the pane was the tab's last one): the pane
+            // comes back as a tab of its own, wearing the name and color the
+            // old one had.
+            match crate::session::restore_saved_tab(&entry.sole_pane_tab(), cols, rows, config, false) {
+                Some(mut tab) => {
+                    tab.adopt_geometry_scale(self.backing_scale());
+                    if run {
+                        tab.for_each_pane(&mut |pane| pane.run_pending_command());
+                    }
+                    let mut tabs = self.ivars().tabs.borrow_mut();
+                    let new_idx = self.ivars().active_tab.get() + 1;
+                    tabs.insert(new_idx, tab);
+                    drop(tabs);
+                    self.ivars().active_tab.set(new_idx);
+                    self.resize_all_panes();
+                    log::info!("Reopened closed pane as a new tab: the tab it came from is closed");
+                }
+                None => log::warn!("Reopening closed pane: could not rebuild its tab"),
+            }
+            return;
+        };
+
+        let mut pane = match Pane::spawn(cols, rows, config, entry.saved.cwd.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Reopening closed pane: spawn failed (cwd={:?}): {}", entry.saved.cwd, e);
+                return;
+            }
+        };
+        let open_timer = pane.open_timer.clone();
+        {
+            let mut term = pane.terminal.write();
+            if let Some(cmd) = line {
+                pane.pending_command.set(Some(cmd.clone()));
+                term.last_command = Some(cmd);
+            }
+            term.title = entry.saved.title.clone();
+        }
+        pane.custom_title = entry.saved.custom_title.clone();
+        pane.subject = entry.saved.subject.clone();
+        if run {
+            pane.run_pending_command();
+        }
+        let id = pane.id;
+
+        {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let old_columns = tabs[tab_idx].num_visible_columns();
+            tabs[tab_idx].restore_pane_at(entry.column, entry.index, pane);
+            tabs[tab_idx].focused_pane = id;
+            let new_columns = tabs[tab_idx].num_visible_columns();
+            tabs[tab_idx].scale_virtual_width(old_columns, new_columns);
+        }
+        open_timer.mark_inserted(id);
+
+        self.ivars().active_tab.set(tab_idx);
+        self.resize_all_panes();
+        self.mark_dirty();
+        log::info!("Reopened closed pane {} in tab {}", id, tab_idx);
     }
 
     /// Remove a tab by index: save to recent projects, remove from list,

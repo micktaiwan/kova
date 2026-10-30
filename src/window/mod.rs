@@ -1628,6 +1628,7 @@ impl KovaView {
             Action::KillWindow => self.do_kill_window(),
             Action::ClosePaneOrTab => self.do_close_pane_or_tab(),
             Action::CloseTab => self.do_close_tab(),
+            Action::ReopenClosedPane => self.do_reopen_closed_pane(),
             Action::OpenRecentProject => self.do_open_recent_projects(),
             Action::OpenSearchPalette => self.do_open_search_palette(),
             Action::OpenPaneSwitcher => {

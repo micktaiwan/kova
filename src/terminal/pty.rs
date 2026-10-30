@@ -335,6 +335,10 @@ impl Pty {
         // pre_exec runs in the child after fork, before exec — the correct
         // place for setsid + TIOCSCTTY to establish the controlling terminal.
         let mut command = std::process::Command::new(&shell);
+        // An app started from an agent's shell inherits its NO_COLOR, and every
+        // program in its panes would then draw in monochrome. A host that wants
+        // it still can: its variables come next.
+        command.env_remove("NO_COLOR");
         // The host's variables first, so the ones Kova sets below win: a host
         // cannot point KOVA_SOCKET / KOVA_PANE_ID somewhere else by accident.
         for (key, value) in &env.vars {

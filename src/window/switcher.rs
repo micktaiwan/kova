@@ -278,6 +278,54 @@ pub(super) fn subject_listing(subjects: &[String], panes: &[(PaneId, Option<Stri
     out
 }
 
+/// What `n` in `Cmd+P` opens a pane in, read from the selected row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RowSubject {
+    /// A subject's header: the tab the row already carries, and the name.
+    Header { tab: TabId, name: String },
+    /// A pane filed under a subject: the box it is drawn in. The row does not
+    /// carry its tab, so the caller looks the pane up.
+    Pane { pane_id: PaneId, name: String },
+}
+
+/// The box the row sits in, if any: a subject's header names its own box, a
+/// pane filed under one names its box. Rows with no box — a pane outside any
+/// subject, the bookmark and anchor sections, a tab header — name nothing, and
+/// `n` on them does nothing rather than guess a subject.
+pub(super) fn row_subject(row: &SwitcherRow) -> Option<RowSubject> {
+    match row {
+        SwitcherRow::SubjectHeader { name, tab, .. } => Some(RowSubject::Header {
+            tab: *tab,
+            name: name.clone(),
+        }),
+        SwitcherRow::Pane { pane_id, subject: Some(name), .. } => Some(RowSubject::Pane {
+            pane_id: *pane_id,
+            name: name.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// Where `n` opens the new pane of a subject, given a tab's `subject_listing`:
+/// `(the pane to split, the pane whose directory to start in)` — the box's
+/// **last** member whose column is on screen, and its **first** member. So the
+/// gesture gives the same pane from the header as from any member (the cwd
+/// never follows the selection), and a minimized member — which has no visible
+/// column to open next to — is skipped.
+///
+/// `None` when there is no such pane: the name is unknown, or the box is empty,
+/// or every member is minimized. The caller then has no column of the box to
+/// open next to and falls back to the tab's focused pane.
+pub(super) fn new_pane_anchor(
+    listing: &[(String, Vec<PaneId>)],
+    name: &str,
+    visible: impl Fn(PaneId) -> bool,
+) -> Option<(PaneId, PaneId)> {
+    let members = listing.iter().find(|(n, _)| n == name).map(|(_, m)| m.as_slice())?;
+    let anchor = members.iter().rev().find(|id| visible(**id))?;
+    Some((*anchor, *members.first()?))
+}
+
 /// What Cmd+Up/Down does to the pane at `p` in a tab with subjects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SubjectMove {
@@ -1314,6 +1362,19 @@ impl KovaView {
             && !flags.intersects(
                 NSEventModifierFlags::Option | NSEventModifierFlags::Control | NSEventModifierFlags::Shift,
             );
+        // `n` on a subject's header, or on a pane filed under one: a new pane
+        // in that box (see `pane_switcher_new_pane_in_subject`). Read from the
+        // typed letter (AZERTY), and with no modifier: Cmd+N, ^N and ⌥N are
+        // other gestures.
+        if subjects_shown
+            && !flags.intersects(
+                NSEventModifierFlags::Command | NSEventModifierFlags::Option | NSEventModifierFlags::Control,
+            )
+            && unmodified.as_deref().is_some_and(|c| c.eq_ignore_ascii_case("n"))
+        {
+            self.pane_switcher_new_pane_in_subject();
+            return;
+        }
         if subjects_shown
             && cmd_only
             && (keycode == 0x7C || keycode == 0x7B)
@@ -1700,6 +1761,51 @@ impl KovaView {
         self.pane_switcher_reselect(pane_id);
     }
 
+    /// `n` in Cmd-P: open a new pane in the selected row's subject — a column
+    /// right after the box, starting in the box's directory, focused, with the
+    /// switcher closed. An empty subject is filled from the tab's focused pane
+    /// (it has no column of its own to open next to).
+    fn pane_switcher_new_pane_in_subject(&self) {
+        let Some((tab_id, name)) = self.pane_switcher_selected_box() else { return };
+        let (anchor, cwd) = {
+            let tabs = self.ivars().tabs.borrow();
+            let Some(tab) = tabs.iter().find(|t| t.id == tab_id) else { return };
+            let listing = subject_listing(&tab.subjects, &tab.pane_subjects());
+            let target = new_pane_anchor(&listing, &name, |id| {
+                tab.pane(id).is_some_and(|p| !p.minimized)
+            });
+            match target {
+                Some((anchor, first)) => (anchor, tab.pane(first).and_then(|p| p.cwd())),
+                // Nothing of the box is on screen: an empty box, or every member
+                // minimized. The tab's focused pane is the only column to open
+                // next to. A name the tab no longer has means the overlay is
+                // stale (renamed or deleted meanwhile): open nothing.
+                None => {
+                    if !tab.subjects.iter().any(|s| s == &name) {
+                        return;
+                    }
+                    let focused = tab.focused_pane;
+                    (focused, tab.pane(focused).and_then(|p| p.cwd()))
+                }
+            }
+        };
+        let Some(new_id) = self.do_split_at(anchor, SplitDirection::Horizontal, cwd.as_deref()) else {
+            return;
+        };
+        {
+            // Filed after the split, not by it: an empty box is opened next to
+            // the tab's focused pane, which may sit in another subject, and the
+            // new pane belongs in the box that was asked for.
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            if let Some(tab) = tabs.iter_mut().find(|t| t.contains(new_id)) {
+                file_under_subject(tab, new_id, &name);
+            }
+        }
+        log::info!("Cmd+P: new pane {} in subject {:?}", new_id, name);
+        *self.ivars().pane_switcher.borrow_mut() = None;
+        self.mark_dirty();
+    }
+
     /// Cmd+Left: take the selected pane out of its subject. A pane from the
     /// middle of the box moves past its last member, so it lands right under
     /// the box. The subject stays, even left empty.
@@ -1723,6 +1829,26 @@ impl KovaView {
         match guard.as_ref().and_then(|s| s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row))) {
             Some(SwitcherRow::SubjectHeader { name, tab, .. }) => Some((*tab, name.clone())),
             _ => None,
+        }
+    }
+
+    /// The box the selected row sits in, with its tab: a subject's header names
+    /// its own box, a pane filed under one names its box. `None` everywhere
+    /// else, so `n` does nothing on a pane outside any subject.
+    fn pane_switcher_selected_box(&self) -> Option<(TabId, String)> {
+        let subject = {
+            let guard = self.ivars().pane_switcher.borrow();
+            let state = guard.as_ref()?;
+            let row = state.columns.get(state.selected_col)?.get(state.selected_row)?;
+            row_subject(row)
+        }?;
+        match subject {
+            RowSubject::Header { tab, name } => Some((tab, name)),
+            RowSubject::Pane { pane_id, name } => {
+                let tabs = self.ivars().tabs.borrow();
+                let tab = tabs.iter().find(|t| t.contains(pane_id))?;
+                Some((tab.id, name))
+            }
         }
     }
 
@@ -2529,6 +2655,59 @@ mod tests {
         assert_eq!(subject_above(&[], &subs(&[None, None]), 0), None);
         // A box's first member sits under the header of its own box.
         assert_eq!(subject_above(&subjects, &panes, 1).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn n_finds_the_box_of_the_selected_row_and_no_other() {
+        let header = SwitcherRow::SubjectHeader { name: "a".into(), empty: false, tab: 3 };
+        assert_eq!(
+            row_subject(&header),
+            Some(RowSubject::Header { tab: 3, name: "a".into() })
+        );
+
+        let mut member = pane_titled("p");
+        let SwitcherRow::Pane { subject, .. } = &mut member else { unreachable!() };
+        *subject = Some("a".into());
+        assert_eq!(
+            row_subject(&member),
+            Some(RowSubject::Pane { pane_id: 0, name: "a".into() })
+        );
+
+        // A pane outside any box, a tab header, and the two saved sections name
+        // nothing: `n` does nothing there rather than open a pane in some
+        // neighbour's subject.
+        assert_eq!(row_subject(&pane_titled("p")), None);
+        assert_eq!(row_subject(&SwitcherRow::TabHeader("tab".into())), None);
+        assert_eq!(row_subject(&SwitcherRow::Bookmark { index: 0, title: "s".into(), detail: None }), None);
+        assert_eq!(row_subject(&SwitcherRow::Anchor { index: 0, title: "s".into(), detail: None }), None);
+    }
+
+    #[test]
+    fn a_new_pane_splits_the_boxs_last_visible_member_and_starts_in_the_firsts_directory() {
+        let listing = vec![
+            ("idle".to_string(), Vec::new()),
+            ("auth".to_string(), vec![7, 9, 11]),
+            ("login".to_string(), vec![4]),
+        ];
+        let all = |_: PaneId| true;
+        assert_eq!(
+            new_pane_anchor(&listing, "auth", all),
+            Some((11, 7)),
+            "cwd of the first member, column of the last one"
+        );
+        assert_eq!(new_pane_anchor(&listing, "login", all), Some((4, 4)), "a box of one opens after itself");
+        assert_eq!(
+            new_pane_anchor(&listing, "auth", |id| id != 11),
+            Some((9, 7)),
+            "a minimized member has no column on screen: the one before it takes the split"
+        );
+        assert_eq!(
+            new_pane_anchor(&listing, "auth", |_| false),
+            None,
+            "no column of the box is on screen: the caller falls back to the focused pane"
+        );
+        assert_eq!(new_pane_anchor(&listing, "idle", all), None, "an empty box has no column of its own");
+        assert_eq!(new_pane_anchor(&listing, "gone", all), None);
     }
 
     #[test]

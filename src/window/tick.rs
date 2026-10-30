@@ -861,6 +861,10 @@ impl KovaView {
                         is_focused,
                         // Set below, once every pane's viewport is known.
                         outlined: false,
+                        // The tab's focused pane is never faded (`is_focused`
+                        // above); the others are, as Kova.app has always drawn
+                        // them — a lone pane is that focus, so nothing fades.
+                        dim_unfocused: true,
                         pane_id: pane.id,
                         custom_title: pane.custom_title.clone(),
                         has_completion: completed,

@@ -1025,6 +1025,48 @@ impl Tab {
         self.columns.iter().position(|col| col.contains(id))
     }
 
+    /// The record that lets the closed-pane undo put `id` back where it is
+    /// right now: its slot (column and row) plus what a snapshot saves of it.
+    ///
+    /// Call it while the pane is still alive — the agent conversation is read
+    /// off the running process (see [`crate::session::saved_pane`]).
+    pub fn closed_pane_record(&self, id: PaneId) -> Option<crate::closed_pane::ClosedPane> {
+        let column = self.column_index_of(id)?;
+        let index = self.columns[column].pane_index_of(id)?;
+        let pane = self.columns[column].panes.get(index)?;
+        Some(crate::closed_pane::ClosedPane {
+            saved: crate::session::saved_pane(pane),
+            tab_id: self.id,
+            column,
+            index,
+            tab_title: self.custom_title.clone(),
+            tab_color: self.color,
+        })
+    }
+
+    /// Put a pane back in the slot `column`/`index` a closed pane left, and
+    /// return its id.
+    ///
+    /// Out-of-range values clamp instead of dropping the pane: the layout may
+    /// have changed between the close and the undo (a split closed, a column
+    /// gone), and losing the pane a second time would be worse than putting it
+    /// at the end of the column it should have been in.
+    pub fn restore_pane_at(&mut self, column: usize, index: usize, pane: Pane) -> PaneId {
+        let column = if column < self.columns.len() {
+            column
+        } else {
+            self.column_index_of(self.focused_pane).unwrap_or(0)
+        };
+        let id = pane.id;
+        let col = &mut self.columns[column];
+        let weight = new_entry_weight(&col.row_weights, &col.minimized_rows());
+        let at = index.min(col.panes.len());
+        col.panes.insert(at, pane);
+        col.row_weights.insert(at, weight);
+        col.custom_row_weights.insert(at, false);
+        id
+    }
+
     // ---------------------------------------------------------------
     // Viewport computation
     // ---------------------------------------------------------------
@@ -1245,23 +1287,34 @@ impl Tab {
     /// Insert a new column after the column containing the focused pane.
     /// Returns the new pane's id.
     pub fn insert_column_after_focused(&mut self, new_pane: Pane) -> PaneId {
-        let new_id = new_pane.id;
         let idx = self.column_index_of(self.focused_pane).unwrap_or(self.columns.len() - 1);
-        let avg_weight = new_entry_weight(&self.column_weights, &self.minimized_columns());
-        self.columns.insert(idx + 1, Column::new(new_pane));
-        self.column_weights.insert(idx + 1, avg_weight);
-        self.custom_weights.insert(idx + 1, false);
-        new_id
+        self.insert_column_at(idx + 1, new_pane)
+    }
+
+    /// Insert a new column right after the column holding `pane_id`, which is
+    /// how a new pane lands next to the box of a subject rather than next to
+    /// the focused pane. `None` when the tab holds no such pane: nothing is
+    /// inserted.
+    pub fn insert_column_after(&mut self, pane_id: PaneId, new_pane: Pane) -> Option<PaneId> {
+        let idx = self.column_index_of(pane_id)?;
+        Some(self.insert_column_at(idx + 1, new_pane))
     }
 
     /// Append a new column at the end.
     /// Returns the new pane's id.
     pub fn append_column(&mut self, new_pane: Pane) -> PaneId {
+        let at = self.columns.len();
+        self.insert_column_at(at, new_pane)
+    }
+
+    /// The one place a column enters the layout: its weight and its
+    /// custom-weight flag enter with it, so no caller can forget them.
+    fn insert_column_at(&mut self, at: usize, new_pane: Pane) -> PaneId {
         let new_id = new_pane.id;
         let avg_weight = new_entry_weight(&self.column_weights, &self.minimized_columns());
-        self.columns.push(Column::new(new_pane));
-        self.column_weights.push(avg_weight);
-        self.custom_weights.push(false);
+        self.columns.insert(at, Column::new(new_pane));
+        self.column_weights.insert(at, avg_weight);
+        self.custom_weights.insert(at, false);
         new_id
     }
 
@@ -2569,6 +2622,31 @@ mod tests {
     }
 
     #[test]
+    fn a_column_inserted_after_a_given_pane_lands_next_to_it_and_not_next_to_the_focus() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let (b, _fb) = super::Pane::capture(10, 2);
+        let (c, _fc) = super::Pane::capture(10, 2);
+        let (n, _fn) = super::Pane::capture(10, 2);
+        let (spare, _fs) = super::Pane::capture(10, 2);
+        let ic = c.id;
+        // `with_columns` focuses the first column, so a column landing after the
+        // last one can only come from the anchor being followed.
+        let mut tab = super::Tab::with_columns(vec![vec![a], vec![b], vec![c]]);
+        let new_id = tab.insert_column_after(ic, n).expect("the tab holds that pane");
+        assert_eq!(tab.column_index_of(new_id), Some(3), "right after the anchor, not after the focus");
+        assert_eq!(tab.columns.len(), 4);
+        assert_eq!(tab.column_weights.len(), 4, "the weight enters with the column");
+        assert_eq!(tab.custom_weights.len(), 4);
+
+        assert_eq!(
+            tab.insert_column_after(9999, spare),
+            None,
+            "a pane the tab does not hold inserts nothing"
+        );
+        assert_eq!(tab.columns.len(), 4);
+    }
+
+    #[test]
     fn a_pane_broken_out_of_its_tab_leaves_its_subject_behind() {
         let (a, _fa) = super::Pane::capture(10, 2);
         let (mut b, _fb) = super::Pane::capture(10, 2);
@@ -2675,6 +2753,41 @@ mod tests {
         assert!(tab.pane_subjects().iter().all(|(_, s)| s.is_none()));
         assert_eq!(tab.delete_subject("idle"), 0, "an empty subject just goes");
         assert!(tab.subjects.is_empty());
+    }
+
+    #[test]
+    fn a_closed_pane_goes_back_into_its_own_slot() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let (b, _fb) = super::Pane::capture(10, 2);
+        let (c, _fc) = super::Pane::capture(10, 2);
+        let (ia, ib, ic) = (a.id, b.id, c.id);
+        let mut tab = super::Tab::with_columns(vec![vec![a, b, c]]);
+        let record = tab.closed_pane_record(ib).expect("a pane in the tab has a slot");
+        assert_eq!((record.column, record.index), (0, 1));
+        assert!(tab.remove_pane(ib));
+        let (again, _f) = super::Pane::capture(10, 2);
+        let id = tab.restore_pane_at(record.column, record.index, again);
+        assert_eq!(id, tab.columns[0].panes[1].id, "the slot it left, not the end");
+        let ids: Vec<super::PaneId> = tab.columns[0].panes.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![ia, id, ic]);
+    }
+
+    #[test]
+    fn a_pane_restored_into_a_layout_that_moved_lands_at_the_edge() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let (b, _fb) = super::Pane::capture(10, 2);
+        let ia = a.id;
+        let mut tab = super::Tab::with_columns(vec![vec![a], vec![b]]);
+        let (p, _fp) = super::Pane::capture(10, 2);
+        let id = tab.restore_pane_at(0, 99, p);
+        assert_eq!(tab.columns[0].panes.last().map(|p| p.id), Some(id), "a row index past the end clamps");
+        assert_eq!(tab.columns.len(), 2, "no column is invented");
+        // A column that no longer exists sends the pane to the focused one
+        // rather than dropping it.
+        let (q, _fq) = super::Pane::capture(10, 2);
+        tab.focused_pane = ia;
+        let id = tab.restore_pane_at(9, 0, q);
+        assert_eq!(tab.columns[0].panes[0].id, id);
     }
 
     #[test]

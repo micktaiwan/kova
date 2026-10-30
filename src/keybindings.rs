@@ -60,6 +60,8 @@ pub enum Action {
     ToggleHelp,
     MemReport,
     CloseTab,
+    /// Put the most recently closed pane back, conversation included.
+    ReopenClosedPane,
     OpenRecentProject,
     OpenSearchPalette,
     OpenPaneSwitcher,
@@ -303,6 +305,7 @@ impl Keybindings {
         bind(&keys.restore_minimized, Action::RestoreLastMinimized);
         bind(&keys.toggle_help, Action::ToggleHelp);
         bind(&keys.close_tab, Action::CloseTab);
+        bind(&keys.reopen_closed_pane, Action::ReopenClosedPane);
         bind(&keys.open_recent_project, Action::OpenRecentProject);
         bind(&keys.open_search, Action::OpenSearchPalette);
         bind(&keys.open_pane_switcher, Action::OpenPaneSwitcher);
@@ -405,6 +408,7 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "toggle-help" => Action::ToggleHelp,
         "mem-report" => Action::MemReport,
         "close-tab" => Action::CloseTab,
+        "reopen-closed-pane" => Action::ReopenClosedPane,
         "open-recent-project" => Action::OpenRecentProject,
         "open-search" => Action::OpenSearchPalette,
         "open-pane-switcher" => Action::OpenPaneSwitcher,

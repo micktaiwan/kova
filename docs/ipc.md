@@ -496,6 +496,9 @@ every open window: `[colors]`, `[status_bar]`, `[global_status_bar]`, `[tab_bar]
 `[bookmarks]`, and the fade / focus outline of `[splits]`. The next frame draws
 with the new values — around 16 ms later, no restart, no session reload.
 
+Kova.app only: a library host keeps its panes' style from the config it read at
+startup and answers `command not supported by this host`.
+
 What it does not touch, because they are read once at startup and would mean
 rebuilding the glyph atlas or resizing every PTY: `[font]`, `[terminal]`,
 `[window]`, `[keys]`. An invalid TOML file leaves every window as it was (the
@@ -512,6 +515,8 @@ Response: `{ "ok": true, "data": { "windows": 2, "needs_restart": ["font", "keys
 ```
 
 Response: `{ "ok": true }`. Closes the tab if it was the last pane.
+
+A closed pane is not lost: the most recent closes (up to ten, in memory for this run only) can be put back with `dispatch-action` `reopen-closed-pane`. What comes back is a fresh shell in the same directory, in the same slot of the same tab (or as a tab of its own when that tab went with it), with the agent conversation it was holding resumed — never the dead terminal's scrollback.
 
 ---
 
@@ -690,6 +695,7 @@ Response: `{ "ok": true }`, or `{ "ok": false, "error": "unknown action: ..." }`
 
 ```
 new-tab  close-pane-or-tab  close-tab  close-window  kill-window  new-window
+reopen-closed-pane                 (put the last closed pane back, conversation included)
 vsplit  hsplit  vsplit-root  hsplit-root  equalize  repaint-pane
 prev-tab  next-tab  switch-tab-1 … switch-tab-9
 navigate-up|down|left|right        (move focus between panes)

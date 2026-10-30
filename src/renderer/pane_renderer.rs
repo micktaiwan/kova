@@ -106,6 +106,7 @@ const JUMP_HIGHLIGHT: [f32; 3] = [1.0, 0.85, 0.3];
 pub(super) struct PaneDrawKey {
     pub(super) vp: [f32; 4],
     pub(super) is_focused: bool,
+    pub(super) dim_unfocused: bool,
     pub(super) outlined: bool,
     pub(super) show_blink: bool,
     pub(super) hover: Option<(Vec<(usize, u16, u16)>, Option<String>)>,
@@ -177,6 +178,7 @@ impl PaneRenderer {
         PaneDrawKey {
             vp: [vp.x, vp.y, vp.width, vp.height],
             is_focused: pane.is_focused,
+            dim_unfocused: pane.dim_unfocused,
             outlined: pane.outlined,
             show_blink: if pane.is_focused { blink_on } else { true },
             hover,
@@ -249,7 +251,7 @@ impl PaneRenderer {
         let (cell_w, cell_h) = ctx.cell_size();
         let zones_before = zones.len();
         let pane_verts = {
-            let mut build = PaneBuild { ctx, style, hovered_url, hovered_url_text, zones };
+            let mut build = PaneBuild { ctx, style, dim_unfocused: pane.dim_unfocused, hovered_url, hovered_url_text, zones };
             let pane_attention = PaneAttention::from_flags(pane.has_bell, pane.has_completion);
             let mut verts = if pane.shell_ready {
                 let t = pane.terminal.read();
@@ -284,6 +286,9 @@ impl PaneRenderer {
 pub(super) struct PaneBuild<'a> {
     pub(super) ctx: &'a mut RenderContext,
     pub(super) style: &'a PaneStyle,
+    /// Fade the pane when it is not focused: `PaneRenderData::dim_unfocused`,
+    /// the caller's decision.
+    pub(super) dim_unfocused: bool,
     /// Hovered URL: per-row segments [(visible_row, col_start, col_end)]
     pub(super) hovered_url: Option<&'a [(usize, u16, u16)]>,
     /// Hovered URL text (for status bar display)
@@ -360,10 +365,14 @@ impl PaneBuild<'_> {
         }
 
         // Pass 3: build vertices
-        // Amount by which this pane's text is faded. Non-zero only for an
-        // unfocused pane in `text` dim mode; `full` mode fades with a veil
-        // quad at the end instead.
-        let text_fade = if !is_focused && self.style.dim_mode == DimMode::Text {
+        // Faded only when the pane lost the focus AND the caller asked for the
+        // fade (`PaneRenderData::dim_unfocused`): a host app manages its own
+        // panes and says no.
+        let dimmed = !is_focused && self.dim_unfocused;
+        // Amount by which this pane's text is faded. Non-zero only for a faded
+        // pane in `text` dim mode; `full` mode fades with a veil quad at the
+        // end instead.
+        let text_fade = if dimmed && self.style.dim_mode == DimMode::Text {
             self.style.dim_opacity
         } else {
             0.0
@@ -626,8 +635,8 @@ impl PaneBuild<'_> {
             self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention, pane_input_chars, pane_id, fg_process, text_fade, bookmarked);
         }
 
-        // Veil over an unfocused pane, status bar included.
-        if !is_focused && self.style.dim_mode == DimMode::Full && self.style.dim_opacity > 0.0 {
+        // Veil over a faded pane, status bar included.
+        if dimmed && self.style.dim_mode == DimMode::Full && self.style.dim_opacity > 0.0 {
             let dim4 = [0.0, 0.0, 0.0, self.style.dim_opacity]; // black overlay
             let no_tex = [0.0, 0.0];
             let white = [1.0, 1.0, 1.0, 0.0];
@@ -945,6 +954,7 @@ mod tests {
             viewport: vp,
             shell_ready: true,
             is_focused: true,
+            dim_unfocused: true,
             outlined: true,
             pane_id: 7,
             custom_title: None,
@@ -1083,7 +1093,7 @@ mod tests {
         let t = terminal();
         let mut zones = Vec::new();
         let mut build = |vp: PaneViewport| {
-            PaneBuild { ctx: &mut ctx, style: &style, hovered_url: None, hovered_url_text: None, zones: &mut zones }
+            PaneBuild { ctx: &mut ctx, style: &style, dim_unfocused: false, hovered_url: None, hovered_url_text: None, zones: &mut zones }
                 .build_vertices(&t, &vp, true, true, true, None, PaneAttention::None, 0, 7, None, false)
         };
         let in_place = build(vp_at(100.5, 30.0));
@@ -1094,5 +1104,67 @@ mod tests {
         assert_eq!(in_place[0].position[0], (100.5 + pad).round());
         assert_eq!(at_origin[0].position[0] + 100.5, 100.5 + pad);
         assert_ne!(in_place[0].position[0], at_origin[0].position[0] + 100.5);
+    }
+
+    /// The library's rule (`docs/embedding.md`): a host app manages its own
+    /// panes, so the pane it embeds is never faded by focus. `dim_unfocused`
+    /// is the caller's decision, exactly like `outlined`.
+    #[test]
+    fn an_unfocused_pane_is_faded_only_when_the_caller_asks() {
+        let config = Config::default();
+        let mut ctx = context(&config);
+        let style = PaneStyle::from_config(&config);
+        let mut p = pane(terminal(), vp_at(100.0, 30.0));
+        p.is_focused = false;
+        p.outlined = false;
+
+        // Not asked: nothing covers the pane, not one dark vertex.
+        p.dim_unfocused = false;
+        let mut plain = PaneRenderer::default();
+        prepare(&mut plain, &mut ctx, &style, &p, true);
+        let veil = |v: &Vertex| v.bg_color == [0.0, 0.0, 0.0, style.dim_opacity];
+        assert!(!plain.vertices().iter().any(veil), "no veil unasked");
+        let plain_len = plain.vertices().len();
+
+        // Asked: one quad more, black at the configured opacity, over exactly
+        // the pane.
+        p.dim_unfocused = true;
+        let mut faded = PaneRenderer::default();
+        prepare(&mut faded, &mut ctx, &style, &p, true);
+        assert_eq!(faded.vertices().len(), plain_len + 6, "the veil is one quad");
+        let cover = &faded.vertices()[plain_len..];
+        assert!(cover.iter().all(|v| veil(v)), "the veil's colour");
+        assert_eq!(cover[0].position, [p.viewport.x, p.viewport.y]);
+        assert_eq!(cover[4].position, [p.viewport.x + p.viewport.width, p.viewport.y + p.viewport.height]);
+        assert_eq!(cover[5].position, [p.viewport.x, p.viewport.y + p.viewport.height]);
+    }
+
+    /// `text` mode fades the glyphs instead of veiling the pane; the same flag
+    /// decides, so a host that asks for no fade gets the plain glyphs of a pane
+    /// nothing fades.
+    #[test]
+    fn the_text_dim_mode_obeys_the_same_flag() {
+        let mut config = Config::default();
+        config.splits.dim_mode = DimMode::Text;
+        let mut ctx = context(&config);
+        let style = PaneStyle::from_config(&config);
+        let mut full = config.clone();
+        full.splits.dim_mode = DimMode::Full;
+        let full_style = PaneStyle::from_config(&full);
+        let mut p = pane(terminal(), vp_at(100.0, 30.0));
+        p.is_focused = false;
+        p.outlined = false;
+        p.dim_unfocused = false;
+
+        let mut plain = PaneRenderer::default();
+        prepare(&mut plain, &mut ctx, &style, &p, true);
+        let mut same = PaneRenderer::default();
+        prepare(&mut same, &mut ctx, &full_style, &p, true);
+        assert_eq!(bits(plain.vertices()), bits(same.vertices()), "unasked: the same build in both modes");
+
+        p.dim_unfocused = true;
+        let mut faded = PaneRenderer::default();
+        prepare(&mut faded, &mut ctx, &style, &p, true);
+        assert_ne!(bits(faded.vertices()), bits(plain.vertices()), "asked: the glyphs fade");
     }
 }

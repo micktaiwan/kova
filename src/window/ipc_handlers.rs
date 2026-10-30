@@ -278,6 +278,12 @@ impl KovaView {
             return Some(false);
         }
 
+        // Recorded while the pane is still alive: the undo needs its
+        // conversation id, which an agent forgets on exit.
+        if let Some(entry) = tabs[tab_idx].closed_pane_record(pane_id) {
+            crate::closed_pane::push(entry);
+        }
+
         if tabs[tab_idx].is_single_pane() {
             // Close the entire tab
             crate::recent_projects::add(&tabs[tab_idx]);

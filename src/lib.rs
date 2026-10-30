@@ -17,6 +17,7 @@ mod ask_card;
 mod bookmarks;
 mod claude_history;
 mod claude_session;
+mod closed_pane;
 mod codex_session;
 mod embed;
 mod events;

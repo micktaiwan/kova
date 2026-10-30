@@ -627,6 +627,11 @@ pub struct PaneRenderData {
     /// tab with more than one visible pane, the library never (the host app
     /// shows which of its views has the keyboard).
     pub outlined: bool,
+    /// Fade this pane while it is not focused (`splits.dim_opacity`). The
+    /// caller decides, like `outlined`: Kova.app fades every pane that is not
+    /// its tab's focused one, a host app never (it manages its own panes, and
+    /// a pane alone on its layer has nothing to be told apart from).
+    pub dim_unfocused: bool,
     pub pane_id: PaneId,
     pub custom_title: Option<String>,
     pub has_completion: bool,
@@ -927,6 +932,7 @@ impl Renderer {
         PaneBuild {
             ctx: &mut self.ctx,
             style: &self.style,
+            dim_unfocused: true,
             hovered_url: self.hovered_url.as_deref(),
             hovered_url_text: self.hovered_url_text.as_deref(),
             zones: &mut self.tooltip_zones,
@@ -2524,6 +2530,11 @@ impl Renderer {
                             "pane, or tab if last one",
                         ),
                         ("Close Tab", kc.close_tab.as_str(), "whole tab at once"),
+                        (
+                            "Reopen Pane",
+                            kc.reopen_closed_pane.as_str(),
+                            "undo a close, conversation included",
+                        ),
                         ("Previous Tab", kc.prev_tab.as_str(), ""),
                         ("Next Tab", kc.next_tab.as_str(), ""),
                         ("Jump to Tab", "cmd+1-9", ""),
@@ -3023,7 +3034,8 @@ impl Renderer {
                 ("\u{2318}\u{2191}\u{2193}", "Move"),
                 ("\u{2318}\u{2190}\u{2192}", "Subject"),
                 ("\u{2318}\u{21e7}\u{2192}", "New subject"),
-                ("\u{23ce}/\u{2318}\u{232b}", "Rename/delete subject"),
+                ("n", "New pane"),
+                ("\u{23ce}/\u{2318}\u{232b}", "Rename/delete"),
                 ("c", "Subject color"),
                 ("b", "Bookmarks"),
                 ("m", "Memory"),
@@ -4566,6 +4578,7 @@ mod tests {
         PaneDrawKey {
             vp: [0.0, 0.0, 800.0, 600.0],
             is_focused: false,
+            dim_unfocused: true,
             outlined: false,
             show_blink: true,
             hover: None,

@@ -45,8 +45,12 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
   `{"ok":false,"error":"…"}`. Pipe it into `jq`.
 - Fields are validated strictly: a field a command does not accept fails the request
   (`unknown field "x" for command "y"`) instead of being ignored.
-- Build JSON with `jq -n --arg` when it carries text (quotes, newlines), never by string
-  concatenation.
+- The socket reads **one JSON command per line** and answers one line per command. Build JSON with
+  `jq -cn --arg` when it carries text (quotes, newlines), never by string concatenation — and keep
+  that `-c`: plain `jq -n` pretty-prints, so one intended command arrives as several lines, each of
+  which fails on its own (`invalid JSON: trailing characters`, one error per line) while the exit
+  status stays 0. Nothing runs and nothing says so. Same for any other pretty-printer
+  (`python3 -m json.tool`, `jq .`).
 - **The `kova` on the PATH is the app binary, not a control CLI.** Its only subcommand is
   `kova ask`; everything else goes through the socket. Older builds started a second Kova window
   for any other word, so never type `kova list-panes`.
@@ -56,13 +60,14 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 | Goal | Command |
 |---|---|
 | Split the focused pane | `{"cmd":"split","direction":"horizontal"}` (side by side, the default) or `"vertical"` (stacked) → `pane_id` |
-| New tab | `{"cmd":"new-tab","cwd":"/abs/path","command":"…"}` → `tab_id`, `pane_id` |
+| New tab | `{"cmd":"new-tab","cwd":"/abs/path","command":"…"}` → `tab_id`, `pane_id` (`command` is only **typed** at the prompt, without Enter, exactly like `split`: see the trap below) |
 | List panes / tabs | `{"cmd":"list-panes"}`, `{"cmd":"list-tabs"}` |
-| Read a pane's screen | `{"cmd":"get-pane-content","panes":[42],"mode":"visible"}` (the field is `panes`, a list or `"all"`, not `pane_id`; `mode` is `visible`, `scrollback` or `all`; the answer is `data.panes[]`, each `{id, text, cursor, cols, rows}` — and `{id, error:"not found"}` when the pane closed meanwhile, so read `text` through `.get`) |
+| Read a pane's screen | `{"cmd":"get-pane-content","panes":[42],"mode":"visible"}` (the field is `panes`, a list or `"all"`, not `pane_id`; `mode` is `visible`, `scrollback` or `all`; the answer is `{"ok":true,"data":{"panes":[ … ]}}`, where `data` is an object keyed `panes`, not the list — see [Reading `get-pane-content`](#reading-get-pane-content); each entry is `{id, text, cursor, cols, rows}`, or `{id, error:"not found"}` when the pane closed meanwhile, so read `text` through `.get`) |
 | Size before reading | `{"cmd":"count-pane-content","panes":"all","mode":"all"}` (responses have no cap) |
 | Type into a pane | `{"cmd":"send-keys","pane_id":42,"text":"make\n"}` (end with `\n` or it is typed, not run) |
 | Wait for the command | `{"cmd":"wait-for-completion","pane_id":42,"timeout_ms":300000}` |
 | Focus / close a pane | `{"cmd":"focus-pane","pane_id":42}`, `{"cmd":"close-pane","pane_id":42}` |
+| Undo a close | `{"cmd":"dispatch-action","action":"reopen-closed-pane"}` — puts the last closed pane back in its slot, its agent conversation resumed |
 | Resume a pane asleep since a relaunch, focus untouched | `{"cmd":"wake-pane","pane_id":42}` |
 | Layout | `resize-pane`, `swap-pane`, `merge-tab`, `merge-window`, `close-tab` |
 | Names and colors | `{"cmd":"rename-pane","pane_id":42,"title":"x"}` (the field is `title`, not `name`), `set-tab-title`, `set-tab-color` |
@@ -78,7 +83,14 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
   for everything else (`navigate-left`, `minimize-pane`, `repaint-pane`, `break-pane`…) and acts on
   the focused pane; some actions open an overlay that then waits for keyboard input (`rename-tab`,
   `open-search`, `merge-tab`, `open-pane-switcher`…).
-- The `command` field of `split` depends on the shell; `split` then `send-keys` is more reliable.
+- **`command` on `split` and `new-tab` is typed, never run.** The line waits at the new shell's
+  prompt for review, with no Enter (that is what `ask` relies on to leave a `claude --resume` line
+  on screen). Two consequences: the pane looks idle and holds no child process until you press it
+  yourself, and a `send-keys` sent next lands **on the same line** — a `command` of `claude` plus a
+  `send-keys` of `claude "summarise this"` gives `claudeclaude: command not found`. So either follow
+  it with `{"cmd":"send-keys","pane_id":N,"text":"\n"}`, or leave `command` out entirely and type
+  the whole line yourself with one `send-keys` ending in `\n`; that second pair is the more reliable
+  one, whatever the shell.
 - **`subscribe`** never gives the connection back: its answer is a snapshot (focus and every pane,
   the same objects as `list-panes`), then one JSON line per change (`focus`, `pane-status`,
   `pane-working`, `pane-open`, `pane-close`, `subjects` with the whole `list-subjects` list, and a
@@ -114,6 +126,26 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
   answers the pane commands, `subscribe` (same events; one tab per pane, `focus` follows the
   pane that has the keyboard in the host) and `notify` (handed to the host, which posts it; an
   error when the host registered no handler). Window, layout and `ask` commands are Kova.app's.
+
+## Reading `list-tabs`
+
+`data` is a flat list, and each entry carries exactly `id` (stable, for `close-tab`), `window`,
+`tab_index` (the position in that window's tab bar), `title`, `pane_count`, `focused_pane_id`,
+`active` (only the key window's tab), `has_bell`, `has_completion`, `has_running`. A tab has **no**
+`cwd`, `focused` or `index`: those are pane fields, and one tab's panes can sit in different
+directories — read `cwd` from `list-panes`.
+
+## Reading `get-pane-content`
+
+The answer is `{"ok": true, "data": {"panes": [ … ]}}`: here `data` is an **object keyed `panes`**,
+the opposite of `list-panes` just below, so iterating `data` itself yields the string `"panes"` and
+dies on `.get`. Each entry is `{id, text, cursor, cols, rows}`, or `{id, error}` for a pane that
+closed meanwhile:
+
+`printf '%s' '{"cmd":"get-pane-content","panes":[N],"mode":"visible"}' | nc -U "$KOVA_SOCKET" | python3 -c 'import json,sys; [print(p.get("text") or p.get("error")) for p in json.load(sys.stdin)["data"]["panes"]]'`
+
+`mode: "all"` is scrollback plus the grid. Neither of them holds the conversation of a pane whose
+app runs in the alternate screen (Claude Code): for that, see the "Read pane N" section below.
 
 ## Reading `list-panes`
 
@@ -188,7 +220,8 @@ over its panes, in a strip under the tab bar (only in a tab where a pane is file
 `subject` (its name, or `null`). `list-subjects` answers one entry per subject: `tab_id`,
 `window`, `tab_index`, `name`, `color` (tab palette index, drawn at random at creation, then kept),
 `pane_ids`, in the order `Cmd+P` draws the boxes (the user changes a color by right-clicking the band
-or pressing `c` on the header in `Cmd+P`); an empty subject
+or pressing `c` on the header in `Cmd+P`; `n` on the header or on a member opens a new pane in that
+box, where its columns end and in its first member's directory); an empty subject
 has `pane_ids: []`. A subject belongs to its tab: the same name in two tabs is two subjects, so
 `rename-subject` and `delete-subject` take the `tab_id` from `list-subjects`. `set-pane-subject`
 creates the subject in the pane's tab when the name is new (`created: true`). `delete-subject`

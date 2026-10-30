@@ -175,22 +175,30 @@ fn session_path() -> PathBuf {
 // Snapshot (save)
 // ---------------------------------------------------------------
 
+/// One pane as a snapshot saves it: where it stood, what it was running, and
+/// which agent conversation it held.
+///
+/// The conversation is read off the live process, so this must run while the
+/// pane's children are alive: Claude Code deletes its session file on exit, and
+/// a dead Codex no longer holds its transcript open — unreadable once the PTY
+/// is reaped. `will_terminate` saves before `shutdown_all` for the app, and the
+/// closed-pane undo records a pane before it is removed for the same reason.
+pub fn saved_pane(p: &Pane) -> SavedPane {
+    SavedPane {
+        cwd: p.cwd(),
+        last_command: p.last_command(),
+        custom_title: p.custom_title.clone(),
+        minimized: p.minimized,
+        title: p.osc_title(),
+        claude_session: None,
+        agent_session: session_to_save(crate::agent_session::for_shell(p.pty.pid()), p.unregistered_session()),
+        subject: p.subject.clone(),
+    }
+}
+
 fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
     SavedFlatColumn {
-        panes: col.panes.iter().map(|p| SavedPane {
-            cwd: p.cwd(),
-            last_command: p.last_command(),
-            custom_title: p.custom_title.clone(),
-            minimized: p.minimized,
-            title: p.osc_title(),
-            claude_session: None,
-            // Must run while the pane's children are alive: Claude Code deletes
-            // its session file on exit, and a dead Codex no longer holds its
-            // transcript open, so this is unreadable once the PTYs are reaped.
-            // `will_terminate` saves before `shutdown_all` for this.
-            agent_session: session_to_save(crate::agent_session::for_shell(p.pty.pid()), p.unregistered_session()),
-            subject: p.subject.clone(),
-        }).collect(),
+        panes: col.panes.iter().map(saved_pane).collect(),
         row_weights: col.row_weights.clone(),
         custom_row_weights: if col.custom_row_weights.iter().any(|&cw| cw) {
             Some(col.custom_row_weights.clone())
@@ -662,6 +670,17 @@ fn runs_on_launch(sp: &SavedPane) -> bool {
 
 fn is_plain_command(line: &str) -> bool {
     line.chars().all(|c| c == ' ' || c.is_ascii_alphanumeric() || "-_./=:,@+".contains(c))
+}
+
+/// The line a reopened pane comes back with, and whether Kova should press
+/// Enter on it rather than leave it waiting at the prompt.
+///
+/// Same rule as a restore at launch: only an agent's resume line runs by
+/// itself, and only when it is plain words. A bare shell pane gets its last
+/// command pre-typed and nothing else — Kova does not replay a command the user
+/// may not have meant to run again (a `rm`, a deploy).
+pub fn reopen_line(sp: &SavedPane) -> (Option<String>, bool) {
+    (restore_command(sp), runs_on_launch(sp))
 }
 
 /// Restore a flat column (v4 format).
@@ -1145,6 +1164,35 @@ mod tests {
             agent_session: None,
             subject: None,
         }
+    }
+
+    #[test]
+    fn a_reopened_pane_resumes_its_conversation_but_only_types_a_shell_command() {
+        // An agent pane: the resume line comes back and Kova presses Enter, so
+        // the conversation is there without a second gesture.
+        let mut agent = pane("/work/app");
+        agent.last_command = Some("omp".into());
+        agent.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Omp,
+            id: "01a17eab-44d5-7315-878f-1c81149f5013".into(),
+            config_dir: None,
+        });
+        let (line, run) = reopen_line(&agent);
+        assert_eq!(
+            line.as_deref(),
+            Some("omp --resume 01a17eab-44d5-7315-878f-1c81149f5013"),
+            "the conversation, not the last command"
+        );
+        assert!(run, "an agent resume line runs itself");
+
+        // A bare shell pane: its last command waits at the prompt. Kova does
+        // not re-run what the user may not have meant to run again, whatever
+        // the line is.
+        let mut shell = pane("/work/app");
+        shell.last_command = Some("npm run dev > /tmp/log".into());
+        let (line, run) = reopen_line(&shell);
+        assert_eq!(line.as_deref(), Some("npm run dev > /tmp/log"), "the last command is offered");
+        assert!(!run, "a pane with no conversation runs nothing");
     }
 
     #[test]
