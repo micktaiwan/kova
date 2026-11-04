@@ -690,6 +690,22 @@ impl Pty {
         Some(process_info(described_pid(fg_pgid, agent)))
     }
 
+    /// Hang up the job running in the foreground, leaving the shell alive: what
+    /// pausing a pane does to its agent. Same escalation as a closed pane
+    /// (`reap_foreground_job`: SIGHUP, then SIGKILL after `JOB_GRACE`), run on
+    /// its own thread so the UI does not wait out the grace. False when the
+    /// shell itself owns the terminal, and nothing was signalled.
+    pub fn hang_up_foreground_job(&self) -> bool {
+        if self.is_dummy {
+            return false;
+        }
+        let Some(pgid) = foreground_pgid(self.master_fd.as_raw_fd(), self.child_pid) else {
+            return false;
+        };
+        std::thread::spawn(move || reap_foreground_job(pgid));
+        true
+    }
+
     /// Returns the name of the foreground process if it differs from the shell
     /// (i.e. a command like vim, cargo, etc. is running).
     pub fn foreground_process_name(&self) -> Option<String> {

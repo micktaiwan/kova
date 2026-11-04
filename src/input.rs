@@ -82,7 +82,12 @@ pub fn key_bytes(
             TerminalAction::End => b"\x1b[F".to_vec(),
             TerminalAction::WordBack => b"\x1bb".to_vec(),
             TerminalAction::WordForward => b"\x1bf".to_vec(),
-            TerminalAction::ShiftEnter => b"\x1b[13;2u".to_vec(),
+            // Shift+Enter means "a newline without executing". CSI u only says
+            // that to a program that pushed the kitty protocol; one that did
+            // not reads it as typed text (`[13;2u`). It gets Ctrl+J instead,
+            // the newline every readline-style prompt already understands.
+            TerminalAction::ShiftEnter if kitty_flags & 1 != 0 => b"\x1b[13;2u".to_vec(),
+            TerminalAction::ShiftEnter => b"\n".to_vec(),
         };
     }
 
@@ -837,8 +842,8 @@ pub(crate) mod tests {
         c("cmd+right is end", "\u{F703}", "\u{F703}", K_RIGHT, "cmd", b"\x1b[F"),
         c("option+left is word back", "\u{F702}", "\u{F702}", K_LEFT, "alt", b"\x1bb"),
         c("option+right is word forward", "\u{F703}", "\u{F703}", K_RIGHT, "alt", b"\x1bf"),
-        c("shift+enter", "\r", "\r", K_RETURN, "shift", b"\x1b[13;2u"),
-        kitty(c("shift+enter wins over kitty", "\r", "\r", K_RETURN, "shift", b"\x1b[13;2u")),
+        c("shift+enter without kitty sends Ctrl+J, the newline", "\r", "\r", K_RETURN, "shift", b"\n"),
+        kitty(c("shift+enter is CSI u once the program pushes kitty", "\r", "\r", K_RETURN, "shift", b"\x1b[13;2u")),
         kitty(c("option+left wins over kitty", "\u{F702}", "\u{F702}", K_LEFT, "alt", b"\x1bb")),
         // Cmd without a terminal binding is left to performKeyEquivalent
         c("cmd+a sends nothing", "a", "a", K_A, "cmd", b""),

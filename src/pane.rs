@@ -2522,6 +2522,43 @@ mod tests {
         assert!(pane.is_working(), "the pane of a working Pi is busy");
     }
 
+    #[test]
+    fn a_foreground_probe_on_a_bare_shell_retracts_a_live_record_but_not_a_result() {
+        use crate::terminal::program_status::{ProgramState, ProgramStatus};
+        let (pane, _fd) = super::Pane::capture(10, 2);
+        let report = |state| {
+            pane.terminal.write().program_status =
+                Some(ProgramStatus { state: Some(state), app: Some("pi".into()), ..Default::default() });
+        };
+
+        report(ProgramState::Working);
+        pane.check_running(false);
+        assert!(pane.is_working(), "no probe, no verdict on the program");
+        assert!(!pane.check_running(true).fg_running);
+        assert!(!pane.is_working(), "a Pi killed mid-run is not busy");
+
+        report(ProgramState::Blocked);
+        pane.check_running(true);
+        assert_eq!(pane.terminal.read().program_status, None, "nor is it still blocked");
+
+        report(ProgramState::Done);
+        pane.check_running(true);
+        assert!(pane.terminal.read().program_status.is_some(), "the result still waits for the eye");
+    }
+
+    #[test]
+    fn background_shells_are_work_without_making_the_agent_busy() {
+        let (pane, _fd) = super::Pane::capture(10, 2);
+        assert!(!pane.has_background_work());
+        pane.set_agent_session(Some(claude_session()));
+        assert!(!pane.has_background_work(), "a Claude at rest with no shell");
+        let mut session = claude_session();
+        session.background_shells = true;
+        pane.set_agent_session(Some(session));
+        assert!(pane.has_background_work(), "closing this pane would kill the shells");
+        assert!(!pane.is_working(), "Cmd+J still sees an agent free to answer");
+    }
+
     fn claude_session() -> crate::agent_session::AgentSession {
         crate::agent_session::AgentSession {
             pid: None,
@@ -2530,6 +2567,7 @@ mod tests {
             name: None,
             peer_name: None,
             config_dir: None,
+            background_shells: false,
         }
     }
 
@@ -2552,6 +2590,7 @@ mod tests {
             name: None,
             peer_name: None,
             config_dir: None,
+            background_shells: false,
         }));
         assert_eq!(pane.last_claude_session_id().as_deref(), Some("claude-id"));
         // The next Claude conversation replaces it.
@@ -2562,6 +2601,7 @@ mod tests {
             name: None,
             peer_name: None,
             config_dir: None,
+            background_shells: false,
         }));
         assert_eq!(pane.last_claude_session_id().as_deref(), Some("next-id"));
         // A dead shell keeps it too.
@@ -2840,6 +2880,7 @@ mod tests {
             name: Some("premier nom".into()),
             peer_name: Some("leak".into()),
             config_dir: None,
+            background_shells: false,
         }));
         assert_eq!(pane.display_title("shell"), "premier nom");
         assert_eq!(pane.agent_session_name().as_deref(), Some("premier nom"));
@@ -2862,6 +2903,7 @@ mod tests {
             name: Some("Claude nommé".into()),
             peer_name: Some("Claude nommé".into()),
             config_dir: None,
+            background_shells: false,
         }));
         assert_eq!(pane.display_title("shell"), "Claude nommé");
         assert_eq!(pane.agent_session_name(), pane.claude_session_name());
@@ -2878,6 +2920,7 @@ mod tests {
             name: None,
             peer_name: Some("myproject-f1".into()),
             config_dir: None,
+            background_shells: false,
         }));
         assert_eq!(pane.claude_session_name(), None);
         assert_eq!(pane.claude_peer_name().as_deref(), Some("myproject-f1"));

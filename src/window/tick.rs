@@ -569,7 +569,8 @@ impl KovaView {
         let tabs = self.ivars().tabs.borrow();
         let Some(tab) = tabs.get(active_idx) else { return };
         for id in shown {
-            if tab.pane(id).is_some_and(|pane| pane.wake()) {
+            // A pane the user paused stays asleep on screen: only `p` wakes it.
+            if tab.pane(id).is_some_and(|pane| !pane.is_paused() && pane.wake()) {
                 log::info!("Restore: pane {} shown, resuming its agent", id);
             }
         }
@@ -989,7 +990,8 @@ impl KovaView {
                 let active_tab_name = tabs[active_idx].title();
                 // Count panes across every tab of this window whose app is busy —
                 // Claude Code's OSC-title spinner, or a `working` record from the
-                // Program Status Protocol (OSC 7501, what Pi sends).
+                // Program Status Protocol (OSC 7501, what Pi sends) — or whose
+                // agent rests at its prompt with background shells still running.
                 let mut working_agents = 0usize;
                 // Panes carrying output nobody has looked at: a bell, or a command
                 // that finished while the eye was elsewhere — the same signal as the
@@ -999,7 +1001,7 @@ impl KovaView {
                 let mut sleeping_panes = 0usize;
                 for t in tabs.iter() {
                     t.for_each_pane(&mut |p| {
-                        if p.is_working() { working_agents += 1; }
+                        if p.is_working() || p.has_background_work() { working_agents += 1; }
                         if p.dormant_session_id().is_some() { sleeping_panes += 1; }
                         let term = p.terminal.read();
                         if term.bell.load(std::sync::atomic::Ordering::Relaxed) || term.unread_completion() {

@@ -41,6 +41,9 @@ pub fn pane_json(
     // Kova.app's own: a library host has no subjects, and its panes carry no
     // such field.
     json["subject"] = serde_json::json!(pane.subject);
+    // Paused with `p` in Cmd+P: its conversation is in `dormant_session_id`,
+    // and showing the pane does not wake it. Kova.app only, like `subject`.
+    json["paused"] = serde_json::json!(pane.is_paused());
     json
 }
 
@@ -1057,7 +1060,7 @@ mod tests {
         assert_eq!(keys, [
             "agent", "agent_session_id", "agent_session_name", "awaiting", "awaiting_seen",
             "awaiting_since", "child_processes", "claude_config_dir", "claude_session_id", "claude_session_name",
-            "cwd", "dormant_session_id", "focused", "id", "is_idle", "minimized", "peer_name", "pid", "subject", "tab",
+            "cwd", "dormant_session_id", "focused", "id", "is_idle", "minimized", "paused", "peer_name", "pid", "subject", "tab",
             "title", "window", "working",
         ]);
         assert_eq!(v["subject"], serde_json::Value::Null, "a pane in no subject");

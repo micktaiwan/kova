@@ -1,9 +1,11 @@
-//! Index of past Claude Code and omp conversations, so the search palette can
+//! Index of past Claude Code, omp and tazu conversations, so the search palette can
 //! find a session that is no longer open in any pane and bring it back.
 //!
 //! Claude Code appends one JSON record per event to
 //! `~/.claude/projects/<slug>/<session-id>.jsonl`; omp writes its own journal
-//! under `~/.omp/agent/sessions/<bucket>/<created>_<id>.jsonl`. Those
+//! under `~/.omp/agent/sessions/<bucket>/<created>_<id>.jsonl`; Tazu
+//! (`~/projects/perso/tazu`) writes `<data dir>/sessions/<id>.jsonl`, with
+//! `~/.tazu` as the default data dir (`TAZU_HOME` moves it). Those
 //! transcripts are big (1.4 GB of Claude alone on this machine) and almost
 //! entirely tool output, so the index keeps only what a search needs: the
 //! prompts the user typed, the text of the agent's own replies, the project
@@ -423,7 +425,8 @@ fn index_file(path: &std::path::Path, len: u64, mtime: u64, entry: &mut IndexedS
     } else {
         entry.indexed_len
     };
-    let omp = entry.agent == Agent::Omp;
+    let tazu = entry.agent == Agent::Tazu;
+    let omp = entry.agent == Agent::Omp || tazu; // both journal a role-nested `message` record per turn
 
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -463,14 +466,17 @@ fn index_file(path: &std::path::Path, len: u64, mtime: u64, entry: &mut IndexedS
         }
         consumed += n as u64;
         let line = String::from_utf8_lossy(&buf);
-        if omp && omp_title_line(&line, entry) {
+        if tazu && tazu_title_line(&line, entry) {
+            continue;
+        }
+        if entry.agent == Agent::Omp && omp_title_line(&line, entry) {
             continue;
         }
         // A Claude line carries at most one of the two; an omp `message` record
         // is one or the other by its role. Both halves go in: the user's
         // questions under `text`, the agent's own words under `reply`.
         let (prompt, reply) = if omp {
-            match omp_message(&line) {
+            match if tazu { tazu_message(&line) } else { omp_message(&line) } {
                 Some((true, text)) => (
                     Some(Prompt {
                         text,
@@ -567,12 +573,49 @@ fn omp_title_line(line: &str, entry: &mut IndexedSession) -> bool {
     }
 }
 
-/// The text of an omp message record, and whether the user typed it. omp
+/// Tazu journal's `meta` (working directory) and `title` records. Returns true when the line was
+/// consumed, so it is not parsed as a prompt too.
+fn tazu_title_line(line: &str, entry: &mut IndexedSession) -> bool {
+    let meta = line.contains("\"type\": \"meta\"");
+    if !meta && !line.contains("\"type\": \"title\"") {
+        return false;
+    }
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    if meta {
+        if let Some(cwd) = record["cwd"].as_str() {
+            entry.cwd = cwd.to_string();
+        }
+        return true;
+    }
+    let title = record["title"].as_str().unwrap_or("").trim();
+    if title.is_empty() {
+        entry.title.clear();
+        entry.titled = false;
+    } else {
+        entry.title = title.to_string();
+        entry.titled = true;
+    }
+    true
+}
+
+/// The text of a role-nested message record, and whether the user typed it. omp
 /// persists ordinary turns as `type: "message"` with the role nested, like Pi,
 /// for both sides of the conversation; tool results carry the `toolResult` role
 /// and are skipped here.
 fn omp_message(line: &str) -> Option<(bool, String)> {
-    if !line.contains("\"type\":\"message\"") {
+    role_message(line, "\"type\":\"message\"")
+}
+
+/// The same record as Tazu journals it: Python's `json.dumps` puts a space after each colon, so the
+/// cheap gate differs; the shape is OpenAI's (`content` is a string, or null on a tool-calling turn).
+fn tazu_message(line: &str) -> Option<(bool, String)> {
+    role_message(line, "\"type\": \"message\"")
+}
+
+fn role_message(line: &str, gate: &str) -> Option<(bool, String)> {
+    if !line.contains(gate) {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -632,6 +675,7 @@ fn refresh(index: &mut Index) -> usize {
     let mut seen: Vec<String> = Vec::new();
     let mut changed = refresh_claude(index, &mut seen);
     changed += refresh_omp(index, &mut seen);
+    changed += refresh_tazu(index, &mut seen);
 
     // Drop entries whose transcript is gone, so a deleted conversation stops
     // showing up as something to resume.
@@ -721,6 +765,45 @@ fn refresh_omp(index: &mut Index, seen: &mut Vec<String>) -> usize {
         }
     }
     changed
+}
+
+/// Every conversation journal of Tazu, `<data dir>/sessions/<id>.jsonl`. A sub-agent's journal (its
+/// `meta` record names the conversation it ran for) is not a conversation to reopen and is left out.
+fn refresh_tazu(index: &mut Index, seen: &mut Vec<String>) -> usize {
+    let root = std::env::var_os("TAZU_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".tazu"))
+        .join("sessions");
+    let files = match std::fs::read_dir(&root) {
+        Ok(f) => f,
+        Err(e) => {
+            log::debug!("tazu history: no journals at {} ({})", root.display(), e);
+            return 0;
+        }
+    };
+    let mut changed = 0usize;
+    for file in files.flatten() {
+        let path = file.path();
+        let id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(crate::tazu_session::session_id_from_file_name);
+        let Some(id) = id else { continue };
+        if crate::tazu_session::resume_command(None, &id).is_none() || is_subagent_journal(&path) {
+            continue;
+        }
+        changed += index_one(index, seen, &file, &path, Agent::Tazu, id);
+    }
+    changed
+}
+
+/// True when the journal's first record says it belongs to a sub-agent run (`"subagent_of"`).
+fn is_subagent_journal(path: &std::path::Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut first = String::new();
+    BufReader::new(file).read_line(&mut first).is_ok() && first.contains("\"subagent_of\"")
 }
 
 /// Fold one transcript file into `index`, and record its path as still alive.
@@ -1105,6 +1188,53 @@ mod tests {
         let len = (slot.len() + header.len() + prompt.len() + rename.len() + clear.len()) as u64;
         assert!(index_file(&path, len, 30, &mut entry));
         assert_eq!(entry.title, "lis le parser");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_tazu_journal_is_indexed_as_python_writes_it() {
+        // Lines as `json.dumps` writes them (a space after each colon), from tazu/session.py.
+        let dir = std::env::temp_dir().join(format!("kova-tazu-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("20261101-132200-ab12.jsonl");
+        let lines = [
+            r#"{"type": "meta", "id": "20261101-132200-ab12", "cwd": "/Users/x/app", "model": "m", "created": "t"}"#,
+            r#"{"type": "message", "message": {"role": "user", "content": "lis le parser"}, "ts": "t"}"#,
+            r#"{"type": "message", "message": {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "Read", "arguments": "{}"}}]}, "ts": "t", "usage": {"prompt_tokens": 1}, "generation": {"id": "gen-1", "provider": "Together", "model": "m"}}"#,
+            r#"{"type": "message", "message": {"role": "tool", "tool_call_id": "c1", "content": "SECRET tool output"}, "ts": "t"}"#,
+            r#"{"type": "message", "message": {"role": "assistant", "content": "Le parser lit les jetons"}, "ts": "t"}"#,
+            r#"{"type": "title", "title": "Parser des jetons", "ts": "t"}"#,
+        ];
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+
+        let mut entry = IndexedSession {
+            agent: Agent::Tazu,
+            id: "20261101-132200-ab12".into(),
+            cwd: String::new(),
+            title: String::new(),
+            last_active: 0,
+            indexed_len: 0,
+            text: String::new(),
+            reply: String::new(),
+            prompts: 0,
+            fallback_title: String::new(),
+            titled: false,
+        };
+        assert!(index_file(&path, body.len() as u64, 10, &mut entry));
+        assert_eq!(entry.cwd, "/Users/x/app");
+        assert_eq!(entry.title, "Parser des jetons", "the journal's title record names the row");
+        assert_eq!(entry.text, "lis le parser\n");
+        assert_eq!(entry.reply, "le parser lit les jetons\n");
+        assert_eq!(entry.prompts, 1);
+        assert!(!entry.text.contains("secret") && !entry.reply.contains("secret"), "tool output stays out");
+        assert!(!is_subagent_journal(&path));
+
+        // A sub-agent run's journal is recognised by its first record and left out of the palette.
+        let child = dir.join("20261101-132300-cd34.jsonl");
+        std::fs::write(&child, "{\"type\": \"meta\", \"id\": \"x\", \"subagent_of\": \"20261101-132200-ab12\"}\n").unwrap();
+        assert!(is_subagent_journal(&child));
 
         std::fs::remove_dir_all(&dir).ok();
     }

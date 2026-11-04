@@ -86,6 +86,9 @@ fn agent_and_session(
     if let Some(id) = env("CLAUDE_CODE_SESSION_ID").filter(|id| is_safe_session_id(id)) {
         return (crate::agent_session::Agent::Claude, Some(id));
     }
+    if let Some(id) = env(crate::tazu_session::SESSION_ENV).filter(|id| is_safe_session_id(id)) {
+        return (crate::agent_session::Agent::Tazu, Some(id));
+    }
     let omps = env("OMPCODE").as_deref() == Some("1")
         || env("PI_SESSION_FILE").is_some_and(|path| path.contains("/.omp/"));
     if let Some(path) = env("PI_SESSION_FILE") {
@@ -1506,6 +1509,23 @@ mod tests {
         assert_eq!(evil.session_id, None);
         assert!(!is_safe_session_id("a\nb"));
         assert!(!is_safe_session_id(""));
+    }
+
+    #[test]
+    fn a_tazu_child_names_its_agent_and_conversation_from_tazu_session_id() {
+        let tazu = |k: &str| match k {
+            "TAZU_SESSION_ID" => Some("20261101-132200-ab12".to_string()),
+            _ => None,
+        };
+        let asker = Asker::from_env(tazu, None, "/w");
+        assert_eq!(asker.agent, crate::agent_session::Agent::Tazu);
+        assert_eq!(asker.session_id.as_deref(), Some("20261101-132200-ab12"));
+        assert_eq!(
+            resume_line(crate::agent_session::Agent::Tazu, "20261101-132200-ab12", "ok").as_deref(),
+            Some("tazu --resume 20261101-132200-ab12 'ok'")
+        );
+        let odd = |k: &str| (k == "TAZU_SESSION_ID").then(|| "a;b c".to_string());
+        assert_eq!(Asker::from_env(odd, None, "/w").session_id, None);
     }
 
     #[test]

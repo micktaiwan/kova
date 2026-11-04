@@ -113,6 +113,18 @@ pub struct SavedPane {
     /// The subject of its tab the pane is filed under (`Pane::subject`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// The user had paused this pane (`p` in Cmd+P): it comes back with its
+    /// conversation asleep, and showing it does not wake it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<SavedPause>,
+}
+
+/// A paused pane, as the session file keeps it (`SavedPane::paused`).
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct SavedPause {
+    /// The name the pane had when it was paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// The conversation a pane was holding, and which agent to hand it back to.
@@ -193,6 +205,7 @@ pub fn saved_pane(p: &Pane) -> SavedPane {
         claude_session: None,
         agent_session: session_to_save(crate::agent_session::for_shell(p.pty.pid()), p.unregistered_session()),
         subject: p.subject.clone(),
+        paused: p.is_paused().then(|| SavedPause { title: p.paused_title() }),
     }
 }
 
@@ -668,7 +681,7 @@ fn runs_on_launch(sp: &SavedPane) -> bool {
     agent_resume_line(sp).is_some_and(|line| is_plain_command(&line))
 }
 
-fn is_plain_command(line: &str) -> bool {
+pub(crate) fn is_plain_command(line: &str) -> bool {
     line.chars().all(|c| c == ' ' || c.is_ascii_alphanumeric() || "-_./=:,@+".contains(c))
 }
 
@@ -681,6 +694,22 @@ fn is_plain_command(line: &str) -> bool {
 /// may not have meant to run again (a `rm`, a deploy).
 pub fn reopen_line(sp: &SavedPane) -> (Option<String>, bool) {
     (restore_command(sp), runs_on_launch(sp))
+}
+
+/// Leave a restored pane's conversation asleep where it should be: a pane the
+/// user had paused stays paused, at launch or reopened with Cmd+O alike; any
+/// other agent sleeps until shown, at launch only, when Kova may run its line.
+fn restore_sleep(pane: &Pane, sp: &SavedPane, at_launch: bool) {
+    let Some(session) = saved_agent_session(sp) else { return };
+    if agent_resume_line(sp).is_none() {
+        return;
+    }
+    if let Some(pause) = sp.paused.as_ref() {
+        pane.sleep_until_shown(session);
+        pane.set_paused(pause.title.clone(), runs_on_launch(sp));
+    } else if at_launch && runs_on_launch(sp) {
+        pane.sleep_until_shown(session);
+    }
 }
 
 /// Restore a flat column (v4 format).
@@ -708,11 +737,7 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
             }
             term.title = sp.title.clone();
         }
-        if at_launch && runs_on_launch(sp) {
-            if let Some(session) = saved_agent_session(sp) {
-                pane.sleep_until_shown(session);
-            }
-        }
+        restore_sleep(&pane, sp, at_launch);
         pane.custom_title = sp.custom_title.clone();
         pane.minimized = sp.minimized;
         pane.subject = sp.subject.clone();
@@ -1163,6 +1188,7 @@ mod tests {
             claude_session: None,
             agent_session: None,
             subject: None,
+            paused: None,
         }
     }
 
@@ -1256,6 +1282,7 @@ mod tests {
             name: None,
             peer_name: None,
             config_dir: None,
+            background_shells: false,
         };
         assert_eq!(
             session_to_save(Some(live), asleep).unwrap().id,
@@ -1434,6 +1461,20 @@ mod tests {
             active_tab: 0,
             frame: None,
         }
+    }
+
+    #[test]
+    fn a_paused_pane_is_saved_paused_with_its_name_and_others_say_nothing() {
+        let mut sp = pane("/p");
+        sp.paused = Some(SavedPause { title: Some("Fix the parser".into()) });
+        let json = serde_json::to_string(&sp).unwrap();
+        let back: SavedPane = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.paused, Some(SavedPause { title: Some("Fix the parser".into()) }));
+
+        let plain = serde_json::to_string(&pane("/p")).unwrap();
+        assert!(!plain.contains("paused"), "a pane never paused writes no key: {plain}");
+        let old: SavedPane = serde_json::from_str(r#"{"cwd":"/p"}"#).unwrap();
+        assert_eq!(old.paused, None, "a file written before pauses reads as not paused");
     }
 
     fn pi_pane(cwd: &str, id: &str) -> SavedPane {

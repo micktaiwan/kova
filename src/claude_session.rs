@@ -71,6 +71,10 @@ pub struct Session {
     /// points Claude Code at another account or a proxy) registers there, and
     /// `claude --resume` from the default dir would not find its transcript.
     pub config_dir: Option<String>,
+    /// Background shells are still running: Claude Code sits at its prompt with
+    /// no spinner in the title, yet closing the pane would kill that work. The
+    /// file's `status` says `shell` then, where it says `idle` once they end.
+    pub background_shells: bool,
 }
 
 /// The session registries to scan, each with the config dir it belongs to:
@@ -173,6 +177,7 @@ fn parse_session_file(data: &str) -> Option<(u32, u64, Session)> {
         .filter(|n| !n.is_empty())
         .map(str::to_string);
     let name = peer_name.clone().filter(|_| !derived);
+    let background_shells = json.get("status").and_then(|v| v.as_str()) == Some("shell");
     Some((
         pid,
         started_at,
@@ -182,6 +187,7 @@ fn parse_session_file(data: &str) -> Option<(u32, u64, Session)> {
             name,
             peer_name,
             config_dir: None,
+            background_shells,
         },
     ))
 }
@@ -576,6 +582,19 @@ mod tests {
         assert_eq!(started_at, 1786280230); // milliseconds → seconds
         assert_eq!(session.id, "430e0c8f");
         assert_eq!(session.name.as_deref(), Some("images"));
+    }
+
+    #[test]
+    fn only_the_shell_status_reports_background_shells() {
+        let with = |status: &str| {
+            let data = format!(r#"{{"pid":1,"sessionId":"abc","startedAt":1000,"status":"{status}"}}"#);
+            parse_session_file(&data).unwrap().2.background_shells
+        };
+        assert!(with("shell"));
+        assert!(!with("idle"));
+        assert!(!with("busy"));
+        let no_status = r#"{"pid":1,"sessionId":"abc","startedAt":1000}"#;
+        assert!(!parse_session_file(no_status).unwrap().2.background_shells);
     }
 
     #[test]

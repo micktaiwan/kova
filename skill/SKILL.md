@@ -1,12 +1,14 @@
 ---
 name: kova
-description: "Drive Kova, a native macOS terminal (Rust + Metal), from Claude Code: open a split or a tab and run a command in it, list panes and the Claude Code, Codex, Pi or omp sessions they hold, read a pane (its whole conversation, not just the screen), send keys, wait for a command to finish, trigger any keyboard shortcut, follow focus changes, post a notification, ask the user a question on a card. Use when: 'open a pane', 'new tab', 'run X in another pane', 'split', 'list the panes', 'read pane N', 'merge pane N', 'what is running in my terminal', 'ask me when you need an answer', or when a task needs a terminal the user can see."
+description: "Drive Kova, a native macOS terminal (Rust + Metal), from Claude Code: open a split or a tab and run a command in it, list panes and the Claude Code, Codex, Pi, omp or tazu sessions they hold, read a pane (its whole conversation, not just the screen), send keys, wait for a command to finish, trigger any keyboard shortcut, follow focus changes, post a notification, ask the user a question on a card. Use when: 'open a pane', 'new tab', 'run X in another pane', 'split', 'list the panes', 'read pane N', 'merge pane N', 'what is running in my terminal', 'ask me when you need an answer', or when a task needs a terminal the user can see."
 ---
 
 # Kova — a scriptable terminal
 
 Kova is a macOS terminal with tabs and splits. Every running Kova listens on a Unix socket and
-accepts one JSON command per line. This skill lives in the kova repo (`skill/`).
+accepts one JSON command per line. This skill lives in this repo's `skill/` directory, and
+`~/.claude/skills/kova` is a symlink **to that directory** — so the file is
+`~/.claude/skills/kova/SKILL.md`, never `~/.claude/skills/kova/skill/…` (that path does not exist).
 
 **If a `LOCAL.md` sits next to this file, read it first.** It carries what is specific to the
 machine and its user: names, habits, working rules. It is excluded from git.
@@ -163,13 +165,20 @@ Each pane carries `id`, `window`, `tab`, `cwd`, `title`, `focused`, `pid`, `chil
   client walking waiting panes must honor `awaiting_seen`, or it offers panes already read.
   `awaiting` shows nowhere in Kova's UI: it is an IPC field. What `Cmd+J`, the switcher's `Tab`
   and the `●N` counter walk is unread output (a bell, a finished command).
-- `agent` (`"claude"`, `"codex"`, `"pi"`, `"omp"` or `null` for a bare shell), `agent_session_id`
+- `agent` (`"claude"`, `"codex"`, `"pi"`, `"omp"`, `"tazu"` or `null` for a bare shell), `agent_session_id`
   and `agent_session_name`: the conversation in the pane, whatever the agent. For Codex the name
   comes from `~/.codex/session_index.jsonl`; for Pi it is the title Pi shows in `/resume` — the
   latest `/name`, else the first message of the conversation — read from the transcript. omp's name
   is its `type: "title"` slot, else the latest `/rename`, else the first message. A Codex session
   resumes with `codex resume <id>`, a Pi one with `pi --session <id>`, an omp one with
-  `omp --resume <id>`, and none is reachable through `ListAgents` / `SendMessage`. Pi writes no file
+  `omp --resume <id>`, a Tazu one (Mickael's own agent, `~/projects/perso/tazu`) with
+  `tazu --resume <id>`, and none is reachable through `ListAgents` / `SendMessage`. Tazu
+  is a Python program, so Kova recognises it by its arguments (`…/bin/tazu` or
+  `-m tazu`) and names its conversation exactly like omp, through the journal
+  (`<data dir>/sessions/<id>.jsonl`, `~/.tazu` by default) it holds open for writing; its name is
+  the latest `{"type":"title"}` entry, else the first message. Its commands carry `TAZU_SESSION_ID`,
+  which is how `kova ask` finds the conversation. Closed Tazu conversations are searchable in
+  Cmd+P like the others (a sub-agent run's journal is left out). Pi writes no file
   per process: its conversation is matched by directory and start time, so two `pi` panes that
   resumed older conversations in the same directory can come out identical — when the snapshot
   hands both the same id, both keep their last command and come back as a bare `pi`. A `pi` started
@@ -184,7 +193,7 @@ Each pane carries `id`, `window`, `tab`, `cwd`, `title`, `focused`, `pid`, `chil
   that conversation (`recover_agent_sessions_by_title` in `session.rs`). A title two conversations
   share names neither.
 - `claude_session_id` (what `claude --resume` takes) and `claude_session_name` (the `/rename`
-  name, `null` until there is one): Claude only, `null` on a Codex, Pi or omp pane so that a client
+  name, `null` until there is one): Claude only, `null` on a Codex, Pi, omp or tazu pane so that a client
   passing it to `claude --resume` never gets an id Claude cannot open. **This id is the only
   identifier that outlives the pane**: the pane id dies with its tab, and a directory is shared by
   every conversation of the same repo. Key on it (`agent_session_id` for the other agents).
@@ -192,13 +201,16 @@ Each pane carries `id`, `window`, `tab`, `cwd`, `title`, `focused`, `pid`, `chil
   shows. To talk to a pane's session, take its `peer_name` and pass it as is to `SendMessage`,
   never `send-keys` (typed text is not submitted the way a message is). It carries the name Claude
   Code derived from the directory even before any `/rename`, which `claude_session_name` does not.
-  `null` for Codex, Pi, omp, and for a pane without Claude.
+  `null` for Codex, Pi, omp, tazu, and for a pane without Claude.
 - `dormant_session_id`: **after a Kova relaunch, a restored agent resumes only once its pane is
   on screen in the active tab** (or on `wake-pane`). Until then the pane is a bare shell with this
   field set, and `agent`, the session ids and `peer_name` are `null`: the session is not in
   `ListAgents`, so `SendMessage` cannot reach it. To talk to it, `wake-pane` first, then wait for
   its `peer_name` in `list-panes`. Never `send-keys` into a sleeping pane: it cancels the resume
   for good and leaves a bare shell.
+- `paused`: the user paused this pane (`p` in Cmd+P) to free what its agent held. Its conversation
+  is in `dormant_session_id` and it is **not** woken by being shown, nor by a relaunch. Leave it
+  paused: `wake-pane` resumes it, so only do that when the user asks for that conversation.
 
 **Kova can restart under a running session, and pane ids do not survive it.** The user relaunches
 it (after a build, for instance) while sessions run in its panes; the tabs come back, but every
@@ -317,7 +329,7 @@ action, or `action: text` when the user typed something.
 - Exit 0: answered. Exit 2: no answer within the timeout (540 s by default inside a Claude Code
   conversation); **end your turn**: Kova delivers the late answer to the conversation itself, typed
   into its pane, after a routine still running there, or by reopening it in a new tab with the
-  agent's own resume line (`claude --resume`, `codex resume`, `pi --session` or `omp --resume`).
+  agent's own resume line (`claude --resume`, `codex resume`, `pi --session`, `omp --resume` or `tazu --resume`).
   It arrives as a message starting with `[Kova] The user answered your question`.
 - Exit 3: the user answered in the conversation instead, and the card was withdrawn (a
   `UserPromptSubmit` hook runs `kova ask --withdraw --session -`). Their message is the answer:

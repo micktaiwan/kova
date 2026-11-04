@@ -1,9 +1,9 @@
 //! One face for the coding agents a pane can be running — Claude Code, Codex
-//! and Pi, plus omp — so everything downstream (pane title, Cmd+J, session
+//! and Pi, plus omp and Tazu — so everything downstream (pane title, Cmd+J, session
 //! restore, IPC) treats them alike instead of knowing only about Claude.
 //!
 //! The per-agent detection stays in `claude_session`, `codex_session`,
-//! `pi_session` and `omp_session`: they find a live session in completely
+//! `pi_session`, `omp_session` and `tazu_session`: they find a live session in completely
 //! different ways (a file per process on one side, the open transcript of a
 //! process on the other, the start time of a process against the names of its
 //! session files elsewhere).
@@ -19,6 +19,7 @@ pub enum Agent {
     Codex,
     Pi,
     Omp,
+    Tazu,
 }
 
 impl Default for Agent {
@@ -35,6 +36,7 @@ impl Agent {
             Agent::Codex => "codex",
             Agent::Pi => "pi",
             Agent::Omp => "omp",
+            Agent::Tazu => "tazu",
         }
     }
 
@@ -45,6 +47,7 @@ impl Agent {
             Agent::Codex => "Codex",
             Agent::Pi => "Pi",
             Agent::Omp => "Omp",
+            Agent::Tazu => "Tazu",
         }
     }
 }
@@ -68,6 +71,9 @@ pub struct AgentSession {
     /// Claude only: the session's `CLAUDE_CONFIG_DIR` when it is not the
     /// default one (`claude_session::Session::config_dir`).
     pub config_dir: Option<String>,
+    /// Claude only: shells the session started in the background are still
+    /// running (`claude_session::Session::background_shells`).
+    pub background_shells: bool,
 }
 
 /// The agent session running under `shell_pid`, if any.
@@ -84,6 +90,7 @@ pub fn for_shell(shell_pid: u32) -> Option<AgentSession> {
             name: s.name,
             peer_name: s.peer_name,
             config_dir: s.config_dir,
+            background_shells: s.background_shells,
         });
     }
     if let Some(s) = crate::codex_session::for_shell(shell_pid) {
@@ -94,6 +101,7 @@ pub fn for_shell(shell_pid: u32) -> Option<AgentSession> {
             name: s.name,
             peer_name: None,
             config_dir: None,
+            background_shells: false,
         });
     }
     if let Some(s) = crate::omp_session::for_shell(shell_pid) {
@@ -104,6 +112,18 @@ pub fn for_shell(shell_pid: u32) -> Option<AgentSession> {
             name: s.name,
             peer_name: None,
             config_dir: None,
+            background_shells: false,
+        });
+    }
+    if let Some(s) = crate::tazu_session::for_shell(shell_pid) {
+        return Some(AgentSession {
+            agent: Agent::Tazu,
+            pid: None,
+            id: s.id,
+            name: s.name,
+            peer_name: None,
+            config_dir: None,
+            background_shells: false,
         });
     }
     let s = crate::pi_session::for_shell(shell_pid)?;
@@ -114,6 +134,7 @@ pub fn for_shell(shell_pid: u32) -> Option<AgentSession> {
         name: s.name,
         peer_name: None,
         config_dir: None,
+        background_shells: false,
     })
 }
 
@@ -134,6 +155,7 @@ pub fn resume_command(
         Agent::Codex => crate::codex_session::resume_command(session_id),
         Agent::Pi => crate::pi_session::resume_command(last_command, session_id),
         Agent::Omp => crate::omp_session::resume_command(last_command, session_id),
+        Agent::Tazu => crate::tazu_session::resume_command(last_command, session_id),
     }
 }
 
@@ -159,6 +181,10 @@ mod tests {
             resume_command(Agent::Omp, id, Some("omp"), None).as_deref(),
             Some("omp --resume 01a07651-015e-78a3-97f2-2eaf0f0cd663")
         );
+        assert_eq!(
+            resume_command(Agent::Tazu, "20261101-132200-ab12", Some("tazu"), None).as_deref(),
+            Some("tazu --resume 20261101-132200-ab12")
+        );
     }
 
     #[test]
@@ -167,14 +193,28 @@ mod tests {
         assert!(resume_command(Agent::Codex, "id\nrm -rf ~", None, None).is_none());
         assert!(resume_command(Agent::Pi, "id\nrm -rf ~", None, None).is_none());
         assert!(resume_command(Agent::Omp, "id\nrm -rf ~", None, None).is_none());
+        assert!(resume_command(Agent::Tazu, "id\nrm -rf ~", None, None).is_none());
     }
 
     #[test]
     fn the_agent_name_round_trips_through_the_session_file() {
-        for agent in [Agent::Claude, Agent::Codex, Agent::Pi, Agent::Omp] {
+        for agent in [Agent::Claude, Agent::Codex, Agent::Pi, Agent::Omp, Agent::Tazu] {
             let json = serde_json::to_string(&agent).unwrap();
             assert_eq!(json, format!("\"{}\"", agent.as_str()));
             assert_eq!(serde_json::from_str::<Agent>(&json).unwrap(), agent);
         }
+    }
+}
+
+#[cfg(test)]
+mod live_probe {
+    /// Measures the real path on a live pane: the status bar's signal, as Kova
+    /// reads it from the session registry. Needs a pane's shell pid.
+    #[test]
+    #[ignore = "needs KOVA_SHELL_PID, the shell of a pane running Claude Code"]
+    fn prints_what_a_live_pane_reports() {
+        let pid: u32 = std::env::var("KOVA_SHELL_PID").unwrap().parse().unwrap();
+        let session = super::for_shell(pid).expect("an agent session under this shell");
+        println!("agent={:?} background_shells={}", session.agent, session.background_shells);
     }
 }

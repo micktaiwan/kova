@@ -599,6 +599,31 @@ pub(super) struct PaneSwitcherState {
     pub(super) attention: Vec<(PaneId, bool, bool)>,
 }
 
+/// What a paused pane's row shows where the running binary would be.
+const PAUSED_LABEL: &str = "paused";
+
+/// What the row says after `p`: the pause or resume that happened, or why
+/// nothing did. Toggles on `paused`, so a paused pane is resumed, never paused
+/// twice.
+fn pause_toggle_label(
+    paused: bool,
+    pause: impl FnOnce() -> Result<(), crate::surface::PauseRefusal>,
+    resume: impl FnOnce() -> Result<(), crate::surface::ResumeRefusal>,
+) -> &'static str {
+    if paused {
+        match resume() {
+            Ok(()) => "resuming",
+            Err(crate::surface::ResumeRefusal::Busy) => "shell busy, not resumed",
+            Err(crate::surface::ResumeRefusal::NotPaused) => "nothing to resume",
+        }
+    } else {
+        match pause() {
+            Ok(()) => PAUSED_LABEL,
+            Err(refusal) => refusal.label(),
+        }
+    }
+}
+
 /// The dim right-hand half of a bookmark row: the agent holding the
 /// conversation. The directory is not repeated here — it is the header of the
 /// group the row sits in. `None` for a bookmarked shell.
@@ -1057,7 +1082,11 @@ impl KovaView {
                         )
                     };
                     let title = pane.display_title("shell");
-                    let mut process = switcher_process_label(pane.fg_process().as_ref(), &title);
+                    let mut process = if pane.is_paused() {
+                        Some(PAUSED_LABEL.to_string())
+                    } else {
+                        switcher_process_label(pane.fg_process().as_ref(), &title)
+                    };
                     // Probed only for the memory list: a process-tree walk per
                     // pane is not worth paying on every Cmd+P.
                     let memory = memory_view.then(|| pane.pty.tree_resident_bytes());
@@ -1375,6 +1404,16 @@ impl KovaView {
             self.pane_switcher_new_pane_in_subject();
             return;
         }
+        // `p` on a pane row: pause its agent, or resume the paused one (see
+        // `pane_switcher_toggle_pause`). On every list, read from the typed
+        // letter (AZERTY), and with no modifier: Cmd+P itself lands here.
+        if !flags.intersects(
+            NSEventModifierFlags::Command | NSEventModifierFlags::Option | NSEventModifierFlags::Control,
+        ) && unmodified.as_deref().is_some_and(|c| c.eq_ignore_ascii_case("p"))
+        {
+            self.pane_switcher_toggle_pause();
+            return;
+        }
         if subjects_shown
             && cmd_only
             && (keycode == 0x7C || keycode == 0x7B)
@@ -1630,6 +1669,28 @@ impl KovaView {
     }
 
     /// The pane on the selected switcher row, if the selection is on one.
+    /// `p` on the selected pane row: pause the agent in it, or resume the one
+    /// paused there. Nothing is asked — a pane whose agent is working is
+    /// simply not paused — so the row says what happened instead, in place of
+    /// the binary it showed, and the list stays open on it.
+    fn pane_switcher_toggle_pause(&self) {
+        let Some(pane_id) = self.pane_switcher_selected_pane() else { return };
+        let outcome = {
+            let tabs = self.ivars().tabs.borrow();
+            let Some(pane) = tabs.iter().find_map(|t| t.pane(pane_id)) else { return };
+            pause_toggle_label(pane.is_paused(), || pane.pause(), || pane.resume_paused())
+        };
+        if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
+            if let Some(SwitcherRow::Pane { process, working, .. }) =
+                state.columns.get_mut(state.selected_col).and_then(|c| c.get_mut(state.selected_row))
+            {
+                *process = Some(outcome.to_string());
+                *working = false;
+            }
+        }
+        self.mark_dirty();
+    }
+
     fn pane_switcher_selected_pane(&self) -> Option<PaneId> {
         let guard = self.ivars().pane_switcher.borrow();
         match guard.as_ref().and_then(|s| s.columns.get(s.selected_col).and_then(|c| c.get(s.selected_row))) {
@@ -2119,6 +2180,17 @@ impl KovaView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p_pauses_a_running_pane_and_resumes_a_paused_one() {
+        use crate::surface::{PauseRefusal, ResumeRefusal};
+        let never_resume = || -> Result<(), ResumeRefusal> { panic!("a running pane is paused, not resumed") };
+        let never_pause = || -> Result<(), PauseRefusal> { panic!("a paused pane is resumed, not paused twice") };
+        assert_eq!(pause_toggle_label(false, || Ok(()), never_resume), "paused");
+        assert_eq!(pause_toggle_label(false, || Err(PauseRefusal::Working), never_resume), "working, not paused");
+        assert_eq!(pause_toggle_label(true, never_pause, || Ok(())), "resuming");
+        assert_eq!(pause_toggle_label(true, never_pause, || Err(ResumeRefusal::Busy)), "shell busy, not resumed");
+    }
 
     /// Build a switcher grid from a compact spec: one string per column, one
     /// char per row — 'h' header, '.' plain pane, 'b' pane with a pending bell,

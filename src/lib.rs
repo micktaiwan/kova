@@ -21,6 +21,7 @@ mod closed_pane;
 mod codex_session;
 mod embed;
 mod events;
+mod tazu_session;
 mod input;
 mod ipc;
 mod keybindings;

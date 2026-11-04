@@ -2056,7 +2056,8 @@ impl Renderer {
 
             // Number of panes whose app is actively working — Claude Code's
             // spinner in the OSC title, or a `working` record from the Program
-            // Status Protocol (Pi's way in). Hidden when none are busy.
+            // Status Protocol (Pi's way in), or background shells of a Claude
+            // Code session at its prompt. Hidden when none are busy.
             if working_agents > 0 {
                 let agents_str = format!("\u{2733}{}", working_agents);
                 let agents_w = agents_str.chars().count() as f32 * cell_w;
@@ -2075,7 +2076,7 @@ impl Renderer {
                     bar_y,
                     agents_w,
                     cell_h,
-                    "Panes working right now (Claude Code's spinner or a program's OSC 7501 status)",
+                    "Panes with work in progress (Claude Code's spinner or background shells, or a program's OSC 7501 status)",
                 );
             }
 
@@ -3005,6 +3006,7 @@ impl Renderer {
             &[
                 ("\u{2191}\u{2193}\u{2190}\u{2192}", "Navigate"),
                 ("\u{23ce}", "Focus"),
+                ("p", "Pause/resume"),
                 ("u", "All panes"),
                 ("esc", "Cancel"),
             ]
@@ -3012,6 +3014,7 @@ impl Renderer {
             &[
                 ("\u{2191}\u{2193}\u{2190}\u{2192}", "Navigate"),
                 ("\u{23ce}", "Focus"),
+                ("p", "Pause/resume"),
                 ("m", "Open panes"),
                 ("b", "Bookmarks"),
                 ("esc", "Cancel"),
@@ -3035,6 +3038,7 @@ impl Renderer {
                 ("\u{2318}\u{2190}\u{2192}", "Subject"),
                 ("\u{2318}\u{21e7}\u{2192}", "New subject"),
                 ("n", "New pane"),
+                ("p", "Pause/resume"),
                 ("\u{23ce}/\u{2318}\u{232b}", "Rename/delete"),
                 ("c", "Subject color"),
                 ("b", "Bookmarks"),
@@ -5606,7 +5610,7 @@ mod vertex_snapshots {
         let (idle_bar, idle_zones) = bar(&mut r, 0);
         let (working_bar, working_zones) = bar(&mut r, 1);
         let (busy_bar, _) = bar(&mut r, 2);
-        let working_zone = "Panes working right now";
+        let working_zone = "Panes with work in progress";
         assert!(
             !idle_zones.iter().any(|t| t.starts_with(working_zone)),
             "nothing busy, nothing shown"

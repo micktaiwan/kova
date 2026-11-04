@@ -130,6 +130,7 @@ mod tests {
             claude_session: None,
             agent_session: None,
             subject: None,
+            paused: None,
         }
     }
 

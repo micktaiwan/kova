@@ -1099,6 +1099,7 @@ fn handle_ipc_set_anchor(
                 Some("codex") => Some(crate::agent_session::Agent::Codex),
                 Some("pi") => Some(crate::agent_session::Agent::Pi),
                 Some("omp") => Some(crate::agent_session::Agent::Omp),
+                Some("tazu") => Some(crate::agent_session::Agent::Tazu),
                 _ => None,
             },
             label,
