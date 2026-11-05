@@ -53,6 +53,9 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
   which fails on its own (`invalid JSON: trailing characters`, one error per line) while the exit
   status stays 0. Nothing runs and nothing says so. Same for any other pretty-printer
   (`python3 -m json.tool`, `jq .`).
+- When a `jq` filter over `list-panes` needs the pane's own field inside a sub-expression (e.g. its
+  index in the tab's id list), bind it first: `.data as $d | [$d[]|select(.tab==0)|.id] as $o | $d[] | . as $p | {id, pos:($o|index($p.id))}`.
+  A bare `index(.id)` resolves `.id` against the array `$o`, not the pane (`Cannot index array with string "id"`).
 - **The `kova` on the PATH is the app binary, not a control CLI.** Its only subcommand is
   `kova ask`; everything else goes through the socket. Older builds started a second Kova window
   for any other word, so never type `kova list-panes`.
