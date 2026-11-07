@@ -75,6 +75,7 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 | Undo a close | `{"cmd":"dispatch-action","action":"reopen-closed-pane"}` — puts the last closed pane back in its slot, its agent conversation resumed |
 | Resume a pane asleep since a relaunch, focus untouched | `{"cmd":"wake-pane","pane_id":42}` |
 | Layout | `resize-pane`, `swap-pane`, `merge-tab`, `merge-window`, `close-tab` |
+| Move a pane (put a stacked pane on the right, change its tab) | no direct command: `focus-pane` → `break-pane` → `merge-tab`, see [Moving a pane](#moving-a-pane-stacked--right-or-into-another-tab) |
 | Names and colors | `{"cmd":"rename-pane","pane_id":42,"title":"x"}` (the field is `title`, not `name`), `set-tab-title`, `set-tab-color` |
 | Any keyboard shortcut | `{"cmd":"dispatch-action","action":"equalize"}` |
 | Notify, the click focuses the pane | `{"cmd":"notify","pane_id":42,"title":"Claude Code","message":"done"}` |
@@ -131,6 +132,23 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
   answers the pane commands, `subscribe` (same events; one tab per pane, `focus` follows the
   pane that has the keyboard in the host) and `notify` (handed to the host, which posts it; an
   error when the host registered no handler). Window, layout and `ask` commands are Kova.app's.
+
+## Moving a pane (stacked → right, or into another tab)
+
+There is no `move-pane` command, and `split` has no "redo in the other direction". The move is
+three existing commands, and the pane keeps its process (`do_break_pane` in
+`src/window/tabs.rs` extracts the pane as it is, nothing is killed):
+
+1. `{"cmd":"focus-pane","pane_id":N}` — `break-pane` acts on the focused pane.
+2. `{"cmd":"dispatch-action","action":"break-pane"}` — N leaves for a new tab of its own, which
+   becomes the active one. Its `id` is the entry with `"active": true` in `list-tabs`.
+3. `{"cmd":"merge-tab","source_tab_id":<that id>,"target_tab_id":<destination tab id>}` — the
+   source's columns are **appended to the right** of the destination (`merge_active_tab_into`,
+   `tabs.rs`), so N comes back as the rightmost full-height column. There is no way to land it
+   left or below: for that, follow with `swap-pane`.
+
+Then `focus-pane` back on the pane the user was in, or the move leaves the keyboard on N. The
+destination tab id is the `id` in `list-tabs` (`list-panes` only gives `tab`, an index).
 
 ## Reading `list-tabs`
 
