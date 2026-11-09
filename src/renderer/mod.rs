@@ -124,6 +124,21 @@ const ANCHOR_FG: [f32; 4] = [1.0, 0.8, 0.25, 1.0];
 /// Color of the "Claude Code is working" marker (status-bar ✳ counter and
 /// switcher ✳ icon). Green: something is happening, nothing is owed.
 const WORKING_FG: [f32; 4] = [0.6, 0.85, 0.6, 1.0];
+/// Same green, faded: an agent at rest whose background shells still run.
+/// Counted in the status bar's ✳N, but free to be asked something.
+const BACKGROUND_FG: [f32; 4] = [0.36, 0.5, 0.36, 1.0];
+
+/// The state marker a switcher row draws in its 2nd char slot, if any: a
+/// working agent wins over background shells, which the bar counts too.
+fn switcher_state_marker(working: bool, background: bool) -> Option<[f32; 4]> {
+    if working {
+        Some(WORKING_FG)
+    } else if background {
+        Some(BACKGROUND_FG)
+    } else {
+        None
+    }
+}
 /// Open todos at the end of a pane switcher row: warm, so a conversation with
 /// work left in it is spotted without reading the dim tail of every row.
 const RAF_TODO_FG: [f32; 4] = [0.95, 0.6, 0.3, 1.0];
@@ -337,6 +352,9 @@ pub struct PaneSwitcherRowRender<'a> {
     pub minimized: bool,
     /// Claude Code is actively working in this pane — drives a ✳ marker.
     pub working: bool,
+    /// The agent rests at its prompt with background shells running — drives
+    /// a dim ✳, since the status bar's ✳N counts these panes too.
+    pub background: bool,
     /// This pane is waiting for the user — drives a ? marker.
     /// Binary running in the pane ("claude 2.1.226"), shown dim at the right
     /// end of the row. `None` on headers and at a bare shell prompt.
@@ -3344,9 +3362,10 @@ impl Renderer {
                             body_scale,
                         );
                     }
-                    // Claude Code state in the 2nd char slot: "✳" while the
-                    // session works.
-                    if row.working {
+                    // Agent state in the 2nd char slot: "✳" while the session
+                    // works, a dim "✳" while it rests with background shells —
+                    // the two things the status bar's ✳N adds up.
+                    if let Some(state_fg) = switcher_state_marker(row.working, row.background) {
                         let state_x = left_margin + scaled_cell_w;
                         self.ctx.render_text(
                             vertices,
@@ -3354,7 +3373,7 @@ impl Renderer {
                             state_x,
                             text_y,
                             right_margin,
-                            WORKING_FG,
+                            state_fg,
                             no_bg,
                             body_scale,
                         );
@@ -4548,6 +4567,18 @@ fn format_key_combo(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn switcher_marks_every_pane_the_working_counter_counts() {
+        // The bar's ✳N adds working panes and panes resting with background
+        // shells; Cmd+P must show both, or the count points at nothing.
+        use super::{switcher_state_marker, BACKGROUND_FG, WORKING_FG};
+        assert_eq!(switcher_state_marker(true, false), Some(WORKING_FG));
+        assert_eq!(switcher_state_marker(false, true), Some(BACKGROUND_FG));
+        assert_eq!(switcher_state_marker(true, true), Some(WORKING_FG));
+        assert_eq!(switcher_state_marker(false, false), None);
+        assert_ne!(BACKGROUND_FG, WORKING_FG);
+    }
+
     #[test]
     fn viewport_off_screen_only_when_no_column_is_visible() {
         let vp = |x: f32, width: f32| super::PaneViewport {

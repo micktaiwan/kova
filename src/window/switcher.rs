@@ -25,6 +25,10 @@ pub(super) enum SwitcherRow {
         /// tool, or any program reporting `state=working` (OSC 7501, Pi's way).
         /// Drawn as ✳.
         working: bool,
+        /// The agent rests at its prompt while shells it started keep running
+        /// (`Surface::has_background_work`). The status bar's ✳N counts these
+        /// panes too, so the row shows a dim ✳ to say which ones they are.
+        background: bool,
         /// The binary running in the pane, with its version when known
         /// ("claude 2.1.226"). `None` at a bare shell prompt, and also when the
         /// title already *is* that name — no row should say "vim … vim".
@@ -1133,6 +1137,7 @@ impl KovaView {
                         has_completion,
                         minimized: pane.minimized,
                         working: pane.is_working(),
+                        background: pane.has_background_work(),
                         process,
                         bookmarked,
                         anchored: anchored_pane,
@@ -1681,11 +1686,12 @@ impl KovaView {
             pause_toggle_label(pane.is_paused(), || pane.pause(), || pane.resume_paused())
         };
         if let Some(state) = self.ivars().pane_switcher.borrow_mut().as_mut() {
-            if let Some(SwitcherRow::Pane { process, working, .. }) =
+            if let Some(SwitcherRow::Pane { process, working, background, .. }) =
                 state.columns.get_mut(state.selected_col).and_then(|c| c.get_mut(state.selected_row))
             {
                 *process = Some(outcome.to_string());
                 *working = false;
+                *background = false;
             }
         }
         self.mark_dirty();
@@ -2214,6 +2220,7 @@ mod tests {
                             has_completion: c == 'c',
                             minimized: false,
                             working: false,
+                            background: false,
                             process: None,
                             bookmarked: false,
                             anchored: c == 'a',
@@ -2512,6 +2519,7 @@ mod tests {
             has_completion: false,
             minimized: false,
             working: true,
+            background: false,
             process: None,
             bookmarked: false,
             anchored: false,
@@ -2577,8 +2585,8 @@ mod tests {
 
     fn pane_titled(title: &str) -> SwitcherRow {
         match switcher_grid(&["."]).remove(0).remove(0) {
-            SwitcherRow::Pane { pane_id, is_current, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, subject, last_in_subject, .. } => {
-                SwitcherRow::Pane { pane_id, title: title.into(), is_current, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, subject, last_in_subject }
+            SwitcherRow::Pane { pane_id, is_current, has_bell, has_completion, minimized, working, background, process, bookmarked, anchored, raf_todo, raf_idea, subject, last_in_subject, .. } => {
+                SwitcherRow::Pane { pane_id, title: title.into(), is_current, has_bell, has_completion, minimized, working, background, process, bookmarked, anchored, raf_todo, raf_idea, subject, last_in_subject }
             }
             _ => unreachable!(),
         }
