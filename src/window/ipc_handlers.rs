@@ -570,6 +570,19 @@ impl KovaView {
         tabs.iter().find_map(|t| t.pane(pane_id)).map(|pane| pane.wake())
     }
 
+    /// IPC: pause the agent in `pane_id` (`Surface::pause`). `None` when the
+    /// pane is not in this window.
+    pub fn ipc_pause_pane(&self, pane_id: PaneId) -> Option<Result<(), crate::surface::PauseRefusal>> {
+        let outcome = {
+            let tabs = self.ivars().tabs.borrow();
+            tabs.iter().find_map(|t| t.pane(pane_id)).map(|pane| pane.pause())
+        };
+        if outcome.is_some() {
+            self.mark_dirty();
+        }
+        outcome
+    }
+
     /// IPC: collect all pane IDs in this window (used to expand `panes: "all"`).
     pub fn ipc_collect_pane_ids(&self, out: &mut Vec<PaneId>) {
         collect_pane_ids_in(&self.ivars().tabs.borrow(), out);

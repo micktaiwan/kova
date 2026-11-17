@@ -810,15 +810,9 @@ impl Tab {
             }
             pane.minimized = true;
             self.minimized_stack.push(id);
-            // Move focus to a non-minimized sibling
+            // Move focus to the nearest visible neighbor, not the first pane
             if self.focused_pane == id {
-                let mut first_non_minimized = None;
-                self.for_each_pane(&mut |p| {
-                    if !p.minimized && first_non_minimized.is_none() {
-                        first_non_minimized = Some(p.id);
-                    }
-                });
-                if let Some(new_focus) = first_non_minimized {
+                if let Some(new_focus) = self.nearest_visible_neighbor(id) {
                     self.focused_pane = new_focus;
                 }
             }
@@ -826,6 +820,16 @@ impl Tab {
         } else {
             false
         }
+    }
+
+    /// The visible pane that should take focus when `id` disappears:
+    /// see `nearest_visible_slot`.
+    fn nearest_visible_neighbor(&self, id: PaneId) -> Option<PaneId> {
+        let col = self.column_index_of(id)?;
+        let row = self.columns[col].pane_index_of(id)?;
+        let grid: Vec<Vec<bool>> = self.columns.iter().map(|c| c.minimized_rows()).collect();
+        let (c, r) = nearest_visible_slot(&grid, col, row)?;
+        Some(self.columns[c].panes[r].id)
     }
 
     /// Restore a specific minimized pane.
@@ -2244,9 +2248,68 @@ impl Column {
 
 }
 
+/// Where focus goes when the pane at (`col`, `row`) is hidden. `grid[c][r]`
+/// is true when that pane is minimized (the hidden pane included). Order: the pane below in the same
+/// column, then above; then the nearest column on the right, then on the
+/// left, picking in that column the visible row closest to `row`.
+fn nearest_visible_slot(grid: &[Vec<bool>], col: usize, row: usize) -> Option<(usize, usize)> {
+    let closest_row = |rows: &[bool]| -> Option<usize> {
+        (0..rows.len())
+            .filter(|&r| !rows[r])
+            .min_by_key(|&r| (r.abs_diff(row), r < row))
+    };
+    if let Some(r) = closest_row(&grid[col]) {
+        return Some((col, r));
+    }
+    for d in 1..grid.len() {
+        for c in [col.checked_add(d), col.checked_sub(d)].into_iter().flatten() {
+            if let Some(r) = grid.get(c).and_then(|rows| closest_row(rows)) {
+                return Some((c, r));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
+    use super::nearest_visible_slot;
     use super::{adjacent_visible_pairs, geometry_ratio, pinned_virtual_width, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, distribute_visible, grow_virtual_for_restored_column, max_visible_fraction, new_entry_weight, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column};
+
+    #[test]
+    fn hiding_a_pane_focuses_its_right_neighbor_not_the_first_pane() {
+        // Columns [A, B(hidden), C]: focus goes to C, not A.
+        let grid = vec![vec![false], vec![true], vec![false]];
+        assert_eq!(nearest_visible_slot(&grid, 1, 0), Some((2, 0)));
+    }
+
+    #[test]
+    fn hiding_the_rightmost_pane_focuses_its_left_neighbor() {
+        let grid = vec![vec![false], vec![false], vec![true]];
+        assert_eq!(nearest_visible_slot(&grid, 2, 0), Some((1, 0)));
+    }
+
+    #[test]
+    fn hiding_a_pane_skips_already_hidden_neighbors() {
+        // [A, B(hidden), C(hidden), D(just hidden)] → B and C skipped, A.
+        let grid = vec![vec![false], vec![true], vec![true], vec![true]];
+        assert_eq!(nearest_visible_slot(&grid, 3, 0), Some((0, 0)));
+    }
+
+    #[test]
+    fn hiding_a_pane_prefers_its_own_column_below_then_above() {
+        let grid = vec![vec![false], vec![false, true, false]];
+        assert_eq!(nearest_visible_slot(&grid, 1, 1), Some((1, 2)));
+        let grid = vec![vec![false], vec![false, true]];
+        assert_eq!(nearest_visible_slot(&grid, 1, 1), Some((1, 0)));
+    }
+
+    #[test]
+    fn hiding_a_pane_lands_on_the_closest_row_of_the_next_column() {
+        // Hidden pane at row 2 of col 0; col 1 has rows 0..3 → row 2.
+        let grid = vec![vec![true, true, true], vec![false, false, false, false]];
+        assert_eq!(nearest_visible_slot(&grid, 0, 2), Some((1, 2)));
+    }
 
     // ------------------------------------------------------------------
     // Minimized entries must not pollute the layout of the visible ones.

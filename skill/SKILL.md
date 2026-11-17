@@ -74,6 +74,7 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 | Focus / close a pane | `{"cmd":"focus-pane","pane_id":42}`, `{"cmd":"close-pane","pane_id":42}` |
 | Undo a close | `{"cmd":"dispatch-action","action":"reopen-closed-pane"}` — puts the last closed pane back in its slot, its agent conversation resumed |
 | Resume a pane asleep since a relaunch, focus untouched | `{"cmd":"wake-pane","pane_id":42}` |
+| Pause a pane's agent to free its memory (`p` in Cmd+P) | `{"cmd":"pause-pane","pane_id":42}` → `{"paused":true}`, or `{"paused":false,"reason":"working, not paused"}` (also `no agent to pause`, `paused`, `cannot resume, not paused`); refused while the agent works, so it never loses a turn. `wake-pane` resumes it |
 | Layout | `resize-pane`, `swap-pane`, `merge-tab`, `merge-window`, `close-tab` |
 | Move a pane (put a stacked pane on the right, change its tab) | no direct command: `focus-pane` → `break-pane` → `merge-tab`, see [Moving a pane](#moving-a-pane-stacked--right-or-into-another-tab) |
 | Names and colors | `{"cmd":"rename-pane","pane_id":42,"title":"x"}` (the field is `title`, not `name`), `set-tab-title`, `set-tab-color` |
@@ -352,9 +353,10 @@ action, or `action: text` when the user typed something.
   into its pane, after a routine still running there, or by reopening it in a new tab with the
   agent's own resume line (`claude --resume`, `codex resume`, `pi --session`, `omp --resume` or `tazu --resume`).
   It arrives as a message starting with `[Kova] The user answered your question`.
-- Exit 3: the user answered in the conversation instead, and the card was withdrawn (a
-  `UserPromptSubmit` hook runs `kova ask --withdraw --session -`). Their message is the answer:
-  end your turn.
+- Exit 3: the user wrote in the conversation instead (a `UserPromptSubmit` hook runs
+  `kova ask --withdraw --session -`). Their message is the answer: end your turn. The card stays,
+  greyed note and a `Dismiss` button added; if they still click an answer there, it arrives later
+  as a `[Kova] The user answered your question` message, like a late answer.
 - Exit 1: an error, or Kova quit while you waited (the question comes back at the next launch). If
   the message says the running Kova "predates `ask`", it learns the command at its next launch.
 - **Outside a Claude Code conversation there is no default timeout and no late delivery.** Only a

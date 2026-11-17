@@ -55,6 +55,8 @@ pub struct CardQuestion<'a> {
     pub input: bool,
     /// Epoch seconds; shown as the local short time.
     pub asked_at: u64,
+    /// A line shown above the message, greyed (a superseded question).
+    pub note: Option<&'a str>,
 }
 
 /// What the user answered: the button (or the first one, for Enter) and the
@@ -71,6 +73,8 @@ const WIDTH: CGFloat = 400.0;
 const INSET: CGFloat = 20.0;
 /// Beyond this the field stops growing and scrolls.
 const MAX_LINES: CGFloat = 8.0;
+/// Gap between two buttons, and between two rows of buttons.
+const BUTTON_SPACING: CGFloat = 8.0;
 const FIELD_FONT_SIZE: CGFloat = 14.0;
 const PLACEHOLDER: &str = "Type an answer, or just click a button";
 
@@ -208,6 +212,7 @@ struct Shown {
     buttons: Vec<String>,
     input: bool,
     asked_at: u64,
+    note: Option<String>,
     waiting: usize,
 }
 
@@ -219,6 +224,7 @@ struct Card {
     badge_holder: Retained<NSView>,
     who: Retained<NSTextField>,
     meta: Retained<NSTextField>,
+    note: Retained<NSTextField>,
     body: Retained<NSTextField>,
     field: Retained<NSTextField>,
     field_box: Retained<NSView>,
@@ -368,6 +374,13 @@ impl Card {
         header.setSpacing(8.0);
         header.setAlignment(NSLayoutAttribute::CenterY);
 
+        // Greyed line above the message, hidden unless the question is superseded.
+        let note = NSTextField::wrappingLabelWithString(&ns(""), mtm);
+        note.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        note.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        note.setPreferredMaxLayoutWidth(WIDTH - 2.0 * INSET);
+        note.setHidden(true);
+
         let body = NSTextField::wrappingLabelWithString(&ns(""), mtm);
         body.setFont(Some(&NSFont::systemFontOfSize(14.0)));
         body.setTextColor(Some(&NSColor::labelColor()));
@@ -408,9 +421,11 @@ impl Card {
             field_height.clone(),
         ]);
 
+        // One horizontal row per line of buttons, wrapped by `button_rows`.
         let buttons = NSStackView::new(mtm);
-        buttons.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-        buttons.setSpacing(8.0);
+        buttons.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        buttons.setAlignment(NSLayoutAttribute::Trailing);
+        buttons.setSpacing(BUTTON_SPACING);
         let footer_spacer = NSView::new(mtm);
         let footer = NSStackView::stackViewWithViews(
             &NSArray::from_slice(&[&*footer_spacer, buttons.as_ref()]),
@@ -419,7 +434,7 @@ impl Card {
         footer.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
 
         let stack = NSStackView::stackViewWithViews(
-            &NSArray::from_slice(&[header.as_ref(), body.as_ref(), &*field_box, footer.as_ref()]),
+            &NSArray::from_slice(&[header.as_ref(), note.as_ref(), body.as_ref(), &*field_box, footer.as_ref()]),
             mtm,
         );
         stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
@@ -437,6 +452,7 @@ impl Card {
             stack.widthAnchor().constraintEqualToConstant(WIDTH),
             // Every row spans the card's inner width: the field no longer runs past the edge.
             header.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
+            note.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
             body.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
             field_box.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
             footer.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
@@ -454,6 +470,7 @@ impl Card {
             badge_holder,
             who,
             meta,
+            note,
             body,
             field,
             field_box,
@@ -496,6 +513,7 @@ impl Card {
             buttons: question.buttons.to_vec(),
             input: question.input,
             asked_at: question.asked_at,
+            note: question.note.map(str::to_string),
             waiting,
         };
         if self.shown.borrow().as_ref() == Some(&shown) && self.panel.isVisible() {
@@ -520,6 +538,8 @@ impl Card {
         let time = short_time(question.asked_at);
         let meta = if waiting > 0 { format!("{} · {} more", time, waiting) } else { time };
         self.meta.setStringValue(&ns(&meta));
+        self.note.setStringValue(&ns(question.note.unwrap_or("")));
+        self.note.setHidden(question.note.is_none());
         self.body.setStringValue(&ns(question.message));
         if is_new {
             self.field.setStringValue(&ns(""));
@@ -543,10 +563,19 @@ impl Card {
         for view in self.buttons.arrangedSubviews().iter() {
             view.removeFromSuperview();
         }
-        // Right-aligned, the default (first action) last, as macOS dialogs do.
-        for (index, title) in question.buttons.iter().enumerate().rev() {
-            let button = self.make_button(mtm, title, index);
-            self.buttons.addArrangedSubview(&button);
+        // Right-aligned, the default (first action) last, as macOS dialogs do;
+        // wrapped onto several rows when they do not fit the card's width.
+        let made: Vec<(Retained<NSButton>, CGFloat)> =
+            question.buttons.iter().enumerate().map(|(index, title)| self.make_button(mtm, title, index)).collect();
+        let widths: Vec<CGFloat> = made.iter().map(|(_, w)| *w).collect();
+        for row in button_rows(&widths, WIDTH - 2.0 * INSET, BUTTON_SPACING) {
+            let line = NSStackView::new(mtm);
+            line.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            line.setSpacing(BUTTON_SPACING);
+            for index in row {
+                line.addArrangedSubview(&made[index].0);
+            }
+            self.buttons.addArrangedSubview(&line);
         }
 
         self.background.layoutSubtreeIfNeeded();
@@ -577,7 +606,8 @@ impl Card {
     /// Drawn by hand: macOS paints its default button blue only in the key
     /// window, and the card never takes the keyboard on its own, so system
     /// buttons all came out grey.
-    fn make_button(&self, mtm: MainThreadMarker, title: &str, index: usize) -> Retained<NSButton> {
+    /// Returns the button and the width it takes.
+    fn make_button(&self, mtm: MainThreadMarker, title: &str, index: usize) -> (Retained<NSButton>, CGFloat) {
         let primary = index == 0;
         let tint = self.tint.borrow();
         let button = unsafe {
@@ -598,12 +628,13 @@ impl Card {
             button.setKeyEquivalent(&ns("\r"));
         }
         button.setTranslatesAutoresizingMaskIntoConstraints(false);
-        let width = button.attributedTitle().size().width + 28.0;
+        // A title longer than the card is truncated rather than pushing the card wider.
+        let width = (button.attributedTitle().size().width + 28.0).max(72.0).min(WIDTH - 2.0 * INSET);
         activate(&[
-            button.widthAnchor().constraintEqualToConstant(width.max(72.0)),
+            button.widthAnchor().constraintEqualToConstant(width),
             button.heightAnchor().constraintEqualToConstant(30.0),
         ]);
-        button
+        (button, width)
     }
 
     /// Grows (or shrinks) the field to its text, up to `MAX_LINES`, and the card
@@ -639,6 +670,33 @@ impl Card {
         self.panel.setFrame_display(frame, true);
         without_animation(|| self.wash.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), frame.size)));
     }
+}
+
+/// Splits buttons (their widths, in action order) into rows that fit `max`,
+/// top row first, each row listed left to right. The first action sits
+/// bottom-right, as macOS dialogs put the default; the rows fill from the
+/// bottom up, each one growing leftward, so the next actions sit beside it.
+fn button_rows(widths: &[CGFloat], max: CGFloat, spacing: CGFloat) -> Vec<Vec<usize>> {
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut used: CGFloat = 0.0;
+    for (index, &width) in widths.iter().enumerate() {
+        match rows.last_mut() {
+            Some(row) if used + spacing + width <= max + 0.5 => {
+                row.push(index);
+                used += spacing + width;
+            }
+            _ => {
+                rows.push(vec![index]);
+                used = width;
+            }
+        }
+    }
+    // Built bottom row first, rightmost first: flip both.
+    rows.reverse();
+    for row in &mut rows {
+        row.reverse();
+    }
+    rows
 }
 
 /// `asked_at` as the local short time (`14:05`, or `2:05 PM` in a 12-hour
@@ -680,5 +738,28 @@ pub fn take_answers() -> Vec<CardAnswer> {
     match ANSWERS.lock() {
         Ok(mut answers) => std::mem::take(&mut *answers),
         Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::button_rows;
+
+    #[test]
+    fn buttons_that_fit_stay_on_one_row_with_the_default_rightmost() {
+        assert_eq!(button_rows(&[100.0, 80.0, 72.0], 360.0, 8.0), vec![vec![2, 1, 0]]);
+    }
+
+    #[test]
+    fn buttons_that_overflow_wrap_with_the_default_bottom_right() {
+        // The case that squeezed one button to an ellipsis: 545 points of buttons in 360.
+        let rows = button_rows(&[138.0, 188.0, 123.0, 72.0], 360.0, 8.0);
+        assert_eq!(rows, vec![vec![3, 2], vec![1, 0]]);
+    }
+
+    #[test]
+    fn a_button_as_wide_as_the_card_gets_its_own_row() {
+        assert_eq!(button_rows(&[360.0, 72.0], 360.0, 8.0), vec![vec![1], vec![0]]);
+        assert!(button_rows(&[], 360.0, 8.0).is_empty());
     }
 }

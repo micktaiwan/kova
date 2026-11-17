@@ -761,6 +761,7 @@ fn handle_ipc_command_sync(
         }
         IpcCommand::ClearAnchors => handle_ipc_clear_anchors(windows),
         IpcCommand::WakePane(pane_id) => handle_ipc_wake_pane(windows, pane_id),
+        IpcCommand::PausePane(pane_id) => handle_ipc_pause_pane(windows, pane_id),
         IpcCommand::ListSubjects => handle_ipc_list_subjects(windows),
         IpcCommand::SetPaneSubject { pane_id, subject } => {
             handle_ipc_set_pane_subject(windows, pane_id, subject)
@@ -1169,6 +1170,28 @@ fn handle_ipc_wake_pane(
                 log::info!("IPC: woke pane {}", pane_id);
             }
             return crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "woken": woken })) };
+        }
+    }
+    crate::ipc::IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: pause the agent in `pane_id` (`Surface::pause`). `paused` is false
+/// when nothing was done, and `reason` then says why (working, no agent,
+/// already paused), the same words the Cmd+P row shows.
+fn handle_ipc_pause_pane(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+) -> crate::ipc::IpcResponse {
+    for win in windows.borrow().iter() {
+        if let Some(outcome) = kova_view(win).and_then(|view| view.ipc_pause_pane(pane_id)) {
+            let data = match outcome {
+                Ok(()) => {
+                    log::info!("IPC: paused pane {}", pane_id);
+                    serde_json::json!({ "paused": true })
+                }
+                Err(refusal) => serde_json::json!({ "paused": false, "reason": refusal.label() }),
+            };
+            return crate::ipc::IpcResponse::Ok { data: Some(data) };
         }
     }
     crate::ipc::IpcResponse::Error { message: format!("pane {} not found", pane_id) }

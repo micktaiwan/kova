@@ -132,6 +132,10 @@ pub struct Question {
     /// Epoch seconds, shown on the card.
     #[serde(default)]
     pub asked_at: u64,
+    /// The user wrote in the conversation after the question was asked (see
+    /// [`Board::withdraw`]): the card keeps it, says so, and adds [`DISMISS`].
+    #[serde(default)]
+    pub superseded: bool,
 }
 
 fn default_true() -> bool {
@@ -142,17 +146,34 @@ fn default_true() -> bool {
 /// answer that is none of the proposed choices must not ride on one of them ("A: stop everything").
 pub const OTHER: &str = "Other";
 
+/// The extra button of a superseded question: closes the card, delivers nothing.
+pub const DISMISS: &str = "Dismiss";
+
+/// The line a superseded card shows above the question.
+pub const SUPERSEDED_NOTE: &str = "You wrote in the conversation since. Answer here anyway, or dismiss.";
+
 impl Question {
     /// The buttons the card shows.
     pub fn buttons(&self) -> Vec<String> {
-        if self.actions.is_empty() {
-            return vec!["Reply".to_string()];
-        }
-        let mut buttons = self.actions.clone();
-        if self.input && !buttons.iter().any(|b| b == OTHER) {
-            buttons.push(OTHER.to_string());
+        let mut buttons = if self.actions.is_empty() {
+            vec!["Reply".to_string()]
+        } else {
+            let mut buttons = self.actions.clone();
+            if self.input && !buttons.iter().any(|b| b == OTHER) {
+                buttons.push(OTHER.to_string());
+            }
+            buttons
+        };
+        if self.dismissable() {
+            buttons.push(DISMISS.to_string());
         }
         buttons
+    }
+
+    /// Whether [`DISMISS`] closes this question without an answer: superseded,
+    /// and the asker did not propose a "Dismiss" of its own, which stays an answer.
+    pub fn dismissable(&self) -> bool {
+        self.superseded && !self.actions.iter().any(|a| a == DISMISS)
     }
 }
 
@@ -951,6 +972,7 @@ impl Board {
             question.from.pane_id.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
             question.message
         );
+        let question = Question { superseded: false, ..question };
         if self.owns_store() {
             self.store.save_question(&question);
         }
@@ -974,26 +996,33 @@ impl Board {
         Ok(answer)
     }
 
-    /// The user answered `session_id`'s questions in the conversation itself:
-    /// take them off the card and off disk, deliver nothing. A `kova ask` still
-    /// waiting gets [`WITHDRAWN`] and exits 3. Returns how many were withdrawn.
+    /// The user wrote in `session_id`'s conversation while its questions were
+    /// on the card. That message may answer them or be about something else,
+    /// so they stay on the card, marked superseded, with a [`DISMISS`] button;
+    /// a click still answers, delivered late like any answer nobody waits for.
+    /// A `kova ask` still waiting gets [`WITHDRAWN`] and exits 3, since the
+    /// conversation has moved on. Returns how many were newly superseded.
     pub fn withdraw(&mut self, session_id: &str) -> usize {
-        let (gone, kept): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.pending).into_iter().partition(|(q, _)| asked_from(q, session_id));
-        self.pending = kept;
-        for (question, responder) in &gone {
-            log::info!("ask {}: withdrawn, the user answered in the conversation", question.id);
-            if self.owns_store() {
-                self.store.remove_question(&question.id);
+        let owns = self.owns_store();
+        let mut count = 0;
+        for (question, responder) in self.pending.iter_mut() {
+            if !asked_from(question, session_id) || question.superseded {
+                continue;
             }
-            if let Some(tx) = responder {
+            log::info!("ask {}: superseded, the user wrote in the conversation; the card keeps it", question.id);
+            question.superseded = true;
+            if owns {
+                self.store.save_question(question);
+            }
+            if let Some(tx) = responder.take() {
                 let _ = tx.send(crate::ipc::IpcResponse::Error { message: WITHDRAWN.to_string() });
             }
+            count += 1;
         }
-        if !gone.is_empty() {
+        if count > 0 {
             self.dirty = true;
         }
-        gone.len()
+        count
     }
 
     /// The user answered `id` on the card. False when no such question waits
@@ -1002,6 +1031,13 @@ impl Board {
         let Some(index) = self.pending.iter().position(|(q, _)| q.id == id) else { return false };
         let (question, responder) = self.pending.remove(index);
         self.dirty = true;
+        if question.dismissable() && action == DISMISS {
+            log::info!("ask {}: dismissed, nothing delivered", id);
+            if self.owns_store() {
+                self.store.remove_question(id);
+            }
+            return true;
+        }
         let answer = Answer { id: id.to_string(), action, text };
         log::info!("ask {}: answered: {}", id, answer.line());
         // On disk before the question leaves it: a quit from here on still delivers it.
@@ -1028,7 +1064,13 @@ impl Board {
             return;
         }
         self.dirty = false;
-        let head = self.pending.first().map(|(q, _)| q);
+        // A live question goes before a superseded one, which would otherwise hide it.
+        let head = self
+            .pending
+            .iter()
+            .map(|(q, _)| q)
+            .find(|q| !q.superseded)
+            .or_else(|| self.pending.first().map(|(q, _)| q));
         let buttons = head.map(|q| q.buttons()).unwrap_or_default();
         let card = head.map(|q| crate::ask_card::CardQuestion {
             id: &q.id,
@@ -1037,6 +1079,7 @@ impl Board {
             buttons: &buttons,
             input: q.input,
             asked_at: q.asked_at,
+            note: q.superseded.then_some(SUPERSEDED_NOTE),
         });
         crate::ask_card::show(mtm, card.as_ref(), self.pending.len().saturating_sub(1));
     }
@@ -1096,8 +1139,9 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
   --json        print the answer as JSON
   --socket      the Kova to ask (default: $KOVA_SOCKET, else the running Kova.app)
 
-Exit codes: 0 answered · 2 no answer within the timeout · 3 the user answered in the conversation
-instead (the card is withdrawn; their message is the answer) · 1 error, or Kova quit while you waited.
+Exit codes: 0 answered · 2 no answer within the timeout · 3 the user wrote in the conversation
+instead (their message is the answer; the card stays, marked, and a click there still arrives later
+as a message) · 1 error, or Kova quit while you waited.
 On a timeout the question stays on the user's screen. When they answer, Kova delivers the answer to
 this conversation itself: typed into its Kova pane if it is still open there, else by reopening it
 in a new Kova tab with `claude --resume`. So after exit 2, end your turn: the answer will come as a message.";
@@ -1275,6 +1319,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         input: cli.input,
         from: asker,
         asked_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        superseded: false,
     };
 
     let body = serde_json::json!({"cmd": "ask", "question": question});
@@ -1350,8 +1395,9 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
         if err == WITHDRAWN {
             return fail(
-                "kova ask: the user answered in the conversation instead of on the card; the card is gone. \
-                 End your turn now: their message is the answer.",
+                "kova ask: the user wrote in the conversation instead of on the card. \
+                 End your turn now: their message is the answer. The card stays, marked; if they still \
+                 answer there, it arrives later as a message.",
                 3,
             );
         }
@@ -1408,7 +1454,7 @@ mod tests {
     }
 
     fn question(id: &str) -> Question {
-        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5 }
+        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, superseded: false }
     }
 
     #[test]
@@ -1877,5 +1923,60 @@ mod tests {
         let names = ["routine-a", "routine-b", "app", "kova", "mira", "docs", "api", "web"];
         let distinct: std::collections::HashSet<String> = names.iter().map(|n| format!("{:?}", agent_rgb(n))).collect();
         assert!(distinct.len() > 3);
+    }
+
+    /// A board that owns no store: nothing touches the disk.
+    fn memory_board() -> Board {
+        Board {
+            store: AskStore::new(std::env::temp_dir().join("kova-ask-test-unowned")),
+            pending: Vec::new(),
+            _owner: None,
+            owner_tried: std::time::Instant::now(),
+            dirty: false,
+        }
+    }
+
+    #[test]
+    fn writing_in_the_conversation_keeps_the_question_on_the_card_marked() {
+        let mut board = memory_board();
+        let (tx, rx) = std::sync::mpsc::channel();
+        board.add(question("q1"), tx);
+        assert_eq!(board.withdraw("abc-123"), 1);
+        match rx.try_recv() {
+            Ok(crate::ipc::IpcResponse::Error { message }) => assert_eq!(message, WITHDRAWN),
+            _ => panic!("the waiting asker must be released"),
+        }
+        let kept = board.questions();
+        assert_eq!(kept.len(), 1, "the card keeps it");
+        assert!(kept[0].superseded);
+        assert_eq!(kept[0].buttons(), vec!["OK", "KO", OTHER, DISMISS]);
+        assert_eq!(board.withdraw("abc-123"), 0, "a second prompt changes nothing");
+        assert_eq!(board.withdraw("other-session"), 0);
+    }
+
+    #[test]
+    fn dismiss_closes_a_superseded_question_without_delivering() {
+        let mut board = memory_board();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        board.add(question("q1"), tx);
+        board.withdraw("abc-123");
+        assert!(board.answer("q1", DISMISS.into(), String::new()));
+        assert!(board.questions().is_empty());
+    }
+
+    #[test]
+    fn an_askers_own_dismiss_stays_an_answer() {
+        let q = Question { actions: vec![DISMISS.into(), "Keep".into()], superseded: true, ..question("1") };
+        assert!(!q.dismissable());
+        assert_eq!(q.buttons(), vec![DISMISS, "Keep", OTHER], "no second Dismiss");
+        assert!(!question("2").dismissable(), "a live question has none");
+    }
+
+    #[test]
+    fn a_new_question_never_arrives_superseded() {
+        let mut board = memory_board();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        board.add(Question { superseded: true, ..question("q1") }, tx);
+        assert!(!board.questions()[0].superseded);
     }
 }

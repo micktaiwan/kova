@@ -426,15 +426,20 @@ Kova.app only: a library host answers `command not supported by this host`.
 { "cmd": "withdraw-asks", "session_id": "6e67ffdd-…" }
 ```
 
-The user answered in the conversation itself (typed a prompt in its pane, or
-from a remote client) rather than on the card: every question that
-conversation (`from.session_id`) still has on the card is taken off it and off
-disk, and **nothing is delivered late** — a click twenty minutes later would
-only retype a stale answer. A `kova ask` still waiting gets the error
+The user wrote in the conversation itself (typed a prompt in its pane, or
+from a remote client) while it had questions on the card. That message may
+answer them or be about something else, so every question that conversation
+(`from.session_id`) still has on the card **stays on it**, marked
+`superseded: true` (on disk too): the card shows a greyed line above the
+message and adds a `Dismiss` button after the others. Dismiss closes it and
+delivers nothing; any other button still answers, delivered late like any
+answer nobody waits for. A live question is shown before a superseded one.
+If the asker proposed a `Dismiss` action itself, no extra button is added and
+its `Dismiss` stays an answer. A `kova ask` still waiting gets the error
 `withdrawn: the user answered in the conversation instead of on the card` and
 exits with code 3. Answers already given and waiting for delivery are not
-touched. Response: `{"ok":true,"data":{"withdrawn":1}}` (0 when nothing was
-pending).
+touched. Response: `{"ok":true,"data":{"withdrawn":1}}`, the number of
+questions newly marked (0 when nothing was pending or all were already marked).
 
 Sent by a Claude Code `UserPromptSubmit` hook running
 `kova ask --withdraw --session -` (it reads the hook's JSON input for the

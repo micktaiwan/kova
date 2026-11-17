@@ -55,6 +55,9 @@ pub enum IpcCommand {
     /// Resume the agent a launch restore left asleep in a pane, without
     /// focusing it (`Surface::wake`).
     WakePane(u32),
+    /// Pause the agent in a pane to free what it holds, as `p` in Cmd+P does
+    /// (`Surface::pause`): refused while the agent works.
+    PausePane(u32),
     /// Create a new tab with an optional CWD and command.
     NewTab {
         cwd: Option<String>,
@@ -625,6 +628,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "send-keys" => &["pane_id", "text"],
         "focus-pane" => &["pane_id"],
         "wake-pane" => &["pane_id"],
+        "pause-pane" => &["pane_id"],
         "new-tab" => &["cwd", "command"],
         "set-tab-title" => &["pane_id", "title"],
         "set-tab-color" => &["pane_id", "color"],
@@ -784,6 +788,10 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
         "wake-pane" => {
             let pane_id = required_u32(&v, "pane_id")?;
             Ok(IpcCommand::WakePane(pane_id))
+        }
+        "pause-pane" => {
+            let pane_id = required_u32(&v, "pane_id")?;
+            Ok(IpcCommand::PausePane(pane_id))
         }
         "new-tab" => {
             let cwd = v.get("cwd").and_then(|c| c.as_str()).map(String::from);
@@ -1776,6 +1784,16 @@ mod tests {
         ));
         assert!(parse_command(r#"{"cmd":"wake-pane"}"#).is_err());
         assert!(parse_command(r#"{"cmd":"wake-pane","pane_id":4,"focus":true}"#).is_err());
+    }
+
+    #[test]
+    fn pause_pane_takes_a_pane_id() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"pause-pane","pane_id":4}"#),
+            Ok(IpcCommand::PausePane(4))
+        ));
+        assert!(parse_command(r#"{"cmd":"pause-pane"}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"pause-pane","pane_id":4,"force":true}"#).is_err());
     }
 
     #[test]
