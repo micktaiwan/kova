@@ -1,7 +1,7 @@
-# 2.0.2
+# 2.1.0
 
-- Subjects: group a tab's panes under a named subject in Cmd+P (Cmd+Right files a pane, Cmd+Left takes it out); a subject survives a relaunch
-- Each subject gets its own color, and a strip under the tab bar names the subject over its panes
-- After a relaunch, agent conversations resume only when their pane is first shown (or on wake-pane), and the status bar counts the sleeping ones (◌N)
-- Resizing the window or dragging a separator no longer resizes every pane several times a frame, and panes scrolled off-screen catch up when shown
-- IPC: list-subjects, set-pane-subject, rename-subject, delete-subject, a subject field on each pane and a subjects event in subscribe
+- Pause an agent from Cmd+P with `p`: its memory is freed, the shell stays, and `p` again resumes the conversation, even after a relaunch
+- Auto-pause (off by default): agents idle and out of focus for `[agents] auto_pause_hours` are paused by Kova, and focusing the pane brings them back
+- Reopen a closed pane with its conversation; Pi, omp and Tazu sessions resume and show up in the search palette
+- Programs can show a status badge on their pane (OSC 7501), counted in the working counter; the switcher marks agents resting with background shells
+- Choose a subject's color (right-click its band, or `c` in Cmd+P); the search palette scrolls with the wheel and opens a hit on click
