@@ -11,7 +11,9 @@ accepts one JSON command per line. This skill lives in this repo's `skill/` dire
 `~/.claude/skills/kova/SKILL.md`, never `~/.claude/skills/kova/skill/…` (that path does not exist).
 
 **If a `LOCAL.md` sits next to this file, read it first.** It carries what is specific to the
-machine and its user: names, habits, working rules. It is excluded from git.
+machine and its user: names, habits, working rules. It is excluded from git. It may be a symlink
+to a private file elsewhere (`ls -l` it before editing): the Edit and Write tools refuse a symlink,
+so write to the path it points to (`readlink`).
 ## Where to look — three levels
 
 
@@ -43,6 +45,13 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
   side panel, a notes app) has its own socket there too. A dead one answers nothing, so a loop
   over them gets an empty reply and a JSON parser fails on it: skip empty replies, or keep only
   the sockets whose `<pid>` is a running process. The name changes when Kova restarts.
+  An agent or scheduled-job session has no `$KOVA_SOCKET` either, so it resolves one first, then
+  runs the command against it:
+  `S=$(for s in /tmp/kova-*.sock; do p=${s#/tmp/kova-}; kill -0 "${p%.sock}" 2>/dev/null && echo "$s"; done | head -1)`.
+  An empty `$S` means no Kova is running (say so; do not pipe an empty variable into `nc`).
+  To query every live Kova (a search across all of them), filter the same way inside the loop, so
+  a dead socket never reaches the parser and the loop's exit status is that of the last live one:
+  `for s in /tmp/kova-*.sock; do p=${s#/tmp/kova-}; kill -0 "${p%.sock}" 2>/dev/null || continue; printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$s" | jq -c '.data[]'; done`.
 - Every answer is `{"ok":true}` (with a `data` payload for the commands that return something) or
   `{"ok":false,"error":"…"}`. Pipe it into `jq`.
 - Fields are validated strictly: a field a command does not accept fails the request
@@ -64,7 +73,7 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 
 | Goal | Command |
 |---|---|
-| Split the focused pane | `{"cmd":"split","direction":"horizontal"}` (side by side, the default) or `"vertical"` (stacked) → `pane_id` |
+| Split the focused pane | `{"cmd":"split","direction":"horizontal"}` (side by side, the default) or `"vertical"` (stacked) → `pane_id`. `split` takes only `direction`, `command`, `cwd`: a `pane_id` is refused (`unknown field pane_id`). To split inside a given tab or next to a given pane, `{"cmd":"focus-pane","pane_id":N}` first, then `split` (it steals the focus; `focus-pane` back afterwards) |
 | New tab | `{"cmd":"new-tab","cwd":"/abs/path","command":"…"}` → `tab_id`, `pane_id` (`command` is only **typed** at the prompt, without Enter, exactly like `split`: see the trap below) |
 | List panes / tabs | `{"cmd":"list-panes"}`, `{"cmd":"list-tabs"}` |
 | Read a pane's screen | `{"cmd":"get-pane-content","panes":[42],"mode":"visible"}` (the field is `panes`, a list or `"all"`, not `pane_id`; `mode` is `visible`, `scrollback` or `all`; the answer is `{"ok":true,"data":{"panes":[ … ]}}`, where `data` is an object keyed `panes`, not the list — see [Reading `get-pane-content`](#reading-get-pane-content); each entry is `{id, text, cursor, cols, rows}`, or `{id, error:"not found"}` when the pane closed meanwhile, so read `text` through `.get`) |

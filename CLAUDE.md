@@ -86,6 +86,6 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 
 ## The `kova` skill is this tool's public surface
 
-`skill/SKILL.md` in this repo describes how a Claude Code session, from anywhere on the machine, uses kova: the commands, the paths, the ports, what it is not allowed to do. The user's specifics (names, habits, working rules) go in `skill/LOCAL.md`, which is excluded from git. Nothing syncs the skill automatically.
+`skill/SKILL.md` in this repo describes how a Claude Code session, from anywhere on the machine, uses kova: the commands, the paths, the ports, what it is not allowed to do. The user's specifics (names, habits, working rules) go in `skill/LOCAL.md`, which is excluded from git and may be a symlink to a private file (edit the `readlink` target, the Edit tool refuses the link itself). Nothing syncs the skill automatically.
 
 **A change here that touches what the skill promises is carried over into the skill right away**: a command or a flag, a socket or data path, a port, a default value, a config file name, a rule about what a session may touch. An outdated skill is worse than no skill at all, because a session acts on what it says.
