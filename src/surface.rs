@@ -315,6 +315,9 @@ pub struct Surface {
     /// the next frame; dropped every ~0.5s by `check_running` for shells
     /// that report nothing. `None` = probe on next read.
     cached_cwd: RefCell<Option<(Option<String>, Option<String>)>>,
+    /// Last time this pane was focused, its agent worked, or its agent was
+    /// started: what auto-pause measures idleness from (`auto_pause_due`).
+    last_active: Cell<std::time::Instant>,
 }
 
 /// A pane the user paused (`Surface::pause`).
@@ -326,6 +329,9 @@ struct Paused {
     /// launch); otherwise the line is typed and waits.
     runs: bool,
     since: std::time::Instant,
+    /// Kova paused it on its own (`crate::auto_pause`), not the user: focusing
+    /// the pane brings the conversation back (`resume_if_auto_paused`).
+    auto: bool,
 }
 
 /// How long after a pause an agent seen in the pane is still the one being
@@ -474,6 +480,7 @@ impl Surface {
             last_claude_session: RefCell::new(None),
             fg_process: RefCell::new(None),
             cached_cwd: RefCell::new(None),
+            last_active: Cell::new(std::time::Instant::now()),
         }
     }
 
@@ -879,6 +886,7 @@ impl Surface {
             return false;
         };
         self.woken.replace(Some(session));
+        self.touch_active();
         // A paused pane whose resume line is not plain words gets it typed
         // and left for Enter, as a launch restore would (`runs_on_launch`).
         let runs = self.paused.borrow_mut().take().map_or(true, |p| p.runs);
@@ -914,6 +922,53 @@ impl Surface {
     /// the agent works — a turn in progress, or shells it started still
     /// running — since hanging it up would lose that work.
     pub fn pause(&self) -> Result<(), PauseRefusal> {
+        self.pause_with(false)
+    }
+
+    /// Auto-pause this pane if its agent has been idle and unfocused for
+    /// `delay` (`crate::auto_pause`; `None` = off). Returns true when it was paused; the
+    /// same refusals as `pause` apply, so a working agent is left alone.
+    pub fn auto_pause_if_due(&self, now: std::time::Instant, delay: Option<std::time::Duration>) -> bool {
+        if delay.is_none() {
+            return false;
+        }
+        if self.is_paused() || self.agent_session.borrow().is_none() {
+            return false;
+        }
+        if self.is_working() || self.has_background_work() {
+            self.touch_active();
+            return false;
+        }
+        let idle = now.saturating_duration_since(self.last_active.get());
+        if !crate::auto_pause::is_due(idle, delay) {
+            return false;
+        }
+        match self.pause_with(true) {
+            Ok(()) => {
+                log::info!("Auto-pause: pane {} paused after {} min idle", self.id, idle.as_secs() / 60);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The pane is in use now: focused, or its agent working or just started.
+    pub fn touch_active(&self) {
+        self.last_active.set(std::time::Instant::now());
+    }
+
+    /// The pane was auto-paused (not by the user).
+    pub fn is_auto_paused(&self) -> bool {
+        self.paused.borrow().as_ref().is_some_and(|p| p.auto)
+    }
+
+    /// Focus is the signal an auto-paused conversation is wanted again: bring
+    /// it back. A pane the user paused stays paused. True when resumed.
+    pub fn resume_if_auto_paused(&self) -> bool {
+        self.is_auto_paused() && self.resume_paused().is_ok()
+    }
+
+    fn pause_with(&self, auto: bool) -> Result<(), PauseRefusal> {
         if self.is_paused() {
             return Err(PauseRefusal::AlreadyPaused);
         }
@@ -945,15 +1000,15 @@ impl Surface {
             id: session.id,
             config_dir: session.config_dir,
         });
-        self.set_paused((!title.is_empty()).then_some(title), runs);
+        self.set_paused((!title.is_empty()).then_some(title), runs, auto);
         self.clear_awaiting();
         Ok(())
     }
 
     /// Mark the conversation asleep in this pane as paused by the user: a
     /// restore does this for a pane saved paused, after `sleep_until_shown`.
-    pub fn set_paused(&self, title: Option<String>, runs: bool) {
-        self.paused.replace(Some(Paused { title, runs, since: std::time::Instant::now() }));
+    pub fn set_paused(&self, title: Option<String>, runs: bool, auto: bool) {
+        self.paused.replace(Some(Paused { title, runs, since: std::time::Instant::now(), auto }));
     }
 
     /// Bring a paused pane's conversation back (`p` again). Refused while the
@@ -1311,7 +1366,7 @@ mod tests {
         let (surface, reader) = super::Surface::capture(80, 24);
         surface.pending_command.set(Some(line.into()));
         surface.sleep_until_shown(crate::session::SavedAgentSession { agent: Agent::Claude, id: "abc".into(), config_dir: None });
-        surface.set_paused(Some("Fix the parser".into()), runs);
+        surface.set_paused(Some("Fix the parser".into()), runs, false);
         (surface, reader)
     }
 
@@ -1376,6 +1431,78 @@ mod tests {
         surface.terminal.write().title = Some("\u{2733} Claude Code".into());
         surface.agent_session.borrow_mut().as_mut().unwrap().background_shells = true;
         assert_eq!(surface.pause(), Err(super::PauseRefusal::Working), "its shells still run");
+    }
+
+    fn agent_surface() -> (super::Surface, std::os::fd::OwnedFd) {
+        use crate::agent_session::{Agent, AgentSession};
+        let (surface, reader) = super::Surface::capture(80, 24);
+        surface.set_agent_session(Some(AgentSession {
+            agent: Agent::Claude,
+            id: "abc".into(),
+            pid: None,
+            name: None,
+            peer_name: None,
+            config_dir: None,
+            background_shells: false,
+        }));
+        surface.terminal.write().title = Some("\u{2733} Claude Code".into());
+        (surface, reader)
+    }
+
+    #[test]
+    fn auto_pause_waits_for_the_delay_and_is_off_without_one() {
+        use std::time::Duration;
+        let (surface, _reader) = agent_surface();
+        let hour = Some(Duration::from_secs(3600));
+        let start = surface.last_active.get();
+        assert!(!surface.auto_pause_if_due(start + Duration::from_secs(10 * 3600), None), "off");
+        assert!(!surface.auto_pause_if_due(start + Duration::from_secs(3599), hour), "not yet");
+        surface.touch_active();
+        assert!(surface.last_active.get() >= start);
+        assert!(!surface.is_paused());
+    }
+
+    #[test]
+    fn a_working_agent_counts_as_active_and_is_never_auto_paused() {
+        use std::time::Duration;
+        let (surface, _reader) = agent_surface();
+        surface.terminal.write().title = Some("\u{2802} Claude Code".into());
+        let later = surface.last_active.get() + Duration::from_secs(10 * 3600);
+        assert!(!surface.auto_pause_if_due(later, Some(Duration::from_secs(60))));
+        assert!(!surface.is_paused());
+        assert!(surface.last_active.get() > later - Duration::from_secs(10 * 3600), "work refreshed it");
+
+        surface.terminal.write().title = Some("\u{2733} Claude Code".into());
+        surface.agent_session.borrow_mut().as_mut().unwrap().background_shells = true;
+        assert!(!surface.auto_pause_if_due(later, Some(Duration::from_secs(60))), "its shells still run");
+    }
+
+    #[test]
+    fn a_pane_with_no_agent_is_never_auto_paused() {
+        use std::time::Duration;
+        let (surface, _reader) = super::Surface::capture(80, 24);
+        let later = surface.last_active.get() + Duration::from_secs(10 * 3600);
+        assert!(!surface.auto_pause_if_due(later, Some(Duration::from_secs(60))));
+    }
+
+    #[test]
+    fn focus_resumes_an_auto_paused_pane_but_not_one_the_user_paused() {
+        use crate::agent_session::Agent;
+        use crate::input::tests::drain;
+        let (surface, _reader) = paused_surface("claude --resume abc", true);
+        assert!(!surface.is_auto_paused());
+        assert!(!surface.resume_if_auto_paused(), "the user paused it: focus does not wake it");
+        assert!(surface.is_paused());
+
+        let (surface, reader) = super::Surface::capture(80, 24);
+        surface.pending_command.set(Some("claude --resume abc".into()));
+        surface.sleep_until_shown(crate::session::SavedAgentSession { agent: Agent::Claude, id: "abc".into(), config_dir: None });
+        surface.set_paused(Some("Fix the parser".into()), true, true);
+        assert!(surface.is_auto_paused());
+        assert!(surface.resume_if_auto_paused());
+        assert!(!surface.is_paused());
+        surface.inject_pending_command();
+        assert_eq!(drain(&reader), b"claude --resume abc\r", "resumed: typed and run");
     }
 
     #[test]

@@ -93,6 +93,7 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 | Anchors | `set-anchor`, `clear-anchors` |
 | Subjects (the boxes of `Cmd+P`) | `{"cmd":"list-subjects"}`, `{"cmd":"set-pane-subject","pane_id":42,"subject":"auth"}` (`null` takes it out), `rename-subject`, `delete-subject`, `set-subject-color` (`"color"` 0..5) (all by `tab_id` + `name`) |
 | Reload the config | `{"cmd":"reload-config"}` |
+| Read or set the automatic pause of idle agents | `{"cmd":"auto-pause"}` reads; `{"cmd":"auto-pause","enabled":true,"hours":2}` sets either or both and saves them to `config.toml` → `{"enabled":true,"hours":2.0}` |
 | Hook signals | `set-pane-status`, `mark-completed`, `mark-started`, `bell` |
 
 - **Prefer the typed commands**, which address a pane by id. `dispatch-action` is the skeleton key
@@ -242,6 +243,8 @@ Each pane carries `id`, `window`, `tab`, `cwd`, `title`, `focused`, `pid`, `chil
 - `paused`: the user paused this pane (`p` in Cmd+P) to free what its agent held. Its conversation
   is in `dormant_session_id` and it is **not** woken by being shown, nor by a relaunch. Leave it
   paused: `wake-pane` resumes it, so only do that when the user asks for that conversation.
+  `auto_paused` true means Kova paused it itself after `auto-pause` hours idle; the user focusing
+  the pane resumes it, so leave it alone too.
 
 **Kova can restart under a running session, and pane ids do not survive it.** The user relaunches
 it (after a build, for instance) while sessions run in its panes; the tabs come back, but every

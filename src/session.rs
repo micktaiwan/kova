@@ -125,6 +125,9 @@ pub struct SavedPause {
     /// The name the pane had when it was paused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Kova paused it (`crate::auto_pause`), so focusing it resumes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
 }
 
 /// The conversation a pane was holding, and which agent to hand it back to.
@@ -205,7 +208,7 @@ pub fn saved_pane(p: &Pane) -> SavedPane {
         claude_session: None,
         agent_session: session_to_save(crate::agent_session::for_shell(p.pty.pid()), p.unregistered_session()),
         subject: p.subject.clone(),
-        paused: p.is_paused().then(|| SavedPause { title: p.paused_title() }),
+        paused: p.is_paused().then(|| SavedPause { title: p.paused_title(), auto: p.is_auto_paused() }),
     }
 }
 
@@ -706,7 +709,7 @@ fn restore_sleep(pane: &Pane, sp: &SavedPane, at_launch: bool) {
     }
     if let Some(pause) = sp.paused.as_ref() {
         pane.sleep_until_shown(session);
-        pane.set_paused(pause.title.clone(), runs_on_launch(sp));
+        pane.set_paused(pause.title.clone(), runs_on_launch(sp), pause.auto);
     } else if at_launch && runs_on_launch(sp) {
         pane.sleep_until_shown(session);
     }
@@ -1464,12 +1467,23 @@ mod tests {
     }
 
     #[test]
+    fn an_auto_paused_pane_is_saved_with_its_flag_and_a_user_pause_without() {
+        let auto = SavedPause { title: None, auto: true };
+        let json = serde_json::to_string(&auto).unwrap();
+        assert!(json.contains("\"auto\":true"), "{json}");
+        assert_eq!(serde_json::from_str::<SavedPause>(&json).unwrap(), auto);
+        let user = serde_json::to_string(&SavedPause { title: None, auto: false }).unwrap();
+        assert!(!user.contains("auto"), "a user pause writes no key: {user}");
+        assert!(!serde_json::from_str::<SavedPause>("{}").unwrap().auto, "older files read as a user pause");
+    }
+
+    #[test]
     fn a_paused_pane_is_saved_paused_with_its_name_and_others_say_nothing() {
         let mut sp = pane("/p");
-        sp.paused = Some(SavedPause { title: Some("Fix the parser".into()) });
+        sp.paused = Some(SavedPause { title: Some("Fix the parser".into()), auto: false });
         let json = serde_json::to_string(&sp).unwrap();
         let back: SavedPane = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.paused, Some(SavedPause { title: Some("Fix the parser".into()) }));
+        assert_eq!(back.paused, Some(SavedPause { title: Some("Fix the parser".into()), auto: false }));
 
         let plain = serde_json::to_string(&pane("/p")).unwrap();
         assert!(!plain.contains("paused"), "a pane never paused writes no key: {plain}");

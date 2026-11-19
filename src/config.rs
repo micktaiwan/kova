@@ -15,6 +15,30 @@ pub struct Config {
     pub bookmarks: BookmarksConfig,
     pub switcher: SwitcherConfig,
     pub keys: KeysConfig,
+    pub agents: AgentsConfig,
+}
+
+/// What Kova does on its own with the coding agents running in its panes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AgentsConfig {
+    /// Pause an agent (as `p` in Cmd+P does) once it has sat idle and
+    /// unfocused for `auto_pause_hours`. Off by default. Both keys are changed
+    /// at run time by the `auto-pause` IPC command, which writes them back.
+    pub auto_pause: bool,
+    pub auto_pause_hours: f64,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        AgentsConfig { auto_pause: false, auto_pause_hours: crate::auto_pause::DEFAULT_HOURS }
+    }
+}
+
+impl AgentsConfig {
+    pub fn auto_pause_settings(&self) -> crate::auto_pause::Settings {
+        crate::auto_pause::Settings { enabled: self.auto_pause, hours: self.auto_pause_hours }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,6 +241,7 @@ impl Default for Config {
             bookmarks: BookmarksConfig::default(),
             switcher: SwitcherConfig::default(),
             keys: KeysConfig::default(),
+            agents: AgentsConfig::default(),
         }
     }
 }
@@ -314,6 +339,13 @@ impl Config {
             log::warn!("config: splits.focus_border_width out of 0..64, using default {}", ds.focus_border_width);
             self.splits.focus_border_width = ds.focus_border_width;
         }
+        if !crate::auto_pause::valid_hours(self.agents.auto_pause_hours) {
+            log::warn!(
+                "config: agents.auto_pause_hours must be > 0, using default {}",
+                crate::auto_pause::DEFAULT_HOURS
+            );
+            self.agents.auto_pause_hours = crate::auto_pause::DEFAULT_HOURS;
+        }
         if self.font.size <= 0.0 {
             let ds = FontConfig::default().size;
             log::warn!("config: font.size<=0, using default {}", ds);
@@ -323,7 +355,7 @@ impl Config {
 }
 
 
-fn config_path() -> PathBuf {
+pub(crate) fn config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".config/kova/config.toml")
 }

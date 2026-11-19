@@ -929,6 +929,18 @@ impl KovaView {
                 }
 
                 let focused = tab.pane(focused_id);
+                // Auto-pause measures idleness from the last time a pane was
+                // in front of the user; an auto-paused one comes back as soon
+                // as it is (`crate::auto_pause`).
+                if window_focused {
+                    if let Some(p) = focused {
+                        p.touch_active();
+                        if p.resume_if_auto_paused() {
+                            log::info!("Auto-pause: pane {} focused, resuming its agent", p.id);
+                            p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
                 let pty_ptr = focused.map(|p| &p.pty as *const crate::terminal::pty::Pty);
                 let focus_reporting = focused.map_or(false, |p| p.terminal.read().focus_reporting);
 
@@ -943,6 +955,18 @@ impl KovaView {
                     // Skip active tab: completion already read into pane_data
                     if i != active_idx {
                         t.check_completion();
+                    }
+                }
+                if refresh_fg {
+                    if let Some(delay) = crate::auto_pause::settings().delay() {
+                        let now = std::time::Instant::now();
+                        for t in tabs.iter() {
+                            t.for_each_pane(&mut |p| {
+                                if p.auto_pause_if_due(now, Some(delay)) {
+                                    p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            });
+                        }
                     }
                 }
                 // One conversation in two panes: raised here, where the ids

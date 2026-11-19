@@ -144,7 +144,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "peer_name": "subscribe on the Kova side",
   "dormant_session_id": null,
   "subject": "auth",
-  "paused": false
+  "paused": false,
+  "auto_paused": false
 }
 ```
 
@@ -180,7 +181,7 @@ The pane switcher, open-pane search results, IPC `title`, and automatic tab titl
 
 `awaiting` is `true` when the app in the pane has declared, over `set-pane-status`, that it is waiting for the user — and nothing Kova observed since contradicts it. `awaiting_since` is the epoch second at which the wait started (`null` when not waiting), so a client can show how long a session has been unanswered. Unlike `working`, this is *pushed*, not guessed: `working` is inferred from the terminal title, while `awaiting` is a claim the running app makes about itself. See `set-pane-status` for how it is set and, more importantly, for the ways Kova retracts it on its own.
 
-`paused` is `true` for a pane the user paused with `p` in `Cmd+P`: Kova hung up its agent (SIGHUP to the foreground job, SIGKILL after 2 s, the shell stays) and keeps the conversation in `dormant_session_id`, the pane keeping the name it had. Unlike a pane asleep since a relaunch, it is not woken by being shown, and it stays paused across a relaunch or a Cmd+O reopen; `p` again resumes it, and so do `wake-pane` and a late `ask` answer. `send-keys` ends the pause the same way it cancels a sleep, and so does an agent the user starts in it by hand. Kova.app only, like `subject`.
+`paused` is `true` for a pane the user paused with `p` in `Cmd+P`: Kova hung up its agent (SIGHUP to the foreground job, SIGKILL after 2 s, the shell stays) and keeps the conversation in `dormant_session_id`, the pane keeping the name it had. Unlike a pane asleep since a relaunch, it is not woken by being shown, and it stays paused across a relaunch or a Cmd+O reopen; `p` again resumes it, and so do `wake-pane` and a late `ask` answer. `send-keys` ends the pause the same way it cancels a sleep, and so does an agent the user starts in it by hand. `auto_paused` is `true` when Kova paused it on its own (`auto-pause`): focusing that pane resumes it. Kova.app only, like `subject`.
 
 `subject` is the name of the subject the pane is filed under in `Cmd+P` (the box it is drawn in), or `null`. Kova.app only: a library host has no subjects and its panes carry no such field. See `list-subjects`.
 
@@ -515,6 +516,36 @@ rebuilding the glyph atlas or resizing every PTY: `[font]`, `[terminal]`,
 loader falls back to defaults and logs the parse error).
 
 Response: `{ "ok": true, "data": { "windows": 2, "needs_restart": ["font", "keys", "terminal", "window"] } }`.
+
+---
+
+### `auto-pause` — read or change the automatic pause of idle agents
+
+```json
+{ "cmd": "auto-pause" }
+{ "cmd": "auto-pause", "enabled": true }
+{ "cmd": "auto-pause", "hours": 1.5 }
+{ "cmd": "auto-pause", "enabled": true, "hours": 3 }
+```
+
+When on, Kova pauses an agent (exactly as `p` in Cmd+P, see `paused` in
+`list-panes`) once it has sat idle for `hours`: not working, no background
+shells, and not the focused pane of the key window while Kova is the active app.
+A working agent is never paused. Focusing an auto-paused pane resumes its
+conversation by itself; a pane the user paused with `p` still waits for `p`.
+
+Both fields are optional: with neither, the command only reads. `enabled` is a
+boolean, `hours` a number greater than 0 (`0.5` is half an hour). A change
+applies at once and is written to `[agents]` in `~/.config/kova/config.toml`
+(`auto_pause`, `auto_pause_hours`), leaving the rest of the file as it was; a
+config file that does not parse is not rewritten and the command answers an
+error. `reload-config` also re-reads the two keys. Off by default, with a
+2-hour delay.
+
+Kova.app only: a library host answers `command not supported by this host`.
+
+Response: `{ "ok": true, "data": { "enabled": true, "hours": 3.0 } }` — the
+settings now in force.
 
 ---
 

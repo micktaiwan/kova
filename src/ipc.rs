@@ -175,6 +175,9 @@ pub enum IpcCommand {
     /// a restart (colors, pane fade, focus outline). Font, keybindings and
     /// terminal geometry keep the values they were started with.
     ReloadConfig,
+    /// Read the auto-pause settings (`crate::auto_pause`), or set either or
+    /// both and save them to `config.toml`. Kova.app only.
+    AutoPause { enabled: Option<bool>, hours: Option<f64> },
     /// Turn this connection into an event stream for the given topics.
     /// The main thread answers with a snapshot of the current state; every
     /// change after that is pushed as its own line. See `topic`.
@@ -652,6 +655,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "set-anchor" => &["pane_id", "cwd", "session_id", "agent", "label"],
         "clear-anchors" => &[],
         "reload-config" => &[],
+        "auto-pause" => &["enabled", "hours"],
         "subscribe" => &["events"],
         "ask" => &["question"],
         "list-asks" => &[],
@@ -1048,6 +1052,21 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
         }
         "clear-anchors" => Ok(IpcCommand::ClearAnchors),
         "reload-config" => Ok(IpcCommand::ReloadConfig),
+        "auto-pause" => {
+            let enabled = match v.get("enabled") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(b) => Some(b.as_bool().ok_or("\"enabled\" must be true or false")?),
+            };
+            let hours = match v.get("hours") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(h) => Some(
+                    h.as_f64()
+                        .filter(|h| crate::auto_pause::valid_hours(*h))
+                        .ok_or("\"hours\" must be a number greater than 0")?,
+                ),
+            };
+            Ok(IpcCommand::AutoPause { enabled, hours })
+        }
         "subscribe" => {
             // Omitted / null = every topic. An explicit list is validated name by
             // name: a typo must fail loudly, exactly like an unknown field, rather
@@ -1803,6 +1822,30 @@ mod tests {
             Ok(IpcCommand::ClearAnchors)
         ));
         assert!(parse_command(r#"{"cmd":"clear-anchors","all":true}"#).is_err());
+    }
+
+    #[test]
+    fn auto_pause_reads_or_sets_its_two_settings() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"auto-pause"}"#),
+            Ok(IpcCommand::AutoPause { enabled: None, hours: None })
+        ));
+        assert!(matches!(
+            parse_command(r#"{"cmd":"auto-pause","enabled":true}"#),
+            Ok(IpcCommand::AutoPause { enabled: Some(true), hours: None })
+        ));
+        assert!(matches!(
+            parse_command(r#"{"cmd":"auto-pause","hours":1.5}"#),
+            Ok(IpcCommand::AutoPause { enabled: None, hours: Some(h) }) if h == 1.5
+        ));
+        assert!(matches!(
+            parse_command(r#"{"cmd":"auto-pause","enabled":false,"hours":3}"#),
+            Ok(IpcCommand::AutoPause { enabled: Some(false), hours: Some(h) }) if h == 3.0
+        ));
+        assert!(parse_command(r#"{"cmd":"auto-pause","hours":0}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"auto-pause","hours":-2}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"auto-pause","enabled":"yes"}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"auto-pause","minutes":30}"#).is_err());
     }
 
     #[test]

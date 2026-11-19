@@ -44,6 +44,8 @@ pub fn pane_json(
     // Paused with `p` in Cmd+P: its conversation is in `dormant_session_id`,
     // and showing the pane does not wake it. Kova.app only, like `subject`.
     json["paused"] = serde_json::json!(pane.is_paused());
+    // Paused by Kova itself (`crate::auto_pause`): focusing the pane resumes it.
+    json["auto_paused"] = serde_json::json!(pane.is_auto_paused());
     json
 }
 
@@ -1071,7 +1073,7 @@ mod tests {
         let mut keys = keys;
         keys.sort();
         assert_eq!(keys, [
-            "agent", "agent_session_id", "agent_session_name", "awaiting", "awaiting_seen",
+            "agent", "agent_session_id", "agent_session_name", "auto_paused", "awaiting", "awaiting_seen",
             "awaiting_since", "child_processes", "claude_config_dir", "claude_session_id", "claude_session_name",
             "cwd", "dormant_session_id", "focused", "id", "is_idle", "minimized", "paused", "peer_name", "pid", "subject", "tab",
             "title", "window", "working",

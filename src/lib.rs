@@ -13,6 +13,7 @@ mod agent_session;
 mod anchors;
 mod appkit_input;
 mod ask;
+mod auto_pause;
 mod ask_card;
 mod bookmarks;
 mod claude_history;

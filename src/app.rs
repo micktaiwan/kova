@@ -205,6 +205,7 @@ define_class!(
 
 impl AppDelegate {
     pub fn new(mtm: MainThreadMarker, config: Config, session_backup: Option<usize>) -> Retained<Self> {
+        crate::auto_pause::set(config.agents.auto_pause_settings());
         let this = mtm.alloc::<Self>().set_ivars(AppDelegateIvars {
             windows: RefCell::new(Vec::new()),
             pending_close: RefCell::new(Vec::new()),
@@ -776,6 +777,7 @@ fn handle_ipc_command_sync(
         IpcCommand::ReloadConfig => {
             handle_ipc_reload_config(windows)
         }
+        IpcCommand::AutoPause { enabled, hours } => handle_ipc_auto_pause(enabled, hours),
         // Run by `crate::ipc::host::dispatch` before this dispatcher. Reaching
         // here means that routing was lost in a refactor.
         IpcCommand::ListPanes
@@ -1297,6 +1299,7 @@ fn handle_ipc_reload_config(
     windows: &RefCell<Vec<Retained<NSWindow>>>,
 ) -> crate::ipc::IpcResponse {
     let config = Config::load();
+    crate::auto_pause::set(config.agents.auto_pause_settings());
     let mut applied = 0usize;
     for win in windows.borrow().iter() {
         if let Some(view) = kova_view(win) {
@@ -1311,6 +1314,26 @@ fn handle_ipc_reload_config(
             "needs_restart": ["font", "keys", "terminal", "window"],
         })),
     }
+}
+
+/// IPC: read the auto-pause settings, or change them (either or both of
+/// `enabled` and `hours`) and save them to `config.toml`. Always answers with
+/// the settings now in force.
+fn handle_ipc_auto_pause(enabled: Option<bool>, hours: Option<f64>) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+    let mut s = crate::auto_pause::settings();
+    if enabled.is_some() || hours.is_some() {
+        if let Some(e) = enabled {
+            s.enabled = e;
+        }
+        if let Some(h) = hours {
+            s.hours = h;
+        }
+        if let Err(message) = crate::auto_pause::set_and_save(s) {
+            return IpcResponse::Error { message };
+        }
+    }
+    IpcResponse::Ok { data: Some(serde_json::json!({ "enabled": s.enabled, "hours": s.hours })) }
 }
 
 /// IPC: trigger any keyboard action by its stable name. With `pane_id`, the

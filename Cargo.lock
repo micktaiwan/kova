@@ -110,6 +110,7 @@ dependencies = [
  "serde_json",
  "simplelog",
  "toml",
+ "toml_edit",
  "unicode-segmentation",
  "unicode-width",
  "vte",
