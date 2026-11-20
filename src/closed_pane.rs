@@ -131,6 +131,9 @@ mod tests {
             agent_session: None,
             subject: None,
             paused: None,
+            uid: None,
+            ui_view: None,
+            ui_pane: false,
         }
     }
 

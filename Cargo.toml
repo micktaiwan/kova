@@ -82,6 +82,7 @@ libc = "0.2"
 block2 = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 toml = "0.8"
 toml_edit = "0.22"
 objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationRequest", "UNNotificationContent", "UNNotification", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger", "UNNotificationSettings", "UNError"] }

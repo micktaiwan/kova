@@ -4,7 +4,7 @@ use rustix_openpty::openpty;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::parser::VteHandler;
@@ -273,11 +273,37 @@ impl Default for SpawnEnv {
     }
 }
 
+/// The half-typed count after the user sent `data`: printable characters
+/// add up; Return, Ctrl-C, Ctrl-U and a lone Escape reset it; escape
+/// sequences (arrows, function keys) do not count. A paste counts its
+/// characters, newlines included as text.
+pub fn typed_after(prev: u32, data: &[u8], paste: bool) -> u32 {
+    if paste {
+        return prev.saturating_add(data.iter().filter(|b| (**b & 0xC0) != 0x80).count() as u32);
+    }
+    match data {
+        [b'\r'] | [b'\n'] | [0x03] | [0x15] | [0x1b] => 0,
+        [0x1b, ..] => prev,
+        _ => {
+            let printable = std::str::from_utf8(data).map(|t| t.chars().filter(|c| !c.is_control()).count()).unwrap_or(0);
+            if data.contains(&b'\r') {
+                0
+            } else {
+                prev.saturating_add(printable as u32)
+            }
+        }
+    }
+}
+
 pub struct Pty {
     master_fd: OwnedFd,
     child_pid: u32,
     shutdown: Arc<AtomicBool>,
     pub input_chars: Arc<AtomicU64>,
+    /// Characters the user typed or pasted since his last Return (Ctrl-C,
+    /// Ctrl-U and Escape reset it): a pane UI event is not typed over a
+    /// half-written line (`docs/pane-ui-spec.md` § 12).
+    pub typed_pending: AtomicU32,
     /// Shared with TerminalState — updated on every write (input) and by the
     /// parser (output) so the status bar can show time since last interaction.
     pub last_activity_secs: Arc<AtomicU64>,
@@ -540,6 +566,7 @@ impl Pty {
             child_pid,
             shutdown,
             input_chars,
+            typed_pending: AtomicU32::new(0),
             last_activity_secs,
             reader_thread: Some(reader_handle),
             is_dummy: false,
@@ -557,6 +584,7 @@ impl Pty {
             child_pid: 0,
             shutdown: Arc::new(AtomicBool::new(false)),
             input_chars: Arc::new(AtomicU64::new(0)),
+            typed_pending: AtomicU32::new(0),
             last_activity_secs: Arc::new(AtomicU64::new(0)),
             reader_thread: None,
             is_dummy: true,
@@ -576,6 +604,7 @@ impl Pty {
             child_pid: 0,
             shutdown: Arc::new(AtomicBool::new(false)),
             input_chars: Arc::new(AtomicU64::new(0)),
+            typed_pending: AtomicU32::new(0),
             last_activity_secs: Arc::new(AtomicU64::new(0)),
             reader_thread: None,
             is_dummy: true,
@@ -637,6 +666,12 @@ impl Pty {
             }
         }
         done
+    }
+
+    /// The user typed (or pasted) `data`: keep the half-typed count.
+    pub fn note_typed(&self, data: &[u8], paste: bool) {
+        let prev = self.typed_pending.load(Ordering::Relaxed);
+        self.typed_pending.store(typed_after(prev, data, paste), Ordering::Relaxed);
     }
 
     pub fn write(&self, data: &[u8]) {
@@ -1052,5 +1087,23 @@ mod tests {
         let info = process_info(std::process::id());
         assert!(!info.name.is_empty(), "argv[0] and p_comm both unreadable");
         assert!(info.name.starts_with("kova"), "unexpected name: {}", info.name);
+    }
+}
+
+#[cfg(test)]
+mod typed_tests {
+    use super::typed_after;
+
+    #[test]
+    fn half_typed_count() {
+        assert_eq!(typed_after(0, b"ab", false), 2);
+        assert_eq!(typed_after(2, b"\x1b[A", false), 2, "arrows do not count");
+        assert_eq!(typed_after(2, b"\r", false), 0);
+        assert_eq!(typed_after(5, &[0x03], false), 0, "Ctrl-C");
+        assert_eq!(typed_after(5, &[0x15], false), 0, "Ctrl-U");
+        assert_eq!(typed_after(5, &[0x1b], false), 0, "Escape");
+        assert_eq!(typed_after(1, "é".as_bytes(), false), 2);
+        assert_eq!(typed_after(0, b"two\nlines", true), 9, "a paste counts");
+        assert_eq!(typed_after(3, &[0x7f], false), 3, "backspace: no reset, no count");
     }
 }

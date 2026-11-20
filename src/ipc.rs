@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, mpsc};
 
 /// Maximum length of a single JSON line from a client (64 KB).
-const MAX_LINE_LEN: usize = 65536;
+/// A `ui-show` carries a view of up to 512 KiB (`docs/pane-ui-spec.md` § 4).
+const MAX_LINE_LEN: usize = 1024 * 1024;
 
 /// How many colors the tab palette holds. Mirrors `tab_colors::TAB_COLORS`, which is what
 /// the right-click menu offers; an index outside it would be silently wrapped at draw time.
@@ -58,6 +59,10 @@ pub enum IpcCommand {
     /// Pause the agent in a pane to free what it holds, as `p` in Cmd+P does
     /// (`Surface::pause`): refused while the agent works.
     PausePane(u32),
+    /// A pane UI command (`ui-show`, `ui-update`, `ui-update-card`,
+    /// `ui-close`, `ui-wait`), served on the main thread by `crate::ui_board`.
+    /// `ui-wait` is served by `handle_connection` itself, like `ask`.
+    Ui(Box<crate::ui_board::UiRequest>),
     /// Create a new tab with an optional CWD and command.
     NewTab {
         cwd: Option<String>,
@@ -203,6 +208,17 @@ pub enum IpcCommand {
     /// from a remote client), so the card would only deliver a stale answer.
     /// Nothing is delivered late; a `kova ask` still waiting exits with code 3.
     WithdrawAsks { session_id: String },
+    /// The asker replaces the card of one of its questions still on the board
+    /// (`docs/decision-cards-spec.md` § 7). `card` is validated on the main
+    /// thread, where the question's asker is known.
+    UpdateAsk {
+        id: String,
+        session_id: String,
+        card: serde_json::Value,
+        message: Option<String>,
+    },
+    /// The asker takes one of its questions back. Nothing is delivered.
+    WithdrawAsk { id: String, session_id: String },
     /// Every subject of every tab, with the panes filed under it, in the order
     /// Cmd+P draws them.
     ListSubjects,
@@ -528,6 +544,15 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, tx: mpsc::Sender<Ip
                 serve_ask(&stream, &tx, *question);
                 return;
             }
+            Ok(IpcCommand::Ui(mut req)) => {
+                // Permissions go by pane: through the process that connected.
+                req.peer_pid = peer_pid(&stream);
+                if let crate::ui_board::UiOp::Wait { timeout_ms, .. } = req.op {
+                    serve_ui_wait(&stream, &tx, *req, timeout_ms);
+                    return;
+                }
+                dispatch(&tx, IpcCommand::Ui(req))
+            }
             Ok(cmd) => dispatch(&tx, cmd),
             Err(msg) => IpcResponse::Error { message: msg },
         };
@@ -538,6 +563,63 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, tx: mpsc::Sender<Ip
         }
         let _ = writer.flush();
     }
+}
+
+/// The pid of the process at the other end of a Unix socket (`LOCAL_PEERPID`),
+/// 0 when the system does not say.
+pub fn peer_pid(stream: &UnixStream) -> i32 {
+    use std::os::fd::AsRawFd;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 { pid } else { 0 }
+}
+
+/// Serve one `ui-wait`: hand the request to the main thread, wait for the
+/// view's next event (or the timeout), write it, then wait for the client's
+/// `ack`; without it the event goes back to the head of the view's queue.
+fn serve_ui_wait(stream: &UnixStream, tx: &mpsc::Sender<IpcRequest>, req: crate::ui_board::UiRequest, timeout_ms: u64) {
+    use crate::ui_board::{UiOp, UiRequest};
+    let mut writer = stream;
+    let view_id = match &req.op {
+        UiOp::Wait { view_id, .. } => view_id.clone(),
+        _ => return,
+    };
+    let internal = |op: UiOp| UiRequest { peer_pid: req.peer_pid, from: req.from.clone(), op };
+    let (resp_tx, resp_rx) = mpsc::channel::<IpcResponse>();
+    if tx.send((IpcCommand::Ui(Box::new(req.clone())), resp_tx)).is_err() {
+        let _ = writeln!(writer, "{}", IpcResponse::Error { message: "app shutting down".into() }.to_json());
+        return;
+    }
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+    let response = match resp_rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(_) => {
+            // Withdraw the waiter, then take what may have been handed meanwhile.
+            let _ = dispatch(tx, IpcCommand::Ui(Box::new(internal(UiOp::Unwait { view_id: view_id.clone() }))));
+            match resp_rx.try_recv() {
+                Ok(r) => r,
+                Err(_) => IpcResponse::Ok { data: None },
+            }
+        }
+    };
+    let handed = matches!(&response, IpcResponse::Ok { data: Some(_) });
+    let sent = writeln!(writer, "{}", response.to_json()).is_ok() && writer.flush().is_ok();
+    if !handed {
+        return;
+    }
+    let _ = stream.set_read_timeout(Some(ASK_ACK_TIMEOUT));
+    let mut ack = String::new();
+    let acked = sent && BufReader::new(stream).read_line(&mut ack).is_ok() && ack.trim() == "ack";
+    let _ = dispatch(tx, IpcCommand::Ui(Box::new(internal(UiOp::Ack { view_id, ok: acked }))));
 }
 
 /// How long a client gets to acknowledge an answer before Kova delivers it late.
@@ -632,6 +714,11 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "focus-pane" => &["pane_id"],
         "wake-pane" => &["pane_id"],
         "pause-pane" => &["pane_id"],
+        "ui-show" => &["session_id", "pane_id", "placement", "size", "view", "from"],
+        "ui-update" => &["view_id", "session_id", "view", "from"],
+        "ui-update-card" => &["view_id", "session_id", "card_id", "card", "from"],
+        "ui-close" => &["view_id", "session_id", "from"],
+        "ui-wait" => &["view_id", "session_id", "timeout_ms", "from"],
         "new-tab" => &["cwd", "command"],
         "set-tab-title" => &["pane_id", "title"],
         "set-tab-color" => &["pane_id", "color"],
@@ -661,6 +748,8 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "list-asks" => &[],
         "answer-ask" => &["id", "action", "text"],
         "withdraw-asks" => &["session_id"],
+        "update-ask" => &["id", "session_id", "card", "message"],
+        "withdraw-ask" => &["id", "session_id"],
         "list-subjects" => &[],
         "set-pane-subject" => &["pane_id", "subject"],
         "rename-subject" => &["tab_id", "name", "new_name"],
@@ -719,6 +808,69 @@ fn subject_name(v: &serde_json::Value, key: &str) -> Result<String, String> {
         ));
     }
     Ok(name.to_string())
+}
+
+/// The `ui-*` commands (`docs/pane-ui-spec.md` § 5). The view and card
+/// documents are validated on the main thread, where the owner is known.
+fn parse_ui(cmd: &str, v: &serde_json::Value) -> Result<IpcCommand, String> {
+    use crate::ui_board::{UiOp, UiRequest};
+    let string = |key: &str| -> Result<String, String> {
+        v.get(key)
+            .ok_or_else(|| format!("missing \"{}\" field", key))?
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| format!("\"{}\" must be a string", key))
+    };
+    let view_id = || -> Result<String, String> {
+        let id = string("view_id")?;
+        if !crate::ask::is_safe_question_id(&id) {
+            return Err("\"view_id\" must be a UUID".to_string());
+        }
+        Ok(id)
+    };
+    let mut from: crate::ask::Asker = match v.get("from") {
+        None | Some(serde_json::Value::Null) => crate::ask::Asker::default(),
+        Some(f) => serde_json::from_value(f.clone()).map_err(|e| format!("invalid \"from\": {}", e))?,
+    };
+    if let Some(session) = v.get("session_id").and_then(|s| s.as_str()) {
+        from.session_id = Some(session.to_string());
+    }
+    if from.session_id.as_deref().is_some_and(|s| !crate::ask::is_safe_session_id(s)) {
+        return Err("\"session_id\" must be a plain session id".to_string());
+    }
+    let op = match cmd {
+        "ui-show" => {
+            let pane_id = required_u32(v, "pane_id")?;
+            let placement = match v.get("placement").and_then(|p| p.as_str()) {
+                None => crate::pane_ui::Placement::DockBottom,
+                Some(p) => crate::pane_ui::Placement::parse(p).ok_or_else(|| format!("unknown placement {}", p))?,
+            };
+            let size = match v.get("size") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(s) => {
+                    let size = s.as_f64().ok_or("\"size\" must be a number")? as f32;
+                    if !(0.2..=0.7).contains(&size) {
+                        return Err("size out of range".to_string());
+                    }
+                    Some(size)
+                }
+            };
+            let view = v.get("view").cloned().ok_or("missing \"view\" field")?;
+            UiOp::Show { pane_id, placement, size, view }
+        }
+        "ui-update" => UiOp::Update { view_id: view_id()?, view: v.get("view").cloned().ok_or("missing \"view\" field")? },
+        "ui-update-card" => UiOp::UpdateCard {
+            view_id: view_id()?,
+            card_id: string("card_id")?,
+            card: v.get("card").filter(|c| !c.is_null()).cloned(),
+        },
+        "ui-close" => UiOp::Close { view_id: view_id()? },
+        _ => {
+            let timeout_ms = v.get("timeout_ms").and_then(|t| t.as_u64()).unwrap_or(600_000);
+            UiOp::Wait { view_id: view_id()?, timeout_ms }
+        }
+    };
+    Ok(IpcCommand::Ui(Box::new(UiRequest { peer_pid: 0, from, op })))
 }
 
 pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
@@ -797,6 +949,7 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             let pane_id = required_u32(&v, "pane_id")?;
             Ok(IpcCommand::PausePane(pane_id))
         }
+        "ui-show" | "ui-update" | "ui-update-card" | "ui-close" | "ui-wait" => parse_ui(cmd, &v),
         "new-tab" => {
             let cwd = v.get("cwd").and_then(|c| c.as_str()).map(String::from);
             let cmd_str = v.get("command").and_then(|c| c.as_str()).map(String::from);
@@ -1105,13 +1258,28 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             let raw = v
                 .get("question")
                 .ok_or_else(|| "missing \"question\" field".to_string())?;
-            let question: crate::ask::Question = serde_json::from_value(raw.clone())
+            // The card is validated on its own (decision_card::validate), with
+            // the spec's error messages rather than serde's.
+            let mut raw = raw.clone();
+            let card = raw
+                .as_object_mut()
+                .and_then(|o| o.remove("card"))
+                .filter(|c| !c.is_null());
+            let message_given = raw
+                .get("message")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.trim().is_empty())
+                .map(String::from);
+            if card.is_some() && raw.get("message").is_none() {
+                raw["message"] = serde_json::json!("");
+            }
+            let mut question: crate::ask::Question = serde_json::from_value(raw)
                 .map_err(|e| format!("invalid \"question\": {}", e))?;
             // The id names files on disk; the session id may end up on a command line.
             if !crate::ask::is_safe_question_id(&question.id) {
                 return Err("\"question.id\" must be a UUID".to_string());
             }
-            if question.message.trim().is_empty() {
+            if card.is_none() && question.message.trim().is_empty() {
                 return Err("\"question.message\" must not be empty".to_string());
             }
             if question
@@ -1121,6 +1289,14 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 .is_some_and(|s| !crate::ask::is_safe_session_id(s))
             {
                 return Err("\"question.from.session_id\" must be a plain session id".to_string());
+            }
+            if let Some(card) = card {
+                let facts = crate::decision_card::AskerFacts {
+                    session_id: question.from.session_id.as_deref(),
+                    claude: question.from.agent == crate::agent_session::Agent::Claude,
+                };
+                let card = crate::decision_card::validate(&card, message_given.as_deref(), &facts)?;
+                question.set_card(card, message_given);
             }
             Ok(IpcCommand::Ask(Box::new(question)))
         }
@@ -1153,6 +1329,36 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 return Err("\"session_id\" must be a plain session id".to_string());
             }
             Ok(IpcCommand::WithdrawAsks { session_id })
+        }
+        "update-ask" | "withdraw-ask" => {
+            let id = v
+                .get("id")
+                .and_then(|i| i.as_str())
+                .ok_or_else(|| "missing \"id\" field".to_string())?
+                .to_string();
+            if !crate::ask::is_safe_question_id(&id) {
+                return Err("\"id\" must be a UUID".to_string());
+            }
+            let card = v.get("card").filter(|c| !c.is_null()).cloned();
+            if cmd == "update-ask" && card.is_none() {
+                return Err("missing card".to_string());
+            }
+            let what = if cmd == "update-ask" { "updating" } else { "withdrawing" };
+            let session_id = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .filter(|s| crate::ask::is_safe_session_id(s))
+                .map(String::from)
+                .ok_or_else(|| format!("{} requires an asker session id", what))?;
+            if cmd == "withdraw-ask" {
+                return Ok(IpcCommand::WithdrawAsk { id, session_id });
+            }
+            let message = match v.get("message") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(m)) => Some(m.clone()).filter(|m| !m.trim().is_empty()),
+                Some(_) => return Err("\"message\" must be a string".to_string()),
+            };
+            Ok(IpcCommand::UpdateAsk { id, session_id, card: card.unwrap_or_default(), message })
         }
         "list-subjects" => Ok(IpcCommand::ListSubjects),
         "set-pane-subject" => {
@@ -1541,6 +1747,33 @@ mod tests {
             err(r#"{"cmd":"withdraw-asks","session_id":"a b"}"#),
             "\"session_id\" must be a plain session id"
         );
+    }
+
+    #[test]
+    fn ask_with_a_card_and_the_asker_commands_parse() {
+        let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let card = r#"{"version":1,"title":"T","blocks":[{"type":"text","text":"b"}],"actions":[{"id":"ok","label":"OK"}]}"#;
+        let ask = format!(r#"{{"cmd":"ask","question":{{"id":"{id}","from":{{"name":"x","session_id":"s1"}},"card":{card}}}}}"#);
+        match parse_command(&ask) {
+            Ok(IpcCommand::Ask(q)) => {
+                assert_eq!(q.message, "T — b", "derived when the caller gives none");
+                assert_eq!(q.actions, vec!["ok"]);
+                assert!(q.card.is_some());
+            }
+            other => panic!("{:?}", other.err()),
+        }
+        let bad = ask.replace(r#""version":1"#, r#""version":2"#);
+        assert_eq!(err(&bad), "unknown card version 2");
+        let update = format!(r#"{{"cmd":"update-ask","id":"{id}","session_id":"s1","card":{card}}}"#);
+        assert!(matches!(parse_command(&update), Ok(IpcCommand::UpdateAsk { .. })));
+        assert_eq!(err(&format!(r#"{{"cmd":"update-ask","id":"{id}","session_id":"s1"}}"#)), "missing card");
+        assert_eq!(err(&format!(r#"{{"cmd":"update-ask","id":"{id}","card":{card}}}"#)), "updating requires an asker session id");
+        assert!(matches!(
+            parse_command(&format!(r#"{{"cmd":"withdraw-ask","id":"{id}","session_id":"s1"}}"#)),
+            Ok(IpcCommand::WithdrawAsk { .. })
+        ));
+        assert_eq!(err(&format!(r#"{{"cmd":"withdraw-ask","id":"{id}"}}"#)), "withdrawing requires an asker session id");
+        assert_eq!(err(r#"{"cmd":"withdraw-ask","id":"../x","session_id":"s1"}"#), "\"id\" must be a UUID");
     }
 
     #[test]

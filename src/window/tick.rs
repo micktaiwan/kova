@@ -171,6 +171,9 @@ impl KovaView {
         // First, so the commands injected below start at the pane's real size.
         self.flush_pending_resize();
 
+        // Docked native views follow their panes (splits, resize, tab switch).
+        self.sync_docks();
+
         self.ask_about_duplicate_session();
 
         self.inject_pending_commands();
@@ -816,8 +819,12 @@ impl KovaView {
                 // Cached set, not the file: this runs for every pane of every frame.
                 let bookmark_keys = ivars.bookmark_keys.borrow();
                 let anchor_keys = ivars.anchor_keys.borrow();
-                let cell_h = renderer.read().cell_size().1;
+                let ((cell_w, cell_h), status_bar) = {
+                    let r = renderer.read();
+                    (r.cell_size(), r.status_bar_enabled())
+                };
                 tab.cell_h.set(cell_h);
+                tab.dock_geometry.set(self.dock_geometry(cell_w, cell_h, status_bar));
                 let tab_bar_h = (cell_h * 2.0).round();
                 let drawable_size = layer.drawableSize();
                 let screen_width = drawable_size.width as f32;
@@ -848,6 +855,10 @@ impl KovaView {
                     self.request_resize_all_panes();
                 }
                 tab.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
+                    // A UI pane has no terminal: its native view covers it.
+                    if pane.ui_pane.get() {
+                        return;
+                    }
                     // First frame this pane is submitted to the renderer = it becomes
                     // visible (loading overlay or content). "time to rectangle".
                     pane.open_timer.mark_first_paint(pane.id);

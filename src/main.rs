@@ -216,6 +216,10 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("ask") {
         std::process::exit(kova::ask_cli(&args[2..]));
     }
+    // `kova ui …`: an agent shows a native view in its pane (docs/pane-ui-spec.md).
+    if args.get(1).map(String::as_str) == Some("ui") {
+        std::process::exit(kova::ui_cli(&args[2..]));
+    }
 
     // Informational flags must exit BEFORE any app machinery runs: launching
     // the full app here restores (and deletes) session.json and truncates the
@@ -234,6 +238,7 @@ fn main() {
         println!("  --session N        restore session.N.json instead of session.json");
         println!();
         println!("  kova ask \"<question>\"  ask the user through the running Kova (kova ask --help)");
+        println!("  kova ui show|update|card|wait|close   a native view in this pane (kova ui --help)");
         return;
     }
 
@@ -241,7 +246,7 @@ fn main() {
     // for an IPC CLI, and each call opened a second Kova window over the user's
     // work. Refuse any positional word instead of launching the app.
     if let Some(word) = stray_subcommand(&args) {
-        eprintln!("kova: '{}' is not a command. This binary is the Kova app; its only subcommand is `kova ask`.", word);
+        eprintln!("kova: '{}' is not a command. This binary is the Kova app; its only subcommands are `kova ask` and `kova ui`.", word);
         eprintln!("Talk to a running Kova through its socket:");
         eprintln!("  printf '%s' '{{\"cmd\":\"list-panes\"}}' | nc -U \"$KOVA_SOCKET\"");
         std::process::exit(2);

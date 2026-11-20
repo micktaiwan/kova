@@ -40,6 +40,8 @@ pub struct AppDelegateIvars {
     app_active: Cell<bool>,
     /// Agents' questions waiting for the user (`kova ask`), shown on the card.
     asks: RefCell<crate::ask::Board>,
+    /// Native views agents show in panes (`docs/pane-ui-spec.md`).
+    ui: RefCell<crate::ui_board::UiBoard>,
 }
 
 define_class!(
@@ -218,6 +220,7 @@ impl AppDelegate {
             events: RefCell::new(crate::events::EventState::new()),
             app_active: Cell::new(false),
             asks: RefCell::new(crate::ask::Board::new()),
+            ui: RefCell::new(crate::ui_board::UiBoard::new(crate::ask::AskStore::default_root())),
         });
         let retained: Retained<Self> = unsafe { msg_send![super(this), init] };
         retained.ivars().config.set(config).ok();
@@ -318,6 +321,7 @@ impl AppDelegate {
                                         .map(|q| {
                                             let mut entry = serde_json::to_value(q).unwrap_or_default();
                                             entry["buttons"] = serde_json::json!(q.buttons());
+                                            entry["card_version"] = serde_json::json!(q.card_version);
                                             entry
                                         })
                                         .collect();
@@ -331,6 +335,48 @@ impl AppDelegate {
                                     let _ = responder.send(crate::ipc::IpcResponse::Ok {
                                         data: Some(serde_json::json!({ "withdrawn": withdrawn })),
                                     });
+                                    continue;
+                                }
+                                // A UI pane has no terminal to type into or read.
+                                let terminal_ids: Vec<u32> = match &cmd {
+                                    crate::ipc::IpcCommand::SendKeys { pane_id, .. }
+                                    | crate::ipc::IpcCommand::WaitForCompletion { pane_id, .. } => vec![*pane_id],
+                                    crate::ipc::IpcCommand::GetPaneContent { panes: crate::ipc::PaneFilter::Ids(ids), .. }
+                                    | crate::ipc::IpcCommand::CountPaneContent { panes: crate::ipc::PaneFilter::Ids(ids), .. } => ids.clone(),
+                                    _ => Vec::new(),
+                                };
+                                if !terminal_ids.is_empty() {
+                                    let host = AppUiHost { windows: &ivars.windows };
+                                    use crate::ui_board::UiHost;
+                                    if terminal_ids.iter().any(|id| host.pane(*id).is_some_and(|p| p.ui_pane)) {
+                                        let _ = responder.send(crate::ipc::IpcResponse::Error { message: "pane has no terminal".to_string() });
+                                        continue;
+                                    }
+                                }
+                                if let crate::ipc::IpcCommand::Ui(req) = cmd {
+                                    let host = AppUiHost { windows: &ivars.windows };
+                                    ivars.ui.borrow_mut().handle(&host, *req, responder);
+                                    continue;
+                                }
+                                if let crate::ipc::IpcCommand::UpdateAsk { id, session_id, card, message } = cmd {
+                                    let response = match ivars.asks.borrow_mut().update(&id, &session_id, &card, message) {
+                                        Ok(version) => crate::ipc::IpcResponse::Ok {
+                                            data: Some(serde_json::json!({ "card_version": version })),
+                                        },
+                                        Err(message) => {
+                                            log::info!("ask {}: update-ask refused: {}", id, message);
+                                            crate::ipc::IpcResponse::Error { message }
+                                        }
+                                    };
+                                    let _ = responder.send(response);
+                                    continue;
+                                }
+                                if let crate::ipc::IpcCommand::WithdrawAsk { id, session_id } = cmd {
+                                    let response = match ivars.asks.borrow_mut().withdraw_one(&id, &session_id) {
+                                        Ok(()) => crate::ipc::IpcResponse::Ok { data: None },
+                                        Err(message) => crate::ipc::IpcResponse::Error { message },
+                                    };
+                                    let _ = responder.send(response);
                                     continue;
                                 }
                                 if let crate::ipc::IpcCommand::AnswerAsk { id, action, text } = cmd {
@@ -365,10 +411,14 @@ impl AppDelegate {
                     // Answers given on the question card, then the card itself.
                     {
                         let mut asks = ivars.asks.borrow_mut();
-                        for a in crate::ask_card::take_answers() {
-                            asks.answer(&a.id, a.action, a.text);
-                        }
+                        asks.drain_card();
                         asks.refresh_card(MainThreadMarker::new_unchecked());
+                    }
+
+                    // Clicks and closes in pane views, then the events waiting.
+                    {
+                        let host = AppUiHost { windows: &ivars.windows };
+                        ivars.ui.borrow_mut().drain_views(&host);
                     }
 
                     // Focus the panes whose notification was clicked. Done here
@@ -587,6 +637,50 @@ pub fn kova_view(window: &NSWindow) -> Option<&crate::window::KovaView> {
 /// Kova.app as an IPC host: every pane and tab of every window, in the order
 /// of the window list. A window whose content view is not a `KovaView` is
 /// skipped, as everywhere else.
+/// The panes of every window, as the pane UI board sees them.
+struct AppUiHost<'a> {
+    windows: &'a RefCell<Vec<Retained<NSWindow>>>,
+}
+
+impl AppUiHost<'_> {
+    fn first<T>(&self, f: impl Fn(&crate::window::KovaView) -> Option<T>) -> Option<T> {
+        self.windows.borrow().iter().filter_map(|w| kova_view(w)).find_map(|v| f(v))
+    }
+}
+
+impl crate::ui_board::UiHost for AppUiHost<'_> {
+    fn pane(&self, id: crate::pane::PaneId) -> Option<crate::ui_board::PaneInfo> {
+        self.first(|v| v.ui_pane_info(id))
+    }
+    fn pane_by_uid(&self, uid: &str) -> Option<crate::ui_board::PaneInfo> {
+        self.first(|v| v.ui_pane_by_uid(uid))
+    }
+    fn find_view(&self, view_id: &str) -> Option<(crate::ui_board::PaneInfo, crate::pane_ui::View)> {
+        self.first(|v| v.ui_find_view(view_id))
+    }
+    fn view_in(&self, id: crate::pane::PaneId) -> Option<crate::pane_ui::View> {
+        self.first(|v| v.ui_view_in(id))
+    }
+    fn set_view(&self, id: crate::pane::PaneId, view: Option<crate::pane_ui::View>) {
+        let _ = self.first(|v| v.ui_set_view(id, view.clone()));
+    }
+    fn open_ui_pane(&self, opener: crate::pane::PaneId, placement: crate::pane_ui::Placement, size: f32) -> Option<crate::pane::PaneId> {
+        self.first(|v| v.ui_open_pane(opener, placement, size))
+    }
+    fn close_pane(&self, id: crate::pane::PaneId) {
+        let _ = self.first(|v| v.ipc_close_pane(id));
+    }
+    fn ui_panes_of(&self, opener_uid: &str) -> usize {
+        self.windows.borrow().iter().filter_map(|w| kova_view(w)).map(|v| v.ui_panes_of(opener_uid)).sum()
+    }
+    fn descends(&self, pid: i32, ancestor: i32) -> bool {
+        crate::ask::descends(pid, ancestor)
+    }
+    fn own_socket(&self) -> String {
+        crate::ipc::socket_path().to_string_lossy().into_owned()
+    }
+}
+
 struct KovaAppHost<'a> {
     windows: &'a RefCell<Vec<Retained<NSWindow>>>,
 }
@@ -802,7 +896,13 @@ fn handle_ipc_command_sync(
         // Intercepted in the tick, before this dispatcher — it needs the event
         // state, which lives on the delegate. Reaching here means that branch was
         // lost in a refactor.
-        IpcCommand::Ask(_) | IpcCommand::ListAsks | IpcCommand::AnswerAsk { .. } | IpcCommand::WithdrawAsks { .. } => {
+        IpcCommand::Ask(_)
+        | IpcCommand::ListAsks
+        | IpcCommand::AnswerAsk { .. }
+        | IpcCommand::WithdrawAsks { .. }
+        | IpcCommand::UpdateAsk { .. }
+        | IpcCommand::WithdrawAsk { .. }
+        | IpcCommand::Ui(_) => {
             log::error!("IPC: an ask command reached the generic dispatcher");
             crate::ipc::IpcResponse::Error {
                 message: "internal: ask was not intercepted".to_string(),

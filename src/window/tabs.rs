@@ -926,6 +926,7 @@ impl KovaView {
                     virtual_width_override: 0.0,
                     geometry_scale: self.backing_scale(),
                     cell_h: std::cell::Cell::new(0.0),
+                    dock_geometry: std::cell::Cell::new(crate::pane::DockGeometry::default()),
                     subjects: Vec::new(),
                     subject_colors: std::collections::HashMap::new(),
                 };

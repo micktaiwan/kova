@@ -118,7 +118,7 @@ fn agent_and_session(
 }
 
 /// One question, as it travels on the socket and sits on disk.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Question {
     pub id: String,
     pub message: String,
@@ -136,10 +136,26 @@ pub struct Question {
     /// [`Board::withdraw`]): the card keeps it, says so, and adds [`DISMISS`].
     #[serde(default)]
     pub superseded: bool,
+    /// A decision card (`crate::decision_card`): when present, the card draws it
+    /// and `message`, `actions`, `input` are only its fallback for an older Kova.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<crate::decision_card::Card>,
+    /// 1 at creation, bumped by each `update-ask`. Left out of the JSON at 1, so
+    /// a plain question serializes exactly as before; `list-asks` adds it.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub card_version: u32,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn one() -> u32 {
+    1
+}
+
+fn is_one(n: &u32) -> bool {
+    *n == 1
 }
 
 /// The button always added after the asker's actions when the card has a text field: a typed
@@ -155,7 +171,10 @@ pub const SUPERSEDED_NOTE: &str = "You wrote in the conversation since. Answer h
 impl Question {
     /// The buttons the card shows.
     pub fn buttons(&self) -> Vec<String> {
-        let mut buttons = if self.actions.is_empty() {
+        // A card lists its own actions, and gets no "Other".
+        let mut buttons = if let Some(card) = &self.card {
+            card.actions.iter().map(|a| a.id.clone()).collect()
+        } else if self.actions.is_empty() {
             vec!["Reply".to_string()]
         } else {
             let mut buttons = self.actions.clone();
@@ -173,7 +192,29 @@ impl Question {
     /// Whether [`DISMISS`] closes this question without an answer: superseded,
     /// and the asker did not propose a "Dismiss" of its own, which stays an answer.
     pub fn dismissable(&self) -> bool {
-        self.superseded && !self.actions.iter().any(|a| a == DISMISS)
+        let own = match &self.card {
+            Some(card) => card.actions.iter().any(|a| a.id == DISMISS),
+            None => self.actions.iter().any(|a| a == DISMISS),
+        };
+        self.superseded && !own
+    }
+
+    /// Whether the card shows a text field.
+    pub fn has_input(&self) -> bool {
+        match &self.card {
+            Some(card) => card.input.is_some(),
+            None => self.input,
+        }
+    }
+
+    /// Put `card` on this question: its fallback fields follow it.
+    pub fn set_card(&mut self, card: crate::decision_card::Card, message: Option<String>) {
+        self.message = message.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| {
+            crate::decision_card::derive_message(&serde_json::to_value(&card).unwrap_or_default())
+        });
+        self.actions = card.legacy_actions();
+        self.input = card.input.is_some();
+        self.card = Some(card);
     }
 }
 
@@ -183,18 +224,132 @@ pub struct Answer {
     pub id: String,
     pub action: String,
     pub text: String,
+    /// The version of the question shown when the user answered (§ 7 of the
+    /// decision cards spec). 1 for an answer kept on disk by an older Kova.
+    #[serde(default = "one")]
+    pub card_version: u32,
+    /// Every `code` block of a decision card, as the user left it: the text
+    /// to send is in `file`, edited or not, never the asker's own copy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<AnswerBlock>,
+}
+
+/// A `code` block's final text, written by Kova when the user answered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerBlock {
+    /// Index in the card's `blocks`.
+    pub block: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Absolute path of the file holding the text, byte for byte.
+    pub file: String,
+    pub sha256: String,
+    /// The user changed the text the card showed.
+    pub edited: bool,
 }
 
 impl Answer {
-    /// One line for the asker: "OK", or "OK: fix that part".
+    /// One line for the asker: "OK", or "OK: fix that part", then where each
+    /// code block's final text is.
     pub fn line(&self) -> String {
-        if self.text.is_empty() { self.action.clone() } else { format!("{}: {}", self.action, self.text) }
+        let mut line = if self.text.is_empty() { self.action.clone() } else { format!("{}: {}", self.action, self.text) };
+        for b in &self.blocks {
+            line.push_str(&format!(
+                " [block {}{} {}: {} sha256 {}]",
+                b.block,
+                b.label.as_deref().map(|l| format!(" \"{}\"", l)).unwrap_or_default(),
+                if b.edited { "edited by the user" } else { "unchanged" },
+                b.file,
+                b.sha256
+            ));
+        }
+        line
     }
+}
+
+/// How long an answer's block files stay on disk: a late delivery can wake
+/// the asking conversation days later.
+pub const ANSWER_FILES_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// `<ask dir>/answers/<question id>/block-<i>.txt`.
+pub fn answer_block_path(root: &Path, question_id: &str, block: usize) -> Option<PathBuf> {
+    let stem = crate::decision_card::grant_file_stem(question_id)?;
+    Some(root.join("answers").join(stem).join(format!("block-{}.txt", block)))
+}
+
+/// Write each code block's final text and fill the answer's `blocks`.
+/// Directory 0700, files 0600, each written atomically.
+pub fn write_answer_blocks(root: &Path, answer: &mut Answer, texts: &[FinalBlock]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    for t in texts {
+        let path = answer_block_path(root, &answer.id, t.block).ok_or("bad question id")?;
+        let dir = path.parent().ok_or("no parent")?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| e.to_string())?;
+        let tmp = dir.join(format!(".block-{}.tmp", t.block));
+        let _ = std::fs::remove_file(&tmp);
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).map_err(|e| e.to_string())?;
+        file.write_all(t.text.as_bytes()).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        answer.blocks.push(AnswerBlock {
+            block: t.block,
+            label: t.label.clone(),
+            file: path.to_string_lossy().into_owned(),
+            sha256: crate::decision_card::sha256_hex(t.text.as_bytes()),
+            edited: t.edited,
+        });
+    }
+    Ok(())
+}
+
+/// Delete answer folders older than [`ANSWER_FILES_TTL_SECS`] (by mtime).
+pub fn prune_answer_files(root: &Path, now: u64) -> usize {
+    let Ok(entries) = std::fs::read_dir(root.join("answers")) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(modified) >= ANSWER_FILES_TTL_SECS && std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// A `code` block's text when the user answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalBlock {
+    pub block: usize,
+    pub label: Option<String>,
+    pub text: String,
+    pub edited: bool,
+}
+
+/// The final text of every `code` block of `card`: the user's version from
+/// `edits` (block index, text) when given, else the card's.
+pub fn final_blocks(card: &crate::decision_card::Card, edits: &[(usize, String)]) -> Vec<FinalBlock> {
+    card.blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| match b {
+            crate::decision_card::Block::Code { text, label } => {
+                let final_text = edits.iter().rev().find(|(e, _)| *e == i).map(|(_, t)| t.clone()).unwrap_or_else(|| text.clone());
+                let edited = final_text != *text;
+                Some(FinalBlock { block: i, label: label.clone(), text: final_text, edited })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// An answer given but not yet delivered, kept on disk until it is: a delivery
 /// can wait hours for a conversation to close, and Kova may quit meanwhile.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Undelivered {
     pub question: Question,
     pub answer: Answer,
@@ -257,11 +412,19 @@ pub fn late_answer_message(question: &Question, answer: &Answer) -> String {
         let flat = t.replace("\r\n", " ");
         flat.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>()
     };
-    format!(
-        "[Kova] The user answered your question \"{}\": {}",
-        one_line(&question.message),
-        one_line(&answer.line())
-    )
+    match &question.card {
+        Some(card) => format!(
+            "[Kova] The user answered your card \"{}\" (v{}): {}",
+            one_line(&card.title),
+            answer.card_version,
+            one_line(&answer.line())
+        ),
+        None => format!(
+            "[Kova] The user answered your question \"{}\": {}",
+            one_line(&question.message),
+            one_line(&answer.line())
+        ),
+    }
 }
 
 /// A Claude session id as Claude Code writes it.
@@ -534,8 +697,15 @@ fn reply_ok(reply: &Option<serde_json::Value>) -> bool {
 /// The answer leaves `store` only once delivered.
 pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_socket: &str) {
     let message = late_answer_message(question, answer);
-    let asker = &question.from;
-    let id = &question.id;
+    let id = question.id.clone();
+    deliver_line(&question.id, &question.from, &message, own_socket, &|| store.remove_delivery(&id));
+}
+
+/// Type `message` into the asker's conversation (its pane, a sleeping pane
+/// woken, or a resume in a new tab), then call `done` once it is delivered.
+/// Shared by late `kova ask` answers and pane UI events. Blocking.
+pub fn deliver_line(id: &str, asker: &Asker, message: &str, own_socket: &str, done: &dyn Fn()) {
+    let message = message.to_string();
     let target = match wake_sleeping_asker(asker, own_socket) {
         Some(Woken::Ready { socket, pane_id }) => Delivery::Pane { socket, pane_id },
         Some(Woken::NotYet { pane_id }) => {
@@ -577,7 +747,7 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
                 if delivered { String::new() } else { format!(" — {}", kept()) }
             );
             if delivered {
-                store.remove_delivery(id);
+                done();
             }
         }
         Delivery::Resume {
@@ -585,7 +755,7 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
             session_id,
             cwd,
         } => resume(
-            store,
+            done,
             id,
             agent,
             &session_id,
@@ -606,7 +776,7 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
             }
             match asker.session_id.as_deref() {
                 Some(session) if !alive() => resume(
-                    store,
+                    done,
                     id,
                     asker.agent,
                     session,
@@ -619,13 +789,13 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
                     id,
                     pid,
                     kept(),
-                    answer.line()
+                    message
                 ),
             }
         }
         Delivery::None => {
-            log::info!("ask {}: answer has nowhere to go (no Claude session to reach): {}", id, answer.line());
-            store.remove_delivery(id);
+            log::info!("ask {}: answer has nowhere to go (no Claude session to reach): {}", id, message);
+            done();
         }
     }
 }
@@ -772,7 +942,7 @@ const RESUME_CHECK: Duration = Duration::from_secs(10);
 /// Reopen the conversation in a new tab of this Kova, in its directory, with
 /// the answer as its next prompt: visible, so the user sees the agent go on.
 fn resume(
-    store: &AskStore,
+    done: &dyn Fn(),
     id: &str,
     agent: crate::agent_session::Agent,
     session_id: &str,
@@ -870,7 +1040,7 @@ fn resume(
         return;
     }
     log::info!("ask {}: reopened session {} in a new tab (pane {}) in {}", id, session_id, pane, cwd.unwrap_or("-"));
-    store.remove_delivery(id);
+    done();
 }
 
 // ─── Kova.app's side: the questions on screen ─────────────────────────────────
@@ -887,7 +1057,128 @@ pub struct Board {
     owner_tried: std::time::Instant,
     /// The card must be redrawn on the next tick.
     dirty: bool,
+    /// The question the card shows, and its rank when last drawn: the card
+    /// follows the id, and falls back on the rank when that question leaves.
+    shown: Option<(String, usize)>,
+    /// A red line on a question's card: its grant could not be written.
+    error: Option<(String, String)>,
 }
+
+/// What set off an answer: grant actions only answer a real click or ⌘Return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    Click,
+    CmdReturn,
+    /// Plain Return: never a grant action.
+    Return,
+    /// `answer-ask`, from any local process.
+    Remote,
+}
+
+/// Why an answer was not taken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClickRefusal {
+    /// The card shown was not the current version (a redraw is pending).
+    Stale,
+    /// Nothing to do, silently (plain Return on a grant action).
+    Ignored,
+    Refused(String),
+}
+
+/// The answer a click (or `answer-ask`) gives on `question`, and the grant it
+/// writes, decided without touching anything: the AppKit handler and
+/// `answer-ask` both go through it. `shown_version` is the version the user
+/// saw; anything but the current one is refused and the card redrawn.
+/// `edits` are the user's versions of the card's `code` blocks (block index,
+/// text); the answer carries every code block's final text, and a grant
+/// authorizes the payload block as the user left it.
+pub fn plan_click(
+    question: &Question,
+    action: &str,
+    text: &str,
+    edits: &[(usize, String)],
+    shown_version: u32,
+    trigger: Trigger,
+    now: u64,
+) -> Result<Planned, ClickRefusal> {
+    if shown_version != question.card_version {
+        return Err(ClickRefusal::Stale);
+    }
+    let text = text.trim().to_string();
+    let answer = Answer { id: question.id.clone(), action: action.to_string(), text: text.clone(), card_version: question.card_version, blocks: Vec::new() };
+    if question.dismissable() && action == DISMISS {
+        return Ok((answer, None, Vec::new()));
+    }
+    let Some(card) = &question.card else {
+        if trigger == Trigger::Remote {
+            check_answer(Some(question), &question.id, action, &text).map_err(ClickRefusal::Refused)?;
+        }
+        return Ok((answer, None, Vec::new()));
+    };
+    let finals = final_blocks(card, edits);
+    let Some(chosen) = card.action(action) else {
+        return Err(ClickRefusal::Refused(format!("no action {} in this card", action)));
+    };
+    if chosen.needs_input && text.is_empty() {
+        return Err(ClickRefusal::Refused(format!("{} needs text", action)));
+    }
+    if card.input.is_none() && !text.is_empty() {
+        return Err(ClickRefusal::Refused("\"text\" must be empty: this card has no text field".to_string()));
+    }
+    let Some(decl) = &chosen.grant else { return Ok((answer, None, finals)) };
+    match trigger {
+        Trigger::Remote => Err(ClickRefusal::Refused("a grant action can only be clicked".to_string())),
+        Trigger::Return => Err(ClickRefusal::Ignored),
+        Trigger::Click | Trigger::CmdReturn => {
+            let Some(session_id) = question.from.session_id.clone() else {
+                return Err(ClickRefusal::Refused("grant requires an asker session id".to_string()));
+            };
+            let grant = crate::decision_card::Grant {
+                question_id: question.id.clone(),
+                session_id,
+                kind: decl.kind.clone(),
+                target: decl.target.clone(),
+                // The bytes the user left in the payload block, edited or not.
+                payload_sha256: finals
+                    .iter()
+                    .find(|f| f.block == decl.payload_block)
+                    .map(|f| crate::decision_card::sha256_hex(f.text.as_bytes()))
+                    .unwrap_or_else(|| decl.payload_sha256.clone()),
+                card_version: question.card_version,
+                clicked_at: now,
+            };
+            Ok((answer, Some(grant), finals))
+        }
+    }
+}
+
+/// What a click gives: the answer, the grant it writes, and the final text of
+/// each code block (written to disk with the answer).
+pub type Planned = (Answer, Option<crate::decision_card::Grant>, Vec<FinalBlock>);
+
+/// Which question the card shows: the one it showed (`prev`, by id) while it
+/// is on the board; else the one now at its old rank — the next in order, or
+/// the previous when it was the last; else the first live question, a
+/// superseded one only when nothing else waits. `pending` is (id, superseded).
+pub fn pick_shown(pending: &[(&str, bool)], prev: Option<(&str, usize)>) -> Option<usize> {
+    if pending.is_empty() {
+        return None;
+    }
+    if let Some((id, rank)) = prev {
+        if let Some(i) = pending.iter().position(|(p, _)| *p == id) {
+            return Some(i);
+        }
+        return Some(rank.min(pending.len() - 1));
+    }
+    Some(pending.iter().position(|(_, superseded)| !superseded).unwrap_or(0))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// What a waiting `kova ask` receives when its asker takes the question back.
+pub const WITHDRAWN_BY_ASKER: &str = "withdrawn by the asker";
 
 impl Board {
     /// Takes the store's lock now, before the socket serves anything: a Kova
@@ -903,7 +1194,28 @@ impl Board {
             );
         }
         OWNS_STORE.store(owner.is_some(), std::sync::atomic::Ordering::Relaxed);
-        Board { store, pending: Vec::new(), _owner: owner, owner_tried: std::time::Instant::now(), dirty: false }
+        // A grant whose session died must not stay forever.
+        let pruned = crate::decision_card::prune_grants(&store.root, now_secs());
+        if pruned > 0 {
+            log::info!("ask: deleted {} expired grant(s)", pruned);
+        }
+        let answers = prune_answer_files(&store.root, now_secs());
+        if answers > 0 {
+            log::info!("ask: deleted {} old answer folder(s)", answers);
+        }
+        Board::with_store(store, owner)
+    }
+
+    fn with_store(store: AskStore, owner: Option<std::fs::File>) -> Board {
+        Board {
+            store,
+            pending: Vec::new(),
+            _owner: owner,
+            owner_tried: std::time::Instant::now(),
+            dirty: false,
+            shown: None,
+            error: None,
+        }
     }
 
     /// A Kova that started while another held the lock takes it over once that
@@ -965,14 +1277,15 @@ impl Board {
     /// A question arrived on the socket; `responder` reaches its waiting connection.
     pub fn add(&mut self, question: Question, responder: std::sync::mpsc::Sender<crate::ipc::IpcResponse>) {
         log::info!(
-            "ask {} from {} session={} pane={}: {}",
+            "ask {} from {} session={} pane={}{}: {}",
             question.id,
             question.from.name,
             question.from.session_id.as_deref().unwrap_or("-"),
             question.from.pane_id.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            if question.card.is_some() { " (card)" } else { "" },
             question.message
         );
-        let question = Question { superseded: false, ..question };
+        let question = Question { superseded: false, card_version: 1, ..question };
         if self.owns_store() {
             self.store.save_question(&question);
         }
@@ -988,12 +1301,111 @@ impl Board {
     /// `answer-ask`: the answer is checked against the question as the card
     /// would have constrained it, then takes the card's own path.
     pub fn answer_checked(&mut self, id: &str, action: String, text: String) -> Result<Answer, String> {
-        // The card trims its field; an answer from elsewhere is held to the same text.
-        let text = text.trim().to_string();
-        check_answer(self.pending.iter().map(|(q, _)| q).find(|q| q.id == id), id, &action, &text)?;
-        let answer = Answer { id: id.to_string(), action: action.clone(), text: text.clone() };
-        self.answer(id, action, text);
+        let Some(version) = self.pending.iter().find(|(q, _)| q.id == id).map(|(q, _)| q.card_version) else {
+            return Err(format!("no pending question {}", id));
+        };
+        match self.submit(id, &action, &text, &[], version, Trigger::Remote) {
+            Ok(answer) => Ok(answer),
+            Err(ClickRefusal::Refused(message)) => Err(message),
+            Err(other) => Err(format!("answer not taken: {:?}", other)),
+        }
+    }
+
+    /// An answer from the card or from `answer-ask`: planned by [`plan_click`],
+    /// its grant written first (nothing is delivered when that fails), then
+    /// handed over. A click on a card not yet redrawn is refused and redrawn.
+    pub fn submit(
+        &mut self,
+        id: &str,
+        action: &str,
+        text: &str,
+        edits: &[(usize, String)],
+        shown_version: u32,
+        trigger: Trigger,
+    ) -> Result<Answer, ClickRefusal> {
+        let Some(question) = self.pending.iter().map(|(q, _)| q).find(|q| q.id == id) else {
+            return Err(ClickRefusal::Ignored);
+        };
+        let planned = plan_click(question, action, text, edits, shown_version, trigger, now_secs());
+        let (mut answer, grant, finals) = match planned {
+            Ok(plan) => plan,
+            Err(ClickRefusal::Stale) => {
+                log::info!("ask {}: click on v{} while v{} is current, redrawing", id, shown_version, question.card_version);
+                self.dirty = true;
+                return Err(ClickRefusal::Stale);
+            }
+            Err(other) => return Err(other),
+        };
+        // The texts first: a grant must never exist for a payload whose file is missing.
+        if let Err(e) = write_answer_blocks(&self.store.root, &mut answer, &finals) {
+            log::warn!("ask {}: cannot write the answer's blocks: {}", id, e);
+            let message = format!("Could not save the edited text: {}", e);
+            self.error = Some((id.to_string(), message.clone()));
+            self.dirty = true;
+            return Err(ClickRefusal::Refused(message));
+        }
+        if let Some(grant) = grant {
+            if let Err(e) = crate::decision_card::write_grant(&self.store.root, &grant) {
+                log::warn!("ask {}: cannot write the grant: {}", id, e);
+                self.error = Some((id.to_string(), format!("Could not record the authorization: {}", e)));
+                self.dirty = true;
+                return Err(ClickRefusal::Refused(format!("Could not record the authorization: {}", e)));
+            }
+            log::info!("ask {}: grant written for {} (v{})", id, grant.target, grant.card_version);
+        }
+        self.deliver(answer.clone());
         Ok(answer)
+    }
+
+    /// `update-ask`: the asker replaces its card. Checks in the spec's order:
+    /// the question is on the board, the caller asked it, then the card.
+    /// Returns the new `card_version`.
+    pub fn update(&mut self, id: &str, session_id: &str, card: &serde_json::Value, message: Option<String>) -> Result<u32, String> {
+        let Some(index) = self.pending.iter().position(|(q, _)| q.id == id) else {
+            return Err("no such question".to_string());
+        };
+        let owns = self.owns_store();
+        let question = &mut self.pending[index].0;
+        if !asked_from(question, session_id) {
+            return Err("not the asker of this question".to_string());
+        }
+        let facts = crate::decision_card::AskerFacts {
+            session_id: question.from.session_id.as_deref(),
+            claude: question.from.agent == crate::agent_session::Agent::Claude,
+        };
+        let card = crate::decision_card::validate(card, message.as_deref(), &facts)?;
+        question.set_card(card, message);
+        question.card_version += 1;
+        log::info!("ask {}: card updated to v{}", id, question.card_version);
+        if owns {
+            self.store.save_question(question);
+        }
+        let version = question.card_version;
+        if self.error.as_ref().is_some_and(|(e, _)| e == id) {
+            self.error = None;
+        }
+        self.dirty = true;
+        Ok(version)
+    }
+
+    /// `withdraw-ask`: the asker takes one question back. Nothing is delivered.
+    pub fn withdraw_one(&mut self, id: &str, session_id: &str) -> Result<(), String> {
+        let Some(index) = self.pending.iter().position(|(q, _)| q.id == id) else {
+            return Err("no such question".to_string());
+        };
+        if !asked_from(&self.pending[index].0, session_id) {
+            return Err("not the asker of this question".to_string());
+        }
+        let (_, responder) = self.pending.remove(index);
+        log::info!("ask {}: withdrawn by its asker", id);
+        if self.owns_store() {
+            self.store.remove_question(id);
+        }
+        if let Some(tx) = responder {
+            let _ = tx.send(crate::ipc::IpcResponse::Error { message: WITHDRAWN_BY_ASKER.to_string() });
+        }
+        self.dirty = true;
+        Ok(())
     }
 
     /// The user wrote in `session_id`'s conversation while its questions were
@@ -1025,25 +1437,28 @@ impl Board {
         count
     }
 
-    /// The user answered `id` on the card. False when no such question waits
-    /// (already answered elsewhere): nothing happens then.
-    pub fn answer(&mut self, id: &str, action: String, text: String) -> bool {
+    /// Hand an answer over: back on the waiting connection, else delivered late.
+    /// Nothing happens when no such question waits (already answered elsewhere).
+    fn deliver(&mut self, answer: Answer) -> bool {
+        let id = answer.id.clone();
         let Some(index) = self.pending.iter().position(|(q, _)| q.id == id) else { return false };
         let (question, responder) = self.pending.remove(index);
         self.dirty = true;
-        if question.dismissable() && action == DISMISS {
+        if self.error.as_ref().is_some_and(|(e, _)| *e == id) {
+            self.error = None;
+        }
+        if question.dismissable() && answer.action == DISMISS {
             log::info!("ask {}: dismissed, nothing delivered", id);
             if self.owns_store() {
-                self.store.remove_question(id);
+                self.store.remove_question(&id);
             }
             return true;
         }
-        let answer = Answer { id: id.to_string(), action, text };
-        log::info!("ask {}: answered: {}", id, answer.line());
+        log::info!("ask {}: answered (v{}): {}", id, answer.card_version, answer.line());
         // On disk before the question leaves it: a quit from here on still delivers it.
         if self.owns_store() {
             self.store.save_delivery(&Undelivered { question: question.clone(), answer: answer.clone() });
-            self.store.remove_question(id);
+            self.store.remove_question(&id);
         }
         let data = serde_json::to_value(&answer).ok();
         let handed = match responder {
@@ -1057,44 +1472,85 @@ impl Board {
         true
     }
 
-    /// Show the oldest question (or hide the card), when something changed.
+    /// The card's ‹ / › (or ⌘[ / ⌘]): show another question. Answers nothing.
+    pub fn browse(&mut self, delta: i32) {
+        let Some((_, rank)) = self.current_shown() else { return };
+        let target = (rank as i64 + delta as i64).clamp(0, self.pending.len() as i64 - 1) as usize;
+        if target != rank {
+            self.shown = Some((self.pending[target].0.id.clone(), target));
+            self.dirty = true;
+        }
+    }
+
+    /// The question the card shows now, and its rank.
+    fn current_shown(&self) -> Option<(String, usize)> {
+        let ids: Vec<(&str, bool)> = self.pending.iter().map(|(q, _)| (q.id.as_str(), q.superseded)).collect();
+        let prev = self.shown.as_ref().map(|(id, rank)| (id.as_str(), *rank));
+        pick_shown(&ids, prev).map(|i| (self.pending[i].0.id.clone(), i))
+    }
+
+    /// Show the question the card is on (or hide the card), when something changed.
     pub fn refresh_card(&mut self, mtm: objc2_foundation::MainThreadMarker) {
         self.retry_owner();
         if !self.dirty {
             return;
         }
         self.dirty = false;
-        // A live question goes before a superseded one, which would otherwise hide it.
-        let head = self
-            .pending
-            .iter()
-            .map(|(q, _)| q)
-            .find(|q| !q.superseded)
-            .or_else(|| self.pending.first().map(|(q, _)| q));
-        let buttons = head.map(|q| q.buttons()).unwrap_or_default();
-        let card = head.map(|q| crate::ask_card::CardQuestion {
+        self.shown = self.current_shown();
+        let total = self.pending.len();
+        let head = self.shown.as_ref().map(|(_, rank)| (&self.pending[*rank].0, *rank));
+        let buttons = head.map(|(q, _)| q.buttons()).unwrap_or_default();
+        let on_board: Vec<&str> = self.pending.iter().map(|(q, _)| q.id.as_str()).collect();
+        let error = self.error.as_ref().filter(|(id, _)| head.is_some_and(|(q, _)| q.id == *id)).map(|(_, e)| e.as_str());
+        let card = head.map(|(q, rank)| crate::ask_card::CardQuestion {
             id: &q.id,
             from: &q.from.name,
             message: &q.message,
             buttons: &buttons,
-            input: q.input,
+            input: q.has_input(),
             asked_at: q.asked_at,
             note: q.superseded.then_some(SUPERSEDED_NOTE),
+            card: q.card.as_ref(),
+            card_version: q.card_version,
+            dismissable: q.dismissable(),
+            position: rank + 1,
+            error,
         });
-        crate::ask_card::show(mtm, card.as_ref(), self.pending.len().saturating_sub(1));
+        crate::ask_card::show(mtm, card.as_ref(), total, &on_board);
+    }
+
+    /// The card's answers and arrows since the last tick.
+    pub fn drain_card(&mut self) {
+        for nav in crate::ask_card::take_browse() {
+            self.browse(nav);
+        }
+        for a in crate::ask_card::take_answers() {
+            match self.submit(&a.id, &a.action, &a.text, &a.edits, a.card_version, a.trigger) {
+                Ok(_) | Err(ClickRefusal::Ignored) | Err(ClickRefusal::Stale) => {}
+                Err(ClickRefusal::Refused(message)) => {
+                    log::info!("ask {}: click refused: {}", a.id, message);
+                    // Shown in red on the card unless it is already (a grant that failed).
+                    if self.error.is_none() {
+                        self.error = Some((a.id.clone(), message));
+                    }
+                    self.dirty = true;
+                }
+            }
+        }
     }
 }
 
 /// What a `kova ask` still waiting receives when its question is withdrawn.
 pub const WITHDRAWN: &str = "withdrawn: the user answered in the conversation instead of on the card";
 
-/// Whether `question` was asked from the conversation `session_id`.
+/// Whether `question` was asked from the conversation `session_id`. A question
+/// whose asker had no session id never matches.
 pub fn asked_from(question: &Question, session_id: &str) -> bool {
     question.from.session_id.as_deref() == Some(session_id)
 }
 
 /// Whether an answer coming from elsewhere than the card (`answer-ask`) is one
-/// the card could have given for `question` (`None`: no question `id` waits).
+/// the card could have given for a plain `question` (`None`: no question `id` waits).
 pub fn check_answer(question: Option<&Question>, id: &str, action: &str, text: &str) -> Result<(), String> {
     let Some(question) = question else { return Err(format!("no pending question {}", id)) };
     let buttons = question.buttons();
@@ -1125,6 +1581,9 @@ fn spawn_late(store: AskStore, question: Question, answer: Answer) {
 
 pub const USAGE: &str = "\
 usage: kova ask \"<message>\" [--actions OK,KO] [--no-input] [--from <name>] [--timeout <seconds>] [--json] [--socket <path>]
+       kova ask --card <file|-> [--from <name>] [--timeout <seconds>] [--json] [--socket <path>]
+       kova ask --update <question id> --card <file|->
+       kova ask --withdraw-id <question id>
 
 Shows a card in Kova with the message, one button per action and a text field, then waits for
 the user and prints the answer on stdout: the action, or \"action: text\" when they typed something.
@@ -1136,7 +1595,14 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
   --timeout     seconds to wait. Default: 540 inside a Claude Code conversation (under the Bash tool's
                 600 s limit; run kova ask with the Bash timeout set to 600000), no limit anywhere else,
                 since only a Claude conversation can receive a late answer
-  --json        print the answer as JSON
+  --card        a decision card (JSON, docs/decision-cards-spec.md): title, blocks, named actions,
+                optional text field and grant action. Excludes a message, --actions and --no-input.
+                The answer is the action id, or \"id: text\"
+  --update      replace the card of a question this conversation asked (its id is in list-asks or in
+                the timeout message); the card's version goes up and the click carries it
+  --withdraw-id take back one question this conversation asked. --update and --withdraw-id return at
+                once: exit 0 on success, the error on stderr and exit 1 otherwise
+  --json        print the answer as JSON (with card_version)
   --socket      the Kova to ask (default: $KOVA_SOCKET, else the running Kova.app)
 
 Exit codes: 0 answered · 2 no answer within the timeout · 3 the user wrote in the conversation
@@ -1150,6 +1616,11 @@ struct CliArgs {
     message: String,
     actions: Vec<String>,
     input: bool,
+    /// `--card <file|->`: a decision card instead of a message.
+    card: Option<String>,
+    /// `--update <id>` / `--withdraw-id <id>`: act on a question already asked.
+    update: Option<String>,
+    withdraw_id: Option<String>,
     from: Option<String>,
     timeout: Option<u64>,
     json: bool,
@@ -1157,16 +1628,35 @@ struct CliArgs {
 }
 
 fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
-    let mut out = CliArgs { message: String::new(), actions: Vec::new(), input: true, from: None, timeout: None, json: false, socket: None };
+    let mut out = CliArgs {
+        message: String::new(),
+        actions: Vec::new(),
+        input: true,
+        card: None,
+        update: None,
+        withdraw_id: None,
+        from: None,
+        timeout: None,
+        json: false,
+        socket: None,
+    };
     let mut message: Option<String> = None;
+    let mut plain_flags = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = || it.next().cloned().ok_or_else(|| format!("kova ask: {} needs a value\n\n{}", a, USAGE));
         match a.as_str() {
+            "--card" => out.card = Some(value()?),
+            "--update" => out.update = Some(value()?),
+            "--withdraw-id" => out.withdraw_id = Some(value()?),
             "--actions" => {
+                plain_flags = true;
                 out.actions = value()?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
             }
-            "--no-input" => out.input = false,
+            "--no-input" => {
+                plain_flags = true;
+                out.input = false
+            }
             "--from" => out.from = Some(value()?),
             "--timeout" => {
                 let raw = value()?;
@@ -1189,6 +1679,33 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
             }
         }
     }
+    if let Some(id) = out.update.as_ref().or(out.withdraw_id.as_ref()) {
+        if out.update.is_some() && out.withdraw_id.is_some() {
+            return Err("kova ask: --update and --withdraw-id exclude each other".to_string());
+        }
+        if out.timeout.is_some() || out.from.is_some() {
+            return Err("kova ask: --timeout and --from do not apply to --update or --withdraw-id".to_string());
+        }
+        if !is_safe_question_id(id) {
+            return Err(format!("kova ask: '{}' is not a question id (a UUID)", id));
+        }
+        if message.is_some() || plain_flags {
+            return Err("kova ask: --update and --withdraw-id take no message, --actions or --no-input".to_string());
+        }
+        if out.update.is_some() && out.card.is_none() {
+            return Err("kova ask: --update needs --card <file|->".to_string());
+        }
+        if out.withdraw_id.is_some() && out.card.is_some() {
+            return Err("kova ask: --withdraw-id takes no --card".to_string());
+        }
+        return Ok(out);
+    }
+    if out.card.is_some() {
+        if message.is_some() || plain_flags {
+            return Err("kova ask: --card excludes a message, --actions and --no-input".to_string());
+        }
+        return Ok(out);
+    }
     out.message = message.filter(|m| !m.trim().is_empty()).ok_or_else(|| USAGE.to_string())?;
     Ok(out)
 }
@@ -1203,7 +1720,7 @@ fn exe_path(pid: i32) -> Option<String> {
 /// The Kova to ask when the caller names none and runs outside a Kova pane (a
 /// routine started by launchd): the live `/tmp/kova-<pid>.sock` served by
 /// Kova.app itself. A library host serves the same path shape, hence the executable check.
-fn discover_socket() -> Option<String> {
+pub(crate) fn discover_socket() -> Option<String> {
     let mut found: Vec<(bool, i32, String)> = Vec::new();
     for entry in std::fs::read_dir("/tmp").ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -1283,6 +1800,59 @@ fn run_withdraw(args: &[String]) -> i32 {
     0
 }
 
+/// The card file (`-` = stdin), parsed: it is sent re-serialized compact.
+pub(crate) fn read_card(path: &str) -> Result<serde_json::Value, String> {
+    let raw = if path == "-" {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).map_err(|e| format!("kova ask: cannot read the card on stdin: {}", e))?;
+        input
+    } else {
+        std::fs::read_to_string(path).map_err(|e| format!("kova ask: cannot read {}: {}", path, e))?
+    };
+    serde_json::from_str(&raw).map_err(|e| format!("kova ask: the card is not JSON: {}", e))
+}
+
+/// One request that returns at once, sent to the Kova that holds the card:
+/// the caller's socket, else Kova.app when that one is a library host.
+pub(crate) fn one_shot(cli_socket: Option<String>, asker_socket: Option<String>, body: serde_json::Value) -> Result<serde_json::Value, String> {
+    let first = cli_socket.clone().or(asker_socket).or_else(discover_socket).ok_or_else(|| {
+        "kova ask: no running Kova found (no $KOVA_SOCKET, no /tmp/kova-<pid>.sock served by Kova.app)".to_string()
+    })?;
+    let mut reply = request(&first, body.clone(), Duration::from_secs(5));
+    let error = reply.as_ref().and_then(|r| r.get("error")).and_then(|e| e.as_str()).unwrap_or_default().to_string();
+    if cli_socket.is_none() && (error == "command not supported by this host" || error.starts_with("unknown command")) {
+        if let Some(app) = discover_socket().filter(|s| *s != first) {
+            reply = request(&app, body, Duration::from_secs(5));
+        }
+    }
+    let reply = reply.ok_or_else(|| format!("kova ask: Kova is not answering on {}", first))?;
+    if reply_ok(&Some(reply.clone())) {
+        Ok(reply)
+    } else {
+        Err(format!("kova ask: {}", reply.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error")))
+    }
+}
+
+/// `kova ask --update` / `--withdraw-id`: act on a question this conversation asked.
+fn run_on_question(cli: &CliArgs, asker: &Asker, card: Option<serde_json::Value>) -> i32 {
+    let Some(session_id) = asker.session_id.clone() else {
+        eprintln!("kova ask: no session id in the environment");
+        return 1;
+    };
+    let body = match (&cli.update, &cli.withdraw_id) {
+        (Some(id), _) => serde_json::json!({"cmd": "update-ask", "id": id, "session_id": session_id, "card": card}),
+        (_, Some(id)) => serde_json::json!({"cmd": "withdraw-ask", "id": id, "session_id": session_id}),
+        _ => return 1,
+    };
+    match one_shot(cli.socket.clone(), asker.kova_socket.clone(), body) {
+        Ok(_) => 0,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            1
+        }
+    }
+}
+
 /// `kova ask …`: returns the process exit code.
 pub fn run_cli(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("--withdraw") {
@@ -1306,23 +1876,46 @@ pub fn run_cli(args: &[String]) -> i32 {
     };
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into());
     let asker = Asker::from_env(|k| std::env::var(k).ok(), cli.from.clone(), &cwd);
+    let card = match cli.card.as_deref().map(read_card) {
+        None => None,
+        Some(Ok(card)) => Some(card),
+        Some(Err(msg)) => return fail(&msg, 1),
+    };
+    if cli.update.is_some() || cli.withdraw_id.is_some() {
+        return run_on_question(&cli, &asker, card);
+    }
     let mut socket = match cli.socket.clone().or_else(|| asker.kova_socket.clone()).or_else(discover_socket) {
         Some(s) => s,
         None => return fail("kova ask: no running Kova found (no $KOVA_SOCKET, no /tmp/kova-<pid>.sock served by Kova.app)", 1),
     };
     let late = can_deliver_late(&asker);
     let wait = cli.timeout.or(if late { Some(540) } else { None });
+    // A card travels as the raw JSON the agent wrote (Kova validates it), with
+    // the fallback fields filled from it for a Kova that predates cards.
+    let (message, actions, input) = match &card {
+        Some(card) => {
+            let (actions, input) = crate::decision_card::legacy_fields(card);
+            (crate::decision_card::derive_message(card), actions, input)
+        }
+        None => (cli.message.clone(), cli.actions.clone(), cli.input),
+    };
     let question = Question {
         id: new_question_id(),
-        message: cli.message.clone(),
-        actions: cli.actions.clone(),
-        input: cli.input,
+        message,
+        actions,
+        input,
         from: asker,
         asked_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         superseded: false,
+        card: None,
+        card_version: 1,
     };
 
-    let body = serde_json::json!({"cmd": "ask", "question": question});
+    let mut question_json = serde_json::to_value(&question).unwrap_or_default();
+    if let Some(card) = &card {
+        question_json["card"] = card.clone();
+    }
+    let body = serde_json::json!({"cmd": "ask", "question": question_json});
     let mut fallback_tried = false;
     let (stream, line, read) = loop {
         let stream = match UnixStream::connect(&socket) {
@@ -1454,7 +2047,7 @@ mod tests {
     }
 
     fn question(id: &str) -> Question {
-        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, superseded: false }
+        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, superseded: false, card: None, card_version: 1 }
     }
 
     #[test]
@@ -1654,8 +2247,8 @@ mod tests {
 
     #[test]
     fn answer_line_and_late_message_stay_on_one_line() {
-        assert_eq!(Answer { id: "1".into(), action: "OK".into(), text: String::new() }.line(), "OK");
-        let answer = Answer { id: "1".into(), action: "OK".into(), text: "but fix\r\nthat part".into() };
+        assert_eq!(Answer { id: "1".into(), action: "OK".into(), text: String::new(), card_version: 1, blocks: vec![] }.line(), "OK");
+        let answer = Answer { id: "1".into(), action: "OK".into(), text: "but fix\r\nthat part".into(), card_version: 1, blocks: vec![] };
         let q = Question { message: "I drafted\nthis reply".into(), ..question("1") };
         let msg = late_answer_message(&q, &answer);
         assert!(!msg.contains('\n') && !msg.contains('\r'));
@@ -1827,7 +2420,7 @@ mod tests {
         assert_eq!(AskStore::new(root.clone()).pending_questions(), vec![q.clone()]);
         store.remove_question(&id);
         assert!(AskStore::new(root.clone()).pending_questions().is_empty());
-        let item = Undelivered { question: q.clone(), answer: Answer { id: id.clone(), action: "OK".into(), text: "fix it".into() } };
+        let item = Undelivered { question: q.clone(), answer: Answer { id: id.clone(), action: "OK".into(), text: "fix it".into(), card_version: 1, blocks: vec![] } };
         store.save_delivery(&item);
         assert_eq!(AskStore::new(root.clone()).undelivered(), vec![item]);
         store.remove_delivery(&id);
@@ -1865,7 +2458,7 @@ mod tests {
     #[test]
     fn late_message_drops_every_control_character() {
         let q = Question { message: "erase\u{15}claude --resume x; rm\u{1b}[A".into(), ..question("1") };
-        let msg = late_answer_message(&q, &Answer { id: "1".into(), action: "OK".into(), text: "a\tb".into() });
+        let msg = late_answer_message(&q, &Answer { id: "1".into(), action: "OK".into(), text: "a\tb".into(), card_version: 1, blocks: vec![] });
         assert!(!msg.chars().any(|c| c.is_control()), "{msg:?}");
     }
 
@@ -1918,6 +2511,26 @@ mod tests {
     }
 
     #[test]
+    fn cli_card_update_and_withdraw_flags() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let c = parse_cli(&args(&["--card", "-", "--from", "cos", "--timeout", "5"])).unwrap();
+        assert_eq!(c.card.as_deref(), Some("-"));
+        assert!(parse_cli(&args(&["msg", "--card", "c.json"])).is_err());
+        assert!(parse_cli(&args(&["--card", "c.json", "--actions", "OK"])).is_err());
+        assert!(parse_cli(&args(&["--card", "c.json", "--no-input"])).is_err());
+        let u = parse_cli(&args(&["--update", id, "--card", "c.json"])).unwrap();
+        assert_eq!(u.update.as_deref(), Some(id));
+        assert!(parse_cli(&args(&["--update", id])).is_err(), "update needs a card");
+        assert!(parse_cli(&args(&["--update", id, "--card", "c", "--timeout", "3"])).is_err());
+        assert!(parse_cli(&args(&["--update", id, "--card", "c", "--from", "x"])).is_err());
+        assert!(parse_cli(&args(&["--update", "../x", "--card", "c"])).is_err());
+        let w = parse_cli(&args(&["--withdraw-id", id])).unwrap();
+        assert_eq!(w.withdraw_id.as_deref(), Some(id));
+        assert!(parse_cli(&args(&["--withdraw-id", id, "--timeout", "3"])).is_err());
+    }
+
+    #[test]
     fn agent_colour_is_stable_and_varies() {
         assert_eq!(agent_rgb("Claude · FLoat"), agent_rgb("Claude · FLoat"));
         let names = ["routine-a", "routine-b", "app", "kova", "mira", "docs", "api", "web"];
@@ -1927,13 +2540,7 @@ mod tests {
 
     /// A board that owns no store: nothing touches the disk.
     fn memory_board() -> Board {
-        Board {
-            store: AskStore::new(std::env::temp_dir().join("kova-ask-test-unowned")),
-            pending: Vec::new(),
-            _owner: None,
-            owner_tried: std::time::Instant::now(),
-            dirty: false,
-        }
+        Board::with_store(AskStore::new(std::env::temp_dir().join("kova-ask-test-unowned")), None)
     }
 
     #[test]
@@ -1960,7 +2567,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         board.add(question("q1"), tx);
         board.withdraw("abc-123");
-        assert!(board.answer("q1", DISMISS.into(), String::new()));
+        assert!(board.submit("q1", DISMISS, "", &[], 1, Trigger::Click).is_ok());
         assert!(board.questions().is_empty());
     }
 
@@ -1978,5 +2585,256 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         board.add(Question { superseded: true, ..question("q1") }, tx);
         assert!(!board.questions()[0].superseded);
+    }
+
+    const QID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    const QID2: &str = "1f8fad5b-d9cb-469f-a165-70867728950e";
+
+    fn draft_json(payload: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "title": "Reply to Alex",
+            "blocks": [
+                { "type": "text", "text": "Alex asks for a review." },
+                { "type": "code", "label": "Draft", "text": payload }
+            ],
+            "actions": [
+                { "id": "post", "label": "Post", "style": "primary",
+                  "grant": { "kind": "outbound", "target": "slack:C1/-",
+                             "payload_sha256": crate::decision_card::sha256_hex(payload.as_bytes()), "payload_block": 1 } },
+                { "id": "edit", "label": "Rewrite", "needs_input": true },
+                { "id": "later", "label": "Later" }
+            ],
+            "input": { "placeholder": "What to change" }
+        })
+    }
+
+    fn card_question(id: &str, payload: &str) -> Question {
+        let facts = crate::decision_card::AskerFacts { session_id: Some("abc-123"), claude: true };
+        let card = crate::decision_card::validate(&draft_json(payload), None, &facts).unwrap();
+        let mut q = question(id);
+        q.set_card(card, None);
+        q
+    }
+
+    fn board_in(dir: &str) -> Board {
+        let root = std::env::temp_dir().join(format!("kova-ask-{}-{}", dir, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        Board::with_store(AskStore::new(root), None)
+    }
+
+    #[test]
+    fn a_card_fills_the_fallback_fields_for_an_older_kova() {
+        let q = card_question(QID, "Hi\n");
+        assert_eq!(q.message, "Reply to Alex — Alex asks for a review.");
+        assert_eq!(q.actions, vec!["edit", "later"], "never the grant action");
+        assert!(q.input);
+        assert_eq!(q.buttons(), vec!["post", "edit", "later"], "no Other on a card");
+    }
+
+    #[test]
+    fn a_plain_question_serializes_as_before() {
+        let q = question("1");
+        let json = serde_json::to_value(&q).unwrap();
+        assert!(json.get("card").is_none() && json.get("card_version").is_none());
+        // A question an older Kova wrote loads at version 1, and so does its answer.
+        let old = r#"{"id":"1","message":"m","actions":[],"input":true,"from":{"name":"x"},"asked_at":1,"superseded":false}"#;
+        assert_eq!(serde_json::from_str::<Question>(old).unwrap().card_version, 1);
+        let answer: Answer = serde_json::from_str(r#"{"id":"1","action":"OK","text":""}"#).unwrap();
+        assert_eq!(answer.card_version, 1);
+        // A card question round-trips through disk.
+        let mut c = card_question(QID, "x");
+        c.card_version = 3;
+        let back: Question = serde_json::from_value(serde_json::to_value(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn late_line_for_a_card_names_its_title_and_version() {
+        let mut q = card_question(QID, "x");
+        q.card_version = 2;
+        let a = Answer { id: QID.into(), action: "edit".into(), text: "shorter\nplease".into(), card_version: 2, blocks: vec![] };
+        assert_eq!(late_answer_message(&q, &a), "[Kova] The user answered your card \"Reply to Alex\" (v2): edit: shorter please");
+    }
+
+    #[test]
+    fn plan_click_gives_a_grant_only_to_a_real_click_on_the_shown_version() {
+        let q = card_question(QID, "Draft\n");
+        let (answer, grant, _) = plan_click(&q, "post", "  ", &[], 1, Trigger::Click, 42).unwrap();
+        assert_eq!(answer, Answer { id: QID.into(), action: "post".into(), text: String::new(), card_version: 1, blocks: vec![] });
+        let grant = grant.expect("a click writes a grant");
+        assert_eq!((grant.session_id.as_str(), grant.target.as_str(), grant.card_version, grant.clicked_at), ("abc-123", "slack:C1/-", 1, 42));
+        assert_eq!(grant.payload_sha256, crate::decision_card::sha256_hex(b"Draft\n"));
+        assert!(plan_click(&q, "post", "", &[], 1, Trigger::CmdReturn, 0).unwrap().1.is_some());
+        assert_eq!(plan_click(&q, "post", "", &[], 1, Trigger::Return, 0), Err(ClickRefusal::Ignored), "Return never grants");
+        assert_eq!(plan_click(&q, "post", "", &[], 1, Trigger::Remote, 0), Err(ClickRefusal::Refused("a grant action can only be clicked".into())));
+        assert_eq!(plan_click(&q, "post", "", &[], 2, Trigger::Click, 0), Err(ClickRefusal::Stale), "a redraw is pending");
+        assert_eq!(plan_click(&q, "edit", " ", &[], 1, Trigger::Click, 0), Err(ClickRefusal::Refused("edit needs text".into())));
+        assert_eq!(plan_click(&q, "nope", "", &[], 1, Trigger::Remote, 0), Err(ClickRefusal::Refused("no action nope in this card".into())));
+        let (a, g, _) = plan_click(&q, "later", "fyi", &[], 1, Trigger::Click, 0).unwrap();
+        assert!(g.is_none());
+        assert_eq!(a.text, "fyi", "every answer carries the field");
+    }
+
+    #[test]
+    fn answer_ask_on_a_grant_action_is_refused_and_writes_nothing() {
+        let mut board = board_in("remote");
+        let (tx, rx) = std::sync::mpsc::channel();
+        board.add(card_question(QID, "x"), tx);
+        assert_eq!(board.answer_checked(QID, "post".into(), String::new()), Err("a grant action can only be clicked".into()));
+        assert!(!crate::decision_card::grants_dir(&board.store.root).exists());
+        assert_eq!(board.questions().len(), 1, "the card stays");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(board.answer_checked(QID, "edit".into(), String::new()), Err("edit needs text".into()));
+        let answer = board.answer_checked(QID, "edit".into(), " shorter ".into()).unwrap();
+        assert_eq!((answer.text.as_str(), answer.card_version), ("shorter", 1));
+        assert!(matches!(rx.try_recv(), Ok(crate::ipc::IpcResponse::Ok { .. })));
+        let _ = std::fs::remove_dir_all(&board.store.root);
+    }
+
+    #[test]
+    fn a_click_on_a_grant_action_writes_the_grant_before_answering() {
+        let mut board = board_in("click");
+        let (tx, rx) = std::sync::mpsc::channel();
+        board.add(card_question(QID, "x"), tx);
+        board.update(QID, "abc-123", &draft_json("second\n"), None).unwrap();
+        assert_eq!(board.submit(QID, "post", "", &[], 1, Trigger::Click), Err(ClickRefusal::Stale), "the old version never grants");
+        assert!(!crate::decision_card::grants_dir(&board.store.root).exists());
+        board.submit(QID, "post", "", &[], 2, Trigger::Click).unwrap();
+        let path = crate::decision_card::grants_dir(&board.store.root).join(format!("{}.json", QID));
+        let grant: crate::decision_card::Grant = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(grant.card_version, 2);
+        assert_eq!(grant.payload_sha256, crate::decision_card::sha256_hex(b"second\n"));
+        match rx.try_recv() {
+            Ok(crate::ipc::IpcResponse::Ok { data: Some(d) }) => assert_eq!(d["card_version"], 2),
+            _ => panic!("answered"),
+        }
+        let _ = std::fs::remove_dir_all(&board.store.root);
+    }
+
+    #[test]
+    fn an_edited_code_block_is_what_the_answer_and_the_grant_carry() {
+        let q = card_question(QID, "Draft\n");
+        // Unchanged: the card's text, not marked edited.
+        let (_, grant, finals) = plan_click(&q, "post", "", &[(1, "Draft\n".into())], 1, Trigger::Click, 0).unwrap();
+        assert_eq!(finals, vec![FinalBlock { block: 1, label: Some("Draft".into()), text: "Draft\n".into(), edited: false }]);
+        assert_eq!(grant.unwrap().payload_sha256, crate::decision_card::sha256_hex(b"Draft\n"));
+        // Edited: the grant authorizes the user's bytes, not the asker's.
+        let (_, grant, finals) = plan_click(&q, "post", "", &[(1, "My draft".into())], 1, Trigger::Click, 0).unwrap();
+        assert_eq!((finals[0].text.as_str(), finals[0].edited), ("My draft", true));
+        assert_eq!(grant.unwrap().payload_sha256, crate::decision_card::sha256_hex(b"My draft"));
+        // Any action carries the blocks; an index that is not a code block is ignored.
+        let (_, _, finals) = plan_click(&q, "later", "", &[(0, "nope".into())], 1, Trigger::Click, 0).unwrap();
+        assert_eq!((finals.len(), finals[0].text.as_str()), (1, "Draft\n"));
+        // A remote answer has no edits: the card's text.
+        assert!(final_blocks(q.card.as_ref().unwrap(), &[]).iter().all(|f| !f.edited));
+    }
+
+    #[test]
+    fn a_click_writes_each_code_block_to_a_file_named_in_the_answer() {
+        let mut board = board_in("blocks");
+        let (tx, rx) = std::sync::mpsc::channel();
+        board.add(card_question(QID, "Draft\n"), tx);
+        let answer = board.submit(QID, "post", "", &[(1, "Édité\r\n ok".into())], 1, Trigger::Click).unwrap();
+        let b = &answer.blocks[0];
+        assert_eq!((b.block, b.edited), (1, true));
+        assert_eq!(std::path::PathBuf::from(&b.file), answer_block_path(&board.store.root, QID, 1).unwrap());
+        assert_eq!(std::fs::read(&b.file).unwrap(), "Édité\r\n ok".as_bytes(), "byte for byte");
+        assert_eq!(b.sha256, crate::decision_card::sha256_hex("Édité\r\n ok".as_bytes()));
+        let grant_path = crate::decision_card::grants_dir(&board.store.root).join(format!("{}.json", QID));
+        let grant: crate::decision_card::Grant = serde_json::from_slice(&std::fs::read(&grant_path).unwrap()).unwrap();
+        assert_eq!(grant.payload_sha256, b.sha256, "the gate checks the file Kova wrote");
+        match rx.try_recv() {
+            Ok(crate::ipc::IpcResponse::Ok { data: Some(d) }) => assert_eq!(d["blocks"][0]["edited"], true),
+            _ => panic!("answered"),
+        }
+        assert!(answer.line().starts_with(&format!("post [block 1 \"Draft\" edited by the user: {} sha256 ", b.file)));
+        let _ = std::fs::remove_dir_all(&board.store.root);
+    }
+
+    #[test]
+    fn old_answer_folders_are_pruned() {
+        let root = std::env::temp_dir().join(format!("kova-ask-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("answers").join("q1")).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(prune_answer_files(&root, now), 0);
+        assert_eq!(prune_answer_files(&root, now + ANSWER_FILES_TTL_SECS + 5), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_grant_that_cannot_be_written_delivers_nothing() {
+        let mut board = board_in("nogrant");
+        // A file where the grants directory should be.
+        std::fs::create_dir_all(&board.store.root).unwrap();
+        std::fs::write(crate::decision_card::grants_dir(&board.store.root), b"x").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        board.add(card_question(QID, "x"), tx);
+        match board.submit(QID, "post", "", &[], 1, Trigger::Click) {
+            Err(ClickRefusal::Refused(m)) => assert!(m.starts_with("Could not record the authorization:"), "{}", m),
+            other => panic!("{:?}", other),
+        }
+        assert_eq!(board.questions().len(), 1);
+        assert!(board.error.is_some());
+        assert!(rx.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(&board.store.root);
+    }
+
+    #[test]
+    fn only_the_asker_updates_or_withdraws_and_the_queue_keeps_its_order() {
+        let mut board = memory_board();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        board.add(question(QID), tx.clone());
+        board.add(question(QID2), tx);
+        let card = draft_json("x");
+        assert_eq!(board.update(QID, "someone-else", &card, None), Err("not the asker of this question".into()));
+        assert_eq!(board.update("2f8fad5b-d9cb-469f-a165-70867728950e", "abc-123", &card, None), Err("no such question".into()));
+        let mut bad = card.clone();
+        bad["version"] = serde_json::json!(9);
+        assert_eq!(board.update(QID, "abc-123", &bad, None), Err("unknown card version 9".into()));
+        // A plain question becomes a card.
+        assert_eq!(board.update(QID, "abc-123", &card, None), Ok(2));
+        assert_eq!(board.update(QID, "abc-123", &card, Some("custom".into())), Ok(3));
+        let ids: Vec<&str> = board.questions().iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(ids, vec![QID, QID2]);
+        assert_eq!(board.questions()[0].message, "custom");
+        assert_eq!(board.withdraw_one(QID2, "nope"), Err("not the asker of this question".into()));
+        assert_eq!(board.withdraw_one(QID2, "abc-123"), Ok(()));
+        assert_eq!(board.withdraw_one(QID2, "abc-123"), Err("no such question".into()));
+        // An asker without a session id never matches.
+        let mut anon = question("3f8fad5b-d9cb-469f-a165-70867728950e");
+        anon.from.session_id = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        board.add(anon, tx);
+        assert_eq!(board.update("3f8fad5b-d9cb-469f-a165-70867728950e", "abc-123", &card, None), Err("not the asker of this question".into()));
+    }
+
+    #[test]
+    fn the_shown_card_is_followed_by_id_and_browsing_answers_nothing() {
+        // Nothing shown yet: the first live question.
+        assert_eq!(pick_shown(&[("a", true), ("b", false)], None), Some(1));
+        assert_eq!(pick_shown(&[("a", true)], None), Some(0));
+        assert_eq!(pick_shown(&[], Some(("a", 0))), None);
+        // An older question leaves: the shown one stays, its rank moves.
+        assert_eq!(pick_shown(&[("b", false), ("c", false)], Some(("c", 2))), Some(1));
+        // The shown one leaves: the next in order, or the previous when it was last.
+        assert_eq!(pick_shown(&[("a", false), ("c", false)], Some(("b", 1))), Some(1));
+        assert_eq!(pick_shown(&[("a", false), ("b", false)], Some(("c", 2))), Some(1));
+
+        let mut board = memory_board();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for id in [QID, QID2] {
+            board.add(question(id), tx.clone());
+        }
+        board.shown = board.current_shown();
+        board.browse(1);
+        assert_eq!(board.shown.as_ref().map(|(id, _)| id.as_str()), Some(QID2));
+        board.browse(5);
+        assert_eq!(board.shown.as_ref().map(|(_, r)| *r), Some(1), "clamped");
+        board.browse(-1);
+        assert_eq!(board.shown.as_ref().map(|(id, _)| id.as_str()), Some(QID));
+        assert_eq!(board.questions().len(), 2);
+        assert!(rx.try_recv().is_err(), "browsing answers nothing");
     }
 }

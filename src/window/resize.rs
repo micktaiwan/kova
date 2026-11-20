@@ -128,9 +128,11 @@ impl KovaView {
         let (mut resized, mut deferred) = (0usize, 0usize);
         if let Some(tab) = tabs.get(idx) {
             tab.cell_h.set(cell_h);
+            tab.dock_geometry.set(self.dock_geometry(cell_w, cell_h, status_bar));
             tab.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
-                // Skip PTY resize for minimized panes (keep old dimensions)
-                if pane.minimized {
+                // Skip PTY resize for minimized panes (keep old dimensions),
+                // and for UI panes, which have no terminal.
+                if pane.minimized || pane.ui_pane.get() {
                     return;
                 }
                 let cols = ((vp.width - 2.0 * h_pad) / cell_w).floor().max(1.0) as u16;

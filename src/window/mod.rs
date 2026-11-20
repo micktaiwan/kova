@@ -1,5 +1,6 @@
 mod attention;
 use attention::{do_history_step, pane_history_state};
+pub(crate) mod dock_view;
 mod duplicates;
 mod geometry;
 mod ipc_handlers;
@@ -50,6 +51,15 @@ struct SeparatorDrag {
     row_sep_index: Option<usize>,
 }
 
+/// The edge between a pane's terminal and its docked view, being dragged.
+#[derive(Clone, Copy)]
+struct DockDrag {
+    pane: crate::pane::PaneId,
+    side: crate::pane::DockSide,
+    /// The pane's whole rectangle (terminal and view), in pixels.
+    full: PaneViewport,
+}
+
 #[derive(Clone, Copy)]
 struct DragTabState {
     tab_index: usize,
@@ -84,6 +94,7 @@ pub struct KovaViewIvars {
     config: OnceCell<Config>,
     keybindings: OnceCell<Keybindings>,
     drag_separator: Cell<Option<SeparatorDrag>>,
+    drag_dock: Cell<Option<DockDrag>>,
     filter: RefCell<Option<FilterState>>,
     rename_tab: RefCell<Option<RenameTabState>>,
     rename_pane: RefCell<Option<RenamePaneState>>,
@@ -139,6 +150,8 @@ pub struct KovaViewIvars {
     /// pane apart without reading `bookmarks.json` on every frame. Refreshed
     /// when the list changes (Cmd+B) — the file is only written from here.
     bookmark_keys: RefCell<std::collections::HashSet<String>>,
+    /// Native views docked in panes (`dock_view`), by pane.
+    docks: RefCell<dock_view::Docks>,
     /// Keys of the saved anchors, read by the same per-frame test as
     /// `bookmark_keys`. Kept apart because the two lists mean different things
     /// and are written by different gestures — an anchor also arrives from
@@ -465,6 +478,9 @@ define_class!(
 
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> objc2::runtime::Bool {
+            if self.pane_view_key_equivalent(event) {
+                return objc2::runtime::Bool::YES;
+            }
             let combo = KeyCombo::from_event(event);
 
             let keybindings = match self.ivars().keybindings.get() {
@@ -683,6 +699,12 @@ define_class!(
                 }
             }
 
+            // The edge of a docked pane view
+            if let Some(drag) = self.hit_test_dock_edge(px, py) {
+                self.ivars().drag_dock.set(Some(drag));
+                return;
+            }
+
             // Check separator hit
             if let Some(drag) = self.hit_test_separator(px, py) {
                 self.ivars().drag_separator.set(Some(drag));
@@ -786,6 +808,12 @@ define_class!(
                 return;
             }
 
+            if let Some(drag) = self.ivars().drag_dock.get() {
+                let (px, py) = self.event_to_pixel(event);
+                self.drag_dock_edge(drag, px, py);
+                return;
+            }
+
             // Handle separator drag
             if let Some(drag) = self.ivars().drag_separator.get() {
                 let (px, py) = self.event_to_pixel(event);
@@ -838,6 +866,10 @@ define_class!(
             self.ivars().input.end_drag();
             if self.ivars().drag_tab.get().is_some() {
                 self.ivars().drag_tab.set(None);
+                return;
+            }
+            if self.ivars().drag_dock.get().is_some() {
+                self.ivars().drag_dock.set(None);
                 return;
             }
             if self.ivars().drag_separator.get().is_some() {
@@ -975,6 +1007,7 @@ impl KovaView {
             last_focused: Cell::new(true),
             config: OnceCell::new(),
             drag_separator: Cell::new(None),
+            drag_dock: Cell::new(None),
             filter: RefCell::new(None),
             rename_tab: RefCell::new(None),
             rename_pane: RefCell::new(None),
@@ -1002,6 +1035,7 @@ impl KovaView {
             resize_feedback: Cell::new(None),
             transient_status: RefCell::new(None),
             bookmark_keys: RefCell::new(crate::bookmarks::keys(&crate::bookmarks::load().items)),
+            docks: RefCell::new(std::collections::HashMap::new()),
             anchor_keys: RefCell::new(crate::anchors::keys(&crate::anchors::load().items)),
             duplicate_session: Cell::new(None),
             accepted_duplicates: RefCell::new(std::collections::HashSet::new()),
@@ -1196,6 +1230,14 @@ impl KovaView {
     /// Update mouse cursor when hovering over a separator (±3px tolerance).
     fn update_separator_cursor(&self, event: &NSEvent) {
         let (px, py) = self.event_to_pixel(event);
+        if let Some(drag) = self.hit_test_dock_edge(px, py) {
+            #[allow(deprecated)]
+            match drag.side {
+                crate::pane::DockSide::Bottom => NSCursor::resizeUpDownCursor().set(),
+                crate::pane::DockSide::Right => NSCursor::resizeLeftRightCursor().set(),
+            }
+            return;
+        }
         let tabs = self.ivars().tabs.borrow();
         let idx = self.ivars().active_tab.get();
         let tab = match tabs.get(idx) {
@@ -2004,7 +2046,7 @@ impl KovaView {
         self.mark_dirty();
     }
 
-    fn mark_dirty(&self) {
+    pub(super) fn mark_dirty(&self) {
         if let Some(pane) = self.focused_pane() {
             // read_recursive: callers may already hold a read guard on this terminal,
             // and a plain read() queued behind a waiting writer would deadlock.

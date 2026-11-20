@@ -46,6 +46,11 @@ pub fn pane_json(
     json["paused"] = serde_json::json!(pane.is_paused());
     // Paused by Kova itself (`crate::auto_pause`): focusing the pane resumes it.
     json["auto_paused"] = serde_json::json!(pane.is_auto_paused());
+    // A UI pane (`docs/pane-ui-spec.md` § 3.2) holds a native view, no terminal.
+    json["kind"] = serde_json::json!(if pane.ui_pane.get() { "ui" } else { "terminal" });
+    if let Some(view) = pane.ui_view.borrow().as_ref() {
+        json["ui_view_id"] = serde_json::json!(view.view_id);
+    }
     json
 }
 
@@ -1075,7 +1080,7 @@ mod tests {
         assert_eq!(keys, [
             "agent", "agent_session_id", "agent_session_name", "auto_paused", "awaiting", "awaiting_seen",
             "awaiting_since", "child_processes", "claude_config_dir", "claude_session_id", "claude_session_name",
-            "cwd", "dormant_session_id", "focused", "id", "is_idle", "minimized", "paused", "peer_name", "pid", "subject", "tab",
+            "cwd", "dormant_session_id", "focused", "id", "is_idle", "kind", "minimized", "paused", "peer_name", "pid", "subject", "tab",
             "title", "window", "working",
         ]);
         assert_eq!(v["subject"], serde_json::Value::Null, "a pane in no subject");

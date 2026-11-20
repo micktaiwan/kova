@@ -117,6 +117,49 @@ pub struct SavedPane {
     /// conversation asleep, and showing it does not wake it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<SavedPause>,
+    /// Stable pane identity (`Pane::uid`): a UI pane names its opener by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    /// The pane view it shows (`docs/pane-ui-spec.md` § 9): this record is
+    /// the view's only copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_view: Option<crate::pane_ui::View>,
+    /// A UI pane: no shell, its view covers it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ui_pane: bool,
+}
+
+/// Uids already given out in this process: a session file holding the same
+/// uid twice (a copied record) gets a fresh one for the second.
+static SEEN_UIDS: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+
+/// The uid a restored pane takes: the saved one, unless already in use.
+fn restored_uid(saved: Option<&str>) -> String {
+    let mut seen = SEEN_UIDS.lock().unwrap_or_else(|e| e.into_inner());
+    let set = seen.get_or_insert_with(Default::default);
+    let uid = match saved {
+        Some(u) if !u.is_empty() && !set.contains(u) => u.to_string(),
+        _ => crate::ask::new_question_id(),
+    };
+    set.insert(uid.clone());
+    uid
+}
+
+/// Give a restored pane its view back (docked, or as a UI pane).
+fn restore_ui(pane: &Pane, sp: &SavedPane) {
+    *pane.uid.borrow_mut() = restored_uid(sp.uid.as_deref());
+    pane.ui_pane.set(sp.ui_pane);
+    if let Some(view) = &sp.ui_view {
+        if !sp.ui_pane {
+            let side = if view.placement == crate::pane_ui::Placement::DockRight {
+                crate::pane::DockSide::Right
+            } else {
+                crate::pane::DockSide::Bottom
+            };
+            pane.dock.set(Some(crate::pane::Dock { side, size: view.size }));
+        }
+        *pane.ui_view.borrow_mut() = Some(view.clone());
+    }
 }
 
 /// A paused pane, as the session file keeps it (`SavedPane::paused`).
@@ -209,6 +252,9 @@ pub fn saved_pane(p: &Pane) -> SavedPane {
         agent_session: session_to_save(crate::agent_session::for_shell(p.pty.pid()), p.unregistered_session()),
         subject: p.subject.clone(),
         paused: p.is_paused().then(|| SavedPause { title: p.paused_title(), auto: p.is_auto_paused() }),
+        uid: Some(p.ensure_uid()),
+        ui_view: p.ui_view.borrow().clone(),
+        ui_pane: p.ui_pane.get(),
     }
 }
 
@@ -723,7 +769,9 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
     let mut panes = Vec::new();
     let mut ids = Vec::new();
     for sp in &saved.panes {
-        let mut pane = match Pane::spawn(cols, rows, config, sp.cwd.as_deref()) {
+        // A UI pane has no shell: a placeholder surface under its view.
+        let spawned = if sp.ui_pane { Pane::placeholder(cols, rows, config) } else { Pane::spawn(cols, rows, config, sp.cwd.as_deref()) };
+        let mut pane = match spawned {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("Pane::spawn failed (cwd={:?}): {}", sp.cwd, e);
@@ -740,7 +788,12 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
             }
             term.title = sp.title.clone();
         }
-        restore_sleep(&pane, sp, at_launch);
+        if !sp.ui_pane {
+            restore_sleep(&pane, sp, at_launch);
+        } else {
+            pane.pending_command.set(None);
+        }
+        restore_ui(&pane, sp);
         pane.custom_title = sp.custom_title.clone();
         pane.minimized = sp.minimized;
         pane.subject = sp.subject.clone();
@@ -987,6 +1040,7 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         // converts them to the display it actually lands on.
         geometry_scale: saved.geometry_scale.unwrap_or(0.0),
         cell_h: std::cell::Cell::new(0.0),
+        dock_geometry: std::cell::Cell::new(crate::pane::DockGeometry::default()),
         subjects: saved.subjects.clone(),
         subject_colors: saved.subject_colors.iter().map(|(k, v)| (k.clone(), *v)).collect(),
     };
@@ -1192,6 +1246,9 @@ mod tests {
             agent_session: None,
             subject: None,
             paused: None,
+            uid: None,
+            ui_view: None,
+            ui_pane: false,
         }
     }
 
@@ -1489,6 +1546,37 @@ mod tests {
         assert!(!plain.contains("paused"), "a pane never paused writes no key: {plain}");
         let old: SavedPane = serde_json::from_str(r#"{"cwd":"/p"}"#).unwrap();
         assert_eq!(old.paused, None, "a file written before pauses reads as not paused");
+    }
+
+    #[test]
+    fn a_pane_view_and_its_uid_survive_the_session_file() {
+        let doc: crate::decision_card::ViewDoc = serde_json::from_value(serde_json::json!({
+            "version": 1, "title": "Drafts", "cards": [{"id": "a", "card": {
+                "version": 1, "title": "A", "blocks": [{"type": "text", "text": "x"}], "actions": [{"id": "ok", "label": "OK"}]}}]
+        })).unwrap();
+        let mut view = crate::pane_ui::View::new("0f8fad5b-d9cb-469f-a165-70867728950e".into(), doc, crate::pane_ui::Placement::PaneRight, 0.5, Default::default());
+        view.cards[0].version = 4;
+        view.cards[0].clicked_at = Some(1_795_000_000);
+        view.opener_uid = Some("opener".into());
+        let mut sp = pane("/a");
+        sp.uid = Some("uid-1".into());
+        sp.ui_view = Some(view.clone());
+        sp.ui_pane = true;
+        let back: SavedPane = serde_json::from_str(&serde_json::to_string(&sp).unwrap()).unwrap();
+        assert_eq!(back.ui_view, Some(view));
+        assert!(back.ui_pane);
+        // A plain pane writes none of these fields.
+        let plain = serde_json::to_value(pane("/b")).unwrap();
+        assert!(plain.get("ui_view").is_none() && plain.get("ui_pane").is_none() && plain.get("uid").is_none());
+    }
+
+    #[test]
+    fn a_duplicate_uid_gets_a_fresh_one() {
+        let first = restored_uid(Some("dup-uid-test"));
+        let second = restored_uid(Some("dup-uid-test"));
+        assert_eq!(first, "dup-uid-test");
+        assert_ne!(second, "dup-uid-test");
+        assert!(crate::ask::is_safe_question_id(&restored_uid(None)));
     }
 
     fn pi_pane(cwd: &str, id: &str) -> SavedPane {

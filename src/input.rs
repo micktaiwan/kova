@@ -14,6 +14,7 @@ use crate::terminal::pty::Pty;
 /// Write raw UTF-8 text to PTY (used by insertText: from NSTextInputClient).
 pub fn write_text(text: &str, pty: &Pty) {
     if !text.is_empty() {
+        pty.note_typed(text.as_bytes(), false);
         pty.write(text.as_bytes());
     }
 }
@@ -58,6 +59,7 @@ pub fn write_key(key: &KeyEvent, pty: &Pty, cursor_keys_app: bool, keybindings: 
     let unmod_str = key.unmod.as_deref().unwrap_or_default();
     let bytes = key_bytes(&key.combo, key.chars.as_deref(), unmod_str, cursor_keys_app, keybindings, kitty_flags);
     if !bytes.is_empty() {
+        pty.note_typed(&bytes, false);
         pty.write(&bytes);
     }
 }
@@ -609,6 +611,7 @@ impl Surface {
             }
             self.pty.write(b"\x1b[200~");
         }
+        self.pty.note_typed(text.as_bytes(), true);
         self.pty.write(text.as_bytes());
         if bracketed { self.pty.write(b"\x1b[201~"); }
     }

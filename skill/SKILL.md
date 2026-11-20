@@ -1,6 +1,6 @@
 ---
 name: kova
-description: "Drive Kova, a native macOS terminal (Rust + Metal), from Claude Code: open a split or a tab and run a command in it, list panes and the Claude Code, Codex, Pi, omp or tazu sessions they hold, read a pane (its whole conversation, not just the screen), send keys, wait for a command to finish, trigger any keyboard shortcut, follow focus changes, post a notification, ask the user a question on a card. Use when: 'open a pane', 'new tab', 'run X in another pane', 'split', 'list the panes', 'read pane N', 'merge pane N', 'what is running in my terminal', 'ask me when you need an answer', or when a task needs a terminal the user can see."
+description: "Drive Kova, a native macOS terminal (Rust + Metal), from Claude Code: open a split or a tab and run a command in it, list panes and the Claude Code, Codex, Pi, omp or tazu sessions they hold, read a pane (its whole conversation, not just the screen), send keys, wait for a command to finish, trigger any keyboard shortcut, follow focus changes, post a notification, ask the user a question on a card (one line, or a decision card with context blocks and named buttons, including a button that authorizes one exact Slack send), show a native view of cards, tables and charts docked in your own pane whose button clicks come back to you (`kova ui`). Use when: 'open a pane', 'new tab', 'run X in another pane', 'split', 'list the panes', 'read pane N', 'merge pane N', 'what is running in my terminal', 'ask me when you need an answer', when the user must decide on something with its context (a draft to post, several items to approve), when results are better shown as a table, chart or list of cards than as text, or when a task needs a terminal the user can see."
 ---
 
 # Kova — a scriptable terminal
@@ -65,6 +65,9 @@ printf '%s\n' '{"cmd":"list-panes"}' | nc -U "$KOVA_SOCKET"
 - When a `jq` filter over `list-panes` needs the pane's own field inside a sub-expression (e.g. its
   index in the tab's id list), bind it first: `.data as $d | [$d[]|select(.tab==0)|.id] as $o | $d[] | . as $p | {id, pos:($o|index($p.id))}`.
   A bare `index(.id)` resolves `.id` against the array `$o`, not the pane (`Cannot index array with string "id"`).
+- **Never split `list-panes` fields with `while read a b c`**: `peer_name`, `title` and `cwd` can contain
+  spaces, so the last variable swallows the rest and the columns shift. Extract fields in `jq`/`python3`
+  and emit JSON or tab-separated lines (`jq -r '.data[] | [.id, .claude_session_id, .cwd] | @tsv'`, then `IFS=$'\t' read`).
 - **The `kova` on the PATH is the app binary, not a control CLI.** Its only subcommand is
   `kova ask`; everything else goes through the socket. Older builds started a second Kova window
   for any other word, so never type `kova list-panes`.
@@ -396,8 +399,86 @@ action, or `action: text` when the user typed something.
 - **The card is visible to anyone looking at the screen.** Never put private content on it
   (health, intimate matters, other people's affairs, secrets). For those, ask in the text of your
   reply, inside the pane, which the user can hide.
-- Protocol: `docs/ipc.md` § `ask`, `list-asks`, `answer-ask`; code: `src/ask.rs` (logic, delivery,
-  client) and `src/ask_card.rs` (the card).
+- Several questions waiting: the card shows `n / N` with `‹` / `›` (⌘[ / ⌘]) to browse; browsing
+  answers nothing.
+
+### Decision cards — `kova ask --card`
+
+When the user needs context to decide (who asked, the thread, the exact draft) and buttons that
+*do* something, send a structured card instead of one line:
+
+```bash
+kova ask --card card.json            # or: kova ask --card - < card.json ; Bash timeout 600000
+kova ask --update <question id> --card card.json   # replace your card; its version goes up
+kova ask --withdraw-id <question id>               # take one question back
+```
+
+- The card is JSON: `version` 1, `title` (≤ 120 chars), optional `subtitle`, `blocks` (1–20:
+  `text` with `**bold**` `_italic_` `` `code` `` `[label](https://…)`, `quote` with `author` /
+  `time`, `code` with `label` for exact text, `fields` key/value rows, `divider`, `context`),
+  `actions` (1–6: `id` `[a-z0-9_-]`, `label` ≤ 24, `style` `primary`|`default`|`destructive`,
+  `needs_input`), optional `input: {"placeholder": …}`. Full format and errors:
+  `docs/decision-cards-spec.md`. A malformed card is refused at once with its first error, exit 1.
+- No `Other` button on a card: add a `needs_input` action if a free answer makes sense. Every answer
+  carries the field's text. The answer prints as `<action id>` or `<action id>: <text>`; `--json`
+  adds `card_version`. A late one arrives as `[Kova] The user answered your card "<title>" (v<n>): …`.
+- **The user can edit every `code` block on the card**, and the answer always carries his version:
+  Kova writes each code block's final text, edited or not, to a file and appends to the answer one
+  `[block <i> "<label>" edited by the user|unchanged: <absolute path> sha256 <hex>]` per block
+  (`--json`: `blocks: [{block, label, file, sha256, edited}]`). **Whatever you send or act on next is
+  that file, byte for byte, never your own copy of the draft**, even when it says `unchanged`.
+- If you `--update` a card and get `no such question`, the user already clicked an older version:
+  ignore that answer if its `card_version` is lower than what you sent, and ask again.
+- **Grant action** (Claude Code askers only, at most one, plus at least one other action): a button
+  that authorizes ONE outbound send of exactly the bytes shown in a `code` block. Write the payload
+  to a file (LF only), put that file's bytes as is in the `code` block, and declare on the action
+  `"grant": {"kind": "outbound", "target": "slack:<channel>/<thread_ts or ->",
+  "payload_sha256": "<sha256 of the file>", "payload_block": <index of the code block>}`. Kova
+  refuses the card if the hash does not match the block. Only a click (or ⌘Return) grants, and the
+  grant authorizes the payload block **as the user left it**: on that answer, send the block's file
+  from the answer (path and `sha256` there; your own file only matches when the text is unchanged)
+  with the machine's grant-aware sender (`skill/LOCAL.md` names it and
+  its exact form), alone on its command line, from the same conversation, within 24 h. Kova only
+  writes the grant; the machine's outbound gate decides. `answer-ask` can never trigger a grant
+  action.
+- `update-ask` / `withdraw-ask` over the socket need your `session_id` (the asker's); the CLI reads
+  it from the environment.
+### Views in your pane — `kova ui`
+
+When the user should decide on several things while talking to you (a batch of drafts, a table,
+a dashboard), show them in your own pane instead of one corner card per question:
+
+```bash
+kova ui show --view view.json                 # docked at the bottom of your pane; prints {"view_id","pane_id"}
+kova ui show --placement pane-right --view -  # or in a pane of its own beside yours (pane-down, dock-right)
+kova ui wait <view_id> --timeout 540          # one click as JSON on stdout (exit 2 on timeout)
+kova ui card <view_id> <card_id> --card c.json   # replace a card after acting on its click; --remove to drop it
+kova ui update <view_id> --view view.json     # replace the whole view
+kova ui close <view_id>
+```
+
+- A view is `{"version":1,"title":…,"cards":[{"id":"draft-a","card":{…}}]}`, each card the
+  document of `kova ask --card` (same blocks, actions, text field, grant). Four more blocks exist
+  for views and cards: `table` (`columns`, `rows`), `bars` (`items` of `{label,value}`, `unit`),
+  `sparkline` (`values`, `label`), `progress` (`value` 0–1, `label`).
+- A click is `{"view_id","card_id","action","text","card_version"}`. When you are not in a
+  `kova ui wait`, it arrives in the conversation as
+  `[Kova] UI "<view>", card "<card>" (v<n>): <action>[: <text>]`; the user closing the view arrives
+  as `[Kova] UI "<view>" was closed by the user`.
+- **After a click, update or remove that card** (`kova ui card …`): its buttons stay locked with a
+  spinner until you do (10 minutes at most). Replace it with the outcome ("Posted ✓") rather than
+  leaving it as it was. Do the send before replacing a card that carries a grant: replacing it
+  deletes the unused grant.
+- `--size` is the view's share, 0.2 to 0.7: of your pane for a docked view (default 0.4), of the
+  room your pane had for `pane-right` / `pane-down` (default 0.5). The terminal keeps at least
+  20 × 6. Once the user drags the edge, a later `kova ui show` keeps their size.
+- Only the agent running in the pane may show, update, wait on or close its views; the CLI finds
+  the pane from `KOVA_PANE_ID`. `list-panes` marks a UI pane `"kind": "ui"`: it has no terminal.
+- Protocol: `docs/ipc.md` § `ui-show`…; spec: `docs/pane-ui-spec.md`; code: `src/ui_board.rs`,
+  `src/pane_ui.rs`, `src/window/dock_view.rs`, `src/ui_cli.rs`.
+- Protocol: `docs/ipc.md` § `ask`, `list-asks`, `answer-ask`, `update-ask`, `withdraw-ask`; spec:
+  `docs/decision-cards-spec.md`; code: `src/ask.rs` (logic, delivery, client),
+  `src/decision_card.rs` (card format, validation, markup, grants) and `src/ask_card.rs` (the card).
 
 ## Traps and rules of conduct
 

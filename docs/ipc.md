@@ -336,8 +336,14 @@ disk), `session_id` must be a plain `[A-Za-z0-9_-]` id (it reaches a command lin
 
 Kova shows the question on a card in the top-right corner of the screen (one
 card, oldest question first, a Dock badge counting them) and answers only when
-the user does — there is no server-side timeout. The response is
-`{"ok":true,"data":{"id":…,"action":"OK","text":"…"}}`, after which the client must
+the user does — there is no server-side timeout. When more than one question
+waits, the card shows `n / N` in its header with `‹` / `›` (⌘[ / ⌘] while the
+card has the keyboard) to browse them; browsing answers nothing, and the card
+keeps the question it shows (by id) when another one arrives or leaves. The
+response is
+`{"ok":true,"data":{"id":…,"action":"OK","text":"…","card_version":1}}` (a decision card with `code`
+blocks adds `blocks: [{block, label, file, sha256, edited}]`: the user can edit those blocks, and
+`file` holds each one's final text, see § 4.1 of `docs/decision-cards-spec.md`), after which the client must
 write the line `ack` within 2 s: without it, the answer is considered lost on
 the way and Kova delivers it to the conversation itself:
 
@@ -363,6 +369,22 @@ the way and Kova delivers it to the conversation itself:
    no longer running in the new pane 10 s after Enter, and the answer stays on
    disk, retried at the next launch.
 
+**Decision cards.** `question.card` (optional) replaces the one-line message
+with a structured card: a title, typed blocks (`text`, `quote`, `code`,
+`fields`, `divider`, `context`), up to 6 named actions, an optional text field,
+and at most one grant action. Format, limits, keys and errors:
+`docs/decision-cards-spec.md`. With a card, `message` is optional (derived from
+the title and first `text` block when absent, at most 1,000 chars when given)
+and `actions` / `input` are filled from the card for an older Kova. The card is
+validated when the question arrives; a refused card answers
+`{"ok":false,"error":"<first error>"}` (e.g. `unknown block type image`,
+`blocks[2].text too long`, `payload_sha256 does not match block 2`). Kova adds
+no `Other` button to a card. A click on a grant action writes
+`<ask dir>/grants/<question id>.json` (0600, directory 0700) before the answer
+leaves; the outbound gate of the machine reads it. Every answer carries
+`card_version`, the version the user saw (plain questions: 1). The late line
+for a card reads `[Kova] The user answered your card "<title>" (v<n>): <action>[: <text>]`.
+
 A pane of a library host (an app that embeds Kova) names that host's socket, which answers `ask`
 with `command not supported by this host` (or `unknown command: ask` for a
 build older than `ask`): `kova ask` then asks Kova.app.
@@ -385,9 +407,11 @@ supported by this host`, which sends `kova ask` on to Kova.app.
 For a client that answers somewhere else than the card, such as a companion app
 that shows them on a phone. Response:
 `{"ok":true,"data":{"asks":[…]}}`, oldest first (the one on the card comes
-first), each entry the `question` object of `ask` exactly as it was asked, plus
+first), each entry the `question` object of `ask` exactly as it was asked (its
+`card` included), plus `"card_version"` and
 `"buttons"`: the buttons the card shows, in order (`["Reply"]` when `actions` is
-empty; `actions` plus a trailing `"Other"` when the card has a text field), so a
+empty; `actions` plus a trailing `"Other"` when the card has a text field; a
+decision card's action ids, without `Other`), so a
 client never re-derives those defaults. `"asks": []` when nothing
 waits. Questions restored after a restart are listed like the others.
 
@@ -416,6 +440,11 @@ Errors:
   `buttons` (case matters);
 - `"text" must be empty: this question has no text field`: the question was
   asked with `input: false`.
+
+On a decision card: `no action <id> in this card`, `<id> needs text` (a
+`needs_input` action with empty text), and `a grant action can only be clicked`
+(nothing is written, the card stays). The answer carries the current
+`card_version`.
 
 Kova.app only: a library host answers `command not supported by this host`.
 
@@ -446,6 +475,94 @@ Sent by a Claude Code `UserPromptSubmit` hook running
 `kova ask --withdraw --session -` (it reads the hook's JSON input for the
 `session_id`, prints nothing and always exits 0). Kova.app only: a library host
 answers `command not supported by this host`, and the client then asks Kova.app.
+
+---
+
+### `update-ask` — the asker replaces its card
+
+```json
+{ "cmd": "update-ask", "id": "6f1c…-uuid", "session_id": "<asker session>", "card": { … }, "message": "…" }
+```
+
+Checks, first failure returned: `missing card`, `updating requires an asker
+session id`, `no such question` (answered, withdrawn, or never asked here),
+`not the asker of this question` (`session_id` ≠ `from.session_id`; a question
+asked without a session id never matches), then the card's validation. On
+success the card (and `message`, given or derived again) is replaced,
+`card_version` goes up by one, the question keeps its place and id, and the
+waiting `kova ask` keeps waiting. A plain question may become a card. Response:
+`{"ok":true,"data":{"card_version":2}}`. Client: `kova ask --update <id> --card <file|->`.
+
+---
+
+### `withdraw-ask` — the asker takes one question back
+
+```json
+{ "cmd": "withdraw-ask", "id": "6f1c…-uuid", "session_id": "<asker session>" }
+```
+
+Same asker check as `update-ask` (`withdrawing requires an asker session id`,
+`no such question`, `not the asker of this question`). The question leaves the
+card, nothing is delivered, and a `kova ask` still waiting gets the error
+`withdrawn by the asker`. Client: `kova ask --withdraw-id <id>`.
+
+Both are Kova.app only: a library host answers `command not supported by this host`.
+
+---
+
+### `ui-show`, `ui-update`, `ui-update-card`, `ui-close`, `ui-wait` — native views in panes
+
+An agent shows a **view** in its own pane: a title and a list of cards (the card documents of
+`kova ask --card`), drawn natively, with buttons whose clicks come back to the agent. Spec:
+`docs/pane-ui-spec.md`; client: `kova ui --help`. All five are Kova.app only.
+
+```json
+{ "cmd": "ui-show", "pane_id": 12, "placement": "dock-bottom", "size": 0.4,
+  "view": { "version": 1, "title": "Drafts", "cards": [ { "id": "draft-a", "card": { … } } ] },
+  "from": { …the asker, as in ask… } }
+{ "cmd": "ui-update", "view_id": "…", "view": { … } }
+{ "cmd": "ui-update-card", "view_id": "…", "card_id": "draft-a", "card": { … } }   // "card": null removes it
+{ "cmd": "ui-close", "view_id": "…" }
+{ "cmd": "ui-wait", "view_id": "…", "timeout_ms": 600000 }
+```
+
+- `placement`: `dock-bottom` (default) or `dock-right` docks the view in the pane, which gives it
+  `size` of its height or width (0.2 to 0.7, default 0.4; `size out of range` otherwise); the
+  terminal is resized to the rest and keeps at least 20 × 6 cells, the view collapsing to a
+  one-line bar when less than 80 pt would remain. `pane-right` / `pane-down` open a **UI pane**
+  next to it, which holds the view and no terminal (at most 4 per pane: `too many ui panes`), and
+  gets `size` of the room the pane had (default 0.5). Once the user drags a docked view's edge,
+  a replacing `ui-show` keeps the dragged size.
+  `ui-show` never moves the keyboard focus. Answer: `{"ok":true,"data":{"view_id":"…","pane_id":N}}`,
+  `pane_id` being the pane holding the view. A second dock `ui-show` on the same pane replaces
+  its view and keeps its `view_id`.
+- **Who may act**: permissions go by pane, through the process at the other end of the socket
+  (`LOCAL_PEERPID`). `ui-show` is accepted only from a process descending from that pane's shell
+  (`not your pane`); the other four only from the pane that owns the view: the docking pane, or
+  the pane that opened the UI pane (`not the owner of this view`; `no such view`). A resumed
+  conversation with a new session id keeps its views.
+- The view is validated like a `kova ask` card, card by card (`cards[3].card: blocks[0].text too
+  long`), plus `too many cards` (50 at most), `duplicate card id <id>`, `view too large` (512 KiB).
+  The card format gains four blocks, also usable in `kova ask --card`: `table`, `bars`,
+  `sparkline`, `progress` (`docs/pane-ui-spec.md` § 4.1).
+- `ui-update` keeps the version of cards whose JSON did not change and bumps the others;
+  `ui-update-card` always bumps (`{"card_version":n}`), appends an unknown card, removes with
+  `null`. Both release the card's click lock and delete its unused grants.
+- **Events**: a click is `{"view_id","card_id","action","text","card_version"}`; the user closing
+  the view (its ✕ or its pane) is `{"view_id","event":"closed"}`. `ui-wait` returns the next one
+  (`data: null` on timeout), and the client must write `ack` within 2 s or the event goes back to
+  the head of the queue; a second `ui-wait` on the same view gets `already waiting`. With nobody
+  waiting (and not within 5 s of a `ui-wait` returning, and no half-typed line in the owner pane)
+  the event is typed into the agent's conversation the way a late `ask` answer is:
+  `[Kova] UI "<view>", card "<card>" (v<n>): <action>[: <text>]` or
+  `[Kova] UI "<view>" was closed by the user`. Each view's last event is also written to
+  `<ask dir>/ui/<view_id>.last.json`; undelivered events wait in `<ask dir>/ui/` (7 days).
+- After a click the card's buttons are locked (spinner) until the agent updates or removes the
+  card, 10 minutes at most. A grant action in a view writes `<ask dir>/grants/<view_id>_<card_id>.json`
+  (id `<view_id>:<card_id>`), as the corner card does.
+- `list-panes` gives every pane `"kind": "terminal"` or `"ui"`, and `ui_view_id` when it shows a
+  view. `send-keys`, `get-pane-content`, `count-pane-content` and `wait-for-completion` on a UI pane
+  answer `pane has no terminal`; `ui-show` on it answers `use ui-update`.
 
 ---
 

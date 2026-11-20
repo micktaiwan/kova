@@ -15,6 +15,11 @@ mod appkit_input;
 mod ask;
 mod auto_pause;
 mod ask_card;
+mod card_view;
+mod pane_ui;
+mod ui_board;
+mod ui_cli;
+mod decision_card;
 mod bookmarks;
 mod claude_history;
 mod claude_session;
@@ -42,6 +47,11 @@ mod tab_colors;
 mod terminal;
 mod update_check;
 mod window;
+
+/// `kova ui …` (see `ui_cli::USAGE`): returns the exit code.
+pub fn ui_cli(args: &[String]) -> i32 {
+    ui_cli::run(args)
+}
 
 /// `kova ask …` (see `ask::USAGE`): returns the exit code.
 pub fn ask_cli(args: &[String]) -> i32 {

@@ -3,6 +3,7 @@
 //! cell, a separator or a tab.
 
 use super::*;
+use crate::pane::DockSide;
 
 impl KovaView {
     /// Convert pixel coords to (visible_row, col) within a pane viewport.
@@ -141,6 +142,66 @@ impl KovaView {
         (cell_h * 2.0).round()
     }
 
+    /// Hit-test the edge between a pane's terminal and its docked view (a
+    /// few pixels on the terminal's side: the view itself takes its clicks).
+    pub(super) fn hit_test_dock_edge(&self, px: f32, py: f32) -> Option<DockDrag> {
+        let tabs = self.ivars().tabs.borrow();
+        let tab = tabs.get(self.ivars().active_tab.get())?;
+        let vp = self.panes_viewport_for_tab(tab);
+        let tolerance = 4.0 * self.backing_scale();
+        let mut found = None;
+        tab.for_each_dock(vp, &mut |pane, split| {
+            if found.is_some() || split.collapsed || pane.ui_pane.get() {
+                return;
+            }
+            let Some(dock) = pane.dock.get() else { return };
+            let (t, v) = (split.terminal, split.view);
+            let hit = match dock.side {
+                DockSide::Bottom => (py - v.y).abs() < tolerance && px >= v.x && px <= v.x + v.width,
+                DockSide::Right => (px - v.x).abs() < tolerance && py >= v.y && py <= v.y + v.height,
+            };
+            if hit {
+                let full = match dock.side {
+                    DockSide::Bottom => PaneViewport { x: t.x, y: t.y, width: t.width, height: t.height + v.height },
+                    DockSide::Right => PaneViewport { x: t.x, y: t.y, width: t.width + v.width, height: t.height },
+                };
+                found = Some(DockDrag { pane: pane.id, side: dock.side, full });
+            }
+        });
+        found
+    }
+
+    /// Move the dragged edge of a docked view to the pointer: the view's
+    /// size follows, is kept for that view, and the terminal is resized.
+    pub(super) fn drag_dock_edge(&self, drag: DockDrag, px: f32, py: f32) {
+        let changed = {
+            let tabs = self.ivars().tabs.borrow();
+            let Some(tab) = tabs.iter().find(|t| t.contains(drag.pane)) else { return };
+            let Some(pane) = tab.pane(drag.pane) else { return };
+            let pos = match drag.side {
+                DockSide::Bottom => py,
+                DockSide::Right => px,
+            };
+            let size = crate::pane::dragged_dock_size(drag.full, drag.side, pos, tab.dock_geometry.get());
+            let Some(mut dock) = pane.dock.get() else { return };
+            if (dock.size - size).abs() < 1e-4 {
+                false
+            } else {
+                dock.size = size;
+                pane.dock.set(Some(dock));
+                if let Some(view) = pane.ui_view.borrow_mut().as_mut() {
+                    view.size = size;
+                    view.dragged = true;
+                }
+                true
+            }
+        };
+        if changed {
+            self.request_resize_all_panes();
+            self.mark_dirty();
+        }
+    }
+
     /// Hit-test separators in the active tab's tree.
     pub(super) fn hit_test_separator(&self, px: f32, py: f32) -> Option<SeparatorDrag> {
         let tabs = self.ivars().tabs.borrow();
@@ -272,6 +333,19 @@ impl KovaView {
         let renderer = self.ivars().renderer.get()?;
         let size = renderer.read().cell_size();
         Some(size)
+    }
+
+    /// What a docked view must leave its pane's terminal (20 columns × 6 rows,
+    /// padding and status bar included), the least room a view is drawn in
+    /// (80 pt), and the height of its collapsed bar.
+    pub(super) fn dock_geometry(&self, cell_w: f32, cell_h: f32, status_bar: bool) -> crate::pane::DockGeometry {
+        let scale = self.backing_scale();
+        let rows = if status_bar { 7.0 } else { 6.0 };
+        crate::pane::DockGeometry {
+            min_terminal: (20.0 * cell_w + 2.0 * self.h_padding(), rows * cell_h),
+            min_view: 80.0 * scale,
+            bar: (28.0 * scale).max(cell_h),
+        }
     }
 
     /// Compute cols/rows for a pane viewport.

@@ -4,6 +4,8 @@ Ultra-fast Mac terminal in Rust + Metal.
 
 This repo is public: nothing personal goes into any tracked file, and an example taken from a conversation is rewritten generically before it lands in skill/SKILL.md or anywhere else.
 
+**Check before committing, not at push.** A new spec, note or source file written in a session names the user's private tools by habit, and `git add -A` sweeps it in; the `pre-push` guard then refuses the whole push after the commit exists. Run `~/.local/bin/public-repo-guard "$PWD"` (exit 1 = blocked, it lists the file and the pattern) before `git add -A`, and rewrite the offending names generically (`a Slack reader`, `a notes app`) in the file itself.
+
 ## Stack
 
 - **Rust** — main language
@@ -81,7 +83,7 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 
 - Mac-only, no cross-platform
 - Performance and minimal RAM above all
-- No feature creep on the app side: tabs, splits, config, that's it. Two extensions allowed: Kova also serves as a terminal library for a host app (work described in `docs/embedding.md`), and Kova shows agents' questions (`kova ask`; `src/ask.rs`, `src/ask_card.rs`, `docs/ipc.md` § `ask`).
+- Kova is a terminal that agents can also draw native UI in: `kova ask` cards (`docs/decision-cards-spec.md`) and views inside panes (`docs/pane-ui-spec.md`). It also serves as a terminal library for a host app (work described in `docs/embedding.md`).
 - **Behavior the user has validated ("that works for me", "it's good") no longer changes; the code itself can move, provided tests prove the behavior is identical.** Required order: the tests that freeze the behavior first, green, then the move. If a review finds a gap between the code and the specs, the specs are aligned with the code, never the reverse: changing validated behavior introduces regressions on something already accepted.
 
 ## The `kova` skill is this tool's public surface

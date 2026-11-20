@@ -462,6 +462,9 @@ pub struct Tab {
     /// Cell height in pixels, used to snap row heights to cell boundaries.
     /// Set by the window before layout; 0.0 = no snapping.
     pub cell_h: Cell<f32>,
+    /// What a docked UI view must leave its terminal, in pixels (see
+    /// [`DockGeometry`]). Set by the window before layout, like `cell_h`.
+    pub dock_geometry: Cell<DockGeometry>,
     /// Subjects of work filed in this tab, in creation order — empty ones
     /// included: Cmd+P lists them at the top of the tab until something is
     /// filed in them again. A pane names its own in `Pane::subject`.
@@ -579,6 +582,7 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            dock_geometry: Cell::new(DockGeometry::default()),
             subjects: Vec::new(),
             subject_colors: std::collections::HashMap::new(),
         })
@@ -614,6 +618,7 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            dock_geometry: Cell::new(DockGeometry::default()),
             subjects: Vec::new(),
             subject_colors: std::collections::HashMap::new(),
         }
@@ -641,6 +646,7 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            dock_geometry: Cell::new(DockGeometry::default()),
             subjects: Vec::new(),
             subject_colors: std::collections::HashMap::new(),
         })
@@ -667,6 +673,7 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            dock_geometry: Cell::new(DockGeometry::default()),
             subjects: Vec::new(),
             subject_colors: std::collections::HashMap::new(),
         })
@@ -1119,7 +1126,32 @@ impl Tab {
         let mut x = vp.x;
         for (col, &w) in self.columns.iter().zip(widths.iter()) {
             let col_vp = PaneViewport { x, y: vp.y, width: w, height: vp.height };
-            col.for_each_pane_with_viewport(col_vp, ch, f);
+            // A docked UI view takes part of its pane: everything that lays out,
+            // draws, resizes or hit-tests the terminal gets the rest.
+            let geometry = self.dock_geometry.get();
+            col.for_each_pane_with_viewport(col_vp, ch, &mut |pane, full| f(pane, pane.terminal_viewport(full, geometry)));
+            x += w;
+        }
+    }
+
+    /// Each pane of this tab that docks a UI view, with the view's rectangle
+    /// (and whether it is collapsed to its one-line bar). Minimized panes are
+    /// left out: their view hides with them.
+    pub fn for_each_dock<F: FnMut(&Pane, DockSplit)>(&self, vp: PaneViewport, f: &mut F) {
+        let widths = self.column_widths(vp.width);
+        let ch = self.cell_h.get();
+        let geometry = self.dock_geometry.get();
+        let mut x = vp.x;
+        for (col, &w) in self.columns.iter().zip(widths.iter()) {
+            let col_vp = PaneViewport { x, y: vp.y, width: w, height: vp.height };
+            col.for_each_pane_with_viewport(col_vp, ch, &mut |pane, full| {
+                if full.height <= 0.0 || full.width <= 0.0 {
+                    return;
+                }
+                if let Some(split) = pane.dock_split(full, geometry) {
+                    f(pane, split);
+                }
+            });
             x += w;
         }
     }
@@ -1132,7 +1164,11 @@ impl Tab {
         for (col, &w) in self.columns.iter().zip(widths.iter()) {
             let col_vp = PaneViewport { x, y: vp.y, width: w, height: vp.height };
             if let Some(result) = col.viewport_for_pane(id, col_vp, ch) {
-                return Some(result);
+                let geometry = self.dock_geometry.get();
+                return Some(match self.pane(id) {
+                    Some(pane) => pane.terminal_viewport(result, geometry),
+                    None => result,
+                });
             }
             x += w;
         }
@@ -1146,8 +1182,8 @@ impl Tab {
         let mut col_x = vp.x;
         for (col, &w) in self.columns.iter().zip(widths.iter()) {
             let col_vp = PaneViewport { x: col_x, y: vp.y, width: w, height: vp.height };
-            if let Some(result) = col.hit_test(x, y, col_vp, ch) {
-                return Some(result);
+            if let Some((pane, full)) = col.hit_test(x, y, col_vp, ch) {
+                return Some((pane, pane.terminal_viewport(full, self.dock_geometry.get())));
             }
             col_x += w;
         }
@@ -1326,6 +1362,20 @@ impl Tab {
     pub fn vsplit_at_pane(&mut self, target_id: PaneId, new_pane: Pane) {
         if let Some(idx) = self.column_index_of(target_id) {
             self.columns[idx].insert_pane_after(target_id, new_pane);
+        }
+    }
+
+    /// Give UI pane `ui`, just opened next to `opener` (a column to its right
+    /// or a row below it), `size` of the room `opener` had.
+    pub fn share_with_ui_pane(&mut self, opener: PaneId, ui: PaneId, size: f32) {
+        let (Some(oc), Some(uc)) = (self.column_index_of(opener), self.column_index_of(ui)) else { return };
+        if oc != uc {
+            share_with_ui(&mut self.column_weights, oc, uc, size);
+            return;
+        }
+        let col = &mut self.columns[oc];
+        if let (Some(o), Some(u)) = (col.pane_index_of(opener), col.pane_index_of(ui)) {
+            share_with_ui(&mut col.row_weights, o, u, size);
         }
     }
 
@@ -1870,6 +1920,116 @@ pub struct Pane {
     /// what orders every Cmd+J walk: the least recently seen pane comes first,
     /// so a tour visits all of them before handing any of them back.
     last_seen: Cell<u64>,
+    /// A native UI view docked in this pane (`docs/pane-ui-spec.md` § 3.1):
+    /// the terminal gives it part of its rectangle.
+    pub dock: Cell<Option<Dock>>,
+    /// The view this pane shows (docked, or the whole pane for a UI pane).
+    /// Saved with the pane record: it is the only copy.
+    pub ui_view: std::cell::RefCell<Option<crate::pane_ui::View>>,
+    /// A UI pane (§ 3.2): no terminal, the view takes the whole rectangle.
+    pub ui_pane: Cell<bool>,
+    /// Stable identity across relaunches (pane ids change): links a UI pane
+    /// to the pane that opened it. Given at the first save without one.
+    pub uid: std::cell::RefCell<String>,
+}
+
+/// Which edge of its pane a docked UI view takes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DockSide {
+    Bottom,
+    Right,
+}
+
+/// A docked view's place: its edge, and the share of the pane it asks for
+/// (of the height for `Bottom`, of the width for `Right`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Dock {
+    pub side: DockSide,
+    pub size: f32,
+}
+
+/// What docking must respect, in pixels: the terminal keeps at least
+/// `min_terminal` (20 columns × 6 rows, padding and status bar included); the
+/// view needs `min_view` to be drawn, else it collapses to a `bar` high strip.
+/// All zero before the window measured its cells: nothing is kept then.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DockGeometry {
+    pub min_terminal: (f32, f32),
+    pub min_view: f32,
+    pub bar: f32,
+}
+
+/// A pane split between its terminal and its docked view.
+#[derive(Clone, Copy)]
+pub struct DockSplit {
+    pub terminal: PaneViewport,
+    pub view: PaneViewport,
+    /// Not enough room left for the view: it shows as a one-line bar.
+    pub collapsed: bool,
+}
+
+/// Split `full` between the terminal and a docked view. The view gets
+/// `dock.size` of the pane, clamped so the terminal keeps `min_terminal`;
+/// when less than `min_view` would remain, the view collapses to a bar of
+/// `bar` pixels and the terminal keeps the rest.
+pub fn split_dock(full: PaneViewport, dock: Dock, g: DockGeometry) -> DockSplit {
+    let (total, keep) = match dock.side {
+        DockSide::Bottom => (full.height, g.min_terminal.1),
+        DockSide::Right => (full.width, g.min_terminal.0),
+    };
+    let room = (total - keep).max(0.0);
+    let (view, collapsed) = if room < g.min_view {
+        (g.bar.min(total), true)
+    } else {
+        ((total * dock.size.clamp(0.0, 1.0)).min(room).round(), false)
+    };
+    let view = view.max(0.0);
+    let split = match dock.side {
+        DockSide::Bottom => {
+            let term_h = total - view;
+            (
+                PaneViewport { x: full.x, y: full.y, width: full.width, height: term_h },
+                PaneViewport { x: full.x, y: full.y + term_h, width: full.width, height: view },
+            )
+        }
+        DockSide::Right => {
+            let term_w = total - view;
+            (
+                PaneViewport { x: full.x, y: full.y, width: term_w, height: full.height },
+                PaneViewport { x: full.x + term_w, y: full.y, width: view, height: full.height },
+            )
+        }
+    };
+    DockSplit { terminal: split.0, view: split.1, collapsed }
+}
+
+/// The share of `full` a docked view gets when the user drags the edge
+/// between it and the terminal to `pos` (pixels: y for `Bottom`, x for
+/// `Right`). The view keeps at least `min_view`, the terminal `min_terminal`.
+pub fn dragged_dock_size(full: PaneViewport, side: DockSide, pos: f32, g: DockGeometry) -> f32 {
+    let (start, total, keep) = match side {
+        DockSide::Bottom => (full.y, full.height, g.min_terminal.1),
+        DockSide::Right => (full.x, full.width, g.min_terminal.0),
+    };
+    if total <= 0.0 {
+        return 0.4;
+    }
+    let least = g.min_view.min(total);
+    let most = (total - keep).max(least);
+    let view = (start + total - pos).clamp(least, most);
+    view / total
+}
+
+/// Give a UI pane `size` of the room its opener had: `weights[opener]` is
+/// split between the two, the other entries keep theirs.
+fn share_with_ui(weights: &mut [f32], opener: usize, ui: usize, size: f32) {
+    if opener >= weights.len() || ui >= weights.len() || opener == ui {
+        return;
+    }
+    let size = size.clamp(0.05, 0.95);
+    let room = weights[opener];
+    weights[ui] = room * size;
+    weights[opener] = room * (1.0 - size);
 }
 
 impl std::ops::Deref for Pane {
@@ -1909,7 +2069,38 @@ impl Pane {
             subject: None,
             idle_agent_seen: Cell::new(false),
             last_seen: Cell::new(0),
+            dock: Cell::new(None),
+            ui_view: std::cell::RefCell::new(None),
+            ui_pane: Cell::new(false),
+            uid: std::cell::RefCell::new(String::new()),
         }
+    }
+
+    /// The part of `full` its terminal gets: all of it, unless a UI view is docked.
+    pub fn terminal_viewport(&self, full: PaneViewport, geometry: DockGeometry) -> PaneViewport {
+        self.dock_split(full, geometry).map_or(full, |s| s.terminal)
+    }
+
+    /// How this pane's rectangle is shared with its view, if it shows one: a
+    /// UI pane gives it all (an empty terminal rectangle at its corner).
+    pub fn dock_split(&self, full: PaneViewport, geometry: DockGeometry) -> Option<DockSplit> {
+        if self.minimized {
+            return None;
+        }
+        if self.ui_pane.get() {
+            let terminal = PaneViewport { x: full.x, y: full.y, width: 0.0, height: 0.0 };
+            return Some(DockSplit { terminal, view: full, collapsed: false });
+        }
+        self.dock.get().map(|dock| split_dock(full, dock, geometry))
+    }
+
+    /// The stable id of this pane, created on first use.
+    pub fn ensure_uid(&self) -> String {
+        let mut uid = self.uid.borrow_mut();
+        if uid.is_empty() {
+            *uid = crate::ask::new_question_id();
+        }
+        uid.clone()
     }
 
     /// Display title for this pane: agent session name > custom title > OSC
@@ -3011,6 +3202,89 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod dock_tests {
+    use super::{dragged_dock_size, share_with_ui, split_dock, Dock, DockGeometry, DockSide};
+    use crate::renderer::PaneViewport;
+
+    fn full() -> PaneViewport {
+        PaneViewport { x: 100.0, y: 50.0, width: 1000.0, height: 800.0 }
+    }
+    const G: DockGeometry = DockGeometry { min_terminal: (400.0, 300.0), min_view: 160.0, bar: 40.0 };
+
+    #[test]
+    fn bottom_dock_takes_its_share_below_the_terminal() {
+        let s = split_dock(full(), Dock { side: DockSide::Bottom, size: 0.4 }, G);
+        assert!(!s.collapsed);
+        assert_eq!((s.terminal.y, s.terminal.height, s.terminal.width), (50.0, 480.0, 1000.0));
+        assert_eq!((s.view.y, s.view.height, s.view.x), (530.0, 320.0, 100.0));
+    }
+
+    #[test]
+    fn right_dock_takes_its_share_beside_the_terminal() {
+        let s = split_dock(full(), Dock { side: DockSide::Right, size: 0.5 }, G);
+        assert_eq!((s.terminal.x, s.terminal.width, s.terminal.height), (100.0, 500.0, 800.0));
+        assert_eq!((s.view.x, s.view.width), (600.0, 500.0));
+    }
+
+    #[test]
+    fn the_terminal_keeps_its_minimum() {
+        let s = split_dock(full(), Dock { side: DockSide::Bottom, size: 0.7 }, G);
+        assert_eq!((s.terminal.height, s.view.height), (300.0, 500.0), "560 asked, 500 left");
+        let s = split_dock(full(), Dock { side: DockSide::Right, size: 0.7 }, G);
+        assert_eq!((s.terminal.width, s.view.width), (400.0, 600.0), "700 asked, 600 left");
+    }
+
+    #[test]
+    fn too_small_a_pane_collapses_the_view_to_a_bar() {
+        let small = PaneViewport { x: 0.0, y: 0.0, width: 1000.0, height: 420.0 };
+        let s = split_dock(small, Dock { side: DockSide::Bottom, size: 0.4 }, G);
+        assert!(s.collapsed, "120 left < 160");
+        assert_eq!((s.terminal.height, s.view.height, s.view.y), (380.0, 40.0, 380.0));
+    }
+
+    #[test]
+    fn before_the_cells_are_measured_nothing_is_kept() {
+        let s = split_dock(full(), Dock { side: DockSide::Bottom, size: 0.4 }, DockGeometry::default());
+        assert!(!s.collapsed);
+        assert_eq!(s.view.height, 320.0);
+    }
+
+    #[test]
+    fn dragging_the_edge_sets_the_view_share() {
+        // full: y 50..850 (800 high), x 100..1100 (1000 wide).
+        assert_eq!(dragged_dock_size(full(), DockSide::Bottom, 450.0, G), 0.5);
+        assert_eq!(dragged_dock_size(full(), DockSide::Right, 850.0, G), 0.25);
+        // The dragged size survives a split_dock round trip.
+        let s = split_dock(full(), Dock { side: DockSide::Bottom, size: dragged_dock_size(full(), DockSide::Bottom, 600.0, G) }, G);
+        assert_eq!(s.view.y, 600.0);
+    }
+
+    #[test]
+    fn a_dragged_edge_keeps_both_minimums() {
+        // Dragged up to the top: the terminal keeps 300 of 800.
+        assert_eq!(dragged_dock_size(full(), DockSide::Bottom, 0.0, G), 500.0 / 800.0);
+        // Dragged down past the bottom: the view keeps 160.
+        assert_eq!(dragged_dock_size(full(), DockSide::Bottom, 2000.0, G), 160.0 / 800.0);
+        assert_eq!(dragged_dock_size(full(), DockSide::Right, 1090.0, G), 160.0 / 1000.0);
+    }
+
+    #[test]
+    fn a_ui_pane_takes_its_share_of_the_openers_room() {
+        // Opener at 2.0, the UI pane inserted after it with an average weight.
+        let mut w = vec![1.0, 2.0, 1.33, 1.0];
+        share_with_ui(&mut w, 1, 2, 0.3);
+        assert_eq!(w[0], 1.0);
+        assert_eq!(w[3], 1.0);
+        assert!((w[1] - 1.4).abs() < 1e-5 && (w[2] - 0.6).abs() < 1e-5, "{w:?}");
+        // Out of range or the same entry: nothing moves.
+        let mut w = vec![1.0, 1.0];
+        share_with_ui(&mut w, 0, 5, 0.3);
+        share_with_ui(&mut w, 1, 1, 0.3);
+        assert_eq!(w, vec![1.0, 1.0]);
+    }
+}
 
 #[cfg(test)]
 mod order_tests {

@@ -5,43 +5,55 @@
 //!
 //! The card sits top-right of the screen, over everything, without taking the
 //! keyboard until the user clicks into it. One question at a time; the others
-//! wait behind it ("N more").
+//! wait behind it, browsable with ‹ › (or ⌘[ / ⌘]) and counted `n / N`.
 //!
 //! Layout: a borderless rounded panel on a translucent HUD background, the
 //! asker's colour washing down from the top edge and rimming the card. Header
-//! (badge, who asks, time, how many wait), the message, the answer field, then
+//! (badge, who asks, the queue, the time), the message, the answer field, then
 //! the buttons right-aligned with the first one as the default (tinted, Enter).
 //!
+//! A decision card (`crate::decision_card`) draws instead a title, a subtitle
+//! and its blocks in a scrolling area, 560 points wide and at most 70 % of the
+//! screen high, with the text field and the buttons pinned below. Its keys:
+//! ⌘Return answers with the primary action from anywhere; Return does too
+//! outside the field, except for a grant action, which only a click or
+//! ⌘Return can trigger.
+//!
 //! Main thread only. The answers are queued here and drained by Kova's render
-//! tick through [`take_answers`]: AppKit calls the button and field callbacks
-//! from inside its event loop, where the window list may be borrowed.
+//! tick through [`take_answers`] and [`take_browse`]: AppKit calls the button
+//! and field callbacks from inside its event loop, where the window list may
+//! be borrowed.
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSAttributedStringNSExtendedStringDrawing, NSAttributedStringNSStringDrawing,
-    NSBackingStoreType, NSButton, NSColor, NSControl, NSControlTextEditingDelegate,
-    NSEventModifierFlags, NSFloatingWindowLevel, NSFocusRingType, NSFont,
-    NSFontAttributeName, NSFontWeightRegular, NSFontWeightSemibold,
-    NSForegroundColorAttributeName, NSLayoutAttribute, NSLayoutConstraint,
+    NSBackingStoreType, NSButton, NSColor, NSControl, NSControlTextEditingDelegate, NSEvent,
+    NSEventModifierFlags, NSFloatingWindowLevel, NSFocusRingType, NSFont, NSFontWeightBold,
+    NSFontWeightRegular, NSFontWeightSemibold, NSLayoutAttribute, NSLayoutConstraint,
     NSLayoutConstraintOrientation, NSLayoutManager, NSLayoutPriorityRequired, NSLineBreakMode,
-    NSPanel, NSRequestUserAttentionType, NSResponder, NSScreen, NSSound, NSStackView,
-    NSStringDrawingOptions, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTextView,
-    NSUserInterfaceLayoutOrientation, NSView, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSWindow, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSControlSize, NSPanel, NSRequestUserAttentionType, NSResponder, NSScreen, NSScrollView, NSScroller, NSSound,
+    NSStackView,
+    NSStringDrawingOptions, NSTextAlignment, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
+    NSTextViewDelegate,
+    NSUserInterfaceLayoutOrientation, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSDate,
-    NSDateFormatter, NSDateFormatterStyle, NSDictionary, NSEdgeInsets, NSNotification, NSObject,
-    NSObjectProtocol, NSString,
+    MainThreadMarker, NSArray, NSDate, NSDateFormatter, NSDateFormatterStyle, NSEdgeInsets,
+    NSNotification, NSObject, NSObjectProtocol,
 };
 use objc2_quartz_core::{CAGradientLayer, CATransaction};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Mutex;
+
+use crate::ask::Trigger;
+use crate::card_view::{activate, attributed, button_rows, cg_colors, ns, CodeEditor, FlippedView};
+use crate::decision_card::{Card as Doc, Style};
 
 /// One question as the card shows it.
 pub struct CardQuestion<'a> {
@@ -50,6 +62,7 @@ pub struct CardQuestion<'a> {
     pub from: &'a str,
     pub message: &'a str,
     /// Never empty, in order; the first is the primary (drawn last, rightmost).
+    /// For a decision card: its action ids, then "Dismiss" when superseded.
     pub buttons: &'a [String],
     /// Whether to show the answer field.
     pub input: bool,
@@ -57,18 +70,34 @@ pub struct CardQuestion<'a> {
     pub asked_at: u64,
     /// A line shown above the message, greyed (a superseded question).
     pub note: Option<&'a str>,
+    /// The decision card to draw instead of `message`.
+    pub card: Option<&'a Doc>,
+    /// The version shown: a click carries it back.
+    pub card_version: u32,
+    /// Whether "Dismiss" closes the question without an answer.
+    pub dismissable: bool,
+    /// 1-based rank in the queue.
+    pub position: usize,
+    /// A red line above the buttons (the authorization could not be recorded).
+    pub error: Option<&'a str>,
 }
 
-/// What the user answered: the button (or the first one, for Enter) and the
-/// field's text, trimmed.
+/// What the user answered: the button (or the primary one, for Return) and
+/// the field's text, trimmed, with the version shown and what set it off.
 pub struct CardAnswer {
     pub id: String,
     pub action: String,
     pub text: String,
+    pub card_version: u32,
+    pub trigger: Trigger,
+    /// The text of each editable `code` block (block index, text).
+    pub edits: Vec<(usize, String)>,
 }
 
-/// The card's width, as in Swift.
+/// The plain card's width, as in Swift.
 const WIDTH: CGFloat = 400.0;
+/// A decision card's width.
+const CARD_WIDTH: CGFloat = 560.0;
 /// Horizontal inset of every row; the vertical one is 4 points less.
 const INSET: CGFloat = 20.0;
 /// Beyond this the field stops growing and scrolls.
@@ -77,11 +106,17 @@ const MAX_LINES: CGFloat = 8.0;
 const BUTTON_SPACING: CGFloat = 8.0;
 const FIELD_FONT_SIZE: CGFloat = 14.0;
 const PLACEHOLDER: &str = "Type an answer, or just click a button";
+/// A decision card is at most this share of the visible screen height.
+const MAX_SCREEN_SHARE: CGFloat = 0.70;
+/// The block area never shrinks below this, however long the field grows.
+const MIN_BLOCKS: CGFloat = 60.0;
 
 /// Answers given since the last [`take_answers`]. A `Mutex` although only the
 /// main thread touches it: `take_answers` takes no `MainThreadMarker`, so a
 /// thread_local would silently hand another thread an empty queue.
 static ANSWERS: Mutex<Vec<CardAnswer>> = Mutex::new(Vec::new());
+/// ‹ (-1) and › (+1) presses since the last [`take_browse`].
+static BROWSE: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
 thread_local! {
     /// The card, built on the first `show`. Kept for the life of the process:
@@ -96,7 +131,8 @@ define_class!(
     /// Swift's `FloatPanel`: a non-activating panel that still accepts the
     /// keyboard when clicked. A borderless window answers NO to
     /// `canBecomeKeyWindow` by default, so without this the field could never
-    /// be typed into.
+    /// be typed into. Also takes the card's keys: ⌘Return, ⌘[ / ⌘], and
+    /// Return outside the field on a decision card.
     #[unsafe(super(NSPanel, NSWindow, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "KovaAskCardPanel"]
@@ -107,8 +143,22 @@ define_class!(
         fn can_become_key_window(&self) -> bool {
             true
         }
+
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, event: &NSEvent) -> bool {
+            let handled = command_key(event);
+            handled || unsafe { msg_send![super(self), performKeyEquivalent: event] }
+        }
+
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            if !return_key(event) {
+                let _: () = unsafe { msg_send![super(self), keyDown: event] };
+            }
+        }
     }
 );
+
 
 define_class!(
     /// Target of the buttons and delegate of the answer field. Holds nothing:
@@ -125,12 +175,14 @@ define_class!(
         fn control_text_did_change(&self, _notification: &NSNotification) {
             if let Some(card) = card() {
                 card.fit_field();
+                card.update_enabled();
             }
         }
 
         /// Enter in the field sends with "Other" when text was typed and the
         /// card has it, else with the first button; Shift+Enter (or
-        /// Option+Enter) adds a line.
+        /// Option+Enter) adds a line. On a decision card Return always adds a
+        /// line: ⌘Return sends.
         #[unsafe(method(control:textView:doCommandBySelector:))]
         fn control_text_view_do_command(
             &self,
@@ -144,6 +196,18 @@ define_class!(
 
     unsafe impl NSTextFieldDelegate for CardTarget {}
 
+    /// An editable `code` block changed: keep its text, grow its box.
+    unsafe impl NSTextDelegate for CardTarget {
+        #[unsafe(method(textDidChange:))]
+        fn text_did_change(&self, _notification: &NSNotification) {
+            if let Some(card) = card() {
+                card.code_edited(MainThreadMarker::from(self));
+            }
+        }
+    }
+
+    unsafe impl NSTextViewDelegate for CardTarget {}
+
     impl CardTarget {
         /// A button: its tag is its index in the question's buttons.
         #[unsafe(method(pressed:))]
@@ -153,12 +217,70 @@ define_class!(
             let action = card.current.borrow().as_ref().and_then(|c| {
                 usize::try_from(index).ok().and_then(|i| c.buttons.get(i).cloned())
             });
-            if let Some(action) = action {
-                card.answer(action);
+            if let Some(action) = action.filter(|_| card.button_enabled(index)) {
+                card.answer(action, Trigger::Click);
             }
+        }
+
+        #[unsafe(method(previous:))]
+        fn previous(&self, _sender: &NSButton) {
+            browse(-1);
+        }
+
+        #[unsafe(method(next:))]
+        fn next(&self, _sender: &NSButton) {
+            browse(1);
         }
     }
 );
+
+fn browse(delta: i32) {
+    if let Ok(mut queue) = BROWSE.lock() {
+        queue.push(delta);
+    }
+}
+
+/// ⌘Return (the primary action) and ⌘[ / ⌘] (browse), read from the typed
+/// character, never the keycode. True when handled.
+fn command_key(event: &NSEvent) -> bool {
+    let flags = event.modifierFlags();
+    if !flags.contains(NSEventModifierFlags::Command) {
+        return false;
+    }
+    let chars = event.charactersIgnoringModifiers().map(|s| s.to_string()).unwrap_or_default();
+    match chars.as_str() {
+        "[" => {
+            browse(-1);
+            true
+        }
+        "]" => {
+            browse(1);
+            true
+        }
+        "\r" | "\u{3}" => card().is_some_and(|card| card.trigger_primary(Trigger::CmdReturn)),
+        _ => false,
+    }
+}
+
+/// Return outside the field: the primary action of a decision card, never a
+/// grant one (and no beep then). False for a plain card, whose default button
+/// carries Return itself.
+fn return_key(event: &NSEvent) -> bool {
+    let flags = event.modifierFlags();
+    if flags.intersects(NSEventModifierFlags::Command | NSEventModifierFlags::Shift | NSEventModifierFlags::Option | NSEventModifierFlags::Control) {
+        return false;
+    }
+    let chars = event.charactersIgnoringModifiers().map(|s| s.to_string()).unwrap_or_default();
+    if chars != "\r" && chars != "\u{3}" {
+        return false;
+    }
+    let Some(card) = card() else { return false };
+    if !card.rich.get() {
+        return false;
+    }
+    card.trigger_primary(Trigger::Return);
+    true
+}
 
 /// The body of `control:textView:doCommandBySelector:`, outside the macro:
 /// an early `return` inside a `define_class!` method fights its `bool`
@@ -168,6 +290,10 @@ fn enter_in_field(mtm: MainThreadMarker, text_view: &NSTextView, selector: Sel) 
         return false;
     }
     let Some(card) = card() else { return false };
+    if card.rich.get() {
+        let _: () = unsafe { msg_send![text_view, insertNewlineIgnoringFieldEditor: None::<&AnyObject>] };
+        return true;
+    }
     // Typed text sent with Enter is the free answer: it goes out as "Other" when the card has
     // that button, never under the first proposed choice.
     let typed = !card.field.stringValue().to_string().trim().is_empty();
@@ -191,7 +317,7 @@ fn enter_in_field(mtm: MainThreadMarker, text_view: &NSTextView, selector: Sel) 
         let _: () = unsafe { msg_send![text_view, insertNewlineIgnoringFieldEditor: None::<&AnyObject>] };
         return true;
     }
-    card.answer(primary);
+    card.answer(primary, Trigger::Return);
     true
 }
 
@@ -199,6 +325,11 @@ fn enter_in_field(mtm: MainThreadMarker, text_view: &NSTextView, selector: Sel) 
 struct Current {
     id: String,
     buttons: Vec<String>,
+    card_version: u32,
+    /// The primary action of a decision card, and whether it is a grant.
+    primary: Option<(String, bool)>,
+    /// The buttons drawn, each with whether it needs text in the field.
+    made: Vec<(Retained<NSButton>, bool)>,
 }
 
 /// Everything `show` last drew, to skip a redraw when nothing changed: the tick
@@ -213,7 +344,11 @@ struct Shown {
     input: bool,
     asked_at: u64,
     note: Option<String>,
-    waiting: usize,
+    card: Option<Doc>,
+    card_version: u32,
+    position: usize,
+    total: usize,
+    error: Option<String>,
 }
 
 struct Card {
@@ -224,20 +359,42 @@ struct Card {
     badge_holder: Retained<NSView>,
     who: Retained<NSTextField>,
     meta: Retained<NSTextField>,
+    /// `‹ n / N ›`, hidden when the question is alone.
+    nav: Retained<NSStackView>,
+    prev: Retained<NSButton>,
+    next: Retained<NSButton>,
+    position: Retained<NSTextField>,
     note: Retained<NSTextField>,
     body: Retained<NSTextField>,
+    title: Retained<NSTextField>,
+    subtitle: Retained<NSTextField>,
+    scroll: Retained<NSScrollView>,
+    scroll_height: Retained<NSLayoutConstraint>,
+    blocks: Retained<NSStackView>,
+    authorizes: Retained<NSTextField>,
+    error: Retained<NSTextField>,
     field: Retained<NSTextField>,
     field_box: Retained<NSView>,
     /// The field's height, set from its text: it grows a line at a time as the
     /// answer gets longer.
     field_height: Retained<NSLayoutConstraint>,
     buttons: Retained<NSStackView>,
+    width: Retained<NSLayoutConstraint>,
     line_height: CGFloat,
     current: RefCell<Option<Current>>,
     shown: RefCell<Option<Shown>>,
-    /// The last question answered: it stays hidden even if `show` is called
-    /// with it again before the caller has drained the answer.
-    answered: RefCell<Option<String>>,
+    /// What the user typed in each question's field, kept while browsing.
+    drafts: RefCell<HashMap<String, String>>,
+    /// The editable `code` blocks of the card shown, by block index.
+    editors: RefCell<Vec<(usize, CodeEditor)>>,
+    /// The user's text of each question's code blocks, for the card version it
+    /// was typed on: kept through redraws and browsing, dropped when the
+    /// question leaves the board or the asker sends a new version.
+    edits: RefCell<HashMap<String, (u32, HashMap<usize, String>)>>,
+    /// The card shows a decision card (wide, scrolling blocks).
+    rich: Cell<bool>,
+    /// Questions already announced with a sound: browsing back to one is silent.
+    announced: RefCell<Vec<String>>,
     tint: RefCell<Retained<NSColor>>,
 }
 
@@ -258,31 +415,6 @@ fn field_font() -> Retained<NSFont> {
     NSFont::systemFontOfSize(FIELD_FONT_SIZE)
 }
 
-fn ns(s: &str) -> Retained<NSString> {
-    NSString::from_str(s)
-}
-
-/// An attributed string with a font and a colour.
-fn attributed(text: &str, font: &NSFont, color: &NSColor) -> Retained<NSAttributedString> {
-    let keys: [&NSAttributedStringKey; 2] = unsafe { [NSFontAttributeName, NSForegroundColorAttributeName] };
-    let values: [&AnyObject; 2] = [font.as_ref(), color.as_ref()];
-    let attrs = NSDictionary::from_slices(&keys, &values);
-    unsafe { NSAttributedString::new_with_attributes(&ns(text), &attrs) }
-}
-
-/// `[c1, c2]` as the untyped array `CAGradientLayer.colors` takes.
-fn cg_colors(colors: &[&NSColor]) -> Retained<NSArray> {
-    let cg: Vec<Retained<AnyObject>> = colors
-        .iter()
-        // A CGColor is an Objective-C object; the cast only erases its type.
-        .map(|c| unsafe { Retained::cast_unchecked::<AnyObject>(c.CGColor()) })
-        .collect();
-    NSArray::from_retained_slice(&cg)
-}
-
-fn activate(constraints: &[Retained<NSLayoutConstraint>]) {
-    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(constraints));
-}
 
 /// Set a layer property with Core Animation's implicit animation off, as
 /// Swift's `CATransaction.setDisableActions(true)` blocks do.
@@ -291,6 +423,24 @@ fn without_animation(f: impl FnOnce()) {
     CATransaction::setDisableActions(true);
     f();
     CATransaction::commit();
+}
+
+fn small_label(mtm: MainThreadMarker, size: CGFloat, color: &NSColor) -> Retained<NSTextField> {
+    let label = NSTextField::wrappingLabelWithString(&ns(""), mtm);
+    label.setFont(Some(&NSFont::systemFontOfSize(size)));
+    label.setTextColor(Some(color));
+    label.setPreferredMaxLayoutWidth(CARD_WIDTH - 2.0 * INSET);
+    label.setHidden(true);
+    label
+}
+
+fn nav_button(mtm: MainThreadMarker, title: &str, target: &CardTarget, action: Sel) -> Retained<NSButton> {
+    let button = unsafe { NSButton::buttonWithTitle_target_action(&ns(title), Some(target), Some(action), mtm) };
+    button.setBordered(false);
+    button.setAttributedTitle(&attributed(title, &NSFont::systemFontOfSize_weight(15.0, unsafe { NSFontWeightSemibold }), &NSColor::labelColor()));
+    button.setTranslatesAutoresizingMaskIntoConstraints(false);
+    activate(&[button.widthAnchor().constraintEqualToConstant(18.0)]);
+    button
 }
 
 impl Card {
@@ -343,7 +493,7 @@ impl Card {
         }
         panel.setContentView(Some(&background));
 
-        // Header: a round badge, who asks, and on the right the time and the queue.
+        // Header: a round badge, who asks, and on the right the queue and the time.
         let badge = NSTextField::labelWithString(&ns("📎"), mtm);
         badge.setFont(Some(&NSFont::systemFontOfSize(15.0)));
         badge.setAlignment(NSTextAlignment::Center);
@@ -365,9 +515,18 @@ impl Card {
             NSLayoutPriorityRequired,
             NSLayoutConstraintOrientation::Horizontal,
         );
+        let prev = nav_button(mtm, "‹", &target, sel!(previous:));
+        let next = nav_button(mtm, "›", &target, sel!(next:));
+        let position = NSTextField::labelWithString(&ns(""), mtm);
+        position.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(11.0, unsafe { NSFontWeightRegular })));
+        position.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        let nav = NSStackView::stackViewWithViews(&NSArray::from_slice(&[prev.as_ref(), position.as_ref(), next.as_ref()]), mtm);
+        nav.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+        nav.setSpacing(2.0);
+        nav.setHidden(true);
         let spacer = NSView::new(mtm);
         let header = NSStackView::stackViewWithViews(
-            &NSArray::from_slice(&[&*badge_holder, who.as_ref(), &*spacer, meta.as_ref()]),
+            &NSArray::from_slice(&[&*badge_holder, who.as_ref(), &*spacer, nav.as_ref(), meta.as_ref()]),
             mtm,
         );
         header.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
@@ -386,6 +545,43 @@ impl Card {
         body.setTextColor(Some(&NSColor::labelColor()));
         body.setSelectable(true);
         body.setPreferredMaxLayoutWidth(WIDTH - 2.0 * INSET);
+
+        // A decision card: title, subtitle, then its blocks in a scrolling area.
+        let title = small_label(mtm, 15.0, &NSColor::labelColor());
+        title.setFont(Some(&NSFont::systemFontOfSize_weight(15.0, unsafe { NSFontWeightBold })));
+        let subtitle = small_label(mtm, 12.0, &NSColor::secondaryLabelColor());
+        let blocks = NSStackView::new(mtm);
+        blocks.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        blocks.setAlignment(NSLayoutAttribute::Leading);
+        blocks.setSpacing(10.0);
+        blocks.setTranslatesAutoresizingMaskIntoConstraints(false);
+        let document = {
+            let this = FlippedView::alloc(mtm).set_ivars(());
+            let view: Retained<FlippedView> = unsafe { msg_send![super(this), init] };
+            view
+        };
+        document.setTranslatesAutoresizingMaskIntoConstraints(false);
+        document.addSubview(&blocks);
+        let scroll = NSScrollView::new(mtm);
+        scroll.setHasVerticalScroller(true);
+        scroll.setAutohidesScrollers(true);
+        scroll.setDrawsBackground(false);
+        scroll.setDocumentView(Some(&document));
+        scroll.setHidden(true);
+        let clip = scroll.contentView();
+        let scroll_height = scroll.heightAnchor().constraintEqualToConstant(0.0);
+        activate(&[
+            blocks.leadingAnchor().constraintEqualToAnchor(&document.leadingAnchor()),
+            blocks.trailingAnchor().constraintEqualToAnchor(&document.trailingAnchor()),
+            blocks.topAnchor().constraintEqualToAnchor(&document.topAnchor()),
+            blocks.bottomAnchor().constraintEqualToAnchor(&document.bottomAnchor()),
+            document.leadingAnchor().constraintEqualToAnchor(&clip.leadingAnchor()),
+            document.topAnchor().constraintEqualToAnchor(&clip.topAnchor()),
+            document.widthAnchor().constraintEqualToAnchor(&clip.widthAnchor()),
+            scroll_height.clone(),
+        ]);
+        let authorizes = small_label(mtm, 11.0, &NSColor::secondaryLabelColor());
+        let error = small_label(mtm, 12.0, &NSColor::systemRedColor());
 
         // The answer field: borderless text inside a rounded, lightly tinted box,
         // so it reads as the place to type rather than a grey line on a grey
@@ -434,28 +630,48 @@ impl Card {
         footer.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
 
         let stack = NSStackView::stackViewWithViews(
-            &NSArray::from_slice(&[header.as_ref(), note.as_ref(), body.as_ref(), &*field_box, footer.as_ref()]),
+            &NSArray::from_slice(&[
+                header.as_ref(),
+                note.as_ref(),
+                body.as_ref(),
+                title.as_ref(),
+                subtitle.as_ref(),
+                scroll.as_ref(),
+                &*field_box,
+                authorizes.as_ref(),
+                error.as_ref(),
+                footer.as_ref(),
+            ]),
             mtm,
         );
         stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
         stack.setAlignment(NSLayoutAttribute::Leading);
         stack.setSpacing(12.0);
         stack.setCustomSpacing_afterView(10.0, &header);
+        stack.setCustomSpacing_afterView(4.0, &title);
+        stack.setCustomSpacing_afterView(6.0, &authorizes);
         stack.setEdgeInsets(NSEdgeInsets { top: INSET - 4.0, left: INSET, bottom: INSET - 4.0, right: INSET });
         stack.setTranslatesAutoresizingMaskIntoConstraints(false);
         background.addSubview(&stack);
+        let width = stack.widthAnchor().constraintEqualToConstant(WIDTH);
+        let inner = |view: &NSView| view.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET);
         activate(&[
             stack.leadingAnchor().constraintEqualToAnchor(&background.leadingAnchor()),
             stack.trailingAnchor().constraintEqualToAnchor(&background.trailingAnchor()),
             stack.topAnchor().constraintEqualToAnchor(&background.topAnchor()),
             stack.bottomAnchor().constraintEqualToAnchor(&background.bottomAnchor()),
-            stack.widthAnchor().constraintEqualToConstant(WIDTH),
+            width.clone(),
             // Every row spans the card's inner width: the field no longer runs past the edge.
-            header.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
-            note.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
-            body.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
-            field_box.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
-            footer.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
+            inner(&header),
+            inner(&note),
+            inner(&body),
+            inner(&title),
+            inner(&subtitle),
+            inner(&scroll),
+            inner(&field_box),
+            inner(&authorizes),
+            inner(&error),
+            inner(&footer),
             badge_holder.widthAnchor().constraintEqualToConstant(28.0),
             badge_holder.heightAnchor().constraintEqualToConstant(28.0),
             badge.centerXAnchor().constraintEqualToAnchor(&badge_holder.centerXAnchor()),
@@ -470,16 +686,32 @@ impl Card {
             badge_holder,
             who,
             meta,
+            nav,
+            prev,
+            next,
+            position,
             note,
             body,
+            title,
+            subtitle,
+            scroll,
+            scroll_height,
+            blocks,
+            authorizes,
+            error,
             field,
             field_box,
             field_height,
             buttons,
+            width,
             line_height,
             current: RefCell::new(None),
             shown: RefCell::new(None),
-            answered: RefCell::new(None),
+            drafts: RefCell::new(HashMap::new()),
+            editors: RefCell::new(Vec::new()),
+            edits: RefCell::new(HashMap::new()),
+            rich: Cell::new(false),
+            announced: RefCell::new(Vec::new()),
             tint: RefCell::new(NSColor::controlAccentColor()),
         }
     }
@@ -490,22 +722,60 @@ impl Card {
         self.panel.orderOut(None);
     }
 
-    /// Queue the answer and hide the card until the caller shows the next one.
-    fn answer(&self, action: String) {
-        let Some(id) = self.current.borrow().as_ref().map(|c| c.id.clone()) else { return };
+    /// Queue the answer; the board decides, and the next `show` moves on (or
+    /// keeps the card with an error line).
+    fn answer(&self, action: String, trigger: Trigger) {
+        let Some((id, card_version)) = self.current.borrow().as_ref().map(|c| (c.id.clone(), c.card_version)) else { return };
         let text = self.field.stringValue().to_string().trim().to_string();
-        log::info!("Ask card: answered {} with {:?}", id, action);
+        let edits: Vec<(usize, String)> =
+            self.editors.borrow().iter().map(|(block, editor)| (*block, editor.view.string().to_string())).collect();
+        log::info!("Ask card: answered {} with {:?} ({:?}, v{})", id, action, trigger, card_version);
         if let Ok(mut answers) = ANSWERS.lock() {
-            answers.push(CardAnswer { id: id.clone(), action, text });
+            answers.push(CardAnswer { id, action, text, card_version, trigger, edits });
         }
-        *self.answered.borrow_mut() = Some(id);
-        self.hide();
     }
 
-    fn show(&self, mtm: MainThreadMarker, question: &CardQuestion, waiting: usize) {
-        if self.answered.borrow().as_deref() == Some(question.id) {
-            return;
+    /// The primary action of a decision card, by key. A grant action answers
+    /// only ⌘Return; a disabled one (needs text, field empty) nothing.
+    fn trigger_primary(&self, trigger: Trigger) -> bool {
+        let primary = self.current.borrow().as_ref().and_then(|c| c.primary.clone());
+        let Some((action, grant)) = primary else { return false };
+        if grant && trigger != Trigger::CmdReturn {
+            return true;
         }
+        let index = self.current.borrow().as_ref().and_then(|c| c.buttons.iter().position(|b| *b == action));
+        if index.is_some_and(|i| self.button_enabled(i as isize)) {
+            self.answer(action, trigger);
+        }
+        true
+    }
+
+    /// Whether button `index` answers: a `needs_input` one does not while the
+    /// field is empty.
+    fn button_enabled(&self, index: isize) -> bool {
+        let empty = self.field.stringValue().to_string().trim().is_empty();
+        let needs = self
+            .current
+            .borrow()
+            .as_ref()
+            .and_then(|c| usize::try_from(index).ok().and_then(|i| c.made.get(i)).map(|(_, needs)| *needs))
+            .unwrap_or(false);
+        !(needs && empty)
+    }
+
+    /// `needs_input` buttons are dimmed while the field is empty. Not
+    /// `setEnabled(false)`: AppKit then erases a custom title entirely.
+    fn update_enabled(&self) {
+        let empty = self.field.stringValue().to_string().trim().is_empty();
+        if let Some(current) = self.current.borrow().as_ref() {
+            for (button, needs_input) in &current.made {
+                let enabled = !(*needs_input && empty);
+                button.setAlphaValue(if enabled { 1.0 } else { 0.4 });
+            }
+        }
+    }
+
+    fn show(&self, mtm: MainThreadMarker, question: &CardQuestion, total: usize, on_board: &[&str]) {
         let shown = Shown {
             id: question.id.to_string(),
             from: question.from.to_string(),
@@ -514,14 +784,41 @@ impl Card {
             input: question.input,
             asked_at: question.asked_at,
             note: question.note.map(str::to_string),
-            waiting,
+            card: question.card.cloned(),
+            card_version: question.card_version,
+            position: question.position,
+            total,
+            error: question.error.map(str::to_string),
         };
         if self.shown.borrow().as_ref() == Some(&shown) && self.panel.isVisible() {
             return;
         }
-        let is_new = self.current.borrow().as_ref().map(|c| c.id.as_str()) != Some(question.id);
-        *self.current.borrow_mut() = Some(Current { id: shown.id.clone(), buttons: shown.buttons.clone() });
+        // The field's text belongs to its question: kept while browsing, dropped
+        // once the question leaves the board.
+        let previous = self.current.borrow().as_ref().map(|c| c.id.clone());
+        let is_new = previous.as_deref() != Some(question.id);
+        {
+            let mut drafts = self.drafts.borrow_mut();
+            if let Some(prev) = previous.filter(|_| is_new) {
+                drafts.insert(prev, self.field.stringValue().to_string());
+            }
+            drafts.retain(|id, text| on_board.contains(&id.as_str()) && !text.is_empty());
+        }
+        self.edits.borrow_mut().retain(|id, (version, _)| {
+            on_board.contains(&id.as_str()) && !(id == question.id && *version != question.card_version)
+        });
+        let announce = {
+            let mut announced = self.announced.borrow_mut();
+            announced.retain(|id| on_board.contains(&id.as_str()));
+            let fresh = !announced.iter().any(|id| id == question.id);
+            if fresh {
+                announced.push(question.id.to_string());
+            }
+            fresh
+        };
         *self.shown.borrow_mut() = Some(shown);
+        let rich = question.card.is_some();
+        self.rich.set(rich);
 
         self.who.setStringValue(&ns(question.from));
         let (r, g, b) = crate::ask::agent_rgb(question.from);
@@ -535,14 +832,42 @@ impl Card {
         }
         let colors = cg_colors(&[&tint.colorWithAlphaComponent(0.42), &tint.colorWithAlphaComponent(0.0)]);
         unsafe { self.wash.setColors(Some(&colors)) };
-        let time = short_time(question.asked_at);
-        let meta = if waiting > 0 { format!("{} · {} more", time, waiting) } else { time };
-        self.meta.setStringValue(&ns(&meta));
+        self.meta.setStringValue(&ns(&short_time(question.asked_at)));
+        self.nav.setHidden(total <= 1);
+        self.position.setStringValue(&ns(&format!("{} / {}", question.position, total)));
+        self.prev.setEnabled(question.position > 1);
+        self.prev.setAlphaValue(if question.position > 1 { 1.0 } else { 0.3 });
+        self.next.setEnabled(question.position < total);
+        self.next.setAlphaValue(if question.position < total { 1.0 } else { 0.3 });
         self.note.setStringValue(&ns(question.note.unwrap_or("")));
         self.note.setHidden(question.note.is_none());
-        self.body.setStringValue(&ns(question.message));
+        self.note.setPreferredMaxLayoutWidth(if rich { CARD_WIDTH } else { WIDTH } - 2.0 * INSET);
+
+        self.width.setConstant(if rich { CARD_WIDTH } else { WIDTH });
+        self.body.setHidden(rich);
+        self.body.setStringValue(&ns(if rich { "" } else { question.message }));
+        self.title.setHidden(!rich);
+        self.scroll.setHidden(!rich);
+        self.subtitle.setHidden(true);
+        self.authorizes.setHidden(true);
+        if let Some(doc) = question.card {
+            self.title.setStringValue(&ns(&doc.title));
+            if let Some(sub) = &doc.subtitle {
+                self.subtitle.setStringValue(&ns(sub));
+                self.subtitle.setHidden(false);
+            }
+            if let Some(target) = doc.grant_action().and_then(|a| a.grant.as_ref()).map(|g| g.target.clone()) {
+                self.authorizes.setStringValue(&ns(&format!("Authorizes: {}", target)));
+                self.authorizes.setHidden(false);
+            }
+            self.draw_blocks(mtm, question.id, doc, &tint);
+        }
+        self.error.setStringValue(&ns(question.error.unwrap_or("")));
+        self.error.setHidden(question.error.is_none());
+
         if is_new {
-            self.field.setStringValue(&ns(""));
+            let draft = self.drafts.borrow_mut().remove(question.id).unwrap_or_default();
+            self.field.setStringValue(&ns(&draft));
             self.field_height.setConstant(self.line_height);
         }
         self.field_box.setHidden(!question.input);
@@ -553,8 +878,13 @@ impl Card {
             layer.setBackgroundColor(fill.map(|c| c.CGColor()).as_deref());
             layer.setBorderColor(Some(&tint.colorWithAlphaComponent(0.6).CGColor()));
         }
+        let placeholder = question
+            .card
+            .and_then(|d| d.input.as_ref())
+            .and_then(|i| i.placeholder.clone())
+            .unwrap_or_else(|| PLACEHOLDER.to_string());
         self.field.setPlaceholderAttributedString(Some(&attributed(
-            PLACEHOLDER,
+            &placeholder,
             &NSFont::systemFontOfSize(14.0),
             &NSColor::whiteColor().colorWithAlphaComponent(0.45),
         )));
@@ -563,12 +893,17 @@ impl Card {
         for view in self.buttons.arrangedSubviews().iter() {
             view.removeFromSuperview();
         }
+        let card_width = if rich { CARD_WIDTH } else { WIDTH };
         // Right-aligned, the default (first action) last, as macOS dialogs do;
         // wrapped onto several rows when they do not fit the card's width.
-        let made: Vec<(Retained<NSButton>, CGFloat)> =
-            question.buttons.iter().enumerate().map(|(index, title)| self.make_button(mtm, title, index)).collect();
-        let widths: Vec<CGFloat> = made.iter().map(|(_, w)| *w).collect();
-        for row in button_rows(&widths, WIDTH - 2.0 * INSET, BUTTON_SPACING) {
+        let made: Vec<(Retained<NSButton>, CGFloat, bool)> = question
+            .buttons
+            .iter()
+            .enumerate()
+            .map(|(index, id)| self.make_button(mtm, question, id, index, card_width))
+            .collect();
+        let widths: Vec<CGFloat> = made.iter().map(|(_, w, _)| *w).collect();
+        for row in button_rows(&widths, card_width - 2.0 * INSET, BUTTON_SPACING) {
             let line = NSStackView::new(mtm);
             line.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
             line.setSpacing(BUTTON_SPACING);
@@ -577,24 +912,19 @@ impl Card {
             }
             self.buttons.addArrangedSubview(&line);
         }
+        let primary = question.card.and_then(|d| d.primary()).map(|a| (a.id.clone(), a.grant.is_some()));
+        *self.current.borrow_mut() = Some(Current {
+            id: question.id.to_string(),
+            buttons: question.buttons.to_vec(),
+            card_version: question.card_version,
+            primary,
+            made: made.into_iter().map(|(b, _, needs)| (b, needs)).collect(),
+        });
+        self.update_enabled();
 
-        self.background.layoutSubtreeIfNeeded();
-        let fitting = self.background.fittingSize();
-        without_animation(|| self.wash.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), fitting)));
-        let size = CGSize::new(WIDTH, fitting.height);
-        let screen = NSScreen::mainScreen(mtm)
-            .map(|s| s.visibleFrame())
-            .unwrap_or(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1440.0, 900.0)));
-        let frame = CGRect::new(
-            CGPoint::new(
-                screen.origin.x + screen.size.width - size.width - 16.0,
-                screen.origin.y + screen.size.height - size.height - 16.0,
-            ),
-            size,
-        );
-        self.panel.setFrame_display(frame, true);
+        self.place(mtm, false);
         self.panel.orderFrontRegardless();
-        if is_new {
+        if announce {
             if let Some(sound) = NSSound::soundNamed(&ns("Glass")) {
                 sound.play();
             }
@@ -603,15 +933,126 @@ impl Card {
         }
     }
 
+    /// The decision card's blocks, rebuilt.
+    fn draw_blocks(&self, mtm: MainThreadMarker, id: &str, doc: &Doc, tint: &NSColor) {
+        for view in self.blocks.arrangedSubviews().iter() {
+            view.removeFromSuperview();
+        }
+        let mut editors = Vec::new();
+        // Leave room for the vertical scroller: a long card scrolls, and a
+        // legacy scroller takes its width out of the clip view, cutting the
+        // right edge of every fixed-width block (an overlay one draws over it).
+        let gutter = NSScroller::scrollerWidthForControlSize_scrollerStyle(
+            NSControlSize::Regular,
+            NSScroller::preferredScrollerStyle(mtm),
+            mtm,
+        );
+        let width = CARD_WIDTH - 2.0 * INSET - gutter - 4.0;
+        let edits = self.edits.borrow();
+        let kept = edits.get(id).map(|(_, texts)| texts);
+        for (index, block) in doc.blocks.iter().enumerate() {
+            // A code block is what the asker will send: the user may change it,
+            // and the answer carries his version (`crate::ask::final_blocks`).
+            let view = match block {
+                crate::decision_card::Block::Code { text, label } => {
+                    let text = kept.and_then(|k| k.get(&index)).unwrap_or(text);
+                    let (view, editor) = crate::card_view::code_block(mtm, text, label.as_deref(), width, true);
+                    if let Some(editor) = editor {
+                        editor.view.setDelegate(Some(ProtocolObject::from_ref(&*self.target)));
+                        editors.push((index, editor));
+                    }
+                    view
+                }
+                _ => crate::card_view::block_view(mtm, block, width, tint),
+            };
+            self.blocks.addArrangedSubview(&view);
+        }
+        drop(edits);
+        *self.editors.borrow_mut() = editors;
+        // Scroll back to the top for a new card.
+        if let Some(document) = self.scroll.documentView() {
+            document.scrollPoint(CGPoint::new(0.0, 0.0));
+        }
+    }
+
+    /// A code block was typed in: remember every editor's text for this
+    /// question and version, and grow the edited box with its text.
+    fn code_edited(&self, mtm: MainThreadMarker) {
+        let Some((id, version)) = self.current.borrow().as_ref().map(|c| (c.id.clone(), c.card_version)) else { return };
+        let texts: HashMap<usize, String> = self
+            .editors
+            .borrow()
+            .iter()
+            .map(|(block, editor)| {
+                editor.height.setConstant(crate::card_view::text_height(&editor.view));
+                (*block, editor.view.string().to_string())
+            })
+            .collect();
+        self.edits.borrow_mut().insert(id, (version, texts));
+        self.place(mtm, true);
+    }
+
+    /// Size the card to its content and pin it top-right of its screen (or keep
+    /// its top edge where it is, `keep_top`, as the field grows). A decision
+    /// card stops at `MAX_SCREEN_SHARE` of the screen: its blocks scroll.
+    fn place(&self, mtm: MainThreadMarker, keep_top: bool) {
+        let screen = self
+            .panel
+            .screen()
+            .or_else(|| NSScreen::mainScreen(mtm))
+            .map(|s| s.visibleFrame())
+            .unwrap_or(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1440.0, 900.0)));
+        if self.rich.get() {
+            self.blocks.layoutSubtreeIfNeeded();
+            let content = self.blocks.fittingSize().height;
+            self.scroll_height.setConstant(content);
+            self.background.layoutSubtreeIfNeeded();
+            let total = self.background.fittingSize().height;
+            let max = screen.size.height * MAX_SCREEN_SHARE;
+            if total > max {
+                self.scroll_height.setConstant((content - (total - max)).max(MIN_BLOCKS));
+            }
+        } else {
+            self.scroll_height.setConstant(0.0);
+        }
+        self.background.layoutSubtreeIfNeeded();
+        let fitting = self.background.fittingSize();
+        let width = if self.rich.get() { CARD_WIDTH } else { WIDTH };
+        let size = CGSize::new(width, fitting.height);
+        let frame = if keep_top {
+            let old = self.panel.frame();
+            CGRect::new(CGPoint::new(old.origin.x, old.origin.y + old.size.height - size.height), size)
+        } else {
+            CGRect::new(
+                CGPoint::new(
+                    screen.origin.x + screen.size.width - size.width - 16.0,
+                    screen.origin.y + screen.size.height - size.height - 16.0,
+                ),
+                size,
+            )
+        };
+        self.panel.setFrame_display(frame, true);
+        without_animation(|| self.wash.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), size)));
+    }
+
     /// Drawn by hand: macOS paints its default button blue only in the key
     /// window, and the card never takes the keyboard on its own, so system
     /// buttons all came out grey.
-    /// Returns the button and the width it takes.
-    fn make_button(&self, mtm: MainThreadMarker, title: &str, index: usize) -> (Retained<NSButton>, CGFloat) {
-        let primary = index == 0;
+    /// Returns the button, the width it takes, and whether it needs text.
+    fn make_button(&self, mtm: MainThreadMarker, question: &CardQuestion, id: &str, index: usize, card_width: CGFloat) -> (Retained<NSButton>, CGFloat, bool) {
+        let action = question.card.and_then(|d| d.action(id));
+        let dismiss = question.dismissable && id == crate::ask::DISMISS && action.is_none();
+        let (title, primary, destructive, needs_input) = match (question.card, action) {
+            (Some(_), Some(a)) => {
+                let hint = if a.grant.is_some() && a.style == Style::Primary { "  ⌘↩" } else { "" };
+                (format!("{}{}", a.label, hint), a.style == Style::Primary, a.style == Style::Destructive, a.needs_input)
+            }
+            (Some(_), None) => (id.to_string(), false, false, false),
+            (None, _) => (id.to_string(), index == 0 && !dismiss, false, false),
+        };
         let tint = self.tint.borrow();
         let button = unsafe {
-            NSButton::buttonWithTitle_target_action(&ns(title), Some(&self.target), Some(sel!(pressed:)), mtm)
+            NSButton::buttonWithTitle_target_action(&ns(&title), Some(&self.target), Some(sel!(pressed:)), mtm)
         };
         button.setTag(index as isize);
         button.setBordered(false);
@@ -622,19 +1063,27 @@ impl Card {
             layer.setBackgroundColor(Some(&fill.CGColor()));
         }
         let weight = unsafe { if primary { NSFontWeightSemibold } else { NSFontWeightRegular } };
-        let color = if primary { NSColor::whiteColor() } else { NSColor::labelColor() };
-        button.setAttributedTitle(&attributed(title, &NSFont::systemFontOfSize_weight(13.0, weight), &color));
-        if primary {
+        let color = if primary {
+            NSColor::whiteColor()
+        } else if destructive {
+            NSColor::systemRedColor()
+        } else {
+            NSColor::labelColor()
+        };
+        button.setAttributedTitle(&attributed(&title, &NSFont::systemFontOfSize_weight(13.0, weight), &color));
+        // A plain card's default button carries Return; a decision card's keys
+        // go through the panel (Return never fires a grant action).
+        if primary && question.card.is_none() {
             button.setKeyEquivalent(&ns("\r"));
         }
         button.setTranslatesAutoresizingMaskIntoConstraints(false);
         // A title longer than the card is truncated rather than pushing the card wider.
-        let width = (button.attributedTitle().size().width + 28.0).max(72.0).min(WIDTH - 2.0 * INSET);
+        let width = (button.attributedTitle().size().width + 28.0).max(72.0).min(card_width - 2.0 * INSET);
         activate(&[
             button.widthAnchor().constraintEqualToConstant(width),
             button.heightAnchor().constraintEqualToConstant(30.0),
         ]);
-        (button, width)
+        (button, width, needs_input)
     }
 
     /// Grows (or shrinks) the field to its text, up to `MAX_LINES`, and the card
@@ -662,41 +1111,8 @@ impl Card {
             return;
         }
         self.field_height.setConstant(height);
-        self.background.layoutSubtreeIfNeeded();
-        let new_height = self.background.fittingSize().height;
-        let mut frame = self.panel.frame();
-        frame.origin.y = frame.origin.y + frame.size.height - new_height;
-        frame.size.height = new_height;
-        self.panel.setFrame_display(frame, true);
-        without_animation(|| self.wash.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), frame.size)));
+        self.place(MainThreadMarker::from(&*self.target), true);
     }
-}
-
-/// Splits buttons (their widths, in action order) into rows that fit `max`,
-/// top row first, each row listed left to right. The first action sits
-/// bottom-right, as macOS dialogs put the default; the rows fill from the
-/// bottom up, each one growing leftward, so the next actions sit beside it.
-fn button_rows(widths: &[CGFloat], max: CGFloat, spacing: CGFloat) -> Vec<Vec<usize>> {
-    let mut rows: Vec<Vec<usize>> = Vec::new();
-    let mut used: CGFloat = 0.0;
-    for (index, &width) in widths.iter().enumerate() {
-        match rows.last_mut() {
-            Some(row) if used + spacing + width <= max + 0.5 => {
-                row.push(index);
-                used += spacing + width;
-            }
-            _ => {
-                rows.push(vec![index]);
-                used = width;
-            }
-        }
-    }
-    // Built bottom row first, rightmost first: flip both.
-    rows.reverse();
-    for row in &mut rows {
-        row.reverse();
-    }
-    rows
 }
 
 /// `asked_at` as the local short time (`14:05`, or `2:05 PM` in a 12-hour
@@ -712,28 +1128,27 @@ fn short_time(asked_at: u64) -> String {
 }
 
 /// Show `question` on the card (replacing what it showed), or hide the card
-/// when `None`. `waiting` is how many more questions queue behind it.
-///
-/// Also sets the Dock badge to the total count (`waiting + 1`), or clears it.
-/// Calling it again with the same id keeps what the user is typing.
-pub fn show(mtm: MainThreadMarker, question: Option<&CardQuestion>, waiting: usize) {
-    let count = question.map(|_| waiting + 1);
+/// when `None`. `total` is how many questions are on the board (`n / N`, and
+/// the Dock badge); `on_board` their ids, to drop the typed text of the ones
+/// that left. Calling it again with the same id keeps what the user is typing.
+pub fn show(mtm: MainThreadMarker, question: Option<&CardQuestion>, total: usize, on_board: &[&str]) {
+    let count = question.map(|_| total);
     if BADGE.with(|b| b.replace(count)) != count {
         let label = count.map(|n| ns(&n.to_string()));
         NSApplication::sharedApplication(mtm).dockTile().setBadgeLabel(label.as_deref());
     }
     match question {
-        Some(question) => card_or_build(mtm).show(mtm, question, waiting),
+        Some(question) => card_or_build(mtm).show(mtm, question, total, on_board),
         None => {
             if let Some(card) = card() {
+                card.drafts.borrow_mut().clear();
                 card.hide();
-                *card.answered.borrow_mut() = None;
             }
         }
     }
 }
 
-/// Answers given since the last call (button clicked or Enter).
+/// Answers given since the last call (button clicked, Return, ⌘Return).
 pub fn take_answers() -> Vec<CardAnswer> {
     match ANSWERS.lock() {
         Ok(mut answers) => std::mem::take(&mut *answers),
@@ -741,25 +1156,10 @@ pub fn take_answers() -> Vec<CardAnswer> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::button_rows;
-
-    #[test]
-    fn buttons_that_fit_stay_on_one_row_with_the_default_rightmost() {
-        assert_eq!(button_rows(&[100.0, 80.0, 72.0], 360.0, 8.0), vec![vec![2, 1, 0]]);
-    }
-
-    #[test]
-    fn buttons_that_overflow_wrap_with_the_default_bottom_right() {
-        // The case that squeezed one button to an ellipsis: 545 points of buttons in 360.
-        let rows = button_rows(&[138.0, 188.0, 123.0, 72.0], 360.0, 8.0);
-        assert_eq!(rows, vec![vec![3, 2], vec![1, 0]]);
-    }
-
-    #[test]
-    fn a_button_as_wide_as_the_card_gets_its_own_row() {
-        assert_eq!(button_rows(&[360.0, 72.0], 360.0, 8.0), vec![vec![1], vec![0]]);
-        assert!(button_rows(&[], 360.0, 8.0).is_empty());
+/// ‹ / › presses since the last call: -1 or +1 each.
+pub fn take_browse() -> Vec<i32> {
+    match BROWSE.lock() {
+        Ok(mut queue) => std::mem::take(&mut *queue),
+        Err(_) => Vec::new(),
     }
 }
