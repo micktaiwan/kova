@@ -380,7 +380,13 @@ fn validate_block(block: &Value, i: usize) -> Result<(), String> {
     };
     for key in b.keys() {
         if !allowed.contains(&key.as_str()) {
-            return Err(format!("unknown field {}.{}", path, key));
+            return Err(format!(
+                "unknown field {}.{} (a \"{}\" block accepts: {})",
+                path,
+                key,
+                kind,
+                allowed.join(", ")
+            ));
         }
     }
     let text = |max: usize| -> Result<(), String> {

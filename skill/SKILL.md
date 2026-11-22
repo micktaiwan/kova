@@ -415,7 +415,7 @@ kova ask --withdraw-id <question id>               # take one question back
 
 - The card is JSON: `version` 1, `title` (≤ 120 chars), optional `subtitle`, `blocks` (1–20:
   `text` with `**bold**` `_italic_` `` `code` `` `[label](https://…)`, `quote` with `author` /
-  `time`, `code` with `label` for exact text, `fields` key/value rows, `divider`, `context`),
+  `time`, `code` with `label` for exact text, `fields` key/value rows (`{"type":"fields","items":[{"key":…,"value":…}]}`: the list key is `items`, not `fields`), `divider`, `context`),
   `actions` (1–6: `id` `[a-z0-9_-]`, `label` ≤ 24, `style` `primary`|`default`|`destructive`,
   `needs_input`), optional `input: {"placeholder": …}`. Full format and errors:
   `docs/decision-cards-spec.md`. A malformed card is refused at once with its first error, exit 1.
@@ -433,7 +433,8 @@ kova ask --withdraw-id <question id>               # take one question back
   that authorizes ONE outbound send of exactly the bytes shown in a `code` block. Write the payload
   to a file (LF only), put that file's bytes as is in the `code` block, and declare on the action
   `"grant": {"kind": "outbound", "target": "slack:<channel>/<thread_ts or ->",
-  "payload_sha256": "<sha256 of the file>", "payload_block": <index of the code block>}`. Kova
+  "payload_sha256": "<sha256 of the file>", "payload_block": <0-based index of the code block in `blocks`>}`
+  (the first block is 0; a 1-based count is refused `payload_block out of range`). Kova
   refuses the card if the hash does not match the block. Only a click (or ⌘Return) grants, and the
   grant authorizes the payload block **as the user left it**: on that answer, send the block's file
   from the answer (path and `sha256` there; your own file only matches when the text is unchanged)
@@ -467,8 +468,8 @@ kova ui close <view_id>
   as `[Kova] UI "<view>" was closed by the user`.
 - **After a click, update or remove that card** (`kova ui card …`): its buttons stay locked with a
   spinner until you do (10 minutes at most). Replace it with the outcome ("Posted ✓") rather than
-  leaving it as it was. Do the send before replacing a card that carries a grant: replacing it
-  deletes the unused grant.
+  leaving it as it was. Do the send before replacing **or removing** (`--remove`) a card that
+  carries a grant: either one deletes the unused grant, and the send is then refused by the gate.
 - `--size` is the view's share, 0.2 to 0.7: of your pane for a docked view (default 0.4), of the
   room your pane had for `pane-right` / `pane-down` (default 0.5). The terminal keeps at least
   20 × 6. Once the user drags the edge, a later `kova ui show` keeps their size.

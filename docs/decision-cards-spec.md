@@ -292,7 +292,7 @@ the content shown on the card**, without typing the passphrase.
 | `kind` | Only `outbound` in v1. |
 | `target` | Free string, ≤ 200 chars, copied into the grant. For Slack: `slack:<channel>/<thread_ts or ->`. The card shows it in a small grey line `Authorizes: <target>` just above the buttons. One click is enough, there is no second confirmation. |
 | `payload_sha256` | Lowercase hex SHA-256 of the exact bytes that will be sent. |
-| `payload_block` | Index in `blocks` of the `code` block that shows that payload. Kova checks that the SHA-256 of `blocks[payload_block].text`, taken as the UTF-8 bytes of the decoded JSON string with **no normalization at all** (no trimming, no line-ending or Unicode normalization), equals `payload_sha256`, and refuses the card otherwise (§ 9). The user therefore always sees the bytes he authorizes. If he edits that block (§ 4.2), the grant written on click carries the SHA-256 of **his** text, which is the block's answer file: the agent sends that file. |
+| `payload_block` | 0-based index in `blocks` of the `code` block that shows that payload. Kova checks that the SHA-256 of `blocks[payload_block].text`, taken as the UTF-8 bytes of the decoded JSON string with **no normalization at all** (no trimming, no line-ending or Unicode normalization), equals `payload_sha256`, and refuses the card otherwise (§ 9). The user therefore always sees the bytes he authorizes. If he edits that block (§ 4.2), the grant written on click carries the SHA-256 of **his** text, which is the block's answer file: the agent sends that file. |
 
 A card has at most one grant action. The payload is bounded by the `code` block limit (8,000 chars):
 a longer message cannot be granted and goes through the passphrase as today.
