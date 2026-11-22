@@ -1,7 +1,6 @@
-# 2.1.0
+# 2.2.0
 
-- Pause an agent from Cmd+P with `p`: its memory is freed, the shell stays, and `p` again resumes the conversation, even after a relaunch
-- Auto-pause (off by default): agents idle and out of focus for `[agents] auto_pause_hours` are paused by Kova, and focusing the pane brings them back
-- Reopen a closed pane with its conversation; Pi, omp and Tazu sessions resume and show up in the search palette
-- Programs can show a status badge on their pane (OSC 7501), counted in the working counter; the switcher marks agents resting with background shells
-- Choose a subject's color (right-click its band, or `c` in Cmd+P); the search palette scrolls with the wheel and opens a hit on click
+- Decision cards: an agent can ask you a question with its context (text, code, key/value rows, links) and named buttons, and you can edit the draft on the card before answering
+- A button on a card can authorize one exact send (a Slack message) that the agent then runs, and nothing else
+- Native views in a pane (`kova ui`): cards, tables and charts docked at the bottom of an agent's pane or beside it, whose clicks go back to the agent
+- Clearer errors when a card is refused: Kova names the fields the block accepts
