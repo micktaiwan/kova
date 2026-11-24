@@ -417,9 +417,11 @@ kova ask --withdraw-id <question id>               # take one question back
   `text` with `**bold**` `_italic_` `` `code` `` `[label](https://…)`, `quote` with `author` /
   `time`, `code` with `label` for exact text, `fields` key/value rows (`{"type":"fields","items":[{"key":…,"value":…}]}`: the list key is `items`, not `fields`), `divider`, `context`),
   `actions` (1–6: `id` `[a-z0-9_-]`, `label` ≤ 24, `style` `primary`|`default`|`destructive`,
-  `needs_input`), optional `input: {"placeholder": …}`. Full format and errors:
+  `needs_input`: requires the card-level `input`), card-level `input: {"placeholder": …}` (the one
+  text field; **required as soon as any action has `needs_input: true`**, else the card is refused with
+  `needs_input without input`). Full format and errors:
   `docs/decision-cards-spec.md`. A malformed card is refused at once with its first error, exit 1.
-- No `Other` button on a card: add a `needs_input` action if a free answer makes sense. Every answer
+- No `Other` button on a card: add a `needs_input` action (plus the card's `input` field) if a free answer makes sense. Every answer
   carries the field's text. The answer prints as `<action id>` or `<action id>: <text>`; `--json`
   adds `card_version`. A late one arrives as `[Kova] The user answered your card "<title>" (v<n>): …`.
 - **The user can edit every `code` block on the card**, and the answer always carries his version:
@@ -431,7 +433,8 @@ kova ask --withdraw-id <question id>               # take one question back
   ignore that answer if its `card_version` is lower than what you sent, and ask again.
 - **Grant action** (Claude Code askers only, at most one, plus at least one other action): a button
   that authorizes ONE outbound send of exactly the bytes shown in a `code` block. Write the payload
-  to a file (LF only), put that file's bytes as is in the `code` block, and declare on the action
+  to a file (LF only, no trailing newline: `printf '%s'`, never `'%s\n'`, or the hash covers a `\n`
+  the block lacks), put that file's bytes as is in the `code` block, and declare on the action
   `"grant": {"kind": "outbound", "target": "slack:<channel>/<thread_ts or ->",
   "payload_sha256": "<sha256 of the file>", "payload_block": <0-based index of the code block in `blocks`>}`
   (the first block is 0; a 1-based count is refused `payload_block out of range`). Kova
@@ -457,15 +460,23 @@ kova ui card <view_id> <card_id> --card c.json   # replace a card after acting o
 kova ui update <view_id> --view view.json     # replace the whole view
 kova ui close <view_id>
 ```
+`kova ui close` answers "no such view" when the user already closed it: harmless, the view is gone, do not retry. A grant attached to a card dies with its card or view, so launch the send the click authorizes before removing or closing anything.
+
 
 - A view is `{"version":1,"title":…,"cards":[{"id":"draft-a","card":{…}}]}`, each card the
   document of `kova ask --card` (same blocks, actions, text field, grant). Four more blocks exist
   for views and cards: `table` (`columns`, `rows`), `bars` (`items` of `{label,value}`, `unit`),
   `sparkline` (`values`, `label`), `progress` (`value` 0–1, `label`).
-- A click is `{"view_id","card_id","action","text","card_version"}`. When you are not in a
+- A click is `{"view_id","card_id","action","text","card_version","blocks"}`. When you are not in a
   `kova ui wait`, it arrives in the conversation as
-  `[Kova] UI "<view>", card "<card>" (v<n>): <action>[: <text>]`; the user closing the view arrives
-  as `[Kova] UI "<view>" was closed by the user`.
+  `[Kova] UI "<view>", card "<card>" (v<n>): <action>[: <text>]`, followed by one
+  `[block <i> "<label>" edited by the user|unchanged: <absolute path> sha256 <hex>]` per `code`
+  block; the user closing the view arrives as `[Kova] UI "<view>" was closed by the user`.
+- **The user can edit every `code` block of a view's cards**, as on the ask card: the click names a
+  file holding each block's final text (`blocks: [{block, label, file, sha256, edited}]`).
+  **Whatever you send or act on next is that file, byte for byte, never your own copy**, even when
+  it says `unchanged`; a grant (Post) authorizes the edited bytes, so your own file is refused by the
+  gate once the user changed a word. Replacing the card (`kova ui card`) drops the user's edits.
 - **After a click, update or remove that card** (`kova ui card …`): its buttons stay locked with a
   spinner until you do (10 minutes at most). Replace it with the outcome ("Posted ✓") rather than
   leaving it as it was. Do the send before replacing **or removing** (`--remove`) a card that

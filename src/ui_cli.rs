@@ -18,7 +18,8 @@ Shows a native view in this agent's Kova pane: a list of decision cards (docs/pa
 docs/decision-cards-spec.md). `show` prints {\"view_id\",\"pane_id\"}. A click reaches you through
 `kova ui wait` (one event as JSON on stdout, exit 0; exit 2 on timeout, default 600 s) or, when
 nothing waits, as a line typed into this conversation:
-  [Kova] UI \"<view>\", card \"<card>\" (v<n>): <action>[: <text>]
+  [Kova] UI \"<view>\", card \"<card>\" (v<n>): <action>[: <text>] [block <i> … : <file> sha256 <hex>]
+The user can edit a card's `code` blocks: send the block file a click names, never your own copy.
 After acting on a click, update or remove that card (`kova ui card`): its buttons stay locked
 until then (10 minutes at most).";
 

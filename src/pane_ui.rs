@@ -168,7 +168,17 @@ impl View {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum UiEvent {
-    Click { view_id: String, card_id: String, action: String, text: String, card_version: u32 },
+    Click {
+        view_id: String,
+        card_id: String,
+        action: String,
+        text: String,
+        card_version: u32,
+        /// Every `code` block of the card as the user left it, in a file Kova
+        /// wrote: the agent sends that file, never its own copy.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blocks: Vec<crate::ask::AnswerBlock>,
+    },
     Closed { view_id: String, event: String },
 }
 
@@ -195,7 +205,7 @@ fn one_line(t: &str) -> String {
 pub fn typed_line(event: &UiEvent, view_title: &str, card_title: &str, last_path: &Path) -> String {
     match event {
         UiEvent::Closed { .. } => format!("[Kova] UI \"{}\" was closed by the user", one_line(view_title)),
-        UiEvent::Click { action, text, card_version, .. } => {
+        UiEvent::Click { action, text, card_version, blocks, .. } => {
             let text = one_line(text);
             let cut = text.chars().count() > MAX_TYPED_TEXT;
             let shown: String = if cut { text.chars().take(MAX_TYPED_TEXT).collect::<String>() + "…" } else { text };
@@ -207,6 +217,7 @@ pub fn typed_line(event: &UiEvent, view_title: &str, card_title: &str, last_path
                 card_version,
                 answer
             );
+            line.push_str(&one_line(&crate::ask::block_reports(blocks)));
             if cut {
                 line.push_str(&format!(" (full event: {})", last_path.display()));
             }
@@ -465,11 +476,11 @@ mod tests {
     #[test]
     fn typed_lines() {
         let p = Path::new("/x/v1.last.json");
-        let click = UiEvent::Click { view_id: "v1".into(), card_id: "a".into(), action: "edit".into(), text: "shorter\nplease".into(), card_version: 3 };
+        let click = UiEvent::Click { view_id: "v1".into(), card_id: "a".into(), action: "edit".into(), text: "shorter\nplease".into(), card_version: 3, blocks: vec![] };
         assert_eq!(typed_line(&click, "Slack drafts", "Reply to Alex", p), "[Kova] UI \"Slack drafts\", card \"Reply to Alex\" (v3): edit: shorter please");
-        let bare = UiEvent::Click { view_id: "v1".into(), card_id: "a".into(), action: "post".into(), text: String::new(), card_version: 1 };
+        let bare = UiEvent::Click { view_id: "v1".into(), card_id: "a".into(), action: "post".into(), text: String::new(), card_version: 1, blocks: vec![] };
         assert!(typed_line(&bare, "V", "C", p).ends_with("(v1): post"));
-        let long = UiEvent::Click { view_id: "v1".into(), card_id: "a".into(), action: "edit".into(), text: "y".repeat(600), card_version: 1 };
+        let long = UiEvent::Click { view_id: "v1".into(), card_id: "a".into(), action: "edit".into(), text: "y".repeat(600), card_version: 1, blocks: vec![] };
         let line = typed_line(&long, "V", "C", p);
         assert!(line.contains(&format!("{}…", "y".repeat(500))) && line.ends_with("(full event: /x/v1.last.json)"));
         assert_eq!(typed_line(&UiEvent::closed("v1"), "V\u{1b}", "", p), "[Kova] UI \"V \" was closed by the user");
@@ -477,7 +488,7 @@ mod tests {
 
     #[test]
     fn events_serialize_as_the_spec_shows() {
-        let click = UiEvent::Click { view_id: "v".into(), card_id: "a".into(), action: "ok".into(), text: "".into(), card_version: 2 };
+        let click = UiEvent::Click { view_id: "v".into(), card_id: "a".into(), action: "ok".into(), text: "".into(), card_version: 2, blocks: vec![] };
         assert_eq!(serde_json::to_value(&click).unwrap(), json!({"view_id": "v", "card_id": "a", "action": "ok", "text": "", "card_version": 2}));
         assert_eq!(serde_json::to_value(UiEvent::closed("v")).unwrap(), json!({"view_id": "v", "event": "closed"}));
         let back: UiEvent = serde_json::from_value(json!({"view_id": "v", "event": "closed"})).unwrap();
@@ -498,7 +509,7 @@ mod tests {
         Stored {
             seq: q.seq(),
             at: n,
-            event: UiEvent::Click { view_id: view.into(), card_id: format!("c{}", n), action: "ok".into(), text: "".into(), card_version: 1 },
+            event: UiEvent::Click { view_id: view.into(), card_id: format!("c{}", n), action: "ok".into(), text: "".into(), card_version: 1, blocks: vec![] },
             owner: crate::ask::Asker::default(),
             view_title: "V".into(),
             card_title: "C".into(),

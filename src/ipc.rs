@@ -219,6 +219,12 @@ pub enum IpcCommand {
     },
     /// The asker takes one of its questions back. Nothing is delivered.
     WithdrawAsk { id: String, session_id: String },
+    /// Every pane UI view shown, for a remote client (a phone). Served on the
+    /// main thread from the `UiBoard`.
+    ListUiViews,
+    /// A click on a view's card from a remote client: the window's path, never
+    /// a grant (`UiBoard::answer_remote`).
+    AnswerUi { view_id: String, card_id: String, action: String, text: String, card_version: Option<u32> },
     /// Every subject of every tab, with the panes filed under it, in the order
     /// Cmd+P draws them.
     ListSubjects,
@@ -747,6 +753,8 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "ask" => &["question"],
         "list-asks" => &[],
         "answer-ask" => &["id", "action", "text"],
+        "list-ui-views" => &[],
+        "answer-ui" => &["view_id", "card_id", "action", "text", "card_version"],
         "withdraw-asks" => &["session_id"],
         "update-ask" => &["id", "session_id", "card", "message"],
         "withdraw-ask" => &["id", "session_id"],
@@ -1301,6 +1309,28 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             Ok(IpcCommand::Ask(Box::new(question)))
         }
         "list-asks" => Ok(IpcCommand::ListAsks),
+        "list-ui-views" => Ok(IpcCommand::ListUiViews),
+        "answer-ui" => {
+            let field = |key: &str| -> Result<Option<String>, String> {
+                match v.get(key) {
+                    None | Some(serde_json::Value::Null) => Ok(None),
+                    Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+                    Some(_) => Err(format!("\"{key}\" must be a string")),
+                }
+            };
+            let view_id = field("view_id")?.ok_or_else(|| "missing \"view_id\" field".to_string())?;
+            if !crate::ask::is_safe_question_id(&view_id) {
+                return Err("\"view_id\" must be a UUID".to_string());
+            }
+            let card_id = field("card_id")?.ok_or_else(|| "missing \"card_id\" field".to_string())?;
+            let action = field("action")?.ok_or_else(|| "missing \"action\" field".to_string())?;
+            let text = field("text")?.unwrap_or_default();
+            let card_version = match v.get("card_version") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(n) => Some(n.as_u64().filter(|n| *n <= u32::MAX as u64).ok_or("\"card_version\" must be a positive integer")? as u32),
+            };
+            Ok(IpcCommand::AnswerUi { view_id, card_id, action, text, card_version })
+        }
         "answer-ask" => {
             let text_field = |key: &str| -> Result<Option<String>, String> {
                 match v.get(key) {

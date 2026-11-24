@@ -510,6 +510,29 @@ Both are Kova.app only: a library host answers `command not supported by this ho
 
 ---
 
+### `list-ui-views`, `answer-ui` — the pane UI views, from a remote client
+
+```json
+{ "cmd": "list-ui-views" }
+{ "cmd": "answer-ui", "view_id": "…uuid", "card_id": "draft-a", "action": "fix", "text": "shorter", "card_version": 2 }
+```
+
+For a client that shows the views somewhere else than the panes (a companion app on a phone).
+`list-ui-views` answers `{"ok":true,"data":{"views":[{"view_id","title","pane_id","owner_pane_id",
+"session_id","cards":[{"id","card_version","locked","card"}]}]}}`: `card` is the card document as
+shown, `locked` is true while a click waits for the agent (`ui-update-card`), `session_id` the
+conversation that owns the view (`null` when Kova cannot tell).
+
+`answer-ui` takes the window's path: the event reaches a waiting `kova ui wait` or is typed into the
+conversation, exactly like a click. Answer: `{"ok":true,"data":{"view_id","card_id","action","card_version"}}`.
+`card_version` is optional; when given and not current: `stale card: version N is shown now`.
+Errors: `no such view`, `no such card`, `card locked: its last click is not handled yet`,
+`no action <id> in this card`, `<id> needs text`, and **`a grant action can only be clicked`**: as
+for `answer-ask`, no grant is ever written from the socket, whoever calls (`decision-cards-spec.md`
+§ 8.3). Kova.app only.
+
+---
+
 ### `ui-show`, `ui-update`, `ui-update-card`, `ui-close`, `ui-wait` — native views in panes
 
 An agent shows a **view** in its own pane: a title and a list of cards (the card documents of

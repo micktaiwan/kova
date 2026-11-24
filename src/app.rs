@@ -353,6 +353,24 @@ impl AppDelegate {
                                         continue;
                                     }
                                 }
+                                if let crate::ipc::IpcCommand::ListUiViews = cmd {
+                                    let host = AppUiHost { windows: &ivars.windows };
+                                    let data = ivars.ui.borrow().list(&host);
+                                    let _ = responder.send(crate::ipc::IpcResponse::Ok { data: Some(data) });
+                                    continue;
+                                }
+                                if let crate::ipc::IpcCommand::AnswerUi { view_id, card_id, action, text, card_version } = cmd {
+                                    let host = AppUiHost { windows: &ivars.windows };
+                                    let response = match ivars.ui.borrow_mut().answer_remote(&host, &view_id, &card_id, &action, &text, card_version) {
+                                        Ok(data) => crate::ipc::IpcResponse::Ok { data: Some(data) },
+                                        Err(message) => {
+                                            log::info!("ui {}: answer-ui on card {} refused: {}", view_id, card_id, message);
+                                            crate::ipc::IpcResponse::Error { message }
+                                        }
+                                    };
+                                    let _ = responder.send(response);
+                                    continue;
+                                }
                                 if let crate::ipc::IpcCommand::Ui(req) = cmd {
                                     let host = AppUiHost { windows: &ivars.windows };
                                     ivars.ui.borrow_mut().handle(&host, *req, responder);
@@ -661,6 +679,9 @@ impl crate::ui_board::UiHost for AppUiHost<'_> {
     fn view_in(&self, id: crate::pane::PaneId) -> Option<crate::pane_ui::View> {
         self.first(|v| v.ui_view_in(id))
     }
+    fn views(&self) -> Vec<(crate::ui_board::PaneInfo, crate::pane_ui::View)> {
+        self.windows.borrow().iter().filter_map(|w| kova_view(w)).flat_map(|v| v.ui_views()).collect()
+    }
     fn set_view(&self, id: crate::pane::PaneId, view: Option<crate::pane_ui::View>) {
         let _ = self.first(|v| v.ui_set_view(id, view.clone()));
     }
@@ -902,6 +923,8 @@ fn handle_ipc_command_sync(
         | IpcCommand::WithdrawAsks { .. }
         | IpcCommand::UpdateAsk { .. }
         | IpcCommand::WithdrawAsk { .. }
+        | IpcCommand::ListUiViews
+        | IpcCommand::AnswerUi { .. }
         | IpcCommand::Ui(_) => {
             log::error!("IPC: an ask command reached the generic dispatcher");
             crate::ipc::IpcResponse::Error {

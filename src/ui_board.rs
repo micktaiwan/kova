@@ -66,6 +66,8 @@ pub trait UiHost {
     fn find_view(&self, view_id: &str) -> Option<(PaneInfo, View)>;
     /// The view pane `id` shows, if any.
     fn view_in(&self, id: PaneId) -> Option<View>;
+    /// Every view shown, with the pane showing it.
+    fn views(&self) -> Vec<(PaneInfo, View)>;
     /// Put `view` on pane `id` (docked unless it is a UI pane), or take it off.
     fn set_view(&self, id: PaneId, view: Option<View>);
     /// Open a UI pane next to `opener`; its id.
@@ -340,9 +342,14 @@ impl UiBoard {
     }
 
     /// A click on a card of a view, from the window. Locked cards and plain
-    /// Return on a grant answer nothing. A grant action writes its grant
-    /// first; when that fails the click is dropped and the reason returned.
-    pub fn click(&mut self, host: &dyn UiHost, view_id: &str, card_id: &str, action: &str, text: &str, trigger: Trigger) -> Result<(), String> {
+    /// Return on a grant answer nothing. `edits` are the user's versions of
+    /// the card's `code` blocks (block index, text), made on the version
+    /// shown: every code block's final text is written to a file the event
+    /// names, then a grant action writes its grant over those bytes, as a
+    /// `kova ask` card does. When a write fails the click is dropped and the
+    /// reason returned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn click(&mut self, host: &dyn UiHost, view_id: &str, card_id: &str, action: &str, text: &str, edits: &[(usize, String)], trigger: Trigger) -> Result<(), String> {
         let (shown_in, mut view) = host.find_view(view_id).ok_or("no such view")?;
         let now = now_secs();
         let slot = view.card(card_id).cloned().ok_or("no such card")?;
@@ -356,20 +363,18 @@ impl UiBoard {
         }
         let owner = self.owner_of(host, &shown_in, &view);
         let asker = owner_asker(&view.owner, owner.as_ref(), &host.own_socket());
-        if let Some(decl) = &chosen.grant {
-            if trigger == Trigger::Return || trigger == Trigger::Remote {
-                return Ok(());
-            }
-            let session = asker.session_id.clone().ok_or("grant requires an asker session id")?;
-            let grant = crate::decision_card::Grant {
-                question_id: pane_ui::grant_id(view_id, card_id),
-                session_id: session,
-                kind: decl.kind.clone(),
-                target: decl.target.clone(),
-                payload_sha256: decl.payload_sha256.clone(),
-                card_version: slot.version,
-                clicked_at: now,
-            };
+        let grant_id = pane_ui::grant_id(view_id, card_id);
+        let session = match &chosen.grant {
+            Some(_) if trigger == Trigger::Return || trigger == Trigger::Remote => return Ok(()),
+            Some(_) => Some(asker.session_id.clone().ok_or("grant requires an asker session id")?),
+            None => None,
+        };
+        let finals = crate::ask::final_blocks(&slot.card, edits);
+        // The texts first: a grant must never exist for a payload whose file is missing.
+        let blocks = crate::ask::write_block_files(&self.root, &grant_id, &finals)
+            .map_err(|e| format!("Could not save the edited text: {}", e))?;
+        if let (Some(decl), Some(session)) = (&chosen.grant, session) {
+            let grant = crate::ask::grant_for(&grant_id, session, decl, &finals, slot.version, now);
             crate::decision_card::write_grant(&self.root, &grant).map_err(|e| format!("Could not record the authorization: {}", e))?;
             log::info!("ui {}: grant written for card {} ({})", view_id, card_id, grant.target);
         }
@@ -379,6 +384,7 @@ impl UiBoard {
             action: action.to_string(),
             text,
             card_version: slot.version,
+            blocks,
         };
         if let Some(s) = view.cards.iter_mut().find(|c| c.id == card_id) {
             s.clicked_at = Some(now);
@@ -391,10 +397,70 @@ impl UiBoard {
         Ok(())
     }
 
+    /// Every view shown, for a remote client (`list-ui-views`): who owns it
+    /// (pane and session), and each card with its version and lock.
+    pub fn list(&self, host: &dyn UiHost) -> Value {
+        let now = now_secs();
+        let views: Vec<Value> = host
+            .views()
+            .into_iter()
+            .map(|(shown_in, view)| {
+                let owner = self.owner_of(host, &shown_in, &view);
+                let asker = owner_asker(&view.owner, owner.as_ref(), &host.own_socket());
+                let cards: Vec<Value> = view
+                    .cards
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "id": s.id,
+                            "card_version": s.version,
+                            "locked": s.locked(now),
+                            "card": serde_json::to_value(&s.card).unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "view_id": view.view_id,
+                    "title": view.title,
+                    "pane_id": shown_in.id,
+                    "owner_pane_id": owner.as_ref().map(|p| p.id),
+                    "session_id": asker.session_id,
+                    "cards": cards,
+                })
+            })
+            .collect();
+        serde_json::json!({ "views": views })
+    }
+
+    /// A click from a remote client (`answer-ui`): the window's own path, but
+    /// refused out loud where the window stays silent. A grant action is never
+    /// granted from here, whoever calls: any local process can reach the socket,
+    /// the agent that asked included (`docs/decision-cards-spec.md` § 8.3).
+    pub fn answer_remote(&mut self, host: &dyn UiHost, view_id: &str, card_id: &str, action: &str, text: &str, card_version: Option<u32>) -> Result<Value, String> {
+        let (_, view) = host.find_view(view_id).ok_or("no such view")?;
+        let slot = view.card(card_id).ok_or("no such card")?;
+        if card_version.is_some_and(|v| v != slot.version) {
+            return Err(format!("stale card: version {} is shown now", slot.version));
+        }
+        if slot.locked(now_secs()) {
+            return Err("card locked: its last click is not handled yet".into());
+        }
+        let chosen = slot.card.action(action).ok_or_else(|| format!("no action {} in this card", action))?;
+        if chosen.grant.is_some() {
+            return Err("a grant action can only be clicked".into());
+        }
+        let version = slot.version;
+        self.click(host, view_id, card_id, action, text, &[], Trigger::Remote)?;
+        Ok(serde_json::json!({ "view_id": view_id, "card_id": card_id, "action": action, "card_version": version }))
+    }
+
     /// The user closed a view (its ✕, or its pane): `closed` goes to its agent.
     pub fn closed_by_user(&mut self, host: &dyn UiHost, view: View, owner_now: Option<PaneInfo>) {
         let asker = owner_asker(&view.owner, owner_now.as_ref(), &host.own_socket());
-        let ids: Vec<String> = view.cards.iter().map(|c| c.id.clone()).collect();
+        // A card the user just clicked keeps its grant: clicking Post then closing the view is one
+        // gesture, and the agent's send may start after the close. The grant stays single-use and
+        // expires with GRANT_TTL_SECS.
+        let ids: Vec<String> = view.cards.iter().filter(|c| c.clicked_at.is_none()).map(|c| c.id.clone()).collect();
         self.drop_grants(&view.view_id, &ids);
         log::info!("ui {}: closed by the user", view.view_id);
         self.enqueue(UiEvent::closed(&view.view_id), asker, &view.title, "");
@@ -475,7 +541,10 @@ impl UiBoard {
     /// waiting. Called from the tick.
     pub fn drain_views(&mut self, host: &dyn UiHost) {
         for c in crate::window::dock_view::take_ui_clicks() {
-            if let Err(e) = self.click(host, &c.view_id, &c.card_id, &c.action, &c.text, c.trigger) {
+            // Edits made on another version of the card than the one now shown are dropped.
+            let current = host.find_view(&c.view_id).and_then(|(_, v)| v.card(&c.card_id).map(|s| s.version));
+            let edits: &[(usize, String)] = if current == Some(c.edits_version) { &c.edits } else { &[] };
+            if let Err(e) = self.click(host, &c.view_id, &c.card_id, &c.action, &c.text, edits, c.trigger) {
                 log::info!("ui {}: click on card {} refused: {}", c.view_id, c.card_id, e);
                 let version = host.find_view(&c.view_id).and_then(|(_, v)| v.card(&c.card_id).map(|s| s.version)).unwrap_or(0);
                 crate::window::dock_view::set_ui_error(&c.view_id, &c.card_id, version, &e);
@@ -558,6 +627,9 @@ mod tests {
         }
         fn view_in(&self, id: PaneId) -> Option<View> {
             self.panes.borrow().get(&id).and_then(|p| p.1.clone())
+        }
+        fn views(&self) -> Vec<(PaneInfo, View)> {
+            self.panes.borrow().values().filter_map(|p| p.1.clone().map(|v| (p.0.clone(), v))).collect()
         }
         fn set_view(&self, id: PaneId, view: Option<View>) {
             if let Some(p) = self.panes.borrow_mut().get_mut(&id) {
@@ -681,14 +753,14 @@ mod tests {
         b.handle(&host, UiRequest { peer_pid: 501, from: Asker::default(), op: UiOp::Wait { view_id: id.clone(), timeout_ms: 1000 } }, tx);
         assert!(rx.try_recv().is_err(), "waits");
         assert!(matches!(call(&mut b, &host, 501, UiOp::Wait { view_id: id.clone(), timeout_ms: 1000 }), IpcResponse::Error { message } if message == "already waiting"));
-        assert_eq!(b.click(&host, &id, "a", "edit", " ", Trigger::Click), Err("edit needs text".into()));
-        b.click(&host, &id, "a", "ok", "", Trigger::Click).unwrap();
+        assert_eq!(b.click(&host, &id, "a", "edit", " ", &[], Trigger::Click), Err("edit needs text".into()));
+        b.click(&host, &id, "a", "ok", "", &[], Trigger::Click).unwrap();
         match rx.try_recv() {
             Ok(IpcResponse::Ok { data: Some(d) }) => assert_eq!(d, json!({"view_id": id, "card_id": "a", "action": "ok", "text": "", "card_version": 1})),
             _ => panic!("handed to the waiter"),
         }
         assert!(host.view_in(1).unwrap().cards[0].clicked_at.is_some(), "locked");
-        b.click(&host, &id, "a", "ok", "", Trigger::Click).unwrap();
+        b.click(&host, &id, "a", "ok", "", &[], Trigger::Click).unwrap();
         assert_eq!(b.pending_events(&id), 1, "a locked card answers nothing: only the in-flight one");
         call(&mut b, &host, 501, UiOp::Ack { view_id: id.clone(), ok: true });
         assert_eq!(b.pending_events(&id), 0);
@@ -706,7 +778,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         b.handle(&host, UiRequest { peer_pid: 501, from: Asker::default(), op: UiOp::Wait { view_id: id.clone(), timeout_ms: 1000 } }, tx);
         host.type_in(1, 3);
-        b.click(&host, &id, "a", "ok", "", Trigger::Click).unwrap();
+        b.click(&host, &id, "a", "ok", "", &[], Trigger::Click).unwrap();
         call(&mut b, &host, 501, UiOp::Ack { view_id: id.clone(), ok: false });
         assert_eq!(b.pending_events(&id), 1, "back in the queue");
         // No waiter now, a wait just returned and the user has a half-typed line: held.
@@ -719,16 +791,79 @@ mod tests {
         let host = Fake::with_pane(1, 500, "s1");
         let mut b = board("grant");
         let (id, _) = show(&mut b, &host, 501, Placement::DockBottom, view(vec![("d", grant_card("hi\n"))])).unwrap();
-        b.click(&host, &id, "d", "post", "", Trigger::Return).unwrap();
+        b.click(&host, &id, "d", "post", "", &[], Trigger::Return).unwrap();
         let dir = crate::decision_card::grants_dir(&b.root);
         assert!(!dir.exists(), "plain Return");
-        b.click(&host, &id, "d", "post", "", Trigger::Click).unwrap();
+        b.click(&host, &id, "d", "post", "", &[], Trigger::Click).unwrap();
         let file = dir.join(format!("{}_d.json", id));
         let grant: crate::decision_card::Grant = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!((grant.question_id, grant.session_id, grant.card_version), (format!("{}:d", id), "s1".to_string(), 1));
         // Replacing the card deletes its unused grant.
         call(&mut b, &host, 501, UiOp::UpdateCard { view_id: id.clone(), card_id: "d".into(), card: Some(card("Posted ✓")) });
         assert!(!file.exists());
+        let _ = std::fs::remove_dir_all(&b.root);
+    }
+
+    #[test]
+    fn an_edited_code_block_is_what_the_click_reports_and_the_grant_authorizes() {
+        let host = Fake::with_pane(1, 500, "s1");
+        let mut b = board("edited");
+        let (id, _) = show(&mut b, &host, 501, Placement::DockBottom, view(vec![("d", grant_card("Draft"))])).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        b.handle(&host, UiRequest { peer_pid: 501, from: Asker::default(), op: UiOp::Wait { view_id: id.clone(), timeout_ms: 1000 } }, tx);
+        b.click(&host, &id, "d", "post", "", &[(0, "My draft".into())], Trigger::Click).unwrap();
+        let event = match rx.try_recv() {
+            Ok(IpcResponse::Ok { data: Some(d) }) => d,
+            other => panic!("{:?}", other.map(|r| r.to_json())),
+        };
+        let block = &event["blocks"][0];
+        assert_eq!((block["block"].as_u64(), block["edited"].as_bool()), (Some(0), Some(true)));
+        let file = block["file"].as_str().unwrap().to_string();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "My draft");
+        assert_eq!(block["sha256"].as_str().unwrap(), crate::decision_card::sha256_hex(b"My draft"));
+        let grant_file = crate::decision_card::grants_dir(&b.root).join(format!("{}_d.json", id));
+        let grant: crate::decision_card::Grant = serde_json::from_slice(&std::fs::read(&grant_file).unwrap()).unwrap();
+        assert_eq!(grant.payload_sha256, crate::decision_card::sha256_hex(b"My draft"), "the gate checks the file Kova wrote");
+        // The line typed when nobody waits names the same file.
+        let parsed: UiEvent = serde_json::from_value(event.clone()).unwrap();
+        let line = pane_ui::typed_line(&parsed, "Drafts", "Post?", std::path::Path::new("/x"));
+        assert!(line.starts_with(&format!("[Kova] UI \"Drafts\", card \"Post?\" (v1): post [block 0 edited by the user: {} sha256 ", file)), "{}", line);
+        let _ = std::fs::remove_dir_all(&b.root);
+    }
+
+    #[test]
+    fn an_unedited_click_reports_every_code_block_unchanged() {
+        let host = Fake::with_pane(1, 500, "s1");
+        let mut b = board("unedited");
+        let (id, _) = show(&mut b, &host, 501, Placement::DockBottom, view(vec![("d", grant_card("hi\n"))])).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        b.handle(&host, UiRequest { peer_pid: 501, from: Asker::default(), op: UiOp::Wait { view_id: id.clone(), timeout_ms: 1000 } }, tx);
+        b.click(&host, &id, "d", "later", "", &[], Trigger::Click).unwrap();
+        let Ok(IpcResponse::Ok { data: Some(event) }) = rx.try_recv() else { panic!("no event") };
+        assert_eq!(event["blocks"][0]["edited"], false);
+        assert_eq!(std::fs::read_to_string(event["blocks"][0]["file"].as_str().unwrap()).unwrap(), "hi\n");
+        assert!(!crate::decision_card::grants_dir(&b.root).exists(), "no grant for a plain action");
+        let _ = std::fs::remove_dir_all(&b.root);
+    }
+
+    #[test]
+    fn a_remote_client_lists_views_and_clicks_but_never_grants() {
+        let host = Fake::with_pane(1, 500, "s1");
+        let mut b = board("remote");
+        let (id, _) = show(&mut b, &host, 501, Placement::DockBottom, view(vec![("a", card("A")), ("d", grant_card("hi\n"))])).unwrap();
+        let list = b.list(&host);
+        let v = &list["views"][0];
+        assert_eq!((v["view_id"].as_str(), v["session_id"].as_str(), v["owner_pane_id"].as_u64()), (Some(id.as_str()), Some("s1"), Some(1)));
+        assert_eq!(v["cards"][1]["card"]["actions"][0]["grant"]["target"], "slack:C1/-");
+        assert_eq!(b.answer_remote(&host, &id, "d", "post", "", Some(1)), Err("a grant action can only be clicked".into()));
+        assert!(!crate::decision_card::grants_dir(&b.root).exists());
+        assert_eq!(b.answer_remote(&host, &id, "a", "ok", "", Some(7)), Err("stale card: version 1 is shown now".into()));
+        assert_eq!(b.answer_remote(&host, &id, "a", "edit", "", None), Err("edit needs text".into()));
+        b.answer_remote(&host, &id, "a", "edit", "shorter", Some(1)).unwrap();
+        // Nobody waits: the event went straight to the conversation (not typed under test).
+        assert_eq!(b.pending_events(&id), 0);
+        assert_eq!(b.list(&host)["views"][0]["cards"][0]["locked"], true);
+        assert_eq!(b.answer_remote(&host, &id, "a", "ok", "", None), Err("card locked: its last click is not handled yet".into()));
         let _ = std::fs::remove_dir_all(&b.root);
     }
 

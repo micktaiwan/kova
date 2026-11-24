@@ -102,7 +102,7 @@ know its card shows what it sent.
 |---|---|---|
 | `text` | `text` (≤ 4,000 chars) | Body text. Inline markup: `**bold**`, `_italic_`, `` `code` ``, `[label](https://…)`. Links open in the default browser; only `https:` and `slack:` schemes are clickable, others render as plain text. |
 | `quote` | `text` (≤ 4,000), `author` (optional, ≤ 80), `time` (optional, ≤ 40, string as given) | Indented, with a vertical bar on the left; `author · time` above in grey. For a message being answered. |
-| `code` | `text` (≤ 8,000), `label` (optional, ≤ 40) | Monospace, framed. `label` sits above in grey (e.g. "Draft"), followed by `· editable` on the `kova ask` card. For exactly what will be sent. No syntax colouring. On the `kova ask` card the user can **edit** it (plain text: no smart quotes, dashes or replacements); see § 4.2. In a pane view (`kova ui`) it stays read-only. |
+| `code` | `text` (≤ 8,000), `label` (optional, ≤ 40) | Monospace, framed. `label` sits above in grey (e.g. "Draft"), followed by `· editable`. For exactly what will be sent. No syntax colouring. The user can **edit** it (plain text: no smart quotes, dashes or replacements), on the `kova ask` card and in a pane view (`kova ui`, pane-ui-spec § 6); see § 4.2. |
 | `fields` | `items`: array of `{ "key": string ≤ 40, "value": string ≤ 300 }`, 1 to 12 | Two columns, key in grey, value with the same inline markup as `text`. |
 | `divider` | none | Thin horizontal line. |
 | `context` | `text` (≤ 300) | Small grey line (source, "relaxed rules", ids). |

@@ -252,19 +252,28 @@ impl Answer {
     /// One line for the asker: "OK", or "OK: fix that part", then where each
     /// code block's final text is.
     pub fn line(&self) -> String {
-        let mut line = if self.text.is_empty() { self.action.clone() } else { format!("{}: {}", self.action, self.text) };
-        for b in &self.blocks {
-            line.push_str(&format!(
+        let line = if self.text.is_empty() { self.action.clone() } else { format!("{}: {}", self.action, self.text) };
+        line + &block_reports(&self.blocks)
+    }
+}
+
+/// Where each code block's final text is, as appended to an answer line (a
+/// `kova ask` answer or a pane view click): ` [block <i> "<label>" edited by
+/// the user|unchanged: <file> sha256 <hex>]` per block.
+pub fn block_reports(blocks: &[AnswerBlock]) -> String {
+    blocks
+        .iter()
+        .map(|b| {
+            format!(
                 " [block {}{} {}: {} sha256 {}]",
                 b.block,
                 b.label.as_deref().map(|l| format!(" \"{}\"", l)).unwrap_or_default(),
                 if b.edited { "edited by the user" } else { "unchanged" },
                 b.file,
                 b.sha256
-            ));
-        }
-        line
-    }
+            )
+        })
+        .collect()
 }
 
 /// How long an answer's block files stay on disk: a late delivery can wake
@@ -280,10 +289,20 @@ pub fn answer_block_path(root: &Path, question_id: &str, block: usize) -> Option
 /// Write each code block's final text and fill the answer's `blocks`.
 /// Directory 0700, files 0600, each written atomically.
 pub fn write_answer_blocks(root: &Path, answer: &mut Answer, texts: &[FinalBlock]) -> Result<(), String> {
+    let blocks = write_block_files(root, &answer.id, texts)?;
+    answer.blocks.extend(blocks);
+    Ok(())
+}
+
+/// Write each code block's final text under `<ask dir>/answers/<id>/`, the
+/// files a click reports. `id` is a question id or a pane view's grant id
+/// (`view:card`). Directory 0700, files 0600, each written atomically.
+pub fn write_block_files(root: &Path, id: &str, texts: &[FinalBlock]) -> Result<Vec<AnswerBlock>, String> {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let mut out = Vec::new();
     for t in texts {
-        let path = answer_block_path(root, &answer.id, t.block).ok_or("bad question id")?;
+        let path = answer_block_path(root, id, t.block).ok_or("bad question id")?;
         let dir = path.parent().ok_or("no parent")?;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| e.to_string())?;
         let tmp = dir.join(format!(".block-{}.tmp", t.block));
@@ -291,7 +310,7 @@ pub fn write_answer_blocks(root: &Path, answer: &mut Answer, texts: &[FinalBlock
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).map_err(|e| e.to_string())?;
         file.write_all(t.text.as_bytes()).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-        answer.blocks.push(AnswerBlock {
+        out.push(AnswerBlock {
             block: t.block,
             label: t.label.clone(),
             file: path.to_string_lossy().into_owned(),
@@ -299,7 +318,7 @@ pub fn write_answer_blocks(root: &Path, answer: &mut Answer, texts: &[FinalBlock
             edited: t.edited,
         });
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Delete answer folders older than [`ANSWER_FILES_TTL_SECS`] (by mtime).
@@ -1133,22 +1152,35 @@ pub fn plan_click(
             let Some(session_id) = question.from.session_id.clone() else {
                 return Err(ClickRefusal::Refused("grant requires an asker session id".to_string()));
             };
-            let grant = crate::decision_card::Grant {
-                question_id: question.id.clone(),
-                session_id,
-                kind: decl.kind.clone(),
-                target: decl.target.clone(),
-                // The bytes the user left in the payload block, edited or not.
-                payload_sha256: finals
-                    .iter()
-                    .find(|f| f.block == decl.payload_block)
-                    .map(|f| crate::decision_card::sha256_hex(f.text.as_bytes()))
-                    .unwrap_or_else(|| decl.payload_sha256.clone()),
-                card_version: question.card_version,
-                clicked_at: now,
-            };
+            let grant = grant_for(&question.id, session_id, decl, &finals, question.card_version, now);
             Ok((answer, Some(grant), finals))
         }
+    }
+}
+
+/// The grant a click on a grant action writes, for a `kova ask` card or a
+/// pane view's card (`id` is then `view:card`): it authorizes the bytes the
+/// user left in the payload block, edited or not.
+pub fn grant_for(
+    id: &str,
+    session_id: String,
+    decl: &crate::decision_card::GrantDecl,
+    finals: &[FinalBlock],
+    card_version: u32,
+    now: u64,
+) -> crate::decision_card::Grant {
+    crate::decision_card::Grant {
+        question_id: id.to_string(),
+        session_id,
+        kind: decl.kind.clone(),
+        target: decl.target.clone(),
+        payload_sha256: finals
+            .iter()
+            .find(|f| f.block == decl.payload_block)
+            .map(|f| crate::decision_card::sha256_hex(f.text.as_bytes()))
+            .unwrap_or_else(|| decl.payload_sha256.clone()),
+        card_version,
+        clicked_at: now,
     }
 }
 

@@ -24,14 +24,15 @@ use objc2_app_kit::{
     NSApplication, NSButton, NSColor, NSControl, NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags,
     NSFocusRingType, NSFont, NSFontWeightRegular, NSFontWeightSemibold, NSLayoutAttribute,
     NSLineBreakMode, NSProgressIndicator, NSProgressIndicatorStyle, NSScrollView,
-    NSResponder, NSStackView, NSTextField, NSTextFieldDelegate, NSTextView, NSUserInterfaceLayoutOrientation, NSView,
+    NSResponder, NSStackView, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSTextViewDelegate,
+    NSUserInterfaceLayoutOrientation, NSView,
 };
 use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSArray, NSEdgeInsets, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{NSArray, NSEdgeInsets, NSNotification, NSObject, NSObjectProtocol, NSString};
 
 use super::KovaView;
 use crate::ask::Trigger;
-use crate::card_view::{activate, attributed, block_view, FlippedView};
+use crate::card_view::{activate, attributed, block_view, code_block, CodeEditor, FlippedView};
 use crate::decision_card::Style;
 use crate::pane::PaneId;
 use crate::pane_ui::{CardSlot, View};
@@ -43,6 +44,10 @@ pub struct UiClick {
     pub action: String,
     pub text: String,
     pub trigger: Trigger,
+    /// The user's versions of the card's `code` blocks (block index, text)
+    /// and the card version they were made on.
+    pub edits: Vec<(usize, String)>,
+    pub edits_version: u32,
 }
 
 static CLICKS: Mutex<Vec<UiClick>> = Mutex::new(Vec::new());
@@ -71,6 +76,38 @@ fn ui_error(view_id: &str) -> Option<(String, u32, String)> {
     ERRORS.lock().ok().and_then(|e| e.as_ref().and_then(|m| m.get(view_id).cloned()))
 }
 
+/// What the user typed in the `code` blocks of a card:
+/// (view id, card id) → (card version, block index → text). Kept apart from
+/// the drawn views, so a rebuild or a tab switch keeps the edits; a new
+/// version of the card (`kova ui card`, `kova ui update`) shows its own text.
+type Edits = HashMap<(String, String), (u32, HashMap<usize, String>)>;
+static EDITS: Mutex<Option<Edits>> = Mutex::new(None);
+
+/// The user's text for block `block` of the card, if edited on `version`.
+fn edited_text(view_id: &str, card_id: &str, version: u32, block: usize) -> Option<String> {
+    let edits = EDITS.lock().ok()?;
+    let (v, texts) = edits.as_ref()?.get(&(view_id.to_string(), card_id.to_string()))?;
+    (*v == version).then(|| texts.get(&block).cloned()).flatten()
+}
+
+/// Every edit of a card: (card version, (block index, text)).
+fn card_edits(view_id: &str, card_id: &str) -> (u32, Vec<(usize, String)>) {
+    let Ok(edits) = EDITS.lock() else { return (0, Vec::new()) };
+    match edits.as_ref().and_then(|m| m.get(&(view_id.to_string(), card_id.to_string()))) {
+        Some((v, texts)) => (*v, texts.iter().map(|(b, t)| (*b, t.clone())).collect()),
+        None => (0, Vec::new()),
+    }
+}
+
+/// Forget the edits of `view_id`'s cards that are gone or replaced.
+fn prune_edits(view: &View) {
+    if let Ok(mut edits) = EDITS.lock() {
+        if let Some(m) = edits.as_mut() {
+            m.retain(|(v, c), (version, _)| *v != view.view_id || view.card(c).is_some_and(|s| s.version == *version));
+        }
+    }
+}
+
 /// What the controls of one drawn view stand for, read by the target.
 #[derive(Default)]
 struct Controls {
@@ -81,6 +118,8 @@ struct Controls {
     fields: Vec<(String, Retained<NSTextField>)>,
     /// Each card's primary action, by card id.
     primaries: Vec<(String, String)>,
+    /// Each editable `code` block: (card id, card version, block index, editor).
+    editors: Vec<(String, u32, usize, CodeEditor)>,
     /// Fields and buttons in reading order, for Tab.
     key_views: Vec<Retained<NSView>>,
     /// The card whose field Escape left: ⌘Return on the view answers it.
@@ -115,6 +154,23 @@ define_class!(
     }
 
     unsafe impl NSTextFieldDelegate for DockTarget {}
+
+    /// An editable `code` block changed: keep its text, grow its box.
+    unsafe impl NSTextDelegate for DockTarget {
+        #[unsafe(method(textDidChange:))]
+        fn text_did_change(&self, _notification: &NSNotification) {
+            code_edited(&self.ivars().controls.borrow());
+        }
+    }
+
+    unsafe impl NSTextViewDelegate for DockTarget {
+        /// Escape in a `code` block leaves it for its card, as in a field
+        /// (NSTextView would open its completion list).
+        #[unsafe(method(textView:doCommandBySelector:))]
+        fn text_view_do_command(&self, text_view: &NSTextView, selector: Sel) -> bool {
+            editor_command(self, text_view, selector)
+        }
+    }
 
     impl DockTarget {
         #[unsafe(method(pressed:))]
@@ -225,8 +281,39 @@ fn field_text(controls: &Controls, card: &str) -> String {
 }
 
 fn push_click(view_id: &str, card: &str, action: &str, text: String, trigger: Trigger) {
+    let (edits_version, edits) = card_edits(view_id, card);
     if let Ok(mut c) = CLICKS.lock() {
-        c.push(UiClick { view_id: view_id.to_string(), card_id: card.to_string(), action: action.to_string(), text, trigger });
+        c.push(UiClick { view_id: view_id.to_string(), card_id: card.to_string(), action: action.to_string(), text, trigger, edits, edits_version });
+    }
+}
+
+fn editor_command(target: &DockTarget, text_view: &NSTextView, selector: Sel) -> bool {
+    if selector != sel!(cancelOperation:) {
+        return false;
+    }
+    let card = {
+        let controls = target.ivars().controls.borrow();
+        controls.editors.iter().find(|(.., e)| std::ptr::eq(&*e.view, text_view)).map(|(c, ..)| c.clone())
+    };
+    target.ivars().controls.borrow_mut().focused_card = card;
+    if let (Some(window), Some(root)) = (text_view.window(), root_of(text_view)) {
+        window.makeFirstResponder(Some(&root));
+    }
+    true
+}
+
+/// A `code` block was typed in: remember every editor's text for its card
+/// and version, and grow each box with its text.
+fn code_edited(controls: &Controls) {
+    let Ok(mut edits) = EDITS.lock() else { return };
+    let m = edits.get_or_insert_with(HashMap::new);
+    for (card, version, block, editor) in &controls.editors {
+        editor.height.setConstant(crate::card_view::text_height(&editor.view));
+        let entry = m.entry((controls.view_id.clone(), card.clone())).or_insert_with(|| (*version, HashMap::new()));
+        if entry.0 != *version {
+            *entry = (*version, HashMap::new());
+        }
+        entry.1.insert(*block, editor.view.string().to_string());
     }
 }
 
@@ -397,6 +484,7 @@ impl DockedView {
             locks,
             error
         );
+        prune_edits(view);
         {
             let mut c = self.controls.borrow_mut();
             c.view_id = view.view_id.clone();
@@ -443,7 +531,7 @@ impl DockedView {
         for (i, slot) in view.cards.iter().enumerate() {
             let err = error.as_ref().filter(|(c, v, _)| *c == slot.id && *v == slot.version).map(|(_, _, m)| m.as_str());
             let draft = drafts.iter().find(|(c, _)| *c == slot.id).map(|(_, t)| t.as_str()).unwrap_or("");
-            let card = self.card_view(mtm, slot, locks[i], err, inner, draft, &mut controls);
+            let card = self.card_view(mtm, &view.view_id, slot, locks[i], err, inner, draft, &mut controls);
             self.list.addArrangedSubview(&card);
         }
         // Tab walks the fields and buttons in reading order, and loops.
@@ -461,9 +549,11 @@ impl DockedView {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn card_view(
         &self,
         mtm: MainThreadMarker,
+        view_id: &str,
         slot: &CardSlot,
         locked: bool,
         error: Option<&str>,
@@ -485,8 +575,22 @@ impl DockedView {
             s.setPreferredMaxLayoutWidth(body);
             rows.push(Retained::into_super(Retained::into_super(s)));
         }
-        for block in &doc.blocks {
-            rows.push(block_view(mtm, block, body, &tint));
+        for (index, block) in doc.blocks.iter().enumerate() {
+            // A code block is what the agent will send: the user may change it
+            // (not while the click waits), and the click carries his version.
+            let view = match block {
+                crate::decision_card::Block::Code { text, label } => {
+                    let text = edited_text(view_id, &slot.id, slot.version, index).unwrap_or_else(|| text.clone());
+                    let (view, editor) = code_block(mtm, &text, label.as_deref(), body, !locked);
+                    if let Some(editor) = editor {
+                        editor.view.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*self.target)));
+                        controls.editors.push((slot.id.clone(), slot.version, index, editor));
+                    }
+                    view
+                }
+                _ => block_view(mtm, block, body, &tint),
+            };
+            rows.push(view);
         }
         if let Some(g) = doc.grant_action().and_then(|a| a.grant.as_ref()) {
             let l = label(mtm, &format!("Authorizes: {}", g.target), 11.0, &NSColor::secondaryLabelColor());
@@ -638,7 +742,11 @@ impl KovaView {
         let card = if std::ptr::eq(view, &*dock.root) {
             c.focused_card.clone()
         } else {
-            c.fields.iter().find(|(_, f)| view.isDescendantOf(f)).map(|(id, _)| id.clone())
+            c.fields
+                .iter()
+                .find(|(_, f)| view.isDescendantOf(f))
+                .map(|(id, _)| id.clone())
+                .or_else(|| c.editors.iter().find(|(.., e)| view.isDescendantOf(&e.view)).map(|(id, ..)| id.clone()))
         };
         if let Some(card) = card {
             if let Some((_, action)) = c.primaries.iter().find(|(id, _)| *id == card) {
@@ -758,6 +866,20 @@ impl KovaView {
             tab.for_each_pane(&mut |p| {
                 if found.is_none() && *p.uid.borrow() == uid {
                     found = Some(pane_info(p));
+                }
+            });
+        }
+        found
+    }
+
+    /// Every view shown in this window, with the pane showing it.
+    pub fn ui_views(&self) -> Vec<(crate::ui_board::PaneInfo, crate::pane_ui::View)> {
+        let tabs = self.ivars().tabs.borrow();
+        let mut found = Vec::new();
+        for tab in tabs.iter() {
+            tab.for_each_pane(&mut |p| {
+                if let Some(v) = p.ui_view.borrow().as_ref() {
+                    found.push((pane_info(p), v.clone()));
                 }
             });
         }

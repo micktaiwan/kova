@@ -545,7 +545,9 @@ fn validate_grant(grant: &Value, path: &str, blocks: &[Value]) -> Result<(), Str
         None => return Err(format!("missing {}.payload_block", path)),
         Some(v) => v.as_u64().ok_or_else(|| format!("{}.payload_block must be an index", path))? as usize,
     };
-    let block = blocks.get(index).ok_or("payload_block out of range")?;
+    let block = blocks.get(index).ok_or_else(|| {
+        format!("payload_block out of range: it is a 0-based index and the card has {} blocks (the first block is 0)", blocks.len())
+    })?;
     if block.get("type").and_then(Value::as_str) != Some("code") {
         return Err("payload_block is not a code block".into());
     }
@@ -1064,7 +1066,7 @@ mod tests {
         assert_eq!(err(c), "payload_block is not a code block");
         let mut c = good.clone();
         c["actions"][0]["grant"]["payload_block"] = json!(9);
-        assert_eq!(err(c), "payload_block out of range");
+        assert!(err(c).starts_with("payload_block out of range: it is a 0-based index"));
         let mut c = good.clone();
         c["blocks"][2]["text"] = json!("Draft body");
         assert_eq!(err(c), "payload_sha256 does not match block 2", "a trailing newline is part of the payload");

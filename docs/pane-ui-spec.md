@@ -160,17 +160,30 @@ kova ui close <view_id>
 
 ## 6. Events: how a click reaches the agent
 
-An event is `{ "view_id", "card_id", "action", "text", "card_version" }`, or
+An event is `{ "view_id", "card_id", "action", "text", "card_version", "blocks" }`, or
 `{ "view_id", "event": "closed" }` when the user closes the view or its pane. The typed line for
 `closed` is `[Kova] UI "<view title>" was closed by the user`.
+
+**Edited `code` blocks.** A `code` block of a card in a view is editable, exactly as on the `kova
+ask` card (decision-cards-spec § 4.2): same plain-text editor, same `· editable` caption, not while
+the card is locked after a click. Every click on a card with `code` blocks (window or `answer-ui`)
+writes the final text of each block, edited or not, to
+`<ask dir>/answers/<view_id>_<card_id>/block-<index>.txt`, before any grant, and the event carries
+`"blocks": [{ "block", "label", "file", "sha256", "edited" }]` (absent for a card without `code`
+blocks). The typed line appends `[block <i> "<label>" edited by the user|unchanged: <file> sha256
+<hex>]` per block, as an ask answer does. **The agent sends that file, never its own copy.** Edits
+survive redraws, tab switches and `ui-update` calls that leave the card unchanged; a new version of
+the card (`kova ui card`, or a `ui-update` that changes it) shows its own text and drops them. A
+remote `answer-ui` carries no edits: its blocks are the card's text. A file that cannot be written
+drops the click with a red line on the card.
 
 Two ways in, the same as for `kova ask`:
 
 - **The agent is waiting** (`kova ui wait`): the event is printed and the command returns.
 - **The agent is not waiting** (it is talking with the user, or idle): Kova types the event into
   the agent's conversation, through the late-delivery path of `kova ask` (`deliver_late`):
-  `[Kova] UI "<view title>", card "<card title>" (v<n>): <action>[: <text>]`, where `<card title>`
-  is the card's `title` (mandatory in the card format). Kova does not wait for the agent to finish
+  `[Kova] UI "<view title>", card "<card title>" (v<n>): <action>[: <text>]`, followed by the block
+  reports above, where `<card title>` is the card's `title` (mandatory in the card format). Kova does not wait for the agent to finish
   its turn: it types the line as an answer to a card is typed today, as soon as the user has nothing
   half-typed in that pane (§ 12).
 - **"Waiting"** means a `ui-wait` connection is open on that view. Between two `kova ui wait` calls of
@@ -211,7 +224,9 @@ pane at click time (Kova's agent detection of that pane); if Kova does not know 
 session id. Adapting `post.sh` and the gate in the dotfiles repo (they match
 grants by session, target and hash, so the id form matters only for the file name and its tests) is
 part of this work, already approved by the owner for the corner card on 2026-11-19
-(decision-cards-spec § 8.4); the same contract applies, nothing beyond it. A click on a grant
+(decision-cards-spec § 8.4); the same contract applies, nothing beyond it. As on the ask card, the
+grant authorizes the payload block **as the user left it**: its `payload_sha256` is the hash of the
+edited text written to the block file, not the one the agent declared. A click on a grant
 action in the pane UI is a real click: the
 same rules apply (no plain Return, ⌘Return only on the primary button, refused through any socket
 command).
@@ -269,7 +284,9 @@ new pane. A view never changes placement: close it and show another.
 **Updating cards (§ 5).** `ui-update-card` with an unknown `card_id` appends the card at the end.
 `ui-update` bumps `card_version` only for cards whose JSON changed. Replacing or removing a card
 deletes its unused grants: the agent must run the send before it replaces the card (for example
-with "Posted ✓").
+with "Posted ✓"). The user closing the view does not delete the grant of a card they clicked:
+clicking Post then closing the view is one gesture, and the agent's send may start after the close
+(the grant stays single-use and expires with its TTL). `ui-close` from the agent still deletes them.
 
 **Versions (§ 6).** Kova never rejects a click. Clicks and updates run one after the other on the
 main thread, so a click always carries the version on screen; comparing it with the last version
