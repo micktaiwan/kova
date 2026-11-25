@@ -564,6 +564,7 @@ impl LibPane {
             input_chars: s.pty.input_chars.clone(),
             fg_process: s.fg_process().map(|p| p.name),
             bookmarked: false,
+            paused: s.is_paused().then(|| s.paused_title().unwrap_or_default()),
         }
     }
 

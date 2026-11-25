@@ -899,6 +899,7 @@ impl KovaView {
                                 bookmark_keys.contains(&cwd) || anchor_keys.contains(&cwd)
                             }),
                         },
+                        paused: pane.is_paused().then(|| pane.paused_title().unwrap_or_default()),
                     });
                 });
 

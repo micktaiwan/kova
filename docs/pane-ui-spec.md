@@ -88,6 +88,7 @@ A view is a list of cards, stacked and scrollable, plus an optional header.
 | `cards` | array, 0 to 50 | yes | Each item: `id` (`[a-z0-9_-]{1,32}`, unique in the view) and `card` (a card document, validated exactly as in decision-cards-spec § 9). The card document
 holds only `version`, `title`, `subtitle`, `blocks`, `actions`, `input`; question fields of
 `kova ask` (id, timeout, asker) are not part of it, so nothing needs ignoring. An empty list shows `title` and "Nothing to decide". |
+| `close_when_empty` | boolean | no (`false`) | When a `ui-update-card` removal or a `ui-update` leaves the view with no card, Kova closes it as `ui-close` would (grants dropped, UI pane closed, a pending `ui-wait` returns) and the reply carries `"closed": true`; no `closed` event is sent. For one-shot lists (drafts to post); a board that lives across passes leaves it off and keeps "Nothing to decide". A view shown with no card stays open. |
 
 Whole document ≤ 512 KiB. Each card keeps its own actions, text field and grant.
 

@@ -88,6 +88,9 @@ pub struct View {
     /// The last session that owned the view: grants and late delivery go there
     /// when Kova cannot tell who runs in the owner pane now.
     pub owner: crate::ask::Asker,
+    /// The document asked for it: removing the last card closes the view.
+    #[serde(default)]
+    pub close_when_empty: bool,
 }
 
 impl View {
@@ -101,6 +104,7 @@ impl View {
             dragged: false,
             opener_uid: None,
             owner,
+            close_when_empty: doc.close_when_empty,
         }
     }
 
@@ -132,6 +136,7 @@ impl View {
         }
         self.title = doc.title;
         self.cards = cards;
+        self.close_when_empty = doc.close_when_empty;
         stale
     }
 
@@ -420,6 +425,7 @@ mod tests {
             version: 1,
             title: "Drafts".into(),
             cards: cards.iter().map(|(id, t)| crate::decision_card::ViewCard { id: id.to_string(), card: card(t) }).collect(),
+            close_when_empty: false,
         }
     }
 

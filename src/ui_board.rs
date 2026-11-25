@@ -181,6 +181,23 @@ impl UiBoard {
         crate::decision_card::validate_view(view, &facts)
     }
 
+    /// Take a view down at the agent's request (`ui-close`, or the last card of
+    /// a `close_when_empty` view removed): its grants go, its UI pane closes,
+    /// a waiting `ui-wait` returns, and no `closed` event is sent.
+    fn close_view(&mut self, host: &dyn UiHost, shown_in: &PaneInfo, current: &View) {
+        let view_id = current.view_id.clone();
+        let ids: Vec<String> = current.cards.iter().map(|c| c.id.clone()).collect();
+        self.drop_grants(&view_id, &ids);
+        self.closed.insert(view_id.clone());
+        host.set_view(shown_in.id, None);
+        if shown_in.ui_pane {
+            host.close_pane(shown_in.id);
+        }
+        if let Some(tx) = self.waiters.remove(&view_id) {
+            let _ = tx.send(ok(None));
+        }
+    }
+
     fn drop_grants(&self, view_id: &str, cards: &[String]) {
         for card in cards {
             crate::decision_card::remove_grant(&self.root, &pane_ui::grant_id(view_id, card));
@@ -241,6 +258,10 @@ impl UiBoard {
                 let stale = current.replace(doc);
                 self.drop_grants(&view_id, &stale);
                 current.owner = owner_asker(&current.owner, Some(&owner), &host.own_socket());
+                if current.close_when_empty && current.cards.is_empty() {
+                    self.close_view(host, &shown_in, &current);
+                    return ok(Some(serde_json::json!({ "closed": true })));
+                }
                 host.set_view(shown_in.id, Some(current));
                 ok(None)
             }
@@ -269,6 +290,10 @@ impl UiBoard {
                     Ok(false) => {}
                 }
                 let version = current.card(&card_id).map(|c| c.version);
+                if current.close_when_empty && current.cards.is_empty() {
+                    self.close_view(host, &shown_in, &current);
+                    return ok(Some(serde_json::json!({ "card_version": version, "closed": true })));
+                }
                 host.set_view(shown_in.id, Some(current));
                 ok(Some(serde_json::json!({ "card_version": version })))
             }
@@ -277,16 +302,7 @@ impl UiBoard {
                     Ok(v) => v,
                     Err(e) => return err(e),
                 };
-                let ids: Vec<String> = current.cards.iter().map(|c| c.id.clone()).collect();
-                self.drop_grants(&view_id, &ids);
-                self.closed.insert(view_id.clone());
-                host.set_view(shown_in.id, None);
-                if shown_in.ui_pane {
-                    host.close_pane(shown_in.id);
-                }
-                if let Some(tx) = self.waiters.remove(&view_id) {
-                    let _ = tx.send(ok(None));
-                }
+                self.close_view(host, &shown_in, &current);
                 ok(None)
             }
             UiOp::Wait { .. } | UiOp::Ack { .. } | UiOp::Unwait { .. } => err("internal: not a command"),
@@ -721,6 +737,28 @@ mod tests {
         assert!(matches!(call(&mut b, &host, 501, UiOp::Close { view_id: id.clone() }), IpcResponse::Ok { .. }));
         assert!(host.view_in(1).is_none());
         assert!(matches!(call(&mut b, &host, 501, UiOp::Close { view_id: id }), IpcResponse::Error { message } if message == "no such view"));
+    }
+
+    #[test]
+    fn close_when_empty_closes_on_the_last_card_only_when_asked() {
+        let host = Fake::with_pane(1, 500, "s1");
+        let mut b = board("empty");
+        let mut v = view(vec![("a", card("A")), ("b", card("B"))]);
+        v["close_when_empty"] = json!(true);
+        let (id, _) = show(&mut b, &host, 501, Placement::DockBottom, v).unwrap();
+        let remove = |b: &mut UiBoard, card: &str| call(b, &host, 501, UiOp::UpdateCard { view_id: id.clone(), card_id: card.into(), card: None });
+        assert!(matches!(remove(&mut b, "a"), IpcResponse::Ok { data: Some(d) } if d.get("closed").is_none()));
+        assert!(host.view_in(1).is_some(), "one card left: the view stays");
+        assert!(matches!(remove(&mut b, "b"), IpcResponse::Ok { data: Some(d) } if d["closed"] == json!(true)));
+        assert!(host.view_in(1).is_none(), "last card removed: the view is gone");
+
+        let (plain, _) = show(&mut b, &host, 501, Placement::DockBottom, view(vec![("a", card("A"))])).unwrap();
+        call(&mut b, &host, 501, UiOp::UpdateCard { view_id: plain, card_id: "a".into(), card: None });
+        assert!(host.view_in(1).is_some(), "without the flag an empty view stays (Nothing to decide)");
+
+        let mut bad = view(vec![]);
+        bad["close_when_empty"] = json!("yes");
+        assert_eq!(show(&mut b, &host, 501, Placement::DockBottom, bad), Err("close_when_empty must be a boolean".into()));
     }
 
     #[test]

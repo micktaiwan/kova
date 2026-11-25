@@ -626,6 +626,9 @@ pub struct ViewDoc {
     pub version: u64,
     pub title: String,
     pub cards: Vec<ViewCard>,
+    /// Close the view once its last card is removed (pane-ui-spec § 2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub close_when_empty: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -645,8 +648,13 @@ pub fn validate_view(view: &Value, asker: &AskerFacts) -> Result<ViewDoc, String
     check_controls(view, "")?;
     let obj = view.as_object().ok_or("view must be an object")?;
     for key in obj.keys() {
-        if !["version", "title", "cards"].contains(&key.as_str()) {
+        if !["version", "title", "cards", "close_when_empty"].contains(&key.as_str()) {
             return Err(format!("unknown field {}", key));
+        }
+    }
+    if let Some(v) = obj.get("close_when_empty") {
+        if !v.is_boolean() {
+            return Err("close_when_empty must be a boolean".into());
         }
     }
     match obj.get("version") {

@@ -662,6 +662,11 @@ pub struct PaneRenderData {
     /// This pane's conversation is bookmarked: its status bar is painted blue,
     /// so a saved conversation is recognisable without opening the switcher.
     pub bookmarked: bool,
+    /// The pane is paused (`Surface::pause`): its agent is gone and only the
+    /// shell is left. `Some(name)` draws a banner over it, so a paused pane is
+    /// never mistaken for an empty one and closed. The name is the one the
+    /// pane had when it was paused, empty when it had none.
+    pub paused: Option<String>,
 }
 
 /// Sub-region of the drawable where a pane is rendered (in pixels).
@@ -4625,6 +4630,7 @@ mod tests {
             last_activity: 0,
             fg_process: None,
             bookmarked: false,
+            paused: None,
             atlas_generation: 0,
         }
     }

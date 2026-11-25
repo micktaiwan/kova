@@ -236,6 +236,7 @@ impl LayerRenderer {
             input_chars: pane.input_chars.clone(),
             custom_title: pane.custom_title.clone(),
             fg_process: pane.fg_process.clone(),
+            paused: pane.paused.clone(),
             ..*pane
         };
 

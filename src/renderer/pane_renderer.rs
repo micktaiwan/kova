@@ -95,6 +95,17 @@ struct PaneVertexEntry {
     zones: Vec<TooltipZone>,
 }
 
+/// Background of the banner over a paused pane (amber-brown, so it reads as
+/// "on hold" against any theme).
+const PAUSED_BAND: [f32; 3] = [0.25, 0.17, 0.05];
+
+/// The two lines of a paused pane's banner: what it is, and how to resume.
+fn paused_banner_lines(name: &str) -> (String, &'static str) {
+    let name = name.trim();
+    let title = if name.is_empty() { "PAUSED".to_string() } else { format!("PAUSED  {name}") };
+    (title, "Cmd+P, then p on this pane, to resume")
+}
+
 /// The band a filter jump leaves for a moment on the line it landed on.
 const JUMP_HIGHLIGHT: [f32; 3] = [1.0, 0.85, 0.3];
 
@@ -118,6 +129,7 @@ pub(super) struct PaneDrawKey {
     pub(super) last_activity: u64,
     pub(super) fg_process: Option<String>,
     pub(super) bookmarked: bool,
+    pub(super) paused: Option<String>,
     pub(super) atlas_generation: u64,
 }
 
@@ -190,6 +202,7 @@ impl PaneRenderer {
             last_activity: t.last_activity_secs.load(std::sync::atomic::Ordering::Relaxed),
             fg_process: pane.fg_process.clone(),
             bookmarked: pane.bookmarked,
+            paused: pane.paused.clone(),
             atlas_generation,
         }
     }
@@ -259,6 +272,9 @@ impl PaneRenderer {
             } else {
                 build.build_loading_vertices(vp)
             };
+            if let Some(name) = pane.paused.as_deref() {
+                build.build_paused_banner(&mut verts, vp, name);
+            }
             // Attention indicator dot on non-focused panes
             if let Some(color) = pane_attention.dot_color() {
                 let dot_x = vp.x + vp.width - cell_w * 2.5;
@@ -847,6 +863,26 @@ impl PaneBuild<'_> {
         }
     }
 
+    /// The banner over a paused pane: the whole pane is veiled and two
+    /// centered lines say it is paused and how to bring it back, so its bare
+    /// shell is not taken for an empty pane and closed.
+    fn build_paused_banner(&mut self, vertices: &mut Vec<Vertex>, vp: &PaneViewport, name: &str) {
+        let (cell_w, cell_h) = self.ctx.cell_size();
+        push_bg_quad_alpha(vertices, vp.x, vp.y, vp.width, vp.height, [0.0, 0.0, 0.0], 0.7);
+        let (title, hint) = paused_banner_lines(name);
+        let band_h = cell_h * 4.0;
+        let band_y = vp.y + (vp.height - band_h) / 2.0;
+        push_bg_quad_alpha(vertices, vp.x, band_y, vp.width, band_h, PAUSED_BAND, 0.95);
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let max_x = vp.x + vp.width - cell_w;
+        for (i, (text, fg)) in [(title.as_str(), [1.0, 0.85, 0.4, 1.0]), (hint, [0.85, 0.85, 0.85, 1.0])].into_iter().enumerate() {
+            let text_w = text.chars().count() as f32 * cell_w;
+            let x = (vp.x + (vp.width - text_w) / 2.0).max(vp.x + cell_w);
+            let y = band_y + cell_h * (1.0 + i as f32);
+            self.ctx.render_status_text(vertices, text, x, y, max_x, fg, no_bg);
+        }
+    }
+
     pub(super) fn build_loading_vertices(&mut self, vp: &PaneViewport) -> Vec<Vertex> {
         let text = "starting...";
         let cell_w = self.ctx.atlas.cell_width;
@@ -964,6 +1000,7 @@ mod tests {
             input_chars: Arc::new(AtomicU64::new(0)),
             fg_process: Some("claude".into()),
             bookmarked: false,
+            paused: None,
         }
     }
 
@@ -1003,6 +1040,29 @@ mod tests {
             .iter()
             .map(|z| (z.x.to_bits(), z.y.to_bits(), z.width.to_bits(), z.height.to_bits(), z.text))
             .collect()
+    }
+
+    #[test]
+    fn a_paused_pane_is_covered_by_its_banner_and_redrawn_when_it_resumes() {
+        let config = Config::default();
+        let mut ctx = context(&config);
+        let style = PaneStyle::from_config(&config);
+        let mut p = pane(terminal(), vp_at(100.0, 30.0));
+        let mut r = PaneRenderer::default();
+        prepare(&mut r, &mut ctx, &style, &p, false);
+        let plain = r.vertices().len();
+        p.paused = Some("Fix the parser".into());
+        let key = PaneRenderer::draw_key(&p, None, None, true, ctx.atlas.generation);
+        assert!(r.key_changed(&key), "pausing a clean pane must rebuild it");
+        prepare(&mut r, &mut ctx, &style, &p, false);
+        let veil = r.vertices().iter().any(|v| {
+            v.position == [100.0, 30.0] && v.bg_color == [0.0, 0.0, 0.0, 0.7]
+        });
+        assert!(veil, "the whole pane is veiled");
+        assert!(r.vertices().len() > plain + 12, "veil, band and text are drawn");
+        p.paused = None;
+        prepare(&mut r, &mut ctx, &style, &p, false);
+        assert_eq!(r.vertices().len(), plain, "resumed: the banner is gone");
     }
 
     #[test]
@@ -1166,5 +1226,18 @@ mod tests {
         let mut faded = PaneRenderer::default();
         prepare(&mut faded, &mut ctx, &style, &p, true);
         assert_ne!(bits(faded.vertices()), bits(plain.vertices()), "asked: the glyphs fade");
+    }
+}
+
+#[cfg(test)]
+mod paused_banner_tests {
+    use super::paused_banner_lines;
+
+    #[test]
+    fn a_paused_pane_names_itself_and_says_how_to_resume() {
+        let (title, hint) = paused_banner_lines("  Fix the parser ");
+        assert_eq!(title, "PAUSED  Fix the parser");
+        assert!(hint.contains("Cmd+P") && hint.contains("resume"), "{hint}");
+        assert_eq!(paused_banner_lines("").0, "PAUSED", "no name: the word alone");
     }
 }

@@ -460,6 +460,7 @@ kova ui card <view_id> <card_id> --card c.json   # replace a card after acting o
 kova ui update <view_id> --view view.json     # replace the whole view
 kova ui close <view_id>
 ```
+A view whose document has `"close_when_empty": true` closes itself when its last card is removed (by `kova ui card … --remove` or a `kova ui update` with no cards; the reply carries `"closed": true`, no `closed` event follows). Without it an empty view stays on "Nothing to decide": right for a board that lives across passes, wrong for a one-shot list of drafts.
 `kova ui close` answers "no such view" when the user already closed it: harmless, the view is gone, do not retry. A grant attached to a card dies with its card or view, so launch the send the click authorizes before removing or closing anything.
 
 
