@@ -1347,6 +1347,12 @@ impl Tab {
         self.insert_column_at(at, new_pane)
     }
 
+    /// Insert a new column at the far left: a pane carried in from the next
+    /// tab lands first in this one's order.
+    pub fn prepend_column(&mut self, new_pane: Pane) -> PaneId {
+        self.insert_column_at(0, new_pane)
+    }
+
     /// The one place a column enters the layout: its weight and its
     /// custom-weight flag enter with it, so no caller can forget them.
     fn insert_column_at(&mut self, at: usize, new_pane: Pane) -> PaneId {

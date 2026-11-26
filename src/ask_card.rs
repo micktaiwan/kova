@@ -33,7 +33,7 @@ use objc2_app_kit::{
     NSEventModifierFlags, NSFloatingWindowLevel, NSFocusRingType, NSFont, NSFontWeightBold,
     NSFontWeightRegular, NSFontWeightSemibold, NSLayoutAttribute, NSLayoutConstraint,
     NSLayoutConstraintOrientation, NSLayoutManager, NSLayoutPriorityRequired, NSLineBreakMode,
-    NSControlSize, NSPanel, NSRequestUserAttentionType, NSResponder, NSScreen, NSScrollView, NSScroller, NSSound,
+    NSControlSize, NSPanel, NSPopUpButton, NSRequestUserAttentionType, NSResponder, NSScreen, NSScrollView, NSScroller, NSSound,
     NSStackView,
     NSStringDrawingOptions, NSTextAlignment, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
     NSTextViewDelegate,
@@ -117,6 +117,8 @@ const MIN_BLOCKS: CGFloat = 60.0;
 static ANSWERS: Mutex<Vec<CardAnswer>> = Mutex::new(Vec::new());
 /// ‹ (-1) and › (+1) presses since the last [`take_browse`].
 static BROWSE: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+/// "Not now" pressed since the last [`take_snooze`]: the pause asked, in seconds.
+static SNOOZE: Mutex<Option<u64>> = Mutex::new(None);
 
 thread_local! {
     /// The card, built on the first `show`. Kept for the life of the process:
@@ -225,6 +227,18 @@ define_class!(
         #[unsafe(method(previous:))]
         fn previous(&self, _sender: &NSButton) {
             browse(-1);
+        }
+
+        /// "Not now": every card waits for the duration picked next to it.
+        #[unsafe(method(snooze:))]
+        fn snooze(&self, _sender: &NSButton) {
+            let Some(card) = card() else { return };
+            let index = usize::try_from(card.snooze_for.indexOfSelectedItem()).unwrap_or(0);
+            let (seconds, label) = crate::ask::DND_CHOICES.get(index).copied().unwrap_or(crate::ask::DND_CHOICES[0]);
+            log::info!("Ask card: not now, for {}", label);
+            if let Ok(mut snooze) = SNOOZE.lock() {
+                *snooze = Some(seconds);
+            }
         }
 
         #[unsafe(method(next:))]
@@ -379,6 +393,8 @@ struct Card {
     /// answer gets longer.
     field_height: Retained<NSLayoutConstraint>,
     buttons: Retained<NSStackView>,
+    /// The pause "Not now" asks for (`crate::ask::DND_CHOICES`).
+    snooze_for: Retained<NSPopUpButton>,
     width: Retained<NSLayoutConstraint>,
     line_height: CGFloat,
     current: RefCell<Option<Current>>,
@@ -623,11 +639,28 @@ impl Card {
         buttons.setAlignment(NSLayoutAttribute::Trailing);
         buttons.setSpacing(BUTTON_SPACING);
         let footer_spacer = NSView::new(mtm);
+        // Bottom-left: "Not now" hides every card for the duration picked
+        // beside it; they all come back, unanswered, when it ends.
+        let snooze = unsafe {
+            NSButton::buttonWithTitle_target_action(&ns("Not now"), Some(&target), Some(sel!(snooze:)), mtm)
+        };
+        snooze.setBordered(false);
+        snooze.setAttributedTitle(&attributed("Not now", &NSFont::systemFontOfSize(12.0), &NSColor::secondaryLabelColor()));
+        snooze.setToolTip(Some(&ns("Hide every card for the time picked; they come back unanswered")));
+        let snooze_for = NSPopUpButton::new(mtm);
+        for (_, label) in crate::ask::DND_CHOICES {
+            snooze_for.addItemWithTitle(&ns(label));
+        }
+        snooze_for.selectItemAtIndex(0);
+        snooze_for.setControlSize(NSControlSize::Small);
+        snooze_for.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         let footer = NSStackView::stackViewWithViews(
-            &NSArray::from_slice(&[&*footer_spacer, buttons.as_ref()]),
+            &NSArray::from_slice(&[snooze.as_ref(), snooze_for.as_ref(), &*footer_spacer, buttons.as_ref()]),
             mtm,
         );
         footer.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+        footer.setAlignment(NSLayoutAttribute::Bottom);
+        footer.setSpacing(4.0);
 
         let stack = NSStackView::stackViewWithViews(
             &NSArray::from_slice(&[
@@ -703,6 +736,7 @@ impl Card {
             field_box,
             field_height,
             buttons,
+            snooze_for,
             width,
             line_height,
             current: RefCell::new(None),
@@ -1146,6 +1180,32 @@ pub fn show(mtm: MainThreadMarker, question: Option<&CardQuestion>, total: usize
             }
         }
     }
+}
+
+/// The cards are paused: hide the card, keep what was typed on each question
+/// for when it comes back, and leave the Dock badge counting what waits.
+pub fn pause(mtm: MainThreadMarker, total: usize) {
+    let count = (total > 0).then_some(total);
+    if BADGE.with(|b| b.replace(count)) != count {
+        let label = count.map(|n| ns(&n.to_string()));
+        NSApplication::sharedApplication(mtm).dockTile().setBadgeLabel(label.as_deref());
+    }
+    if let Some(card) = card() {
+        // The field of the question shown is saved like a browse away from it.
+        if let Some(id) = card.current.borrow().as_ref().map(|c| c.id.clone()) {
+            let text = card.field.stringValue().to_string();
+            if !text.is_empty() {
+                card.drafts.borrow_mut().insert(id, text);
+            }
+        }
+        card.snooze_for.selectItemAtIndex(0);
+        card.hide();
+    }
+}
+
+/// The pause "Not now" asked since the last call, in seconds.
+pub fn take_snooze() -> Option<u64> {
+    SNOOZE.lock().ok().and_then(|mut s| s.take())
 }
 
 /// Answers given since the last call (button clicked, Return, ⌘Return).

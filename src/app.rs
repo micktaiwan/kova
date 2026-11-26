@@ -330,6 +330,22 @@ impl AppDelegate {
                                     });
                                     continue;
                                 }
+                                if let crate::ipc::IpcCommand::AskDnd { minutes } = cmd {
+                                    let mut asks = ivars.asks.borrow_mut();
+                                    let now = crate::ask::now_secs();
+                                    match minutes {
+                                        Some(0) => asks.set_pause(None),
+                                        Some(m) => asks.set_pause(Some(now + m * 60)),
+                                        None => {}
+                                    }
+                                    let _ = responder.send(crate::ipc::IpcResponse::Ok {
+                                        data: Some(serde_json::json!({
+                                            "paused_until": asks.paused_at(now),
+                                            "waiting": asks.questions().len(),
+                                        })),
+                                    });
+                                    continue;
+                                }
                                 if let crate::ipc::IpcCommand::WithdrawAsks { session_id } = cmd {
                                     let withdrawn = ivars.asks.borrow_mut().withdraw(&session_id);
                                     let _ = responder.send(crate::ipc::IpcResponse::Ok {
@@ -919,6 +935,7 @@ fn handle_ipc_command_sync(
         // lost in a refactor.
         IpcCommand::Ask(_)
         | IpcCommand::ListAsks
+        | IpcCommand::AskDnd { .. }
         | IpcCommand::AnswerAsk { .. }
         | IpcCommand::WithdrawAsks { .. }
         | IpcCommand::UpdateAsk { .. }

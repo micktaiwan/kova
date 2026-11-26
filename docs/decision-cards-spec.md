@@ -213,6 +213,16 @@ The counter and the arrows apply to plain questions too. That is a visible chang
 card, intended and unconditional (no flag), to be written in `docs/ipc.md` § `ask` along with the
 rest of this spec.
 
+### 6.1 Not now
+
+The card's footer carries, bottom-left, a "Not now" button and a select (20 min, the default;
+1 h; 3 h). "Not now" answers nothing: it pauses **every** card for the duration picked, the card
+disappears, and the whole queue comes back, unanswered and with any typed text kept, when the
+pause ends. The Dock badge keeps counting what waits. `kova ask --dnd` reads, sets or ends the
+pause (`docs/ipc.md` § `ask-dnd`); a `kova ask` during the pause exits 4 at once, its question
+queued and its answer delivered late. An agent that is about to start work ending on a card reads
+`kova ask --dnd` first: exit 4 means the user is not available, keep it for later.
+
 ## 7. Updating and withdrawing a card
 
 New socket command:

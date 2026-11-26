@@ -419,6 +419,33 @@ Kova.app only: a library host answers `command not supported by this host`.
 
 ---
 
+### `ask-dnd` — pause the cards ("Not now")
+
+```json
+{ "cmd": "ask-dnd" }
+{ "cmd": "ask-dnd", "minutes": 20 }
+{ "cmd": "ask-dnd", "minutes": 0 }
+```
+
+Without `minutes`, reads; with it, pauses the cards for that many minutes from
+now (1 to 1440), or ends the pause (`0`). The card's own "Not now" button, with
+its 20 min / 1 h / 3 h choice, does the same. Response:
+`{"ok":true,"data":{"paused_until":1764160800,"waiting":3}}`, `paused_until`
+being `null` when no pause runs.
+
+While paused, no card shows and the Dock badge keeps counting what waits. Every
+question stays in the queue and all come back, unanswered, when the pause ends.
+An `ask` that arrives then, and every `ask` still waiting when the pause starts,
+is answered at once with the error `paused until <epoch seconds>` when its asker
+can receive a late answer (it has a session id); its question stays queued and
+its answer is delivered late, as after a timeout. An asker without a session id
+keeps waiting, since letting it go would lose the answer. The pause is kept on
+disk (`~/.config/kova/ask/paused-until`) and survives a restart.
+
+Kova.app only: a library host answers `command not supported by this host`.
+
+---
+
 ### `answer-ask` — answer a pending question as if on the card
 
 ```json

@@ -266,7 +266,7 @@ focused pane also emits a `focus` event with `reason: "session"`.
 A subject is a named group of panes inside one tab, drawn in `Cmd+P` as a box under its name
 (`Cmd+→` files the selected pane, `Cmd+←` takes it out), and on screen as a colored band naming it
 over its panes, in a strip under the tab bar (only in a tab where a pane is filed: it costs a row). Each pane of `list-panes` carries
-`subject` (its name, or `null`). `list-subjects` answers one entry per subject: `tab_id`,
+`subject` (its name, or `null`). `list-subjects` answers `.data` as a bare array (not `.data.subjects`; `jq '.data.subjects'` fails with "Cannot index array"), one entry per subject: `tab_id`,
 `window`, `tab_index`, `name`, `color` (tab palette index, drawn at random at creation, then kept),
 `pane_ids`, in the order `Cmd+P` draws the boxes (the user changes a color by right-clicking the band
 or pressing `c` on the header in `Cmd+P`; `n` on the header or on a member opens a new pane in that
@@ -372,8 +372,17 @@ action, or `action: text` when the user typed something.
   `kova ask --withdraw --session -`). Their message is the answer: end your turn. The card stays,
   greyed note and a `Dismiss` button added; if they still click an answer there, it arrives later
   as a `[Kova] The user answered your question` message, like a late answer.
+- Exit 4: the user paused the cards ("Not now" on a card: 20 min, 1 h or 3 h, or
+  `kova ask --dnd`). They are not available: do not disturb them. Your question is kept and shows
+  when the pause ends; its answer arrives later as a `[Kova] The user answered your question`
+  message. Do not ask again, do not fall back to asking in your text: end your turn.
 - Exit 1: an error, or Kova quit while you waited (the question comes back at the next launch). If
   the message says the running Kova "predates `ask`", it learns the command at its next launch.
+- **Check the pause before work that would end on a card**: `kova ask --dnd` prints
+  `paused until HH:MM (N question(s) waiting)` and exits 4 while the user paused the cards,
+  `not paused …` and exit 0 otherwise. Paused = not the moment: keep the decision for later rather
+  than preparing a card nobody will see. Only the user pauses: never set or end the pause yourself
+  (`kova ask --dnd 20`, `--dnd off`) unless they ask.
 - **Outside a Claude Code conversation there is no default timeout and no late delivery.** Only a
   `CLAUDE_CODE_SESSION_ID` lets Kova deliver an answer later; a script, or a harness that does not
   export it, leaves the wait unlimited, so the call is killed by whatever wraps it: no exit code,
@@ -411,6 +420,7 @@ When the user needs context to decide (who asked, the thread, the exact draft) a
 kova ask --card card.json            # or: kova ask --card - < card.json ; Bash timeout 600000
 kova ask --update <question id> --card card.json   # replace your card; its version goes up
 kova ask --withdraw-id <question id>               # take one question back
+kova ask --dnd                                     # is the user paused? exit 4 = yes, not now
 ```
 
 - The card is JSON: `version` 1, `title` (≤ 120 chars), optional `subtitle`, `blocks` (1–20:
@@ -437,7 +447,7 @@ kova ask --withdraw-id <question id>               # take one question back
   the block lacks), put that file's bytes as is in the `code` block, and declare on the action
   `"grant": {"kind": "outbound", "target": "slack:<channel>/<thread_ts or ->",
   "payload_sha256": "<sha256 of the file>", "payload_block": <0-based index of the code block in `blocks`>}`
-  (the first block is 0; a 1-based count is refused `payload_block out of range`). Kova
+  (the index counts every entry of `blocks`, `context` and `fields` included, and the first block is 0; a 1-based count is refused `payload_block out of range`). Kova
   refuses the card if the hash does not match the block. Only a click (or ⌘Return) grants, and the
   grant authorizes the payload block **as the user left it**: on that answer, send the block's file
   from the answer (path and `sha256` there; your own file only matches when the text is unchanged)

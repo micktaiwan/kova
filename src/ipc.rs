@@ -195,6 +195,9 @@ pub enum IpcCommand {
     /// The questions still waiting on this Kova's card, oldest first (a remote
     /// client shows them on a phone). Served on the main thread from the `Board`.
     ListAsks,
+    /// Read the pause of the cards ("Not now"), or set it: `minutes` from now,
+    /// 0 ends it. Served on the main thread from the `Board`.
+    AskDnd { minutes: Option<u64> },
     /// Answer a pending question from elsewhere than the card (a remote client): the same
     /// `Board` path as a click, so the asker gets it the same way. `action`
     /// and `text` are checked against the question there, not here.
@@ -752,6 +755,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "subscribe" => &["events"],
         "ask" => &["question"],
         "list-asks" => &[],
+        "ask-dnd" => &["minutes"],
         "answer-ask" => &["id", "action", "text"],
         "list-ui-views" => &[],
         "answer-ui" => &["view_id", "card_id", "action", "text", "card_version"],
@@ -1309,6 +1313,13 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             Ok(IpcCommand::Ask(Box::new(question)))
         }
         "list-asks" => Ok(IpcCommand::ListAsks),
+        "ask-dnd" => match v.get("minutes") {
+            None | Some(serde_json::Value::Null) => Ok(IpcCommand::AskDnd { minutes: None }),
+            Some(m) => match m.as_u64() {
+                Some(m) if m <= 24 * 60 => Ok(IpcCommand::AskDnd { minutes: Some(m) }),
+                _ => Err("\"minutes\" must be a number of minutes from 0 (end the pause) to 1440".to_string()),
+            },
+        },
         "list-ui-views" => Ok(IpcCommand::ListUiViews),
         "answer-ui" => {
             let field = |key: &str| -> Result<Option<String>, String> {
@@ -2085,6 +2096,17 @@ mod tests {
             Ok(IpcCommand::ClearAnchors)
         ));
         assert!(parse_command(r#"{"cmd":"clear-anchors","all":true}"#).is_err());
+    }
+
+    #[test]
+    fn ask_dnd_reads_or_sets_the_pause() {
+        assert!(matches!(parse_command(r#"{"cmd":"ask-dnd"}"#), Ok(IpcCommand::AskDnd { minutes: None })));
+        assert!(matches!(parse_command(r#"{"cmd":"ask-dnd","minutes":20}"#), Ok(IpcCommand::AskDnd { minutes: Some(20) })));
+        assert!(matches!(parse_command(r#"{"cmd":"ask-dnd","minutes":0}"#), Ok(IpcCommand::AskDnd { minutes: Some(0) })));
+        assert!(parse_command(r#"{"cmd":"ask-dnd","minutes":-5}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"ask-dnd","minutes":"20"}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"ask-dnd","minutes":5000}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"ask-dnd","pane_id":1}"#).is_err());
     }
 
     #[test]

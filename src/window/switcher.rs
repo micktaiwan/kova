@@ -331,32 +331,77 @@ pub(super) fn new_pane_anchor(
 }
 
 /// What Cmd+Up/Down does to the pane at `p` in a tab with subjects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SubjectMove {
-    /// Nothing to do: the edge of the tab, or of the pane's box.
+    /// Nothing to do: the edge of the pane's box.
     Stay,
     /// Trade places with the pane at this index: the previous or next member
     /// of the same subject.
     Swap(usize),
     /// Step this many times in the direction asked (`Tab::move_pane_in_order`).
     Steps(usize),
+    /// File the pane under the empty box drawn right above it. Nothing moves
+    /// on screen. `subjects` is the tab's subject list in its new order, when
+    /// the box the pane leaves becomes empty and has to go back up.
+    Enter { name: String, subjects: Option<Vec<String>> },
+    /// A pane outside any box at the first or last line of its tab: the
+    /// gesture carries it on to the neighbouring tab.
+    Edge,
 }
 
 /// Cmd+Up/Down with subjects. A pane in a subject moves among its members only,
 /// and stops at the edge of its box (leaving it is Cmd+Left). A pane outside
-/// moves one line of the list, and a box in the way is jumped over whole. The
-/// empty boxes at the top are not places in the layout: a pane stops under
-/// them, at the first position, as it always did.
+/// moves one line of the list, and a box in the way is jumped over whole.
 ///
-/// Without any subject this is exactly one step, as before subjects existed.
+/// The empty boxes at the top are not places in the layout, so moving up into
+/// one files the pane under it (`Enter`): a pane outside any box enters the
+/// last empty box, and the first member of the box right under the empty ones
+/// climbs on into the next. A pane alone in its box empties it as it climbs:
+/// that box goes back to the top of the empty ones, so the next press reaches
+/// the box drawn above and never the one just left.
+///
+/// A pane outside any box at either end of its tab gets `Edge`. Without any
+/// subject this is one step, or `Edge` at the ends, as before subjects existed.
 pub(super) fn subject_move(subjects: &[String], panes: &[Option<String>], p: usize, forward: bool) -> SubjectMove {
     let Some(own) = panes.get(p) else { return SubjectMove::Stay };
+    let outline = subject_outline(subjects, panes);
     if let Some(name) = own.as_deref() {
         let same = |j: &usize| panes[*j].as_deref() == Some(name);
         let other = if forward { (p + 1..panes.len()).find(same) } else { (0..p).rev().find(same) };
-        return other.map_or(SubjectMove::Stay, SubjectMove::Swap);
+        if let Some(q) = other {
+            return SubjectMove::Swap(q);
+        }
+        if forward {
+            return SubjectMove::Stay;
+        }
+        // The first member: climb into the empty box right above the header.
+        let Some(header) = outline
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Subject { name: n, .. } if n == name))
+        else {
+            return SubjectMove::Stay;
+        };
+        let Some(OutlineItem::Subject { name: above, empty: true }) = header.checked_sub(1).and_then(|i| outline.get(i))
+        else {
+            return SubjectMove::Stay;
+        };
+        let alone = panes.iter().filter(|s| s.as_deref() == Some(name)).count() == 1;
+        let reordered = if alone {
+            // `name` empties and `above` fills: `name` goes before the first
+            // box still empty, so it is drawn at the top of the empty ones.
+            let mut list: Vec<String> = subjects.iter().filter(|s| *s != name).cloned().collect();
+            let filed = |s: &str| panes.iter().any(|x| x.as_deref() == Some(s));
+            list.iter()
+                .position(|s| s != above && !filed(s))
+                .map(|at| {
+                    list.insert(at, name.to_string());
+                    list
+                })
+        } else {
+            None
+        };
+        return SubjectMove::Enter { name: above.clone(), subjects: reordered };
     }
-    let outline = subject_outline(subjects, panes);
     let Some(pos) = outline.iter().position(|it| matches!(it, OutlineItem::Pane { index, .. } if *index == p)) else {
         return SubjectMove::Stay;
     };
@@ -367,12 +412,15 @@ pub(super) fn subject_move(subjects: &[String], panes: &[Option<String>], p: usi
         match outline.get(pos + 1) {
             Some(OutlineItem::Pane { index, subject: None, .. }) => Some(*index),
             Some(OutlineItem::Pane { subject: Some(name), .. } | OutlineItem::Subject { name, .. }) => members(name).last().copied(),
-            None => None,
+            None => return SubjectMove::Edge,
         }
     } else {
         match pos.checked_sub(1).and_then(|i| outline.get(i)) {
             Some(OutlineItem::Pane { index, subject: None, .. }) => Some(*index),
-            Some(OutlineItem::Subject { empty: true, .. }) | None => None,
+            Some(OutlineItem::Subject { name, empty: true }) => {
+                return SubjectMove::Enter { name: name.clone(), subjects: None };
+            }
+            None => return SubjectMove::Edge,
             Some(OutlineItem::Pane { subject: Some(name), .. } | OutlineItem::Subject { name, .. }) => members(name).first().copied(),
         }
     };
@@ -1375,7 +1423,7 @@ impl KovaView {
             if let Some((tab, name)) = self.pane_switcher_selected_subject() {
                 self.pane_switcher_move_subject(tab, &name, keycode == 0x7D);
             } else {
-                self.pane_switcher_move_selected(keycode == 0x7D);
+                self.pane_switcher_move_selected(keycode == 0x7D, event.isARepeat());
             }
             return;
         }
@@ -1729,15 +1777,22 @@ impl KovaView {
     ///
     /// With subjects, a step is one line of the list (`subject_move`): a pane
     /// in a box trades places with the previous or next member, a pane outside
-    /// jumps over a whole box. Without any, it is one step of the tab's order.
+    /// jumps over a whole box, and moving up into an empty box files the pane
+    /// under it. Without any, it is one step of the tab's order.
+    ///
+    /// Past the first or last line of its tab, a pane outside any box goes on
+    /// to the neighbouring tab (`move_pane_to_neighbour_tab`). Both that and
+    /// entering an empty box take a fresh press: a held key stops under the
+    /// empty boxes and at the edge, so holding Cmd+Up to bring a pane to the
+    /// top of its tab never files it or throws it into another tab.
     ///
     /// The overlay is rebuilt afterwards rather than patched in place — the
     /// list is a snapshot of the panes, and the tab groups it packs into
     /// columns depend on the order — then the selection is put back on the pane
     /// that moved, wherever the rebuild landed it.
-    fn pane_switcher_move_selected(&self, forward: bool) {
+    fn pane_switcher_move_selected(&self, forward: bool, repeat: bool) {
         let Some(pane_id) = self.pane_switcher_selected_pane() else { return };
-        let moved = {
+        let (moved, edge) = {
             let mut tabs = self.ivars().tabs.borrow_mut();
             match tabs.iter_mut().find(|t| t.pane(pane_id).is_some()) {
                 Some(tab) => {
@@ -1745,8 +1800,20 @@ impl KovaView {
                     let subjects: Vec<Option<String>> = order.iter().map(|(_, s)| s.clone()).collect();
                     let p = order.iter().position(|(id, _)| *id == pane_id).unwrap_or(0);
                     match subject_move(&tab.subjects, &subjects, p, forward) {
-                        SubjectMove::Stay => false,
-                        SubjectMove::Swap(q) => tab.swap_pane_positions(pane_id, order[q].0),
+                        SubjectMove::Stay => (false, false),
+                        SubjectMove::Edge => (false, true),
+                        SubjectMove::Swap(q) => (tab.swap_pane_positions(pane_id, order[q].0), false),
+                        // A held key stops under the empty boxes, as at the edge.
+                        SubjectMove::Enter { .. } if repeat => (false, false),
+                        SubjectMove::Enter { name, subjects } => {
+                            if let Some(list) = subjects {
+                                tab.subjects = list;
+                            }
+                            file_under_subject(tab, pane_id, &name);
+                            // Nothing moved on screen: only the list changes.
+                            self.pane_switcher_reselect_after(pane_id, false);
+                            return;
+                        }
                         SubjectMove::Steps(n) => {
                             let mut moved = false;
                             for _ in 0..n {
@@ -1755,18 +1822,86 @@ impl KovaView {
                                 }
                                 moved = true;
                             }
-                            moved
+                            (moved, false)
                         }
                     }
                 }
-                None => false,
+                None => (false, false),
             }
         };
+        if edge && !repeat {
+            match self.move_pane_to_neighbour_tab(pane_id, forward) {
+                Ok(Some(name)) => {
+                    self.set_transient_status(&format!("Moved pane to tab {}", name));
+                    self.pane_switcher_reselect_after(pane_id, true);
+                }
+                Ok(None) => {}
+                Err(why) => self.set_transient_status(why),
+            }
+            return;
+        }
         if !moved {
             return;
         }
-        self.resize_all_panes();
+        self.pane_switcher_reselect_after(pane_id, true);
+    }
+
+    /// Put the selection back on `pane_id` once the list changed under it,
+    /// after laying the panes out again when they moved on screen.
+    fn pane_switcher_reselect_after(&self, pane_id: PaneId, layout_moved: bool) {
+        if layout_moved {
+            self.resize_all_panes();
+        }
         self.pane_switcher_reselect(pane_id);
+    }
+
+    /// Carry `pane_id` out of its tab into the tab before it (`forward` false)
+    /// or after it, in this window: it lands as the last column of the tab
+    /// before, or the first column of the tab after, so in Cmd+P it is the line
+    /// right across the tab boundary. It leaves its subject behind, like any
+    /// pane changing tab. Returns the title of the tab it reached, `None` when
+    /// there is no tab on that side.
+    ///
+    /// The only pane of a tab is refused: moving it would close the tab and
+    /// lose its title and its empty subjects without a word. Merging the whole
+    /// tab is its own gesture.
+    fn move_pane_to_neighbour_tab(&self, pane_id: PaneId, forward: bool) -> Result<Option<String>, &'static str> {
+        let full = self.drawable_viewport();
+        let min_w = self.min_split_width_px();
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let Some(src) = tabs.iter().position(|t| t.pane(pane_id).is_some()) else { return Ok(None) };
+        let Some(dst) = (if forward { Some(src + 1) } else { src.checked_sub(1) }).filter(|&d| d < tabs.len()) else {
+            return Ok(None);
+        };
+        if tabs[src].is_single_pane() {
+            return Err("The only pane of its tab: merge the tab instead (Cmd+Ctrl+M)");
+        }
+        let old_columns = tabs[src].num_visible_columns();
+        let Some(pane) = tabs[src].extract_pane(pane_id) else { return Ok(None) };
+        let was_minimized = tabs[src].minimized_stack.contains(&pane_id);
+        tabs[src].minimized_stack.retain(|&id| id != pane_id);
+        if tabs[src].focused_pane == pane_id {
+            tabs[src].focused_pane = tabs[src].first_pane().id;
+        }
+        let new_columns = tabs[src].num_visible_columns();
+        tabs[src].scale_virtual_width(old_columns, new_columns);
+        tabs[src].clamp_scroll(full.width, min_w);
+        let target = &mut tabs[dst];
+        let old_columns = target.num_visible_columns();
+        if forward {
+            target.prepend_column(pane);
+        } else {
+            target.append_column(pane);
+        }
+        if was_minimized {
+            target.minimized_stack.push(pane_id);
+        }
+        let new_columns = target.num_visible_columns();
+        target.scale_virtual_width(old_columns, new_columns);
+        target.clamp_scroll(full.width, min_w);
+        let title = target.title();
+        log::info!("pane switcher: moved pane {} from tab {} to tab {}", pane_id, src, dst);
+        Ok(Some(title))
     }
 
     /// Cmd+Right: file the selected pane under the subject drawn right above
@@ -2847,8 +2982,8 @@ mod tests {
         let panes = subs(&[None, None, None]);
         assert_eq!(subject_move(&[], &panes, 1, true), SubjectMove::Steps(1));
         assert_eq!(subject_move(&[], &panes, 1, false), SubjectMove::Steps(1));
-        assert_eq!(subject_move(&[], &panes, 0, false), SubjectMove::Stay);
-        assert_eq!(subject_move(&[], &panes, 2, true), SubjectMove::Stay);
+        assert_eq!(subject_move(&[], &panes, 0, false), SubjectMove::Edge, "on to the tab before");
+        assert_eq!(subject_move(&[], &panes, 2, true), SubjectMove::Edge, "on to the tab after");
     }
 
     #[test]
@@ -2913,10 +3048,54 @@ mod tests {
     }
 
     #[test]
-    fn empty_subjects_at_the_top_are_not_a_place_to_move_to() {
+    fn moving_up_into_an_empty_box_files_the_pane_under_it() {
         let subjects = names(&["idle"]);
         let panes = subs(&[None, None]);
-        assert_eq!(subject_move(&subjects, &panes, 0, false), SubjectMove::Stay);
+        assert_eq!(
+            subject_move(&subjects, &panes, 0, false),
+            SubjectMove::Enter { name: "idle".into(), subjects: None }
+        );
         assert_eq!(subject_move(&subjects, &panes, 1, false), SubjectMove::Steps(1));
+    }
+
+    #[test]
+    fn a_pane_climbs_through_the_empty_boxes_one_per_press() {
+        // [api] [l3m] [mcp] (empty), then a lone pane: three presses reach api.
+        let mut subjects = names(&["api", "l3m", "mcp"]);
+        let mut pane = subs(&[None, None]);
+        let mut reached = Vec::new();
+        for _ in 0..3 {
+            match subject_move(&subjects, &pane, 0, false) {
+                SubjectMove::Enter { name, subjects: list } => {
+                    if let Some(list) = list {
+                        subjects = list;
+                    }
+                    pane[0] = Some(name.clone());
+                    reached.push(name);
+                }
+                other => panic!("expected to enter a box, got {:?}", other),
+            }
+        }
+        assert_eq!(reached, ["mcp", "l3m", "api"], "each press enters the box drawn right above");
+    }
+
+    #[test]
+    fn the_first_member_of_a_shared_box_climbs_without_reordering() {
+        let subjects = names(&["idle", "a"]);
+        let panes = subs(&[Some("a"), Some("a")]);
+        assert_eq!(
+            subject_move(&subjects, &panes, 0, false),
+            SubjectMove::Enter { name: "idle".into(), subjects: None }
+        );
+        assert_eq!(subject_move(&subjects, &panes, 1, false), SubjectMove::Swap(0));
+    }
+
+    #[test]
+    fn a_box_not_under_the_empty_ones_still_stops_its_members() {
+        let subjects = names(&["idle", "a"]);
+        let panes = subs(&[None, Some("a")]);
+        assert_eq!(subject_move(&subjects, &panes, 1, false), SubjectMove::Stay, "leaving is Cmd+Left");
+        assert_eq!(subject_move(&subjects, &panes, 1, true), SubjectMove::Stay, "a box never crosses a tab");
+        assert_eq!(subject_move(&subjects, &panes, 0, true), SubjectMove::Steps(1));
     }
 }

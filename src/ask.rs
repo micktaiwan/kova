@@ -168,6 +168,55 @@ pub const DISMISS: &str = "Dismiss";
 /// The line a superseded card shows above the question.
 pub const SUPERSEDED_NOTE: &str = "You wrote in the conversation since. Answer here anyway, or dismiss.";
 
+/// The pauses the card's "Not now" offers, in seconds with their label; the
+/// first is the default.
+pub const DND_CHOICES: [(u64, &str); 3] = [(20 * 60, "20 min"), (60 * 60, "1 h"), (3 * 60 * 60, "3 h")];
+
+/// The error a `kova ask` receives while the user paused the cards: followed by
+/// the epoch second the pause ends at. Its question is kept and shows then.
+pub const PAUSED_PREFIX: &str = "paused until ";
+
+/// The error line for a pause ending at `until`.
+pub fn paused_error(until: u64) -> String {
+    format!("{}{}", PAUSED_PREFIX, until)
+}
+
+/// The end of the pause an error line announces, if it is one.
+pub fn paused_until_of(error: &str) -> Option<u64> {
+    error.strip_prefix(PAUSED_PREFIX)?.trim().parse().ok()
+}
+
+/// `kova ask --dnd <value>`: `off` (or 0) ends the pause, `<n>m`, `<n>h` or a
+/// bare number of minutes sets one. Returns minutes, 0 for off; at most a day.
+pub fn parse_dnd_minutes(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim().to_ascii_lowercase();
+    if raw == "off" {
+        return Ok(0);
+    }
+    let (digits, factor) = match raw.strip_suffix('h') {
+        Some(d) => (d, 60),
+        None => (raw.strip_suffix("min").or_else(|| raw.strip_suffix('m')).unwrap_or(&raw), 1),
+    };
+    let minutes = digits
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(factor))
+        .ok_or_else(|| format!("kova ask: --dnd takes off, minutes (20, 20m) or hours (1h), got '{}'", raw))?;
+    if minutes > 24 * 60 {
+        return Err("kova ask: --dnd pauses for a day at most".to_string());
+    }
+    Ok(minutes)
+}
+
+/// `until` (epoch seconds) as the local `HH:MM`.
+pub fn local_hhmm(until: u64) -> String {
+    let t = until as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
 impl Question {
     /// The buttons the card shows.
     pub fn buttons(&self) -> Vec<String> {
@@ -639,6 +688,27 @@ impl AskStore {
     pub fn undelivered(&self) -> Vec<Undelivered> {
         read(&self.deliveries())
     }
+
+    /// The pause of the cards (`Board::set_pause`), kept across a restart: the
+    /// epoch second it ends at, in a file of its own. `None` removes it.
+    pub fn save_pause(&self, until: Option<u64>) {
+        let path = self.root.join("paused-until");
+        match until {
+            Some(until) => {
+                let _ = std::fs::create_dir_all(&self.root);
+                if let Err(e) = std::fs::write(&path, until.to_string()) {
+                    log::warn!("ask: cannot save the pause in {}: {}", path.display(), e);
+                }
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    pub fn load_pause(&self) -> Option<u64> {
+        std::fs::read_to_string(self.root.join("paused-until")).ok()?.trim().parse().ok()
+    }
 }
 
 fn write<T: Serialize>(dir: &Path, id: &str, value: &T) {
@@ -1081,6 +1151,9 @@ pub struct Board {
     shown: Option<(String, usize)>,
     /// A red line on a question's card: its grant could not be written.
     error: Option<(String, String)>,
+    /// The user said "Not now": until this epoch second no card shows, the
+    /// questions wait in the queue, and a `kova ask` gets [`PAUSED_PREFIX`].
+    paused_until: Option<u64>,
 }
 
 /// What set off an answer: grant actions only answer a real click or ⌘Return.
@@ -1205,7 +1278,7 @@ pub fn pick_shown(pending: &[(&str, bool)], prev: Option<(&str, usize)>) -> Opti
     Some(pending.iter().position(|(_, superseded)| !superseded).unwrap_or(0))
 }
 
-fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
@@ -1247,6 +1320,44 @@ impl Board {
             dirty: false,
             shown: None,
             error: None,
+            paused_until: None,
+        }
+    }
+
+    /// The end of the pause, while one runs at `now`.
+    pub fn paused_at(&self, now: u64) -> Option<u64> {
+        self.paused_until.filter(|until| *until > now)
+    }
+
+    /// Pause the cards until `until` (epoch seconds), or end the pause (`None`).
+    /// Every `kova ask` still waiting whose answer can reach it later is let go
+    /// with [`PAUSED_PREFIX`]: an agent must not sit on a card nobody will read.
+    /// One that cannot receive a late answer keeps waiting, or it would lose it.
+    pub fn set_pause(&mut self, until: Option<u64>) {
+        match until {
+            Some(until) => log::info!("ask: cards paused until {} ({} waiting)", local_hhmm(until), self.pending.len()),
+            None => log::info!("ask: pause ended ({} waiting)", self.pending.len()),
+        }
+        self.paused_until = until;
+        if self.owns_store() {
+            self.store.save_pause(until);
+        }
+        if let Some(until) = until {
+            for (question, responder) in self.pending.iter_mut() {
+                if can_deliver_late(&question.from) {
+                    if let Some(tx) = responder.take() {
+                        let _ = tx.send(crate::ipc::IpcResponse::Error { message: paused_error(until) });
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// A pause whose end has passed is over: the card comes back.
+    fn expire_pause(&mut self, now: u64) {
+        if self.paused_until.is_some_and(|until| until <= now) {
+            self.set_pause(None);
         }
     }
 
@@ -1286,6 +1397,10 @@ impl Board {
 
     /// Put the questions kept on disk on the card, and resume the deliveries.
     fn replay(&mut self) {
+        if let Some(until) = self.store.load_pause().filter(|until| *until > now_secs()) {
+            log::info!("ask: cards paused until {}, restored from disk", local_hhmm(until));
+            self.paused_until = Some(until);
+        }
         let undelivered = self.store.undelivered();
         for question in self.store.pending_questions() {
             // Answered just before a quit: the answer is on disk, the question must not come back.
@@ -1321,7 +1436,17 @@ impl Board {
         if self.owns_store() {
             self.store.save_question(&question);
         }
-        self.pending.push((question, Some(responder)));
+        // Paused: the question waits in the queue, and its asker is told at once
+        // rather than after its timeout; the answer reaches it late, as usual.
+        let responder = match self.paused_at(now_secs()) {
+            Some(until) if can_deliver_late(&question.from) => {
+                log::info!("ask {}: queued, the cards are paused until {}", question.id, local_hhmm(until));
+                let _ = responder.send(crate::ipc::IpcResponse::Error { message: paused_error(until) });
+                None
+            }
+            _ => Some(responder),
+        };
+        self.pending.push((question, responder));
         self.dirty = true;
     }
 
@@ -1524,10 +1649,15 @@ impl Board {
     /// Show the question the card is on (or hide the card), when something changed.
     pub fn refresh_card(&mut self, mtm: objc2_foundation::MainThreadMarker) {
         self.retry_owner();
+        self.expire_pause(now_secs());
         if !self.dirty {
             return;
         }
         self.dirty = false;
+        if self.paused_at(now_secs()).is_some() {
+            crate::ask_card::pause(mtm, self.pending.len());
+            return;
+        }
         self.shown = self.current_shown();
         let total = self.pending.len();
         let head = self.shown.as_ref().map(|(_, rank)| (&self.pending[*rank].0, *rank));
@@ -1553,6 +1683,9 @@ impl Board {
 
     /// The card's answers and arrows since the last tick.
     pub fn drain_card(&mut self) {
+        if let Some(seconds) = crate::ask_card::take_snooze() {
+            self.set_pause(Some(now_secs() + seconds));
+        }
         for nav in crate::ask_card::take_browse() {
             self.browse(nav);
         }
@@ -1616,6 +1749,7 @@ usage: kova ask \"<message>\" [--actions OK,KO] [--no-input] [--from <name>] [--
        kova ask --card <file|-> [--from <name>] [--timeout <seconds>] [--json] [--socket <path>]
        kova ask --update <question id> --card <file|->
        kova ask --withdraw-id <question id>
+       kova ask --dnd [off | <minutes> | <n>h]   read, set or end the pause of the cards (--dnd --help)
 
 Shows a card in Kova with the message, one button per action and a text field, then waits for
 the user and prints the answer on stdout: the action, or \"action: text\" when they typed something.
@@ -1639,7 +1773,9 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
 
 Exit codes: 0 answered · 2 no answer within the timeout · 3 the user wrote in the conversation
 instead (their message is the answer; the card stays, marked, and a click there still arrives later
-as a message) · 1 error, or Kova quit while you waited.
+as a message) · 4 the user paused the cards (\"Not now\", see kova ask --dnd): the question waits in
+the queue and shows when the pause ends, its answer arrives later as a message · 1 error, or Kova
+quit while you waited.
 On a timeout the question stays on the user's screen. When they answer, Kova delivers the answer to
 this conversation itself: typed into its Kova pane if it is still open there, else by reopening it
 in a new Kova tab with `claude --resume`. So after exit 2, end your turn: the answer will come as a message.";
@@ -1795,6 +1931,88 @@ fn withdraw_session(flag: Option<&str>, stdin: impl FnOnce() -> String, env: Opt
 }
 
 /// `kova ask --withdraw …`: always 0, see [`WITHDRAW_USAGE`].
+const DND_USAGE: &str = "kova ask --dnd [off | <minutes> | <n>m | <n>h] [--json] [--socket <path>]
+
+Reads, sets or ends the pause of the cards, the one the card's \"Not now\" button starts (20 min,
+1 h or 3 h). While it runs no card shows: the questions wait in the queue and all come back when it
+ends, and a `kova ask` returns at once with exit 4. With no value it only reads.
+
+Exit codes: 0 not paused · 4 paused (stdout says until when and how many questions wait) · 1 error.
+An agent checks it before work that would end on a card: exit 4 means not now, keep it for later.";
+
+/// `kova ask --dnd …`: returns the process exit code.
+fn run_dnd(args: &[String]) -> i32 {
+    let mut minutes: Option<u64> = None;
+    let mut socket: Option<String> = None;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--socket" => socket = it.next().cloned(),
+            "--json" => json = true,
+            "-h" | "--help" => {
+                println!("{}", DND_USAGE);
+                return 0;
+            }
+            value if minutes.is_none() => match parse_dnd_minutes(value) {
+                Ok(m) => minutes = Some(m),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    return 1;
+                }
+            },
+            other => {
+                eprintln!("kova ask --dnd: unexpected '{}'\n{}", other, DND_USAGE);
+                return 1;
+            }
+        }
+    }
+    let mut body = serde_json::json!({"cmd": "ask-dnd"});
+    if let Some(m) = minutes {
+        body["minutes"] = serde_json::json!(m);
+    }
+    let first = socket.clone().or_else(|| std::env::var("KOVA_SOCKET").ok().filter(|s| !s.is_empty())).or_else(discover_socket);
+    let Some(first) = first else {
+        eprintln!("kova ask --dnd: no running Kova found (no $KOVA_SOCKET, no /tmp/kova-<pid>.sock served by Kova.app)");
+        return 1;
+    };
+    let mut reply = request(&first, body.clone(), Duration::from_secs(2));
+    // A library host's socket has no card: the pause lives on Kova.app.
+    let error = |r: &Option<serde_json::Value>| {
+        r.as_ref().and_then(|r| r.get("error")).and_then(|e| e.as_str()).map(String::from)
+    };
+    let unsupported = error(&reply).is_some_and(|e| e == "command not supported by this host" || e.starts_with("unknown command"));
+    if unsupported && socket.is_none() {
+        if let Some(app) = discover_socket().filter(|s| *s != first) {
+            reply = request(&app, body, Duration::from_secs(2));
+        }
+    }
+    let Some(reply) = reply else {
+        eprintln!("kova ask --dnd: Kova is not answering on {}", first);
+        return 1;
+    };
+    if let Some(e) = error(&Some(reply.clone())) {
+        if e.starts_with("unknown command") {
+            eprintln!("kova ask --dnd: the running Kova predates the pause ({}). It learns it at its next launch.", e);
+        } else {
+            eprintln!("kova ask --dnd: {}", e);
+        }
+        return 1;
+    }
+    let data = reply.get("data").cloned().unwrap_or_default();
+    let until = data.get("paused_until").and_then(|u| u.as_u64());
+    let waiting = data.get("waiting").and_then(|w| w.as_u64()).unwrap_or(0);
+    if json {
+        println!("{}", data);
+    } else {
+        match until {
+            Some(until) => println!("paused until {} ({} question(s) waiting)", local_hhmm(until), waiting),
+            None => println!("not paused ({} question(s) on the card)", waiting),
+        }
+    }
+    if until.is_some() { 4 } else { 0 }
+}
+
 fn run_withdraw(args: &[String]) -> i32 {
     let mut session: Option<String> = None;
     let mut socket: Option<String> = None;
@@ -1893,6 +2111,9 @@ pub fn run_cli(args: &[String]) -> i32 {
             return 0;
         }
         return run_withdraw(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("--dnd") {
+        return run_dnd(&args[1..]);
     }
     let fail = |msg: &str, code: i32| -> i32 {
         eprintln!("{}", msg);
@@ -2017,6 +2238,18 @@ pub fn run_cli(args: &[String]) -> i32 {
                 "kova ask: the Kova on {} predates `ask` ({}). It answers from its next launch.",
                 socket, err
             ), 1);
+        }
+        if let Some(until) = paused_until_of(err) {
+            return if late {
+                fail(&format!(
+                    "kova ask: the user paused the cards until {} (\"Not now\"): do not disturb them. The question \
+                     is kept (id {}) and shows when the pause ends; the answer will reach this conversation as a \
+                     message. Do not ask again. End your turn now.",
+                    local_hhmm(until), question.id
+                ), 4)
+            } else {
+                fail(&format!("kova ask: the user paused the cards until {}. Ask again after that.", local_hhmm(until)), 4)
+            };
         }
         if err == WITHDRAWN {
             return fail(
@@ -2609,6 +2842,90 @@ mod tests {
         assert!(!q.dismissable());
         assert_eq!(q.buttons(), vec![DISMISS, "Keep", OTHER], "no second Dismiss");
         assert!(!question("2").dismissable(), "a live question has none");
+    }
+
+    #[test]
+    fn not_now_lets_a_waiting_asker_go_and_keeps_its_question() {
+        let mut board = memory_board();
+        let (tx, rx) = std::sync::mpsc::channel();
+        board.add(question("q1"), tx);
+        let until = now_secs() + 1200;
+        board.set_pause(Some(until));
+        match rx.try_recv() {
+            Ok(crate::ipc::IpcResponse::Error { message }) => assert_eq!(paused_until_of(&message), Some(until)),
+            _ => panic!("the waiting asker must be told at once"),
+        }
+        assert_eq!(board.questions().len(), 1, "the question stays in the queue");
+        assert_eq!(board.paused_at(now_secs()), Some(until));
+    }
+
+    #[test]
+    fn a_question_asked_during_the_pause_is_queued_and_its_asker_told() {
+        let mut board = memory_board();
+        let until = now_secs() + 600;
+        board.set_pause(Some(until));
+        let (tx, rx) = std::sync::mpsc::channel();
+        board.add(question("q1"), tx);
+        assert!(matches!(rx.try_recv(), Ok(crate::ipc::IpcResponse::Error { message }) if message == paused_error(until)));
+        assert_eq!(board.questions().len(), 1);
+    }
+
+    #[test]
+    fn an_asker_that_cannot_get_a_late_answer_keeps_waiting_through_the_pause() {
+        let mut board = memory_board();
+        let mut q = question("q1");
+        q.from.session_id = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        board.add(q.clone(), tx);
+        board.set_pause(Some(now_secs() + 600));
+        assert!(rx.try_recv().is_err(), "released, it would lose the answer");
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        board.add(Question { id: "q2".into(), ..q }, tx2);
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_pause_ends_by_itself_or_on_demand() {
+        let mut board = memory_board();
+        let now = now_secs();
+        board.set_pause(Some(now + 60));
+        board.expire_pause(now + 59);
+        assert!(board.paused_at(now + 59).is_some());
+        board.expire_pause(now + 60);
+        assert_eq!(board.paused_until, None);
+        board.set_pause(Some(now + 600));
+        board.set_pause(None);
+        assert_eq!(board.paused_at(now), None);
+    }
+
+    #[test]
+    fn the_pause_is_kept_on_disk() {
+        let root = std::env::temp_dir().join(format!("kova-ask-pause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = AskStore::new(root.clone());
+        assert_eq!(store.load_pause(), None);
+        store.save_pause(Some(1_900_000_000));
+        assert_eq!(AskStore::new(root.clone()).load_pause(), Some(1_900_000_000));
+        store.save_pause(None);
+        assert_eq!(store.load_pause(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dnd_values_read_as_minutes() {
+        assert_eq!(parse_dnd_minutes("off"), Ok(0));
+        assert_eq!(parse_dnd_minutes("0"), Ok(0));
+        assert_eq!(parse_dnd_minutes("20"), Ok(20));
+        assert_eq!(parse_dnd_minutes("20m"), Ok(20));
+        assert_eq!(parse_dnd_minutes("20min"), Ok(20));
+        assert_eq!(parse_dnd_minutes("1h"), Ok(60));
+        assert_eq!(parse_dnd_minutes("3H"), Ok(180));
+        assert!(parse_dnd_minutes("2d").is_err());
+        assert!(parse_dnd_minutes("25h").is_err());
+        assert!(parse_dnd_minutes("-5").is_err());
+        assert_eq!(paused_until_of("paused until 1900000000"), Some(1_900_000_000));
+        assert_eq!(paused_until_of(WITHDRAWN), None);
+        assert_eq!(DND_CHOICES[0].0, 20 * 60, "the default is 20 min");
     }
 
     #[test]
