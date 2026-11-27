@@ -466,30 +466,106 @@ fn is_claude_invocation(cmd: &str) -> bool {
     first == "claude" || first.ends_with("/claude")
 }
 
-/// Drop the flags that select a conversation, so appending `--resume <id>`
-/// cannot collide with what the previous invocation already carried.
-fn strip_session_flags(cmd: &str) -> Vec<String> {
-    let tokens: Vec<&str> = cmd.split_whitespace().collect();
-    let mut out = Vec::with_capacity(tokens.len());
-    let mut skip_value = false;
+/// Claude Code options that take a value: the token after them is that value,
+/// never the prompt. Variadic ones (`--add-dir a b`) keep only their first value.
+const CLAUDE_VALUE_FLAGS: [&str; 34] = [
+    "--add-dir", "--agent", "--agents", "--allowedTools", "--allowed-tools",
+    "--append-system-prompt", "--append-system-prompt-file", "--autocompact", "--betas",
+    "--debug-file", "--disallowedTools", "--disallowed-tools", "--effort", "--environment",
+    "--fallback-model", "--file", "--input-format", "--json-schema", "--max-budget-usd",
+    "--mcp-config", "--model", "-n", "--name", "--output-format", "--permission-mode",
+    "--permission-prompts", "--plugin-dir", "--plugin-url", "--setting-sources", "--settings",
+    "--system-prompt", "--system-prompt-file", "--system-prompt-snapshot", "--tools",
+];
 
-    for token in tokens {
+/// Split a command line into words the way the shell would, each word kept as
+/// written (quotes included), so a quoted prompt is one word, not several.
+fn shell_words(cmd: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = cmd.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                word.push(c);
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' {
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                    }
+                }
+            }
+            None if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            None => {
+                word.push(c);
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                } else if c == '\\' {
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                    }
+                }
+            }
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// Drop the flags that select a conversation, so appending `--resume <id>`
+/// cannot collide with what the previous invocation already carried, and the
+/// prompt the pane was started with (`claude "/coach" …`): resuming must not
+/// show it again, and once saved it would come back at every relaunch.
+///
+/// `known_flags`: the command is `claude` itself, whose options are known, so
+/// every word that is not an option or an option's value is a prompt. A
+/// launcher's options are not known; there only a quoted word counts as one.
+fn strip_session_flags_of(cmd: &str, known_flags: bool) -> Vec<String> {
+    let mut words = shell_words(cmd).into_iter();
+    let mut out: Vec<String> = words.next().into_iter().collect();
+    let mut skip_value = false;
+    let mut takes_value = false;
+
+    for word in words {
+        let is_flag = word.starts_with('-');
         if skip_value {
             skip_value = false;
             // A flag follows: the previous option had no value after all.
-            if !token.starts_with('-') {
+            if !is_flag {
                 continue;
             }
         }
-        match token {
-            "-r" | "--resume" | "--session-id" | "--from-pr" => {
-                skip_value = true;
+        if takes_value {
+            takes_value = false;
+            if !is_flag {
+                out.push(word);
+                continue;
             }
+        }
+        match word.as_str() {
+            "-r" | "--resume" | "--session-id" | "--from-pr" => skip_value = true,
             "-c" | "--continue" | "--fork-session" => {}
-            _ => out.push(token.to_string()),
+            w if is_flag => {
+                takes_value = known_flags && CLAUDE_VALUE_FLAGS.contains(&w);
+                out.push(word);
+            }
+            w if known_flags || w.starts_with('"') || w.starts_with('\'') => {} // the prompt
+            _ => out.push(word),
         }
     }
     out
+}
+
+fn strip_session_flags(cmd: &str) -> Vec<String> {
+    strip_session_flags_of(cmd, is_claude_invocation(cmd))
 }
 
 #[cfg(test)]
@@ -760,6 +836,30 @@ mod tests {
         assert_eq!(resume(Some("RUST_LOG=debug claude"), "abc"), "claude --resume abc");
         assert_eq!(resume(Some("claude | tee log"), "abc"), "claude --resume abc");
         assert_eq!(resume(Some(""), "abc"), "claude --resume abc");
+    }
+
+    #[test]
+    fn resume_drops_the_prompt_the_pane_was_started_with() {
+        assert_eq!(resume(Some(r#"claude "/cos board" --resume old"#), "abc"), "claude --resume abc");
+        assert_eq!(resume(Some("claude 'fix the bug' --model opus"), "abc"), "claude --model opus --resume abc");
+        assert_eq!(resume(Some("claude hello"), "abc"), "claude --resume abc");
+        assert_eq!(
+            resume(Some(r#"claude --append-system-prompt "be brief" "$(cat /tmp/p.md)""#), "abc"),
+            r#"claude --append-system-prompt "be brief" --resume abc"#
+        );
+        assert_eq!(
+            resume(Some(r#"claude "say \"hi\" twice" --dangerously-skip-permissions"#), "abc"),
+            "claude --dangerously-skip-permissions --resume abc"
+        );
+    }
+
+    #[test]
+    fn a_launcher_loses_its_quoted_prompt_but_keeps_its_own_options() {
+        let dir = Some("/Users/x/.claude-deepseek");
+        assert_eq!(
+            resume_command(Some(r#"deepseek-cc --mcp a,b "/coach" --resume old"#), "abc", dir).as_deref(),
+            Some("deepseek-cc --mcp a,b --resume abc")
+        );
     }
 
     #[test]

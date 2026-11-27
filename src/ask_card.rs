@@ -30,7 +30,7 @@ use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSAttributedStringNSExtendedStringDrawing, NSAttributedStringNSStringDrawing,
     NSBackingStoreType, NSButton, NSColor, NSControl, NSControlTextEditingDelegate, NSEvent,
-    NSEventModifierFlags, NSFloatingWindowLevel, NSFocusRingType, NSFont, NSFontWeightBold,
+    NSEventModifierFlags, NSFloatingWindowLevel, NSFocusRingType, NSFont, NSFontWeightBold, NSImage,
     NSFontWeightRegular, NSFontWeightSemibold, NSLayoutAttribute, NSLayoutConstraint,
     NSLayoutConstraintOrientation, NSLayoutManager, NSLayoutPriorityRequired, NSLineBreakMode,
     NSControlSize, NSPanel, NSPopUpButton, NSRequestUserAttentionType, NSResponder, NSScreen, NSScrollView, NSScroller, NSSound,
@@ -229,12 +229,12 @@ define_class!(
             browse(-1);
         }
 
-        /// "Not now": every card waits for the duration picked next to it.
+        /// "Not now": every card waits for the duration picked in the header menu.
         #[unsafe(method(snooze:))]
-        fn snooze(&self, _sender: &NSButton) {
-            let Some(card) = card() else { return };
-            let index = usize::try_from(card.snooze_for.indexOfSelectedItem()).unwrap_or(0);
-            let (seconds, label) = crate::ask::DND_CHOICES.get(index).copied().unwrap_or(crate::ask::DND_CHOICES[0]);
+        fn snooze(&self, sender: &NSPopUpButton) {
+            // Item 0 of a pull-down is the button's face; the durations follow.
+            let Some(index) = snooze_choice(sender.indexOfSelectedItem()) else { return };
+            let (seconds, label) = crate::ask::DND_CHOICES[index];
             log::info!("Ask card: not now, for {}", label);
             if let Ok(mut snooze) = SNOOZE.lock() {
                 *snooze = Some(seconds);
@@ -393,8 +393,6 @@ struct Card {
     /// answer gets longer.
     field_height: Retained<NSLayoutConstraint>,
     buttons: Retained<NSStackView>,
-    /// The pause "Not now" asks for (`crate::ask::DND_CHOICES`).
-    snooze_for: Retained<NSPopUpButton>,
     width: Retained<NSLayoutConstraint>,
     line_height: CGFloat,
     current: RefCell<Option<Current>>,
@@ -448,6 +446,37 @@ fn small_label(mtm: MainThreadMarker, size: CGFloat, color: &NSColor) -> Retaine
     label.setPreferredMaxLayoutWidth(CARD_WIDTH - 2.0 * INSET);
     label.setHidden(true);
     label
+}
+
+/// The pull-down behind "Not now": a moon face, then one item per pause.
+fn snooze_menu(mtm: MainThreadMarker, target: &CardTarget) -> Retained<NSPopUpButton> {
+    let menu = NSPopUpButton::new(mtm);
+    menu.setPullsDown(true);
+    menu.setBordered(false);
+    menu.addItemWithTitle(&ns(""));
+    if let Some(face) = menu.itemAtIndex(0) {
+        let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns("moon.zzz"), Some(&ns("Not now")));
+        face.setImage(image.as_deref());
+    }
+    for (_, label) in crate::ask::DND_CHOICES {
+        menu.addItemWithTitle(&ns(&format!("Not now, for {}", label)));
+    }
+    menu.setControlSize(NSControlSize::Small);
+    menu.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+    menu.setToolTip(Some(&ns("Not now: hide every card for a while; they come back unanswered")));
+    unsafe {
+        menu.setTarget(Some(target));
+        menu.setAction(Some(sel!(snooze:)));
+    }
+    menu.setContentHuggingPriority_forOrientation(NSLayoutPriorityRequired, NSLayoutConstraintOrientation::Horizontal);
+    menu
+}
+
+/// The pause picked in the "Not now" pull-down, as an index into
+/// `crate::ask::DND_CHOICES`: item 0 is the button's face, not a choice.
+fn snooze_choice(selected: isize) -> Option<usize> {
+    let index = usize::try_from(selected).ok()?.checked_sub(1)?;
+    (index < crate::ask::DND_CHOICES.len()).then_some(index)
 }
 
 fn nav_button(mtm: MainThreadMarker, title: &str, target: &CardTarget, action: Sel) -> Retained<NSButton> {
@@ -540,9 +569,12 @@ impl Card {
         nav.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
         nav.setSpacing(2.0);
         nav.setHidden(true);
+        // Top-right: "Not now", one pull-down that pauses every card for the
+        // duration picked; they all come back, unanswered, when it ends.
+        let snooze = snooze_menu(mtm, &target);
         let spacer = NSView::new(mtm);
         let header = NSStackView::stackViewWithViews(
-            &NSArray::from_slice(&[&*badge_holder, who.as_ref(), &*spacer, nav.as_ref(), meta.as_ref()]),
+            &NSArray::from_slice(&[&*badge_holder, who.as_ref(), &*spacer, nav.as_ref(), meta.as_ref(), snooze.as_ref()]),
             mtm,
         );
         header.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
@@ -639,28 +671,11 @@ impl Card {
         buttons.setAlignment(NSLayoutAttribute::Trailing);
         buttons.setSpacing(BUTTON_SPACING);
         let footer_spacer = NSView::new(mtm);
-        // Bottom-left: "Not now" hides every card for the duration picked
-        // beside it; they all come back, unanswered, when it ends.
-        let snooze = unsafe {
-            NSButton::buttonWithTitle_target_action(&ns("Not now"), Some(&target), Some(sel!(snooze:)), mtm)
-        };
-        snooze.setBordered(false);
-        snooze.setAttributedTitle(&attributed("Not now", &NSFont::systemFontOfSize(12.0), &NSColor::secondaryLabelColor()));
-        snooze.setToolTip(Some(&ns("Hide every card for the time picked; they come back unanswered")));
-        let snooze_for = NSPopUpButton::new(mtm);
-        for (_, label) in crate::ask::DND_CHOICES {
-            snooze_for.addItemWithTitle(&ns(label));
-        }
-        snooze_for.selectItemAtIndex(0);
-        snooze_for.setControlSize(NSControlSize::Small);
-        snooze_for.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         let footer = NSStackView::stackViewWithViews(
-            &NSArray::from_slice(&[snooze.as_ref(), snooze_for.as_ref(), &*footer_spacer, buttons.as_ref()]),
+            &NSArray::from_slice(&[&*footer_spacer, buttons.as_ref()]),
             mtm,
         );
         footer.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-        footer.setAlignment(NSLayoutAttribute::Bottom);
-        footer.setSpacing(4.0);
 
         let stack = NSStackView::stackViewWithViews(
             &NSArray::from_slice(&[
@@ -736,7 +751,6 @@ impl Card {
             field_box,
             field_height,
             buttons,
-            snooze_for,
             width,
             line_height,
             current: RefCell::new(None),
@@ -1198,7 +1212,6 @@ pub fn pause(mtm: MainThreadMarker, total: usize) {
                 card.drafts.borrow_mut().insert(id, text);
             }
         }
-        card.snooze_for.selectItemAtIndex(0);
         card.hide();
     }
 }
@@ -1221,5 +1234,19 @@ pub fn take_browse() -> Vec<i32> {
     match BROWSE.lock() {
         Ok(mut queue) => std::mem::take(&mut *queue),
         Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snooze_menu_face_is_not_a_choice() {
+        assert_eq!(snooze_choice(0), None, "item 0 is the moon face");
+        assert_eq!(snooze_choice(-1), None, "nothing selected");
+        assert_eq!(snooze_choice(1), Some(0), "the first duration is 20 min");
+        assert_eq!(snooze_choice(crate::ask::DND_CHOICES.len() as isize), Some(crate::ask::DND_CHOICES.len() - 1));
+        assert_eq!(snooze_choice(crate::ask::DND_CHOICES.len() as isize + 1), None);
     }
 }

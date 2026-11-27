@@ -215,8 +215,8 @@ rest of this spec.
 
 ### 6.1 Not now
 
-The card's footer carries, bottom-left, a "Not now" button and a select (20 min, the default;
-1 h; 3 h). "Not now" answers nothing: it pauses **every** card for the duration picked, the card
+The card's header carries, top-right, a moon button (tooltip "Not now") that opens a menu: Not now
+for 20 min, 1 h or 3 h. Picking one answers nothing: it pauses **every** card for the duration picked, the card
 disappears, and the whole queue comes back, unanswered and with any typed text kept, when the
 pause ends. The Dock badge keeps counting what waits. `kova ask --dnd` reads, sets or ends the
 pause (`docs/ipc.md` § `ask-dnd`); a `kova ask` during the pause exits 4 at once, its question
